@@ -1068,7 +1068,21 @@ async def _handle_plugin_message(
             except HandoffNotFoundError:
                 logger.warning("Plugin reported open_failed for unknown handoff %s", handoff_id)
             else:
-                await _fallback_to_tier1(context, manager, handoff_id)
+                # Only fall back to a server-side Tier 1 launch when the plugin
+                # is on the SERVER's own machine (local mode). For a REMOTE
+                # plugin, a Tier 1 launch would open Photoshop on the SERVER --
+                # the wrong machine (the user is at the plugin's machine, not
+                # the server). In that case leave the handoff in `error` with
+                # the plugin's own message so the real failure is visible,
+                # instead of silently opening on the server.
+                if connection.local_mode is False:
+                    logger.info(
+                        "cpsb: remote plugin open_failed for %s -- NOT falling back to a "
+                        "server-side Tier 1 launch (would open on the wrong machine)",
+                        handoff_id,
+                    )
+                else:
+                    await _fallback_to_tier1(context, manager, handoff_id)
     elif msg_type == "save_detected":
         pass  # Informational only -- pixels follow via POST /cpsb/upload.
     elif msg_type == "pong":

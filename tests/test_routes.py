@@ -1383,14 +1383,14 @@ class TestSettings:
 
 
 class TestPluginWebsocket:
-    async def handshake(self, ws, context: CpsbContext) -> dict:
+    async def handshake(self, ws, context: CpsbContext, local_mode: bool = True) -> dict:
         await ws.send_json(
             {"type": "hello", "plugin_version": "0.1.0", "ps_version": "26.5", "uxp_version": "8.1"}
         )
         ack = await ws.receive_json(timeout=5)
         assert ack["type"] == "hello_ack"
         assert ack["input_cpsb_path"] == str(context.cpsb_input_dir.resolve())
-        await ws.send_json({"type": "ready", "local_mode": True})
+        await ws.send_json({"type": "ready", "local_mode": local_mode})
         return ack
 
     async def test_handshake_marks_tier2_connected(self, client, context, events, launches):
@@ -1445,6 +1445,49 @@ class TestPluginWebsocket:
             )
             await wait_until(lambda: manager.get(data["handoff_id"]).status == "error")
             assert manager.get(data["handoff_id"]).error == "boom"
+
+    async def test_open_failed_local_mode_falls_back_to_tier1(
+        self, client, manager, context, source_image, launches, monkeypatch
+    ):
+        """A LOCAL-mode plugin that fails to open falls back to a Tier 1 OS-open
+        (same machine as the server, so the launch lands on the right screen)."""
+        monkeypatch.setattr(
+            routes_module, "tier1_status", lambda: Tier1Status(available=True)
+        )
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context, local_mode=True)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            await ws.receive_json(timeout=5)  # open_handoff command
+            await ws.send_json(
+                {"type": "open_failed", "handoff_id": data["handoff_id"], "error": "boom"}
+            )
+            # The Tier 1 fallback launch fires and drives status to editing.
+            await wait_until(lambda: manager.get(data["handoff_id"]).status == "editing")
+            assert len(launches.calls) == 1
+
+    async def test_open_failed_remote_mode_does_not_fall_back(
+        self, client, manager, context, source_image, launches, monkeypatch
+    ):
+        """A REMOTE-mode plugin that fails to open must NOT fall back to a
+        server-side Tier 1 launch — that would open Photoshop on the server
+        (the wrong machine). The handoff stays in `error` with the plugin's
+        message, and no OS launch happens."""
+        monkeypatch.setattr(
+            routes_module, "tier1_status", lambda: Tier1Status(available=True)
+        )
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            await ws.receive_json(timeout=5)  # open_handoff command
+            await ws.send_json(
+                {"type": "open_failed", "handoff_id": data["handoff_id"], "error": "boom"}
+            )
+            await wait_until(lambda: manager.get(data["handoff_id"]).status == "error")
+            assert manager.get(data["handoff_id"]).error == "boom"
+            # No server-side launch — a remote plugin's failure stays an error.
+            assert launches.calls == []
 
     async def test_cancel_notifies_plugin(self, client, manager, context, source_image, launches):
         async with client.ws_connect("/cpsb/ws") as ws:

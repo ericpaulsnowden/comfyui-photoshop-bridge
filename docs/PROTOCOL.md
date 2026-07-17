@@ -227,7 +227,11 @@ Plugin → server:
 - `{"type": "opened", "handoff_id": "...", "document_id": 123}` — document open
   succeeded; server sets status `editing`.
 - `{"type": "open_failed", "handoff_id": "...", "error": "..."}` — server sets status
-  `error`, falls back to Tier 1 OS-open if available.
+  `error`. If the plugin is in LOCAL mode (same machine as the server), the server falls
+  back to a Tier 1 OS-open if available. For a REMOTE-mode plugin it does **not** fall
+  back — a server-side launch would open Photoshop on the wrong machine (the server, not
+  the machine the user is at) — leaving the handoff in `error` with the plugin's message
+  so the real failure is visible.
 - `{"type": "save_detected", "handoff_id": "..."}` — informational (UI badge); pixels
   follow via POST `/cpsb/upload`.
 - `{"type": "pong"}`
