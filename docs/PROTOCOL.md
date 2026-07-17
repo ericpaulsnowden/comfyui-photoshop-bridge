@@ -425,15 +425,22 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `image/photoshop`.
 - Frontend gives it AUTO-GROWING image inputs: `image_1`, `image_2`, … — connecting one
   reveals the next empty socket (pattern forked from rgthree's MIT implementation, with
-  attribution comment). Backend accepts any number ≥ 1 via optional inputs.
+  attribution comment). Backend accepts any number ≥ 1 via optional inputs. Each socket
+  carries a ComfyUI IMAGE, which may be a multi-image BATCH (e.g. a VAE Decode emitting
+  several images) — every image in every batch becomes its own layer (frames expanded in
+  batch order within a socket, sockets in `image_1..image_N` order).
 - Widgets: `filename_prefix` (STRING, default "compose"), `group_name` (STRING, default
   "ComfyUI Layers"), `mode` (COMBO — the SAME three strings as the Edit in Photoshop
   node's BridgeMode: "Wait for first save" (default) | "Re-run on every save" |
   "Don't open (composite only)"). (Replaces the earlier `edit_after` BOOLEAN — pre-release
   breaking change.) `timeout_seconds` (INT, default 1800) applies to "Wait for first save".
-- Behavior: canvas = max width × max height across inputs; every image becomes one
-  pixel layer, CENTERED, never rescaled; `image_1` is the BOTTOM layer, higher indices
-  stack on top; all layers inside ONE group named `group_name`. Written via psd-tools
+  `max_layers` (INT, default 64, min 1, max 512) caps the total images turned into layers
+  across all sockets, oldest-first; a larger batch is truncated (first N kept) with a
+  logged warning — no silent drop.
+- Behavior: canvas = max width × max height across inputs; every image (across every
+  socket's batch) becomes one pixel layer, CENTERED, never rescaled; `image_1`'s first
+  frame is the BOTTOM layer, later frames/indices stack on top; all layers inside ONE
+  group named `group_name`. Written via psd-tools
   (`PSDImage.new` → `create_pixel_layer` → `create_group`) to
   `input/<filename_prefix>_%05d.psd` (unique per execution). Outputs:
   (IMAGE flattened composite, MASK = 1-alpha of composite else zeros, STRING = the

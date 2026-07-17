@@ -56,6 +56,14 @@ GREEN = (0, 255, 0)
 BLUE = (0, 0, 255)
 
 
+def make_batch(colors, size: tuple[int, int] = (24, 16)) -> np.ndarray:
+    """An NxHxWx3 ComfyUI-layout tensor: one solid-color frame per color.
+
+    Models a batched IMAGE socket (e.g. a VAE Decode emitting multiple images).
+    """
+    return np.concatenate([make_tensor(c, size) for c in colors], axis=0)
+
+
 def raises_interrupt():
     """The interrupt this test environment surfaces as (no real ComfyUI installed).
 
@@ -418,6 +426,44 @@ class TestComputeInputsHash:
         assert b != c
 
 
+class TestCollectLayerImages:
+    """Batch expansion + the max_layers cap (multi-image IMAGE input -> layers)."""
+
+    def test_frames_to_pils_expands_batch(self):
+        pils = compose_module._tensor_frames_to_pils(make_batch([RED, GREEN]))
+        assert [p.getpixel((0, 0)) for p in pils] == [RED, GREEN]
+
+    def test_single_socket_batch_expands_to_layers(self):
+        kwargs = {"image_1": make_batch([RED, GREEN, BLUE])}
+        pils, total = compose_module._collect_layer_images(kwargs, max_layers=64)
+        assert total == 3
+        assert [p.getpixel((0, 0)) for p in pils] == [RED, GREEN, BLUE]
+
+    def test_multiple_sockets_concatenate_index_then_batch_order(self):
+        kwargs = {"image_1": make_batch([RED, GREEN]), "image_2": make_batch([BLUE])}
+        pils, total = compose_module._collect_layer_images(kwargs, max_layers=64)
+        assert total == 3
+        assert [p.getpixel((0, 0)) for p in pils] == [RED, GREEN, BLUE]
+
+    def test_cap_truncates_and_reports_total(self):
+        kwargs = {"image_1": make_batch([RED] * 10)}
+        pils, total = compose_module._collect_layer_images(kwargs, max_layers=4)
+        assert total == 10
+        assert len(pils) == 4
+
+    def test_cap_spans_sockets(self):
+        kwargs = {"image_1": make_batch([RED] * 3), "image_2": make_batch([BLUE] * 3)}
+        pils, total = compose_module._collect_layer_images(kwargs, max_layers=4)
+        assert total == 6
+        # 3 from image_1 (bottom), then 1 from image_2 -- cap hit mid-socket.
+        assert [p.getpixel((0, 0)) for p in pils] == [RED, RED, RED, BLUE]
+
+    def test_no_sockets_is_empty(self):
+        pils, total = compose_module._collect_layer_images({}, max_layers=64)
+        assert pils == []
+        assert total == 0
+
+
 class TestIsChanged:
     def test_bare_hash_when_no_active_handoff(self, configured):
         value = ComposePSD.IS_CHANGED(
@@ -684,6 +730,36 @@ class TestExecuteCompose:
         array = (image_out[0].numpy() * 255.0).round().astype("uint8")
         assert array.shape == (10, 10, 3)  # (height, width, channels)
         assert mask_out.shape == (1, 10, 10)
+
+    def test_batched_input_becomes_layers(self, context, manager, configured):
+        """A single batched IMAGE socket (e.g. a VAE Decode's multiple outputs)
+        expands frame-by-frame into one PSD layer each."""
+        node = ComposePSD()
+        _, _, filename_out = node.execute(
+            filename_prefix="compose",
+            group_name="Batch",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_batch([RED, GREEN, BLUE], size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Layer 1", "Layer 2", "Layer 3"]
+
+    def test_max_layers_caps_batch(self, context, manager, configured):
+        """max_layers bounds the batch: only the first N images become layers."""
+        node = ComposePSD()
+        _, _, filename_out = node.execute(
+            filename_prefix="compose",
+            group_name="Capped",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            max_layers=2,
+            image_1=make_batch([RED, GREEN, BLUE, RED, GREEN], size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Layer 1", "Layer 2"]
 
     def test_image_1_is_bottom_image_n_is_top(self, context, manager, configured):
         """image_1 bottom, image_2 top -- same-bbox overlap: top wins (PROTOCOL.md §6c)."""

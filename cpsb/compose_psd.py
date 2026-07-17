@@ -110,6 +110,56 @@ def _collect_connected_images(kwargs: dict[str, Any]) -> list[Any]:
     return images
 
 
+#: Default cap on how many images become PSD layers (the `max_layers` widget).
+#: Generous enough that ordinary batches (a handful of VAE-decoded images, plus
+#: a few separate sockets) never truncate, while still bounding a runaway batch
+#: (e.g. a long video decode) so it can't silently produce a thousand-layer PSD.
+DEFAULT_MAX_LAYERS = 64
+
+
+def _tensor_frames_to_pils(image: Any) -> list[Image.Image]:
+    """Every frame of a ComfyUI ``IMAGE`` tensor (NHWC float32 [0,1]) as PIL images.
+
+    A ComfyUI ``IMAGE`` is a BATCH: a VAE Decode (or any node) can emit several
+    images on a single socket. Unlike :func:`cpsb.nodes._tensor_to_pil` (which
+    keeps only the first frame), this expands the whole batch so each image
+    becomes its own PSD layer (PROTOCOL.md §6c: multi-image batches -> layers).
+    """
+    import numpy as np
+
+    frames: list[Image.Image] = []
+    for frame in image:  # iterate the leading batch dimension
+        array = frame.cpu().numpy() if hasattr(frame, "cpu") else np.asarray(frame)
+        array = np.clip(array * 255.0, 0, 255).astype(np.uint8)
+        frames.append(Image.fromarray(array, mode="RGB"))
+    return frames
+
+
+def _collect_layer_images(
+    kwargs: dict[str, Any], max_layers: int
+) -> tuple[list[Image.Image], int]:
+    """Expand every connected ``image_N`` socket's batch into layer images.
+
+    Order is ``image_1``..``image_N`` (bottom-to-top), and within each socket
+    the batch's own frame order. The total is capped at *max_layers* -- only the
+    first *max_layers* images become layers, and frames past the cap are counted
+    but never decoded (a huge batch is sliced before conversion, so it can't
+    blow up memory just to be dropped).
+
+    Returns ``(pil_images, total_available)`` where *total_available* is how many
+    images existed across all sockets before the cap, so the caller can tell the
+    user when it truncated.
+    """
+    pil_images: list[Image.Image] = []
+    total_available = 0
+    for tensor in _collect_connected_images(kwargs):
+        total_available += len(tensor)
+        remaining = max_layers - len(pil_images)
+        if remaining > 0:
+            pil_images.extend(_tensor_frames_to_pils(tensor[:remaining]))
+    return pil_images, total_available
+
+
 def _sanitize_filename_prefix(raw: str) -> str:
     """Reduce ``filename_prefix`` to a single safe filename component.
 
@@ -500,6 +550,10 @@ class PhotoshopComposePSD:
                     {"default": nodes.BridgeMode.WAIT_FIRST_SAVE},
                 ),
                 "timeout_seconds": ("INT", {"default": 1800, "min": 10, "max": 86400}),
+                "max_layers": (
+                    "INT",
+                    {"default": DEFAULT_MAX_LAYERS, "min": 1, "max": 512},
+                ),
             },
             "optional": optional,
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -513,6 +567,7 @@ class PhotoshopComposePSD:
         mode: str,
         timeout_seconds: int,
         unique_id: str,
+        max_layers: int = DEFAULT_MAX_LAYERS,
         **kwargs: Any,
     ) -> str:
         """:func:`_compute_inputs_hash`, folded with the latest-edit hash when consumable.
@@ -538,7 +593,7 @@ class PhotoshopComposePSD:
         IS folded (through :func:`_compute_inputs_hash`) because switching it
         genuinely changes the output.
         """
-        pil_images = [nodes._tensor_to_pil(t) for t in _collect_connected_images(kwargs)]
+        pil_images, _ = _collect_layer_images(kwargs, max_layers)
         prefix = _sanitize_filename_prefix(filename_prefix)
         inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode)
 
@@ -559,6 +614,7 @@ class PhotoshopComposePSD:
         mode: str,
         timeout_seconds: int,
         unique_id: str,
+        max_layers: int = DEFAULT_MAX_LAYERS,
         **kwargs: Any,
     ) -> tuple[Any, Any, str]:
         """Compose (or consume) and return ``(IMAGE, MASK, STRING)`` (PROTOCOL.md §6c).
@@ -593,10 +649,15 @@ class PhotoshopComposePSD:
                 docstring).
             timeout_seconds: Bound on the "Wait for first save" blocking wait;
                 unused by the other two modes.
+            max_layers: Cap on how many images become layers. Each connected
+                socket's IMAGE batch is expanded frame-by-frame into layers
+                (so a VAE Decode emitting N images yields N layers); the total
+                across all sockets is capped here, oldest-first, with a warning
+                logged when it truncates.
             unique_id: This node instance's id (ComfyUI's hidden
                 ``UNIQUE_ID`` input), used to key its handoff lookup.
-            **kwargs: The connected ``image_N`` tensors, whichever subset
-                ComfyUI passed for this execution.
+            **kwargs: The connected ``image_N`` tensors (each possibly a
+                multi-image batch), whichever subset ComfyUI passed.
 
         Returns:
             ``(IMAGE, MASK, STRING)`` -- see the class docstring.
@@ -613,10 +674,20 @@ class PhotoshopComposePSD:
         manager = state.manager
         node_id = str(unique_id)
 
-        tensors = _collect_connected_images(kwargs)
-        if not tensors:
+        pil_images, total_available = _collect_layer_images(kwargs, max_layers)
+        if not pil_images:
             raise ValueError("PhotoshopComposePSD needs at least one connected image_N input")
-        pil_images = [nodes._tensor_to_pil(tensor) for tensor in tensors]
+        if total_available > len(pil_images):
+            # No silent truncation: a batch bigger than the cap loses layers, so
+            # say so in the log (the user's lever is the max_layers widget).
+            logger.warning(
+                "cpsb compose_psd: node %s: %d input image(s) exceed max_layers=%d; "
+                "using the first %d as layers (raise max_layers to include more)",
+                node_id,
+                total_available,
+                max_layers,
+                len(pil_images),
+            )
 
         prefix = _sanitize_filename_prefix(filename_prefix)
         inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode)
