@@ -74,9 +74,13 @@ def _wire_into_comfyui() -> None:
     manager = HandoffManager(context)
 
     # Custom nodes load before PromptServer.add_routes()/run, so adding to
-    # the app's router here lands our routes on ComfyUI's own port.
+    # the app's router here lands our routes on ComfyUI's own port. We must
+    # register both the bare and /api-prefixed paths ourselves, because the
+    # frontend's api.fetchApi always calls /api/cpsb/... and registering our
+    # own RouteTableDef directly skips ComfyUI's /api mirroring (see
+    # cpsb.routes.add_routes_to_app).
     cpsb_routes.install(server.app, context, manager)
-    server.app.add_routes(cpsb_routes.routes)
+    cpsb_routes.add_routes_to_app(server.app)
 
     _cpsb_nodes.configure(context, manager, server.app, server.loop)
 

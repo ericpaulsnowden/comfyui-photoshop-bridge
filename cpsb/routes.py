@@ -102,6 +102,32 @@ def install(app: web.Application, context: CpsbContext, manager: HandoffManager)
     app[_APP_KEY_PLUGIN] = _PluginSlot()
 
 
+def add_routes_to_app(app: web.Application) -> None:
+    """Register every ``/cpsb/*`` route on *app* under BOTH the bare path and
+    the ``/api``-prefixed path.
+
+    ComfyUI's own ``PromptServer.add_routes()`` duplicates its route table
+    under ``/api`` (``server.py``: it builds ``/api`` + path for every
+    ``RouteDef`` in ``self.routes`` and adds both tables to the app), and the
+    frontend's ``api.fetchApi`` always calls the ``/api``-prefixed form. A
+    custom node that registers its own ``RouteTableDef`` directly with
+    ``app.add_routes()`` gets only the bare paths, so every frontend call
+    (``/api/cpsb/open`` etc.) lands on ComfyUI's static handler and comes back
+    ``405 Method Not Allowed`` for anything but GET.
+
+    Replicating the duplication here -- rather than appending our routes to
+    ``PromptServer.routes`` and letting ComfyUI mirror them -- keeps
+    registration independent of whether ComfyUI's ``add_routes()`` runs before
+    or after custom nodes load, and avoids double-registering the bare paths.
+    """
+    api_routes = web.RouteTableDef()
+    for route in routes:
+        if isinstance(route, web.RouteDef):
+            api_routes.route(route.method, "/api" + route.path, **route.kwargs)(route.handler)
+    app.add_routes(api_routes)
+    app.add_routes(routes)
+
+
 def _context(request: web.Request) -> CpsbContext:
     return request.app[_APP_KEY_CONTEXT]
 

@@ -116,6 +116,49 @@ async def wait_until(predicate, timeout: float = 5.0) -> None:
     raise AssertionError("Condition not met in time")
 
 
+@pytest.fixture
+async def api_client(context: CpsbContext, manager: HandoffManager, launches: LaunchRecorder):
+    """A client whose routes are mounted via ``add_routes_to_app`` -- i.e. under
+    both the bare and ``/api``-prefixed paths, exactly as ``__init__.py`` wires
+    them into the real ComfyUI server -- so the ``/api`` mirroring is exercised.
+    """
+    app = web.Application()
+    routes_module.add_routes_to_app(app)
+    routes_module.install(app, context, manager)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    yield test_client
+    await test_client.close()
+
+
+class TestApiPrefix:
+    """Regression guard: the frontend only ever calls the ``/api``-prefixed
+    form (``api.fetchApi``), so every route must answer there, not just on the
+    bare path. A prior version registered bare paths only, so every frontend
+    POST came back 405 from ComfyUI's static handler.
+    """
+
+    async def test_open_answers_on_api_prefixed_path(
+        self, api_client, source_image, launches
+    ):
+        response = await api_client.post("/api/cpsb/open", json=open_body())
+        assert response.status == 200
+
+    async def test_open_still_answers_on_bare_path(self, api_client, source_image, launches):
+        response = await api_client.post("/cpsb/open", json=open_body())
+        assert response.status == 200
+
+    async def test_status_answers_on_both_paths(self, api_client):
+        assert (await api_client.get("/cpsb/status")).status == 200
+        assert (await api_client.get("/api/cpsb/status")).status == 200
+
+    async def test_api_prefixed_open_rejects_wrong_method(self, api_client):
+        # GET on the POST-only route must be 405 (route exists, method wrong) --
+        # proving the path is genuinely registered, not falling through to a
+        # 404. This is the exact status the bare-only bug produced for POSTs.
+        assert (await api_client.get("/api/cpsb/open")).status == 405
+
+
 class TestOpen:
     async def test_happy_path_creates_and_launches(
         self, client, manager, context, source_image, launches
