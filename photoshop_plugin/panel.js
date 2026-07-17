@@ -83,9 +83,10 @@ function initPanel() {
 
   /**
    * Renders the version self-identification line: plugin version alone
-   * while not connected, plugin + server versions once connected, with the
-   * error accent and an "(update mismatch)" note when the two differ
-   * (docs/PROTOCOL.md §9 — mismatches warn, never refuse the connection).
+   * while not connected, plugin + server versions once connected, with an
+   * amber "update available" heads-up when the two differ (docs/PROTOCOL.md
+   * §9 — a mismatch is informational, the connection is still fine; never
+   * red, never "refuse").
    * @param {import('./connection.js').CpsbConnectionState} state
    * @returns {void}
    */
@@ -94,7 +95,7 @@ function initPanel() {
     if (state.status === 'connected' && state.serverVersion) {
       const mismatch = state.serverVersion !== pluginVersion
       versionEl.textContent = mismatch
-        ? `Plugin v${pluginVersion} • Server v${state.serverVersion} (update mismatch)`
+        ? `Plugin v${pluginVersion} • Server v${state.serverVersion} · update available`
         : `Plugin v${pluginVersion} • Server v${state.serverVersion}`
       // On mismatch, add the color-only accent class alongside the banner
       // class (which keeps the banner's weight/size); the accent is

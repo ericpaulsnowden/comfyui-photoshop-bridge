@@ -122,11 +122,15 @@
       }
 
       /* Accent added to the version banner on a plugin/server mismatch.
-         Color only — it sits alongside .cpsb-version (which keeps the
-         banner's weight and size) and is self-sufficient, so the accent
-         never depends on cascade order between competing classes. */
+         AMBER, not red: a version mismatch is an informational "update when
+         convenient" heads-up, NOT a connection error — the connection is
+         fine (the green pill is the authority on that). Red here was read as
+         "broken" in the field even while Connected. Color only — it sits
+         alongside .cpsb-version (which keeps the banner's weight and size)
+         and is self-sufficient, so the accent never depends on cascade
+         order between competing classes. */
       .cpsb-version-mismatch {
-        color: #e74c3c;
+        color: #e6b800;
       }
 
       /* --- Sections --- */
