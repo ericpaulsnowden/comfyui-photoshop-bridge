@@ -2,7 +2,7 @@
   "manifestVersion": 5,
   "id": "com.cpsb.comfyui-bridge",
   "name": "ComfyUI Bridge",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "main": "panel.html",
   "host": {
     "app": "PS",
@@ -34,7 +34,10 @@
   ],
   "requiredPermissions": {
     "network": {
-      "domains": "all"
+      "domains": [
+        "ws://localhost:8188",
+        "http://localhost:8188"
+      ]
     },
     "localFileSystem": "fullAccess"
   }
