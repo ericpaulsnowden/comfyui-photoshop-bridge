@@ -20,6 +20,7 @@ import contextlib
 import io
 import json
 import logging
+import platform
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,7 @@ from .handoff import (
     compute_source_hash,
 )
 from .launcher import launch_photoshop, tier1_status
+from .locality import is_request_local
 from .psd_io import write_psd
 
 logger = logging.getLogger("cpsb")
@@ -175,6 +177,10 @@ def _parse_open_body(body: Any) -> tuple[dict[str, Any], str | None]:
     subfolder = str(body.get("subfolder", ""))
     workflow_name = str(body.get("workflow_name") or "")
     mode = str(body.get("mode", "new"))
+    # Acknowledges the client-locality gate (PROTOCOL.md §2/§7): the
+    # frontend sets this once the user has confirmed opening Photoshop on
+    # a machine other than the one they're browsing from.
+    client_remote_ok = bool(body.get("client_remote_ok", False))
 
     if source_type not in _VALID_SOURCE_TYPES:
         return {}, f"Invalid type: {source_type!r}"
@@ -192,6 +198,7 @@ def _parse_open_body(body: Any) -> tuple[dict[str, Any], str | None]:
             "origin_kind": origin_kind,
             "workflow_name": workflow_name,
             "mode": mode,
+            "client_remote_ok": client_remote_ok,
         },
         None,
     )
@@ -306,12 +313,31 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         # handoff at all (mirrors mode:"fresh"'s existing ordering).
         supersede_existing = True
 
-    if not tier2_connected(request.app) and not tier1_status().available:
+    tier2 = tier2_connected(request.app)
+    if not tier2 and not tier1_status().available:
         return _error(
             503,
             "Neither Photoshop (Tier 1) nor the Photoshop panel plugin (Tier 2) is available.",
             tier1_available=False,
             tier2_connected=False,
+        )
+
+    # Client-locality gate (PROTOCOL.md §2/§7). Only relevant when this
+    # request would actually take the Tier 1 path -- a connected Tier 2
+    # plugin bypasses it entirely, since the document opens wherever the
+    # plugin runs, which is where the user chose to install it. Placed
+    # here, after the 409/503 checks above have settled that an open will
+    # truly be attempted, but BEFORE any handoff is created, any file is
+    # written, or the pending supersede (explicit `mode:"fresh"`, or the
+    # auto-supersede-on-changed-source decided above) is actually applied
+    # below -- a 428 must leave no side effects.
+    if not tier2 and not fields["client_remote_ok"] and not is_request_local(request):
+        server_name = platform.node()
+        return _error(
+            428,
+            f"Photoshop will open on {server_name}, not this computer",
+            reason="client_remote",
+            server_name=server_name,
         )
 
     if mode == "original":

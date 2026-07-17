@@ -115,6 +115,15 @@ Create a handoff and open it in Photoshop. Body (JSON):
   `pending`/`editing`/`edited`), respond **409** with
   `{"error": ..., "existing_handoff_id": "..."}` — the frontend then shows
   "Edit Original / Start Fresh" and re-calls with the chosen mode.
+- `client_remote_ok` (optional bool, default false): acknowledges the client-locality
+  gate below. When the Tier 1 path would be used AND the requesting client is not on
+  the server's machine AND this flag is absent, respond **428** with
+  `{"error": ..., "reason": "client_remote", "server_name": "<platform.node()>"}` —
+  the frontend shows a confirm ("Photoshop will open on <server_name>, not this
+  computer") and re-sends with `client_remote_ok: true` if the user proceeds (choice
+  remembered per-browser in localStorage; only the affirmative is persisted). A
+  connected Tier 2 plugin bypasses this gate entirely (the document opens wherever the
+  plugin runs, which is where the user chose to install it).
 - `mode:"original"`: re-open the existing handoff's `source.psd` (layers preserved).
   Requires `existing` handoff for the node; 404 otherwise.
 - `mode:"fresh"`: mark the existing handoff `superseded`, then proceed as `new`.
@@ -267,17 +276,40 @@ handoff to `error` (terminal statuses would silently drop all subsequent saves).
 
 Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
 widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
-"[Add as node]" for `terminal_output`; auto-queue only for `load_image`/`bridge_node`
-when the `cpsb.autoQueue` setting is on).
+"[Add as node]" for `terminal_output`). Auto-queue policy:
+- `load_image` origins: queue when the `cpsb.autoQueue` setting is on.
+- `bridge_node` origins: queue IFF the origin node's `mode` widget is
+  `"Re-run on every save"` (§6) — the node-level mode overrides the global setting
+  (an explicit per-node choice must not be silently disabled elsewhere). For the
+  other two modes, NEVER: a blocking bridge node delivers the arriving edit
+  downstream inside the run completing at that moment, so a re-queue would run the
+  entire workflow (and its SaveImage nodes) again per save — the field-reported
+  "one click saved multiple files" loop. This is safe by construction: blocking mode
+  never auto-queues, and re-run mode never blocks, so no edit is ever both consumed
+  in-run and re-queued.
 
 ---
 
 ## 6. Bridge node
 
-- Class `PhotoshopBridge`, display name "Photoshop Bridge", category `image/photoshop`.
-- Inputs: `image` (IMAGE); `wait_for_edit` (BOOLEAN, default True); `timeout_seconds`
-  (INT, default 1800, min 10, max 86400). Hidden: `unique_id` (UNIQUE_ID), `prompt`
-  (PROMPT), `extra_pnginfo` (EXTRA_PNGINFO).
+- Class `PhotoshopBridge` (stable node id — saved workflows depend on it), display name
+  "Edit in Photoshop", category `image/photoshop`.
+- Inputs: `image` (IMAGE); `mode` (COMBO, exactly these strings — the frontend matches
+  on them: `"Wait for first save"` (default) | `"Re-run on every save"` |
+  `"Open only (don't wait)"`); `timeout_seconds` (INT, default 1800, min 10, max
+  86400 — applies only to "Wait for first save"). Hidden: `unique_id` (UNIQUE_ID),
+  `prompt` (PROMPT), `extra_pnginfo` (EXTRA_PNGINFO). (This replaces the earlier
+  `wait_for_edit` BOOLEAN — pre-release breaking change, no migration shim.)
+- Mode semantics:
+  - "Wait for first save": block in execute() until the first save arrives, deliver it
+    downstream in the same run, done. Later saves into the still-open document are
+    still ingested (gallery stays current; next MANUAL queue consumes the latest) but
+    never trigger a run.
+  - "Re-run on every save": never blocks. First run opens Photoshop and passes the
+    input through unchanged; each subsequent save auto-queues a re-run (frontend §5
+    policy) which consumes the latest edit — live-iterate mode. No timeout involved.
+  - "Open only (don't wait)": passthrough + fire-and-forget open; saves are ingested
+    and consumed on the next manual queue only.
 - Output: IMAGE.
 - Execute (edit-consumption semantics): if an active handoff for this node already has
   an edit AND its `source_hash` matches the current input, that edit is returned
@@ -318,12 +350,21 @@ Order: settings `photoshop_path` override → platform discovery → error.
   time and surfaces through the launch-failure path (§2 note). The frontend must NOT
   hard-disable Tier 1 based on `window.location.hostname` — a non-localhost hostname
   (e.g. ComfyUI under `--listen`, browsed via a LAN address on the same machine) does
-  not imply Photoshop is elsewhere; Tier 1 only requires Photoshop on the SERVER's
-  machine, and the server-side gate above is the sole authority. A non-local hostname
-  may surface as an informational note ("Photoshop opens on the ComfyUI server's
-  machine"), shown at most once, never as a disable. Launch calls are blocking
-  subprocess work and MUST run off the event loop (`asyncio.to_thread`) when invoked
-  from route/websocket handlers.
+  not imply the client is elsewhere; hostname cannot distinguish the two cases at all.
+  Launch calls are blocking subprocess work and MUST run off the event loop
+  (`asyncio.to_thread`) when invoked from route/websocket handlers.
+
+**Client locality (the authority on "is the browser on the server's machine"):** the
+server decides, deterministically, per request: the requester is local iff the HTTP
+request's peer address is an address this machine owns — tested by attempting to bind
+a throwaway socket to `request.remote` (bind succeeds only for locally-owned
+addresses; handles loopback AND the same-machine-via-LAN-address case that hostname
+checks get wrong). If a forwarding header (`X-Forwarded-For`/`X-Real-IP`) is present,
+the peer address is a proxy's, so the client is treated as remote/unknown (fails
+safe into the §2 confirm flow). Non-local clients don't lose Tier 1 — they get the
+§2 `428 client_remote` confirm ("Photoshop will open on <server_name>") with an
+explicit, per-browser-remembered opt-in, because launching on the server's screen is
+useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
 
 ---
 

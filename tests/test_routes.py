@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import platform
 import threading
 import time
 
@@ -360,6 +361,126 @@ class TestAutoSupersedeOnChangedSource:
         fresh_body = await fresh.json()
         assert fresh_body["handoff_id"] != first["handoff_id"]
         assert manager.get(first["handoff_id"]).status == "superseded"
+
+
+async def _connect_tier2_plugin(ws, context: CpsbContext) -> None:
+    """Minimal hello/ready handshake to register a ready Tier 2 plugin (PROTOCOL.md §3).
+
+    A slimmer, standalone duplicate of ``TestPluginWebsocket.handshake`` --
+    kept separate rather than shared so this module's other test classes
+    don't couple to that class's own helper.
+    """
+    await ws.send_json(
+        {"type": "hello", "plugin_version": "0.1.0", "ps_version": "26.5", "uxp_version": "8.1"}
+    )
+    await ws.receive_json(timeout=5)  # hello_ack
+    await ws.send_json({"type": "ready", "local_mode": True})
+
+
+class TestClientLocalityGate:
+    """PROTOCOL.md §2/§7: ``POST /cpsb/open`` gates a Tier 1 launch behind a
+    428 confirm when the requesting client isn't on this machine.
+
+    ``cpsb.routes`` imports ``is_request_local`` into its own namespace
+    (``from .locality import is_request_local``), so that -- not
+    ``cpsb.locality`` -- is where these tests monkeypatch it.
+    """
+
+    async def test_local_client_no_gate(self, client, source_image, launches):
+        """aiohttp's ``TestClient`` always connects from 127.0.0.1 -- the
+        loopback fast path -- so every existing ``/cpsb/open`` test (none
+        of which patch ``is_request_local``) must keep passing unmodified,
+        and a fresh request here must never see a 428.
+        """
+        response = await client.post("/cpsb/open", json=open_body())
+        assert response.status == 200
+
+    async def test_remote_client_gated_with_no_side_effects(
+        self, client, manager, context, source_image, launches, monkeypatch
+    ):
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+
+        response = await client.post("/cpsb/open", json=open_body())
+
+        assert response.status == 428
+        body = await response.json()
+        assert body["reason"] == "client_remote"
+        assert body["server_name"] == platform.node()
+        assert "error" in body
+        # No side effects whatsoever: no handoff recorded, no folder on disk.
+        assert manager.list_all() == []
+        assert list(context.cpsb_input_dir.glob("*")) == []
+
+    async def test_remote_client_gate_does_not_supersede_existing(
+        self, client, context, manager, source_image, launches, monkeypatch
+    ):
+        first = await (await client.post("/cpsb/open", json=open_body())).json()
+        assert manager.get(first["handoff_id"]).status == "editing"
+
+        # Upstream re-generated the image under the SAME filename -- without
+        # the gate this auto-supersedes the old handoff and proceeds once
+        # the open is actually attempted (TestAutoSupersedeOnChangedSource).
+        (context.output_dir / SOURCE_FILENAME).write_bytes(png_bytes((1, 2, 3)))
+
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+        # The 428 gate must intercept before that pending supersede is
+        # applied, exactly like it already defers past the 503 check.
+        response = await client.post("/cpsb/open", json=open_body())
+
+        assert response.status == 428
+        assert manager.get(first["handoff_id"]).status == "editing"  # NOT superseded
+
+    async def test_remote_client_with_client_remote_ok_proceeds(
+        self, client, source_image, launches, monkeypatch
+    ):
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+
+        response = await client.post("/cpsb/open", json=open_body(client_remote_ok=True))
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["tier"] == 1
+        assert data["status"] == "pending"
+
+    async def test_tier2_connected_bypasses_gate_without_flag(
+        self, client, context, source_image, launches, monkeypatch
+    ):
+        """A connected Tier 2 plugin bypasses the gate entirely, flag or
+        not -- the document opens on the plugin's own machine, which is
+        wherever the user chose to install it.
+        """
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            response = await client.post("/cpsb/open", json=open_body())
+
+            assert response.status == 200
+            assert (await response.json())["tier"] == 2
+
+    async def test_mode_original_gated_the_same(
+        self, client, manager, source_image, launches, monkeypatch
+    ):
+        """mode:"original" is still a Tier 1 launch on the server -- the
+        gate must apply to it exactly as it does to a fresh open.
+        """
+        first = await (await client.post("/cpsb/open", json=open_body())).json()
+
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+        response = await client.post("/cpsb/open", json=open_body(mode="original"))
+
+        assert response.status == 428
+        body = await response.json()
+        assert body["reason"] == "client_remote"
+        assert manager.get(first["handoff_id"]).status == "editing"  # untouched
+
+        # And the acknowledgement flag lets the exact same re-open through.
+        acknowledged = await client.post(
+            "/cpsb/open", json=open_body(mode="original", client_remote_ok=True)
+        )
+        assert acknowledged.status == 200
+        assert (await acknowledged.json())["handoff_id"] == first["handoff_id"]
 
 
 class TestUpload:

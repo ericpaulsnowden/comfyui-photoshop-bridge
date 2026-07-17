@@ -264,16 +264,38 @@ export function addLoadImageNodeNear(originNode, ref) {
   app.canvas?.selectNode?.(newNode)
 }
 
+/** Exact `mode` widget value that opts a bridge node into live re-runs (PROTOCOL.md §6). */
+const BRIDGE_MODE_RERUN = 'Re-run on every save'
+
 /**
- * Queues the workflow when the setting allows it for this origin kind
- * (PLAN.md §3 / PROTOCOL.md §5). Uses the documented `app.queuePrompt`
- * overload (`number, batchCount = 1`); `0` means "append normally", matching
- * the long-standing extension convention.
+ * Queues the workflow when policy allows it for this origin (PROTOCOL.md §5).
+ * Uses the documented `app.queuePrompt` overload (`number, batchCount = 1`);
+ * `0` means "append normally", matching the long-standing extension
+ * convention.
+ *
+ * Policy: `load_image` queues when the global `cpsb.autoQueue` setting is on.
+ * `bridge_node` queues IFF the origin node's `mode` widget is
+ * "Re-run on every save" — a per-node explicit choice that overrides the
+ * global setting. In the bridge's other modes, never: a blocking bridge
+ * delivers the arriving edit downstream inside the run finishing at this
+ * very moment, so re-queueing would run the whole workflow (and its
+ * SaveImage nodes) a second time per save — confirmed in the field as "one
+ * click saved multiple files." Safe by construction: blocking mode never
+ * auto-queues, re-run mode never blocks.
  * @param {import('./api.js').CpsbOriginKind} originKind
+ * @param {import('../../../scripts/app.js').LGraphNode | null} node - The
+ * origin node when it still exists (needed to read a bridge's mode widget;
+ * a deleted bridge node simply never re-queues).
  */
-function maybeAutoQueue(originKind) {
-  if (originKind !== 'load_image' && originKind !== 'bridge_node') return
-  if (!settings.getAutoQueue()) return
+function maybeAutoQueue(originKind, node) {
+  if (originKind === 'load_image') {
+    if (!settings.getAutoQueue()) return
+  } else if (originKind === 'bridge_node') {
+    const mode = node?.widgets?.find((w) => w.name === 'mode')?.value
+    if (mode !== BRIDGE_MODE_RERUN) return
+  } else {
+    return
+  }
   app.queuePrompt(0).catch((error) => {
     api.warn('auto-queue after Photoshop edit failed', error)
   })
@@ -314,7 +336,7 @@ function handleLoadImageOrBridge(payload) {
         `"${payload.origin_kind}" — relying on cpsb.status for the badge`
     )
   }
-  maybeAutoQueue(payload.origin_kind)
+  maybeAutoQueue(payload.origin_kind, node)
 }
 
 /**

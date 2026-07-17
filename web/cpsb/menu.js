@@ -180,29 +180,147 @@ function describeUnavailable(body) {
   return 'Neither Photoshop (Tier 1) nor the Photoshop panel plugin (Tier 2) is available.'
 }
 
-let remoteBrowsingNoted = false
+/**
+ * localStorage key remembering an affirmative answer to the PROTOCOL.md §2
+ * remote-open confirm below, so a given browser is asked at most once. Only
+ * the affirmative is ever written — there is no stored "no".
+ */
+const REMOTE_OPEN_ALLOWED_KEY = 'cpsb.remoteOpenAllowed'
+
+/** Guards the warning below so a broken `localStorage` never spams the console. */
+let localStorageWarned = false
 
 /**
- * One-time-per-session heads-up when the page is browsed via a non-local
- * hostname (e.g. `--listen` + LAN address): Photoshop opens on the SERVER's
- * machine. Informational only — never gates anything (PROTOCOL.md §7); on
- * the common same-machine-via-LAN-address setup the note is simply harmless.
+ * @param {unknown} error
  */
-function maybeNoteRemoteBrowsing() {
-  if (remoteBrowsingNoted || !state.isRemoteBrowsingLikely()) return
-  remoteBrowsingNoted = true
-  ui.showToast({
-    severity: 'info',
-    summary: 'Photoshop opens on the ComfyUI server’s machine',
-    detail:
-      'You’re browsing ComfyUI via a network address. If Photoshop runs on a ' +
-      'different machine than the ComfyUI server, install the Photoshop panel plugin.'
-  })
+function warnLocalStorageUnavailable(error) {
+  if (localStorageWarned) return
+  localStorageWarned = true
+  api.warn(
+    'localStorage is unavailable; the "open Photoshop on a different ' +
+      'computer" choice will not be remembered between opens',
+    error
+  )
+}
+
+/**
+ * @returns {boolean} Whether this browser has already been told, and
+ * agreed, that Photoshop opens on the ComfyUI server's machine
+ * (PROTOCOL.md §2) — only the affirmative is ever persisted.
+ * Feature-detected: some browser configurations (storage disabled by
+ * policy, certain private-browsing modes) throw on `localStorage` access
+ * rather than simply leaving it absent.
+ */
+function isRemoteOpenAllowed() {
+  try {
+    return window.localStorage.getItem(REMOTE_OPEN_ALLOWED_KEY) === '1'
+  } catch (error) {
+    warnLocalStorageUnavailable(error)
+    return false
+  }
+}
+
+/**
+ * Persists the user's "Open on <server_name>" choice so this browser is
+ * never asked again (PROTOCOL.md §2: "choice remembered per-browser in
+ * localStorage; only the affirmative is persisted").
+ */
+function rememberRemoteOpenAllowed() {
+  try {
+    window.localStorage.setItem(REMOTE_OPEN_ALLOWED_KEY, '1')
+  } catch (error) {
+    warnLocalStorageUnavailable(error)
+  }
+}
+
+/**
+ * Thrown internally by {@link openWithRemoteConfirm} when the user
+ * dismisses or cancels the PROTOCOL.md §2 remote-open confirm. Callers
+ * catch this specifically and stop silently — declining is a deliberate
+ * answer, not a failure, so it shows no toast.
+ */
+class RemoteOpenCancelled extends Error {
+  constructor() {
+    super('Remote-open confirm was cancelled')
+    this.name = 'RemoteOpenCancelled'
+  }
+}
+
+/**
+ * Adds `client_remote_ok: true` to an open-request body when the user has
+ * already agreed, in this browser, to open Photoshop on the server's
+ * machine AND the page looks remotely browsed
+ * ({@link state.isRemoteBrowsingLikely}) — a pure optimization so the
+ * 428-then-retry round trip in {@link openWithRemoteConfirm} never happens
+ * for a choice that's already known. Never required for correctness: a
+ * body that omits the flag (e.g. an `isRemoteBrowsingLikely()`
+ * false-negative — PROTOCOL.md §7 notes hostname can't perfectly determine
+ * locality) still reaches the same outcome via the 428 branch below, just
+ * one extra request later.
+ * @param {import('./api.js').CpsbOpenRequest} body
+ * @returns {import('./api.js').CpsbOpenRequest}
+ */
+function withProactiveRemoteFlag(body) {
+  if (isRemoteOpenAllowed() && state.isRemoteBrowsingLikely()) {
+    return { ...body, client_remote_ok: true }
+  }
+  return body
+}
+
+/**
+ * POSTs `/cpsb/open`, transparently resolving the PROTOCOL.md §2/§7
+ * client-locality confirm. A 428 with `body.reason === "client_remote"` is
+ * caught here: if this browser already agreed ({@link isRemoteOpenAllowed}),
+ * the SAME open is retried immediately with `client_remote_ok: true`
+ * (covers the case where {@link withProactiveRemoteFlag} didn't already
+ * send it proactively, e.g. an `isRemoteBrowsingLikely()` false-negative);
+ * otherwise the user is asked once via {@link ui.chooseDialog}, and on
+ * "allow" the choice is persisted and the same retry happens. Every other
+ * status (409, 503, or anything else) is rethrown untouched — this
+ * function's only job is the 428 branch, so it composes transparently with
+ * a caller's own 409/503 handling, including a 409-driven re-call that then
+ * hits 428.
+ * @param {import('./api.js').CpsbOpenRequest} body
+ * @returns {Promise<import('./api.js').CpsbOpenResponse>}
+ * @throws {RemoteOpenCancelled} The user declined the confirm.
+ * @throws {import('./api.js').CpsbApiError} Any other non-2xx response.
+ */
+async function openWithRemoteConfirm(body) {
+  try {
+    return await api.openHandoff(withProactiveRemoteFlag(body))
+  } catch (error) {
+    if (
+      error instanceof api.CpsbApiError &&
+      error.status === 428 &&
+      error.body &&
+      typeof error.body === 'object' &&
+      error.body.reason === 'client_remote'
+    ) {
+      const serverName = error.body.server_name
+      if (!isRemoteOpenAllowed()) {
+        const choice = await ui.chooseDialog({
+          title: 'Photoshop is on a different computer',
+          message:
+            `Photoshop will open on “${serverName}” — the machine running ` +
+            'ComfyUI — not on this computer. If you’re not at that machine, ' +
+            'cancel and install the Photoshop panel plugin there instead. ' +
+            '(Remote opening on THIS computer is planned.)',
+          choices: [{ label: `Open on ${serverName}`, value: 'allow', primary: true }]
+        })
+        if (choice !== 'allow') throw new RemoteOpenCancelled()
+        rememberRemoteOpenAllowed()
+      }
+      return api.openHandoff({ ...body, client_remote_ok: true })
+    }
+    throw error
+  }
 }
 
 /**
  * POSTs `/cpsb/open` for a single image on a node, handling the 409
- * existing-handoff response with the Edit Original / Start Fresh chooser.
+ * existing-handoff response with the Edit Original / Start Fresh chooser,
+ * and — via {@link openWithRemoteConfirm} — the PROTOCOL.md §2/§7 428
+ * remote-open confirm.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @param {"new" | "original" | "fresh"} mode
  * @param {number} [imageIndex]
@@ -227,19 +345,21 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
     mode
   }
   try {
-    await api.openHandoff(body)
+    await openWithRemoteConfirm(body)
     // Toast only after the POST succeeds — the 409 path below shows its own
-    // chooser instead (and the recursive re-call toasts exactly once), and a
-    // 503/other failure must not be preceded by a false "Opening…".
+    // chooser instead (and the recursive re-call toasts exactly once), a
+    // declined remote-open confirm shows no toast at all (see
+    // openWithRemoteConfirm), and a 503/other failure must not be preceded
+    // by a false "Opening…".
     ui.showToast({
       severity: 'info',
       summary: 'Opening in Photoshop…',
       detail: 'ComfyUI will watch this file and bring back your edits automatically.'
     })
-    maybeNoteRemoteBrowsing()
     // No further UI here by design — the cpsb.status/cpsb.updated events
     // drive the node badge (badges.js) and the gallery (gallery.js).
   } catch (error) {
+    if (error instanceof RemoteOpenCancelled) return
     if (error instanceof api.CpsbApiError && error.status === 409) {
       const choice = await ui.chooseDialog({
         title: 'Already editing this image',
@@ -276,7 +396,14 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
  * "Open all N in Photoshop": opens every image on the node without
  * interrupting the batch with a per-image dialog — an image that already
  * has an active handoff is silently re-opened (`mode: "original"`) instead
- * of popping the Edit Original / Start Fresh chooser N times.
+ * of popping the Edit Original / Start Fresh chooser N times. The
+ * PROTOCOL.md §2 remote-open confirm is likewise resolved at most ONCE for
+ * the whole batch, not per image: client locality can't change between
+ * images in the same call, and {@link openWithRemoteConfirm} persists an
+ * "allow" to `localStorage` before the next iteration's request even goes
+ * out, so only the first 428 in the loop can ever show the dialog. If the
+ * user declines it, {@link RemoteOpenCancelled} aborts the whole batch
+ * immediately rather than continuing to the next image.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 async function openAllInPhotoshop(node) {
@@ -297,15 +424,17 @@ async function openAllInPhotoshop(node) {
       mode: 'new'
     }
     try {
-      await api.openHandoff(body)
+      await openWithRemoteConfirm(body)
       opened++
     } catch (error) {
+      if (error instanceof RemoteOpenCancelled) break
       if (error instanceof api.CpsbApiError && error.status === 409) {
         try {
-          await api.openHandoff({ ...body, mode: 'original' })
+          await openWithRemoteConfirm({ ...body, mode: 'original' })
           opened++
           continue
         } catch (retryError) {
+          if (retryError instanceof RemoteOpenCancelled) break
           api.debugLog('batch re-open (original) failed', retryError)
         }
       } else {

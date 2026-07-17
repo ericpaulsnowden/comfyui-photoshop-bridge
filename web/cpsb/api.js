@@ -107,6 +107,10 @@ export function warn(...args) {
  * @property {CpsbOriginKind} origin_kind
  * @property {string} [workflow_name]
  * @property {"new" | "original" | "fresh"} mode
+ * @property {boolean} [client_remote_ok] - Acknowledges the PROTOCOL.md §2/§7
+ * client-locality gate; default `false` server-side when omitted. Only set
+ * this `true` once the user has agreed to open Photoshop on the server's
+ * machine (menu.js remembers that choice per-browser in `localStorage`).
  */
 
 /**
@@ -114,6 +118,17 @@ export function warn(...args) {
  * @property {string} handoff_id
  * @property {1 | 2} tier
  * @property {"pending"} status
+ */
+
+/**
+ * @typedef {Object} CpsbClientRemoteBody
+ * Body of the 428 response from `/cpsb/open` (PROTOCOL.md §2/§7): the Tier 1
+ * path would be used, but the requesting client isn't on the server's
+ * machine and the request didn't set `client_remote_ok`.
+ * @property {string} error
+ * @property {"client_remote"} reason
+ * @property {string} server_name - The server machine's hostname
+ * (`platform.node()`), for the "Photoshop will open on <server_name>" confirm.
  */
 
 /**
@@ -216,7 +231,8 @@ async function request(route, options) {
 /**
  * POST `/cpsb/open` — create (or re-open) a handoff and launch Photoshop.
  * On a 409 the returned error's `.body` is
- * `{error, existing_handoff_id}` (PROTOCOL.md §2); on a 503 it is
+ * `{error, existing_handoff_id}` (PROTOCOL.md §2); on a 428 it is
+ * {@link CpsbClientRemoteBody}; on a 503 it is
  * `{error, tier1_available, tier2_connected}`.
  * @param {CpsbOpenRequest} body
  * @returns {Promise<CpsbOpenResponse>}

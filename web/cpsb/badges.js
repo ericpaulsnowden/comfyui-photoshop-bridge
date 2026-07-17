@@ -40,11 +40,20 @@
  * `closeRect` below, which are recomputed every draw and consulted as-is by
  * the mouse hooks, guaranteeing the two can never drift apart.
  *
- * The badge is centered over the node's IMAGE preview region rather than
- * pinned below the title bar, so it reads as "THIS PICTURE is being edited"
- * rather than a generic corner status chip — see `getPreciseImageRect` /
- * `getFallbackImageRect` for how that region is determined (and where it
- * falls back when it can't be determined precisely).
+ * Placement: on a node WITH a displayed image the badge is centered over
+ * the IMAGE preview region rather than pinned below the title bar, so it
+ * reads as "THIS PICTURE is being edited" — see `getPreciseImageRect` /
+ * `getFallbackImageRect` for how that region is determined. On a node with
+ * NO image preview at all (e.g. a Photoshop Bridge node mid-wait), there is
+ * no image region to center over and the node body is fully occupied by
+ * slot rows + widgets — so the pill instead anchors strictly BELOW the last
+ * widget row (`getBelowWidgetsRect`), never over slots or widgets, growing
+ * past the node's bottom edge when the node is too short for it to fit
+ * inside (litegraph only clips node drawing when `node.clip_area` is set —
+ * `LGraphCanvas.ts` `drawNode`, ~line 5673 — which ComfyUI nodes don't set,
+ * so a pill slightly past the body renders fine, and overflowing DOWN into
+ * empty canvas is harmless where overflowing UP would cover the output
+ * slot).
  *
  * The spinner needs to animate while the canvas would otherwise sit
  * perfectly idle for however long the user takes in Photoshop, so a single
@@ -100,14 +109,28 @@ const CLOSE_SIZE = 13
 const CLOSE_GAP = 6
 
 /**
- * Litegraph's own default single-widget height
- * (`src/lib/litegraph/src/LiteGraphGlobal.ts`: `NODE_WIDGET_HEIGHT = 20`),
- * used only as a last-resort per-widget height estimate in
- * {@link getFallbackImageRect} for a widget that doesn't expose its own
- * `computedHeight`. Inlined rather than read from `window.LiteGraph` so this
- * cheap fallback heuristic has no extra runtime dependency.
+ * Litegraph's default single-widget row height
+ * (`src/lib/litegraph/src/LiteGraphGlobal.ts` line 51:
+ * `NODE_WIDGET_HEIGHT = 20`). Used only when `window.LiteGraph` is somehow
+ * unavailable at draw time (it is installed before any extension's `setup()`
+ * — see pasteback.js's header) or a widget exposes no `computedHeight`.
  */
 const DEFAULT_WIDGET_HEIGHT = 20
+
+/**
+ * Litegraph's slot row height (`src/lib/litegraph/src/LiteGraphGlobal.ts`
+ * line 50: `NODE_SLOT_HEIGHT = 20`). Same fallback role as
+ * {@link DEFAULT_WIDGET_HEIGHT}, for {@link getBelowWidgetsRect}'s
+ * never-drawn-node estimate.
+ */
+const DEFAULT_SLOT_HEIGHT = 20
+
+/**
+ * Gap between the bottom of the last widget row and the top of the pill in
+ * {@link getBelowWidgetsRect} ("the loader should be after the two UI
+ * fields" — it must clear the widgets, not touch them).
+ */
+const BELOW_WIDGETS_MARGIN = 6
 
 /**
  * Minimum height of the fallback "image region" ({@link getFallbackImageRect}),
@@ -267,10 +290,13 @@ function getPreciseImageRect(node) {
 }
 
 /**
- * Fallback anchor when {@link getPreciseImageRect} can't determine an exact
- * rect (by far the common case: a single displayed image). Approximates
- * "the image preview area" as the node body below its input widgets, down
- * to the bottom of the node.
+ * Fallback anchor for a node WITH a displayed image (`node.imgs` non-empty)
+ * when {@link getPreciseImageRect} can't determine an exact rect (by far the
+ * common case: a single displayed image). Approximates "the image preview
+ * area" as the node body below its input widgets, down to the bottom of the
+ * node. Nodes with NO image at all never reach this —
+ * {@link getBelowWidgetsRect} handles them instead, since for those the
+ * body below the widgets is empty canvas, not a picture to overlay.
  *
  * ComfyUI_frontend always appends the image preview as the LAST widget
  * after any input widgets (`src/services/litegraphService.ts`
@@ -300,11 +326,87 @@ function getFallbackImageRect(node) {
 }
 
 /**
+ * Anchor for a node with NO displayed image (e.g. the Photoshop Bridge node
+ * itself while it waits): a pill-height strip strictly BELOW the last
+ * widget row, so the pill can never cover the node's slot rows or widgets
+ * ("the loader should be after the two UI fields"). Returning a strip of
+ * exactly `PILL_HEIGHT` makes `drawBadge`'s shared centering math place the
+ * pill at precisely this strip's `y` — and since `drawBadge` never clamps
+ * the pill's y UPWARD, a node too short to fit it inside the body simply
+ * has the pill extend past its bottom edge (acceptable; overflowing upward
+ * over the output slot is not — the exact bug this fixes).
+ *
+ * Widget bottom-edge geometry, verified in `Comfy-Org/ComfyUI_frontend`
+ * `src/lib/litegraph/src/LGraphNode.ts`:
+ * - `_arrangeWidgets` assigns each visible widget's node-local top:
+ *   `w.y = y; y += w.computedHeight ?? 0` (lines 4206-4210), starting from
+ *   `startY = widgets_start_y ?? (widgets_up ? 0 : widgetStartY) + 2`
+ *   (line 4154), where `arrange()` derives `widgetStartY` from the measured
+ *   slot rows' bounds: `slotsBounds[1] + slotsBounds[3] - this.pos[1]`
+ *   (lines 4280-4285) — i.e. widgets sit below the slot rows, and a
+ *   standard (non-custom) widget's `computedHeight` is
+ *   `LiteGraph.NODE_WIDGET_HEIGHT + 4` (line 4181), spacing included.
+ * - `drawWidgets` records `widget.last_y = y` at draw time (line 3985) — on
+ *   this frontend a copy of `widget.y`, on classic litegraph the only
+ *   populated field — and the node's own hit-testing consumes `last_y` the
+ *   same way (`getWidgetOnPos`, lines 2291-2296). So `last_y` is preferred
+ *   here (draw-truth on every frontend generation), then `y` when it is a
+ *   positive number (its pre-`arrange()` default is 0, which is
+ *   indistinguishable from "unset" and was the root cause of this pill
+ *   previously landing over the slot rows).
+ * - Both can be legitimately absent before the node's first frame:
+ *   `onDrawForeground` fires BEFORE `arrange()`/`drawNodeWidgets` within
+ *   `drawNode` (`LGraphCanvas.ts` lines 5722 vs 5728-5743). For that one
+ *   frame the estimate below reconstructs the same layout arithmetic from
+ *   the constants: `max(#inputs, #outputs)` slot rows of `NODE_SLOT_HEIGHT`
+ *   (`LiteGraphGlobal.ts` line 50) for `widgetStartY`, `+ 2` (line 4154),
+ *   then one `NODE_WIDGET_HEIGHT + 4` row (line 4181, `LiteGraphGlobal.ts`
+ *   line 51) per visible widget.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {BadgeRect}
+ */
+function getBelowWidgetsRect(node) {
+  const LiteGraph = window.LiteGraph
+  const widgetHeight = LiteGraph?.NODE_WIDGET_HEIGHT ?? DEFAULT_WIDGET_HEIGHT
+  const slotHeight = LiteGraph?.NODE_SLOT_HEIGHT ?? DEFAULT_SLOT_HEIGHT
+  const widgets = (node.widgets ?? []).filter((w) => !w.hidden)
+
+  let widgetsBottom = null
+  for (const w of widgets) {
+    const top =
+      typeof w.last_y === 'number'
+        ? w.last_y
+        : typeof w.y === 'number' && w.y > 0
+          ? w.y
+          : null
+    if (top === null) continue
+    const bottom = top + (typeof w.computedHeight === 'number' ? w.computedHeight : widgetHeight)
+    if (widgetsBottom === null || bottom > widgetsBottom) widgetsBottom = bottom
+  }
+
+  if (widgetsBottom === null) {
+    // Never drawn yet — reconstruct the layout arithmetic (see JSDoc):
+    // slot rows, the +2 widget-start pad, then stacked widget rows.
+    const slotRows = Math.max(node.inputs?.length ?? 0, node.outputs?.length ?? 0)
+    widgetsBottom = slotRows * slotHeight + 2 + widgets.length * (widgetHeight + 4)
+  }
+
+  return {
+    x: 0,
+    y: widgetsBottom + BELOW_WIDGETS_MARGIN,
+    w: node.size[0],
+    h: PILL_HEIGHT
+  }
+}
+
+/**
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @returns {BadgeRect}
  */
 function getBadgeAnchorRect(node) {
-  return getPreciseImageRect(node) ?? getFallbackImageRect(node)
+  const precise = getPreciseImageRect(node)
+  if (precise) return precise
+  return node.imgs?.length ? getFallbackImageRect(node) : getBelowWidgetsRect(node)
 }
 
 /**
