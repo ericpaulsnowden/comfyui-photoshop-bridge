@@ -163,6 +163,50 @@ def _pil_to_tensor(image: Image.Image) -> Any:
     return torch.from_numpy(array)[None, ...]
 
 
+def _image_tensor_size(image: Any) -> tuple[int, int]:
+    """``(width, height)`` of a ComfyUI ``IMAGE`` tensor (NHWC, single frame)."""
+    _, height, width, _ = image.shape
+    return width, height
+
+
+def _mask_tensor_from_l(image: Image.Image) -> Any:
+    """A single-channel PIL image (white = 1.0) as a ComfyUI ``MASK`` tensor.
+
+    Used as-is, no inversion (PROTOCOL.md §6/§4) -- this is the extracted-
+    channel-mask preference, the first tier of the MASK output's preference
+    order.
+    """
+    import numpy as np
+    import torch
+
+    array = np.array(image.convert("L")).astype(np.float32) / 255.0
+    return torch.from_numpy(array)[None, ...]
+
+
+def _alpha_complement_mask_tensor(image: Image.Image) -> Any:
+    """``1 - alpha`` of *image* as a ``MASK`` tensor (LoadImage parity, PROTOCOL.md §6).
+
+    The second tier of the MASK output's preference order. Callers only
+    invoke this once they've confirmed *image*'s mode carries an alpha band.
+    """
+    import numpy as np
+    import torch
+
+    alpha = np.array(image.convert("RGBA").split()[-1]).astype(np.float32) / 255.0
+    return torch.from_numpy(1.0 - alpha)[None, ...]
+
+
+def _zeros_mask_tensor(width: int, height: int) -> Any:
+    """An all-zero ``MASK`` tensor sized ``(1, height, width)`` (PROTOCOL.md §6).
+
+    The last tier of the MASK output's preference order -- also what a
+    passthrough run (no edit yet) always pairs with the input image.
+    """
+    import torch
+
+    return torch.zeros((1, height, width), dtype=torch.float32)
+
+
 def _raise_interrupt() -> None:
     """Raise ComfyUI's own cancellation exception.
 
@@ -251,10 +295,17 @@ class PhotoshopBridge:
     since they never wait, a passthrough re-execution against a handoff that
     is simply still open and unsaved must not relaunch/refocus Photoshop on
     every single re-run (PROTOCOL.md §5/§6).
+
+    Outputs: ``(IMAGE, MASK)``. MASK preference order (PROTOCOL.md §6): the
+    edit's extracted channel mask (PROTOCOL.md §4) -> else ``1 - alpha`` of
+    the edit image (LoadImage parity) -> else an all-zero mask sized to the
+    image. White = 1.0; inversion is the consumer's job. A passthrough run
+    (no edit yet, either mode) returns an all-zero mask alongside the
+    unchanged input image.
     """
 
     CATEGORY = "image/photoshop"
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = ("IMAGE", "MASK")
     FUNCTION = "execute"
 
     @classmethod
@@ -306,7 +357,7 @@ class PhotoshopBridge:
         unique_id: str,
         prompt: Any = None,
         extra_pnginfo: Any = None,
-    ) -> tuple[Any]:
+    ) -> tuple[Any, Any]:
         state = _require_state()
         manager = state.manager
         node_id = str(unique_id)
@@ -338,7 +389,7 @@ class PhotoshopBridge:
 
         if active is not None and active.edits:
             logger.info("cpsb bridge: node %s: an edit already arrived, returning it", node_id)
-            return (self._load_edit_tensor(manager, active.handoff_id, image),)
+            return self._load_edit_tensors(manager, active.handoff_id, image)
 
         is_new_handoff = active is None
         if is_new_handoff:
@@ -374,7 +425,11 @@ class PhotoshopBridge:
                 meta.handoff_id,
                 mode,
             )
-            return (image,)
+            # Passthrough: no edit exists yet for this (possibly brand-new)
+            # handoff, so there is nothing to derive a mask from -- an
+            # all-zero mask sized to the input image (PROTOCOL.md §6).
+            width, height = _image_tensor_size(image)
+            return image, _zeros_mask_tensor(width, height)
 
         # mode == BridgeMode.WAIT_FIRST_SAVE, so `attempt` was always assigned above.
         if not attempt.ok:
@@ -399,7 +454,7 @@ class PhotoshopBridge:
         if outcome != WaitOutcome.EDITED:
             _raise_interrupt()
 
-        return (self._load_edit_tensor(manager, meta.handoff_id, image),)
+        return self._load_edit_tensors(manager, meta.handoff_id, image)
 
     @staticmethod
     def _create_handoff(
@@ -569,10 +624,38 @@ class PhotoshopBridge:
             return routes.OpenAttempt(tier=2, ok=False, error=error)
 
     @staticmethod
-    def _load_edit_tensor(manager: HandoffManager, handoff_id: str, fallback_image: Any) -> Any:
+    def _load_edit_tensors(
+        manager: HandoffManager, handoff_id: str, fallback_image: Any
+    ) -> tuple[Any, Any]:
+        """The active handoff's ``(IMAGE, MASK)`` tensors (PROTOCOL.md §6).
+
+        Falls back to *fallback_image* (the node's own input, unchanged)
+        paired with an all-zero mask when there is no edit on disk yet
+        (shouldn't normally happen here -- every caller already confirmed
+        ``active.edits`` or a successful wait first -- but a filesystem
+        race is cheap to guard against). MASK preference order once the
+        edit image itself is loaded: the edit's extracted channel mask
+        (PROTOCOL.md §4, via ``HandoffManager.mask_image_path``) -> else
+        ``1 - alpha`` of the edit image (LoadImage parity) -> else an
+        all-zero mask sized to the edit image.
+        """
         path = manager.edit_image_path(handoff_id)
         if path is None or not path.exists():
-            return fallback_image
+            width, height = _image_tensor_size(fallback_image)
+            return fallback_image, _zeros_mask_tensor(width, height)
+
         with Image.open(path) as edit_image:
             edit_image.load()
-            return _pil_to_tensor(edit_image)
+            image_tensor = _pil_to_tensor(edit_image)
+
+            mask_path = manager.mask_image_path(handoff_id)
+            if mask_path is not None and mask_path.exists():
+                with Image.open(mask_path) as mask_image:
+                    mask_image.load()
+                    return image_tensor, _mask_tensor_from_l(mask_image)
+
+            if "A" in edit_image.mode:
+                return image_tensor, _alpha_complement_mask_tensor(edit_image)
+
+            width, height = edit_image.size
+            return image_tensor, _zeros_mask_tensor(width, height)

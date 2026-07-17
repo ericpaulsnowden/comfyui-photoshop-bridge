@@ -92,7 +92,13 @@ const WS_READY_STATE_OPEN = 1
  * @property {string | null} serverVersion
  * @property {boolean | null} localMode - `null` until the handshake
  * completes at least once.
- * @property {string | null} lastError
+ * @property {string | null} lastError - Human-readable description of the
+ * most recent connection failure (constructor throw, failed attempt, or
+ * dropped connection); `null` once connected.
+ * @property {number} attempts - Consecutive failed connection attempts
+ * since the last successful handshake.
+ * @property {number | null} nextRetryAt - Epoch ms of the next scheduled
+ * reconnect attempt, or `null` when none is pending (connected or mid-attempt).
  */
 
 /**
@@ -128,11 +134,18 @@ class ConnectionManager extends EventTarget {
     this.localMode = null
     /** @type {string | null} */
     this.lastError = null
+    /** Consecutive failed attempts since the last successful handshake. */
+    this.attempts = 0
+    /** @type {number | null} Epoch ms of the next scheduled reconnect. */
+    this.nextRetryAt = null
     /** @type {WebSocket | null} */
     this._socket = null
-    this._backoffIndex = 0
     /** @type {ReturnType<typeof setTimeout> | null} */
     this._reconnectTimer = null
+    /** @type {string | null} Last failure detail, to console-warn only on change. */
+    this._lastFailureDetail = null
+    /** @type {string | null} Detail stashed by an `error` event, if the runtime provided any. */
+    this._socketErrorDetail = null
     this._started = false
   }
 
@@ -150,15 +163,24 @@ class ConnectionManager extends EventTarget {
 
   /** @returns {void} */
   _open() {
+    this.nextRetryAt = null
+    this._socketErrorDetail = null
     this._setStatus('connecting')
     /** @type {WebSocket} */
     let socket
     try {
       socket = new WebSocket(WS_URL)
     } catch (error) {
-      this.lastError = describeError(error)
-      logError(`could not create WebSocket for ${WS_URL}: ${this.lastError}`)
+      // Constructor-throw path. This is where a manifest-permission denial
+      // surfaces (UXP's WebSocket is documented to throw from the
+      // constructor, and permission problems reject at creation) — the
+      // thrown message is surfaced verbatim so "Permission denied" in the
+      // log/panel is clearly distinguishable from the onclose path below
+      // (connection refused / server absent, which reach `_onClose` with a
+      // close code instead).
+      this._recordFailure(describeError(error))
       this._scheduleReconnect()
+      this._setStatus('disconnected')
       return
     }
     this._socket = socket
@@ -169,11 +191,14 @@ class ConnectionManager extends EventTarget {
       this._onMessage(event)
     }
     socket.onclose = (event) => this._onClose(event)
-    socket.onerror = () => {
-      // The WebSocket spec gives `error` events no useful detail; `close`
-      // always follows and carries what detail is available, so reconnect
-      // scheduling lives there exclusively to avoid double-scheduling.
-      logWarn(`WebSocket error event for ${WS_URL}`)
+    socket.onerror = (event) => {
+      // The WebSocket spec gives `error` events little to no detail and
+      // `close` always follows, so all failure bookkeeping/scheduling lives
+      // in `_onClose`. If this runtime DID attach a message to the error
+      // event, stash it so the close-path failure text can include it.
+      const detail =
+        event && (/** @type {any} */ (event).message || (/** @type {any} */ (event).error && /** @type {any} */ (event).error.message))
+      if (detail) this._socketErrorDetail = String(detail)
     }
   }
 
@@ -242,8 +267,10 @@ class ConnectionManager extends EventTarget {
     /** @type {CpsbReadyMessage} */
     const ready = { type: 'ready', local_mode: this.localMode }
     this.send(ready)
-    this._backoffIndex = 0
+    this.attempts = 0
+    this.nextRetryAt = null
     this.lastError = null
+    this._lastFailureDetail = null
     this._setStatus('connected')
     logInfo(
       `connected to server ${msg.server_version} (${this.localMode ? 'local' : 'remote'} mode)`
@@ -275,19 +302,57 @@ class ConnectionManager extends EventTarget {
     const wasConnected = this.status === 'connected'
     this._socket = null
     this.localMode = null
-    this._setStatus('disconnected')
+    const code = event ? event.code : undefined
+    const reason = event ? event.reason : ''
     if (wasConnected) {
-      const reason = (event && event.reason) || `code ${event && event.code}`
-      logWarn(`disconnected from server (${reason}) — reconnecting`)
+      // An established connection dropped — not a failed attempt, so the
+      // attempt counter stays at 0 and the next retry starts the backoff
+      // schedule from the beginning.
+      this.lastError = `connection lost (code ${code}${reason ? `, ${reason}` : ''})`
+      logWarn(`disconnected from server (${this.lastError}) — reconnecting`)
+    } else {
+      // A connection attempt that never opened (or died before hello_ack).
+      // Connection-refused / server-absent both surface here, typically as
+      // close code 1006 with no reason — distinguishable in the log from a
+      // permission denial, which throws from the constructor instead.
+      let detail = `connection failed (code ${code}${reason ? `, ${reason}` : ''})`
+      if (this._socketErrorDetail) detail += `; ${this._socketErrorDetail}`
+      this._recordFailure(detail)
     }
+    // Schedule BEFORE announcing the state change so the statechange
+    // payload already carries nextRetryAt for the panel's countdown.
     this._scheduleReconnect()
+    this._setStatus('disconnected')
+  }
+
+  /**
+   * Records one failed connection attempt: bumps the attempt counter, sets
+   * `lastError`, and writes the attempt (with the actual exception/close
+   * detail) to the ring buffer. Only a NEW failure message reaches
+   * `console.warn` (via `logError`); repeats of the same message go to the
+   * ring buffer only (`logWarn`) — reconnecting forever every 10s must not
+   * spam the console with an identical line each time.
+   * @param {string} detail
+   * @returns {void}
+   */
+  _recordFailure(detail) {
+    this.attempts += 1
+    this.lastError = detail
+    const message = `connect attempt ${this.attempts} failed: ${detail}`
+    if (detail === this._lastFailureDetail) {
+      logWarn(message)
+    } else {
+      logError(message)
+    }
+    this._lastFailureDetail = detail
   }
 
   /** @returns {void} */
   _scheduleReconnect() {
     if (this._reconnectTimer) return
-    const delay = BACKOFF_STEPS_MS[Math.min(this._backoffIndex, BACKOFF_STEPS_MS.length - 1)]
-    this._backoffIndex += 1
+    const delay =
+      BACKOFF_STEPS_MS[Math.min(Math.max(this.attempts - 1, 0), BACKOFF_STEPS_MS.length - 1)]
+    this.nextRetryAt = Date.now() + delay
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null
       this._open()
@@ -316,7 +381,9 @@ class ConnectionManager extends EventTarget {
       url: WS_URL,
       serverVersion: this.serverVersion,
       localMode: this.localMode,
-      lastError: this.lastError
+      lastError: this.lastError,
+      attempts: this.attempts,
+      nextRetryAt: this.nextRetryAt
     }
   }
 

@@ -1,0 +1,54 @@
+tests/fixtures/
+================
+
+Real, tool-authored files that can't be reasonably faked with a library
+call. Currently just one, needed for the channel-based mask extraction
+feature (PROTOCOL.md §4, `cpsb/psd_io.py`'s `extract_mask_channel`).
+
+mask_channel_sample.psd (not yet present -- a product-owner spike)
+--------------------------------------------------------------------
+
+`extract_mask_channel` is fully covered against psd-tools' own read/write
+symmetry: `tests/test_psd_io.py::TestExtractMaskChannel` builds low-level
+PSD records by hand (there is no higher-level psd-tools API for adding a
+document-level extra/spot channel) and round-trips them through a real
+save/open. What that suite CANNOT confirm is the one assumption the whole
+approach rests on: that real Photoshop always writes the
+`ALPHA_IDENTIFIERS` / `ALPHA_NAMES_UNICODE` image resources for every extra
+channel it manages, once any extra channel exists in a document -- that is
+Photoshop's own behavior, not psd-tools', and needs an actual Photoshop
+save to verify (no Photoshop access was available while building this
+feature; see docs/SPIKES.md for this project's other pending M0 spikes).
+
+`tests/test_psd_io.py::TestExtractMaskChannelRealFixture` is skipped until
+this file exists. To add it:
+
+1. In Photoshop, create or open any RGB document (any size; a small one,
+   under 100x100px, keeps the fixture file small).
+2. Open the Channels panel (Window > Channels).
+3. Add a new channel: Channels panel menu > New Channel. Name it exactly
+   `Mask` (matches this project's default `mask_channel_name` setting --
+   see PROTOCOL.md §2 -- so the test doesn't need to configure anything).
+4. Select the new channel and paint or fill it with something visibly
+   non-uniform (e.g. a gradient, or a filled rectangle over a black
+   background) -- a completely flat fill would still pass the current
+   test, but a non-uniform pattern makes the fixture useful for a future,
+   more specific pixel-value assertion too.
+5. Re-select the composite channel (so the document displays normally) and
+   make sure File > File Info / Preferences > File Handling > "Maximize PSD
+   and PSB File Compatibility" is set to "Always" (or "Ask", and click
+   "Maximize compatibility" if prompted) -- `extract_mask_channel` reads the
+   merged/composite ImageData section, which is only fully written when
+   compatibility is maximized (mirrors this project's own composite-vs-
+   recomposite RGB fallback in `read_edited_psd`).
+6. File > Save As, format Photoshop (.psd), and save it as
+   `mask_channel_sample.psd` directly in this directory
+   (`tests/fixtures/mask_channel_sample.psd`).
+7. Run `pytest tests/test_psd_io.py -k RealFixture` -- it should now run
+   (not skip) and pass. If it fails, that's real signal: either this
+   project's channel-selection logic has a bug, or the assumption above
+   about Photoshop's own save behavior doesn't hold and
+   `cpsb/psd_io.py::extract_mask_channel`'s docstring / PROTOCOL.md §4 need
+   a second look.
+
+Keep the file small (well under 100KB) -- it's committed to the repo.

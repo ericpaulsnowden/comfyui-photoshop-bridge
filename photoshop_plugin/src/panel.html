@@ -2,32 +2,38 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <link rel="stylesheet" href="./panel.css" />
+    <link rel="stylesheet" href="panel.css" />
   </head>
   <body>
     <div class="cpsb-panel">
-      <div class="cpsb-status-row">
+      <div class="cpsb-status-pill">
         <span id="cpsb-status-dot" class="cpsb-dot cpsb-dot-disconnected"></span>
-        <sp-body id="cpsb-status-text" size="S">Disconnected</sp-body>
+        <span id="cpsb-status-text" class="cpsb-status-text">Disconnected</span>
       </div>
-      <div id="cpsb-server-url" class="cpsb-muted"></div>
+      <div id="cpsb-server-url" class="cpsb-muted cpsb-conn-line"></div>
+      <div id="cpsb-last-error" class="cpsb-error-line cpsb-conn-line"></div>
+      <div id="cpsb-retry-line" class="cpsb-muted cpsb-conn-line"></div>
 
-      <sp-divider size="small"></sp-divider>
+      <div class="cpsb-rule"></div>
 
-      <div class="cpsb-section-title">Active handoffs</div>
-      <ul id="cpsb-handoff-list" class="cpsb-list">
-        <li class="cpsb-empty">No documents from ComfyUI are currently open.</li>
-      </ul>
+      <!-- Headings are written in uppercase directly: text-transform is not
+           in UXP's documented CSS property set. -->
+      <div class="cpsb-section-title">ACTIVE HANDOFFS</div>
+      <div id="cpsb-handoff-list">
+        <div class="cpsb-empty">No documents from ComfyUI are currently open.</div>
+      </div>
 
-      <sp-divider size="small"></sp-divider>
+      <div class="cpsb-rule"></div>
 
-      <details class="cpsb-advanced">
-        <summary>Advanced</summary>
-        <div class="cpsb-log-wrap">
-          <pre id="cpsb-log" class="cpsb-log"></pre>
-        </div>
-      </details>
+      <!-- Plain div + JS click toggle: <details>/<summary> are unsupported
+           in UXP (treated as bare divs, so the disclosure never collapses),
+           and the `hidden` attribute is documented as unsupported too. -->
+      <div id="cpsb-advanced-toggle" class="cpsb-advanced-toggle">
+        <span id="cpsb-advanced-caret" class="cpsb-caret">&#9656;</span>
+        <span class="cpsb-section-title">ADVANCED</span>
+      </div>
+      <pre id="cpsb-log" class="cpsb-log cpsb-collapsed"></pre>
     </div>
-    <script src="./index.js"></script>
+    <script src="index.js"></script>
   </body>
 </html>

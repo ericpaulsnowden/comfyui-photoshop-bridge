@@ -1,91 +1,140 @@
 /*
- * Minimal styling layered on top of UXP's own theming. <sp-button>,
- * <sp-divider>, and <sp-body> already track Photoshop's current theme with
- * zero CSS of our own (they are Photoshop's native Spectrum UXP widgets,
- * not a UI library this plugin ships). Everything below is either plain
- * layout, or uses Photoshop's documented theme-aware CSS custom properties
- * (--uxp-host-*, see the "Making your Plugin Theme-aware" guide) so this
- * still reads correctly across all four Photoshop themes (darkest, dark,
- * light, lightest), not just dark.
+ * Panel styling, restricted to UXP's DOCUMENTED CSS subset — UXP's CSS
+ * engine is not a browser's, and undocumented properties are silently
+ * dropped. Everything used below appears in Adobe's property reference
+ * (uxp-api/reference-css/styles/): padding/margin longhands, flexbox
+ * (display/flex-direction/align-items/flex/min-width), color,
+ * background-color, border longhands + border-radius (the bare `border:`
+ * shorthand is NOT documented — only per-side shorthands like
+ * `border-bottom` and the width/style/color longhands), overflow,
+ * white-space, text-overflow, letter-spacing, font-*, height/max-height.
+ * Deliberately NOT used, because they are absent from that reference and
+ * silently no-op in a real Photoshop panel: `gap` (spacing is done with
+ * margins), `text-transform` (headings are written in uppercase directly),
+ * `word-break`, `cursor`, `list-style`.
+ *
+ * Theming: colors come exclusively from Photoshop's documented theme-aware
+ * variables (--uxp-host-*, see the "Making your Plugin Theme-aware" guide),
+ * and the panel's text color is paired with a background from the same
+ * variable family — so the panel tracks all four PS themes (darkest/dark/
+ * light/lightest) and text can never collide with the host background. If a
+ * variable were ever missing, that declaration is skipped and the host
+ * default inherits — never a hardcoded foreground on an unknown background.
+ * The only fixed colors are the semantic status-dot fills and the error
+ * accent, chosen to read against every PS theme's gray range.
  */
 
+html,
 body {
   margin: 0;
-  padding: 12px;
-  color: var(--uxp-host-text-color);
-  font-size: var(--uxp-host-font-size, 12px);
+  padding: 0;
+  height: 100%;
 }
 
 .cpsb-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
+  height: 100%;
+  overflow-y: auto;
+  padding: 14px;
+  color: var(--uxp-host-text-color);
+  background-color: var(--uxp-host-background-color);
+  font-size: var(--uxp-host-font-size, 12px);
 }
 
-.cpsb-status-row {
+/* --- Connection pill ---------------------------------------------------- */
+
+.cpsb-status-pill {
   display: flex;
+  flex-direction: row;
   align-items: center;
-  gap: 6px;
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--uxp-host-border-color);
+  border-radius: 12px;
+  padding: 5px 12px;
+  margin-bottom: 8px;
 }
 
 .cpsb-dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
-  flex: none;
-  background: #888888;
+  border-radius: 4px;
+  margin-right: 8px;
+  background-color: #808080;
 }
 
 .cpsb-dot-connected {
-  background: #2ecc71;
+  background-color: #2ecc71;
 }
 
 .cpsb-dot-connecting {
-  background: #e6b800;
+  background-color: #e6b800;
 }
 
 .cpsb-dot-disconnected {
-  background: #e74c3c;
+  background-color: #e74c3c;
+}
+
+.cpsb-status-text {
+  font-weight: 600;
+}
+
+/* --- Connection detail lines (URL, last error, retry state) ------------- */
+
+.cpsb-conn-line {
+  margin-top: 2px;
+  margin-bottom: 2px;
 }
 
 .cpsb-muted {
-  color: var(--uxp-host-text-color-secondary, var(--uxp-host-text-color));
+  color: var(--uxp-host-text-color-secondary);
   font-size: var(--uxp-host-font-size-smaller, 11px);
+}
+
+.cpsb-error-line {
+  color: #e74c3c;
+  font-size: var(--uxp-host-font-size-smaller, 11px);
+  white-space: pre-wrap;
+}
+
+/* --- Sections ------------------------------------------------------------ */
+
+.cpsb-rule {
+  height: 1px;
+  background-color: var(--uxp-host-border-color);
+  margin-top: 12px;
+  margin-bottom: 12px;
 }
 
 .cpsb-section-title {
-  font-weight: 600;
   font-size: var(--uxp-host-font-size-smaller, 11px);
-  text-transform: uppercase;
-  color: var(--uxp-host-label-text-color, var(--uxp-host-text-color));
-  margin-top: 4px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--uxp-host-label-text-color);
+  margin-bottom: 8px;
 }
 
-.cpsb-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
+/* --- Handoff list (plain divs: UXP treats ul/li as divs anyway) ---------- */
 
 .cpsb-empty {
-  color: var(--uxp-host-text-color-secondary, var(--uxp-host-text-color));
+  color: var(--uxp-host-text-color-secondary);
   font-size: var(--uxp-host-font-size-smaller, 11px);
-  padding: 4px 0;
+  padding-top: 2px;
+  padding-bottom: 2px;
 }
 
 .cpsb-handoff-item {
   display: flex;
+  flex-direction: row;
   align-items: center;
-  gap: 8px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--uxp-host-border-color, rgba(128, 128, 128, 0.3));
+  padding-top: 6px;
+  padding-bottom: 6px;
+  border-bottom-width: 1px;
+  border-bottom-style: solid;
+  border-bottom-color: var(--uxp-host-border-color);
 }
 
 .cpsb-handoff-item:last-child {
-  border-bottom: none;
+  border-bottom-width: 0;
 }
 
 .cpsb-handoff-name {
@@ -94,40 +143,50 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: var(--uxp-host-font-size, 12px);
+  margin-right: 8px;
 }
 
 .cpsb-handoff-status {
-  flex: none;
-  color: var(--uxp-host-text-color-secondary, var(--uxp-host-text-color));
+  color: var(--uxp-host-text-color-secondary);
   font-size: var(--uxp-host-font-size-smaller, 11px);
+  margin-right: 8px;
 }
 
-.cpsb-advanced {
-  margin-top: 4px;
+/* --- Advanced section (JS-driven disclosure: <details> is unsupported) --- */
+
+.cpsb-advanced-toggle {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
 }
 
-.cpsb-advanced summary {
-  cursor: pointer;
+.cpsb-advanced-toggle .cpsb-section-title {
+  margin-bottom: 0;
+}
+
+.cpsb-caret {
+  margin-right: 6px;
   font-size: var(--uxp-host-font-size-smaller, 11px);
-  text-transform: uppercase;
-  color: var(--uxp-host-label-text-color, var(--uxp-host-text-color));
-}
-
-.cpsb-log-wrap {
-  margin-top: 6px;
+  color: var(--uxp-host-text-color-secondary);
 }
 
 .cpsb-log {
-  margin: 0;
+  margin-top: 8px;
   max-height: 160px;
   overflow-y: auto;
-  font-size: 10px;
-  font-family: monospace;
-  white-space: pre-wrap;
-  word-break: break-word;
-  background: var(--uxp-host-background-color, rgba(128, 128, 128, 0.1));
-  border: 1px solid var(--uxp-host-border-color, rgba(128, 128, 128, 0.3));
-  border-radius: 4px;
+  overflow-x: auto;
   padding: 6px;
+  font-size: 10px;
+  font-family: Courier, monospace;
+  white-space: pre-wrap;
+  color: var(--uxp-host-text-color-secondary);
+  background-color: var(--uxp-host-widget-hover-background-color);
+  border-width: 1px;
+  border-style: solid;
+  border-color: var(--uxp-host-border-color);
+  border-radius: 4px;
+}
+
+.cpsb-collapsed {
+  display: none;
 }

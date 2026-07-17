@@ -12,6 +12,18 @@
  */
 
 import { api } from '../../../scripts/api.js'
+import { FRONTEND_VERSION } from './version.js'
+
+/**
+ * Re-exported so every other `cpsb/` module reads this build's own version
+ * through the same `import * as api from './api.js'` it already uses for
+ * everything else (this file's header: "the only module that talks to the
+ * network... everything else depends on this file"), instead of importing
+ * `version.js` directly in three more places. Compare against
+ * {@link CpsbStatusResponse}'s `server_version` for the PROTOCOL.md §9
+ * version-mismatch check (state.js `getServerVersion` / cpsb.js `setup`).
+ */
+export { FRONTEND_VERSION }
 
 /** Set to `true` locally to enable verbose [cpsb] console logging. */
 export const DEBUG = false
@@ -69,11 +81,25 @@ export function warn(...args) {
  */
 
 /**
+ * @typedef {Object} CpsbMaskFileRef
+ * A mask file as recorded on a `meta.json` edit entry (PROTOCOL.md §1/§4).
+ * Unlike {@link CpsbImageRef}, no `subfolder`/`type` is carried: the mask is
+ * always written "beside the edit" it belongs to, i.e. into that edit's own
+ * handoff folder — combine with {@link editSubfolder} for a full reference.
+ * @property {string} filename
+ */
+
+/**
  * @typedef {Object} CpsbEdit
  * @property {string} filename - `edit_%03d.png`, arrival order.
  * @property {number} ts
  * @property {CpsbFidelity} fidelity
  * @property {CpsbSiblingOutput | null} [sibling_output]
+ * @property {CpsbMaskFileRef | null} [mask] - The extracted-channel mask
+ * recorded for this edit (PROTOCOL.md §1/§4), or absent/`null` when none was
+ * extracted (no qualifying channel, Tier 2 remote mode, or a non-fatal
+ * extraction failure). Missing entirely on edits recorded before this field
+ * existed. Same handoff folder as `filename` — see {@link editSubfolder}.
  */
 
 /**
@@ -141,6 +167,9 @@ export function warn(...args) {
 
 /**
  * @typedef {Object} CpsbStatusResponse
+ * @property {string} server_version - The backend's semver string
+ * (PROTOCOL.md §2/§9). Compare against {@link FRONTEND_VERSION} for the
+ * version-mismatch warning (state.js `getServerVersion` / cpsb.js `setup`).
  * @property {boolean} tier1_available
  * @property {string | null} tier1_reason
  * @property {boolean} tier2_connected
@@ -154,6 +183,8 @@ export function warn(...args) {
  * @property {number} debounce_ms
  * @property {number} cleanup_days
  * @property {boolean} sibling_outputs
+ * @property {string} managed_folder_name
+ * @property {string} mask_channel_name
  */
 
 /**
@@ -167,6 +198,14 @@ export function warn(...args) {
  * @property {CpsbFileType} type
  * @property {CpsbFidelity} fidelity
  * @property {CpsbSiblingOutput | null} sibling_output
+ * @property {CpsbImageRef | null} mask - Full reference to the extracted
+ * mask image (PROTOCOL.md §5), or `null` when this edit had no extractable
+ * mask (§4). Unlike {@link CpsbEdit.mask}, this carries the complete
+ * `{filename, subfolder, type}` triple since the event payload must be
+ * self-contained. Mask *consumption* is entirely backend-side (the
+ * Photoshop Bridge node's MASK output, PROTOCOL.md §6) — this frontend only
+ * surfaces the mask's presence (gallery.js's "MASK" chip); pasteback.js is
+ * intentionally unchanged.
  */
 
 /**

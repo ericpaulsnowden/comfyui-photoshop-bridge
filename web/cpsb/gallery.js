@@ -198,6 +198,21 @@ function buildStatusChip(meta) {
 }
 
 /**
+ * A small "Mask" chip for a card whose latest edit carries an extracted
+ * mask (PROTOCOL.md §1/§4, `CpsbEdit.mask`) — presence-only signal, no
+ * other behavior (mask *consumption* is the Photoshop Bridge node's MASK
+ * output, entirely backend-side per PROTOCOL.md §6).
+ * @param {import('./api.js').CpsbEdit | undefined} latestEdit
+ * @returns {HTMLElement | null}
+ */
+function buildMaskChip(latestEdit) {
+  if (!latestEdit?.mask) return null
+  const chip = ui.el('span', { className: 'cpsb-chip cpsb-chip-mask', text: 'Mask' })
+  chip.title = latestEdit.mask.filename
+  return chip
+}
+
+/**
  * @param {import('./api.js').CpsbHandoffMeta} meta
  * @returns {HTMLElement}
  */
@@ -229,6 +244,15 @@ function buildCard(meta) {
     )
   }
 
+  // Grouped in their own flex row (rather than as two more direct children
+  // of `.cpsb-card-header`) so `justify-content: space-between` keeps
+  // pairing exactly two items — title vs. this group — instead of spacing
+  // three chips apart with the mask chip stranded in the middle.
+  const maskChip = buildMaskChip(latestEdit)
+  const headerBadges = ui.el('div', {
+    className: 'cpsb-card-header-badges',
+    children: [...(maskChip ? [maskChip] : []), buildStatusChip(meta)]
+  })
   const header = ui.el('div', {
     className: 'cpsb-card-header',
     children: [
@@ -236,7 +260,7 @@ function buildCard(meta) {
         className: 'cpsb-card-title',
         text: meta.workflow_name || 'Untitled workflow'
       }),
-      buildStatusChip(meta)
+      headerBadges
     ]
   })
 
@@ -316,6 +340,58 @@ function buildConnectionPill() {
 }
 
 /**
+ * Subtle "vX.Y.Z" label for the gallery header, showing this frontend
+ * build's own version — the one value known with certainty as soon as this
+ * module runs (the backend's version arrives asynchronously via
+ * `/cpsb/status` and may still be `null` on a very first paint). Full detail
+ * — both versions plus the Tier-2 connection state — is in the tooltip
+ * rather than inline, per the "show subtly" instruction.
+ * @returns {HTMLElement}
+ */
+function buildVersionLabel() {
+  const serverVersion = state.getServerVersion()
+  const tierInfo = state.getTierInfo()
+  const connSummary = tierInfo.tier2Connected
+    ? `Photoshop panel connected${tierInfo.psVersion ? ` (Photoshop ${tierInfo.psVersion})` : ''}`
+    : 'Photoshop panel not connected'
+  const label = ui.el('span', {
+    className: 'cpsb-gallery-version',
+    text: `v${api.FRONTEND_VERSION}`
+  })
+  label.title =
+    `Backend v${serverVersion || 'unknown'} · Frontend v${api.FRONTEND_VERSION}\n` +
+    connSummary
+  return label
+}
+
+/**
+ * @returns {boolean} Whether the backend's reported version differs from
+ * this frontend build's own — `false` while the server version is still
+ * unknown (pre-first-fetch), never a false positive.
+ */
+function isVersionMismatched() {
+  const serverVersion = state.getServerVersion()
+  return !!serverVersion && serverVersion !== api.FRONTEND_VERSION
+}
+
+/**
+ * Persistent (not auto-dismissing, unlike the one-time toast in cpsb.js)
+ * mismatch line for the gallery header — stays visible for as long as the
+ * mismatch does, since re-opening the sidebar tab re-runs `rebuild()`.
+ * @returns {HTMLElement}
+ */
+function buildVersionMismatchNotice() {
+  const serverVersion = state.getServerVersion()
+  return ui.el('div', {
+    className: 'cpsb-gallery-version-mismatch',
+    text:
+      `Version mismatch — backend v${serverVersion}, frontend ` +
+      `v${api.FRONTEND_VERSION}. Restart the ComfyUI server or hard-refresh ` +
+      'the browser.'
+  })
+}
+
+/**
  * @param {HTMLElement} container
  */
 function renderUpgradeBanner(container) {
@@ -348,7 +424,15 @@ function rebuild() {
   if (!rootEl) return
   rootEl.replaceChildren()
 
-  rootEl.appendChild(ui.el('div', { className: 'cpsb-gallery-header', children: [buildConnectionPill()] }))
+  rootEl.appendChild(
+    ui.el('div', {
+      className: 'cpsb-gallery-header',
+      children: [buildConnectionPill(), buildVersionLabel()]
+    })
+  )
+  if (isVersionMismatched()) {
+    rootEl.appendChild(buildVersionMismatchNotice())
+  }
   renderUpgradeBanner(rootEl)
 
   const handoffs = state.getAllHandoffs()

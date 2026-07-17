@@ -22,6 +22,7 @@ import * as menu from './cpsb/menu.js'
 import * as pasteback from './cpsb/pasteback.js'
 import * as badges from './cpsb/badges.js'
 import * as gallery from './cpsb/gallery.js'
+import * as ui from './cpsb/ui.js'
 import { SETTINGS } from './cpsb/settings.js'
 
 /**
@@ -41,9 +42,52 @@ function safely(label, fn) {
   }
 }
 
+/**
+ * This extension's own GitHub repo — the target of the About-panel badge
+ * below (PROTOCOL.md doesn't cover the About panel; the field itself is
+ * `Comfy-Org/ComfyUI_frontend`'s `ComfyExtension.aboutPageBadges`).
+ */
+const REPO_URL = 'https://github.com/ericpaulsnowden/comfyui-photoshop-bridge'
+
+let versionMismatchChecked = false
+
+/**
+ * One-time check, run once the initial `/cpsb/status` fetch resolves:
+ * compares the backend's reported version against this frontend build's own
+ * (PROTOCOL.md §9 only specifies the plugin<->backend `hello`/`hello_ack`
+ * exchange; this is the analogous frontend<->backend check the doc doesn't
+ * itself define — a product decision, not a protocol requirement). A
+ * mismatch almost always means only one half of an update was applied —
+ * e.g. `git pull` without restarting the ComfyUI server, or a stale browser
+ * tab left open across a frontend update. The gallery header
+ * (`gallery.js` `buildVersionMismatchNotice`) surfaces the same condition
+ * persistently; this toast is deliberately one-time only.
+ */
+function checkVersionMismatch() {
+  if (versionMismatchChecked) return
+  versionMismatchChecked = true
+  const serverVersion = state.getServerVersion()
+  if (!serverVersion || serverVersion === api.FRONTEND_VERSION) return
+  ui.showToast({
+    severity: 'warn',
+    summary: 'Photoshop Bridge version mismatch',
+    detail:
+      `backend v${serverVersion}, frontend v${api.FRONTEND_VERSION} — if ` +
+      'you just updated, restart the ComfyUI server (backend) or ' +
+      'hard-refresh the browser (frontend).'
+  })
+}
+
 app.registerExtension({
   name: 'cpsb.PhotoshopBridge',
   settings: SETTINGS,
+  aboutPageBadges: [
+    {
+      label: `Photoshop Bridge v${api.FRONTEND_VERSION}`,
+      url: REPO_URL,
+      icon: 'pi pi-github'
+    }
+  ],
 
   /**
    * Fires once per node type at startup (and again for any type re-sent by
@@ -89,5 +133,8 @@ app.registerExtension({
     safely('badges.init', () => badges.init())
     safely('gallery.registerGalleryTab', () => gallery.registerGalleryTab())
     safely('state.initState', () => state.initState())
+    // Piggybacks on the same (idempotent — see state.js) initState() call
+    // rather than a second independent fetch, running once it resolves.
+    safely('checkVersionMismatch', () => state.initState().then(checkVersionMismatch))
   }
 })

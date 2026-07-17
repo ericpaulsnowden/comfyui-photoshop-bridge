@@ -57,7 +57,8 @@ input/<managed>/<handoff_id>/
   "edits": [
     {"filename": "edit_001.png", "ts": 1752680123.4,
      "fidelity": "composite" | "recomposite" | "plugin",
-     "sibling_output": {"filename": "ComfyUI_00042_ps1.png", "subfolder": ""} 
+     "sibling_output": {"filename": "ComfyUI_00042_ps1.png", "subfolder": ""},
+     "mask": {"filename": "mask_001.png"} 
     }
   ]
 }
@@ -121,9 +122,11 @@ Create a handoff and open it in Photoshop. Body (JSON):
   `{"error": ..., "reason": "client_remote", "server_name": "<platform.node()>"}` —
   the frontend shows a confirm ("Photoshop will open on <server_name>, not this
   computer") and re-sends with `client_remote_ok: true` if the user proceeds (choice
-  remembered per-browser in localStorage; only the affirmative is persisted). A
-  connected Tier 2 plugin bypasses this gate entirely (the document opens wherever the
-  plugin runs, which is where the user chose to install it).
+  remembered per-browser in localStorage; only the affirmative is persisted). A connected Tier 2 plugin in REMOTE mode bypasses this gate (the plugin is on a
+  different machine than the server — almost certainly the one the user is at). A
+  plugin in LOCAL mode does NOT bypass it: local mode means the plugin sits on the
+  server's own machine, so for a remote browser the document would still open on the
+  wrong screen — the same confirm applies.
 - `mode:"original"`: re-open the existing handoff's `source.psd` (layers preserved).
   Requires `existing` handoff for the node; 404 otherwise.
 - `mode:"fresh"`: mark the existing handoff `superseded`, then proceed as `new`.
@@ -176,6 +179,7 @@ Gallery "Discard" for stale handoffs: same as cancel but sets `discarded`. 200/4
 ### GET `/cpsb/status`
 ```json
 {
+  "server_version": "0.2.0",
   "tier1_available": true,
   "tier1_reason": null,            // or "headless-server" | "no-photoshop" | ...
   "tier2_connected": false,
@@ -191,7 +195,7 @@ Returns `orig_thumb.png` bytes. (Edited-image thumbnails are fetched via ComfyUI
 ### GET `/cpsb/settings` / POST `/cpsb/settings`
 Backend-persisted settings (stored at `<user_dir>/cpsb.json`), JSON object:
 `{"photoshop_path": "", "debounce_ms": 800, "cleanup_days": 14, "sibling_outputs": true,
-"managed_folder_name": "photoshop"}`.
+"managed_folder_name": "photoshop", "mask_channel_name": "Mask"}`.
 POST merges partial updates and returns the full object. `managed_folder_name` is
 sanitized to a single safe path segment (no separators, no `..`); an invalid value falls
 back to the default. (Frontend-only preferences — auto-queue toggle — use ComfyUI's
@@ -258,6 +262,20 @@ A read that still fails after the retry budget is **non-terminal**: the watcher 
 leaves the handoff `editing` so the next save retries ingestion — it must never move a
 handoff to `error` (terminal statuses would silently drop all subsequent saves).
 
+**Mask extraction (channel-based, product owner's spec):** whenever the saved PSD is
+readable server-side (Tier 1 always; Tier 2 in local mode — the plugin saved to the
+shared `source.psd` path), ingest also inspects the document's EXTRA channels (alpha /
+spot channels beyond the core RGB and composite transparency):
+- exactly one extra channel → it is the mask;
+- more than one → the one whose name equals the `mask_channel_name` setting
+  (default `"Mask"`, case-insensitive) wins; if none match, no mask;
+- none → no mask.
+The winning channel's pixels are written as single-channel `mask_%03d.png` beside the
+edit (white = 1.0 mask, no inversion in the pipeline) and recorded on the edit entry
+(`mask`). Tier 2 remote mode has no server-side PSD → `mask: null` (plugin-side channel
+export is a future spike). Mask extraction failures are non-fatal: log, `mask: null`,
+the edit itself still ingests.
+
 ---
 
 ## 5. Frontend events (server → ComfyUI frontend via send_sync)
@@ -267,7 +285,8 @@ handoff to `error` (terminal statuses would silently drop all subsequent saves).
   {"handoff_id": "...", "origin_node_id": "17", "origin_kind": "load_image",
    "filename": "edit_002.png", "subfolder": "cpsb/a1b2c3d4", "type": "input",
    "fidelity": "plugin",
-   "sibling_output": null }
+   "sibling_output": null,
+   "mask": {"filename": "mask_002.png", "subfolder": "cpsb/a1b2c3d4", "type": "input"} }
   ```
 - `"cpsb.status"` — handoff lifecycle changed (badge/gallery refresh):
   `{"handoff_id": "...", "origin_node_id": "17", "status": "editing"}`
@@ -310,7 +329,9 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     policy) which consumes the latest edit — live-iterate mode. No timeout involved.
   - "Open only (don't wait)": passthrough + fire-and-forget open; saves are ingested
     and consumed on the next manual queue only.
-- Output: IMAGE.
+- Outputs: (IMAGE, MASK). MASK preference order: the edit's extracted channel mask
+  (§4) → else `1 - alpha` of the edit image (LoadImage parity) → else an all-zero
+  mask sized to the image. White = 1.0; inversion is the consumer's job.
 - Execute (edit-consumption semantics): if an active handoff for this node already has
   an edit AND its `source_hash` matches the current input, that edit is returned
   immediately WITHOUT re-opening Photoshop — re-execution is the "consume the edit"

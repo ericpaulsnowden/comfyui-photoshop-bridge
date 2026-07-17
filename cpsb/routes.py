@@ -42,14 +42,17 @@ from .handoff import (
 from .launcher import launch_photoshop, tier1_status
 from .locality import is_request_local
 from .psd_io import write_psd
+from .version import __version__
 
 logger = logging.getLogger("cpsb")
 
 routes = web.RouteTableDef()
 
 #: This backend's protocol version, exchanged in the plugin's `hello`/`hello_ack`
-#: handshake (PROTOCOL.md §9). Bump alongside `pyproject.toml`'s `[project].version`.
-_SERVER_VERSION = "0.1.0"
+#: handshake (PROTOCOL.md §9) and reported at `GET /cpsb/status` (PROTOCOL.md
+#: §2). Single source of truth is `cpsb.version`, which `scripts/bump_version.py`
+#: rewrites alongside `pyproject.toml`'s `[project].version`.
+_SERVER_VERSION = __version__
 
 _PING_INTERVAL_SECONDS = 30
 _PONG_TIMEOUT_SECONDS = 15
@@ -157,6 +160,37 @@ def tier2_connected(app: web.Application) -> bool:
     slot = app.get(_APP_KEY_PLUGIN)
     plugin = slot.connection if slot is not None else None
     return plugin is not None and plugin.ready
+
+
+def _tier2_bypasses_locality_gate(app: web.Application) -> bool:
+    """Whether a connected Tier 2 plugin bypasses the client-locality gate.
+
+    PROTOCOL.md §2 (amended): a connected plugin bypasses the gate ONLY when
+    it is in REMOTE mode -- the document then opens wherever the plugin
+    runs, which is where the user chose to install it, almost certainly the
+    same machine as the requesting browser. A plugin in LOCAL mode sits on
+    the SERVER's own machine (``local_mode`` means the shared
+    ``input_cpsb_path`` from ``hello_ack`` exists on the plugin's local
+    filesystem, PROTOCOL.md §3) -- the same machine the Tier 1 OS-launch
+    path would use -- so for a remote browser the document would still land
+    on a screen that browser can't see: the gate still applies exactly as
+    it does to Tier 1.
+
+    ``tier2_connected()`` requires ``plugin.ready``, and the plugin's
+    ``ready`` message handler (``_handle_plugin_message``) always sets
+    ``local_mode`` in the very same branch that flips ``ready`` to `True`
+    (one message, two fields, set together) -- so a connected, ready
+    plugin's ``local_mode`` is never ``None`` here; the assert below
+    documents and enforces that invariant rather than silently trusting it.
+    """
+    slot = app.get(_APP_KEY_PLUGIN)
+    plugin = slot.connection if slot is not None else None
+    if plugin is None or not plugin.ready:
+        return False
+    assert plugin.local_mode is not None, (
+        "a ready Tier 2 plugin always has local_mode set (see _handle_plugin_message)"
+    )
+    return plugin.local_mode is False
 
 
 # -- POST /cpsb/open ---------------------------------------------------------
@@ -322,16 +356,20 @@ async def open_handoff_route(request: web.Request) -> web.Response:
             tier2_connected=False,
         )
 
-    # Client-locality gate (PROTOCOL.md §2/§7). Only relevant when this
-    # request would actually take the Tier 1 path -- a connected Tier 2
-    # plugin bypasses it entirely, since the document opens wherever the
-    # plugin runs, which is where the user chose to install it. Placed
-    # here, after the 409/503 checks above have settled that an open will
-    # truly be attempted, but BEFORE any handoff is created, any file is
-    # written, or the pending supersede (explicit `mode:"fresh"`, or the
-    # auto-supersede-on-changed-source decided above) is actually applied
-    # below -- a 428 must leave no side effects.
-    if not tier2 and not fields["client_remote_ok"] and not is_request_local(request):
+    # Client-locality gate (PROTOCOL.md §2/§7, amended). Relevant whenever
+    # this request would open on THIS machine -- the Tier 1 path always, and
+    # the Tier 2 path too unless the connected plugin is in REMOTE mode (see
+    # _tier2_bypasses_locality_gate). Placed here, after the 409/503 checks
+    # above have settled that an open will truly be attempted, but BEFORE
+    # any handoff is created, any file is written, or the pending supersede
+    # (explicit `mode:"fresh"`, or the auto-supersede-on-changed-source
+    # decided above) is actually applied below -- a 428 must leave no side
+    # effects.
+    if (
+        not _tier2_bypasses_locality_gate(request.app)
+        and not fields["client_remote_ok"]
+        and not is_request_local(request)
+    ):
         server_name = platform.node()
         return _error(
             428,
@@ -587,6 +625,7 @@ async def status_route(request: web.Request) -> web.Response:
     is_tier2_connected = tier2_connected(request.app)
     return web.json_response(
         {
+            "server_version": _SERVER_VERSION,
             "tier1_available": tier1.available,
             "tier1_reason": tier1.reason,
             "tier2_connected": is_tier2_connected,

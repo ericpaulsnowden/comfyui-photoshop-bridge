@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 
@@ -19,6 +20,7 @@ from cpsb.handoff import (
     WaitOutcome,
     compute_source_hash,
 )
+from cpsb.psd_io import write_psd
 
 
 def make_image(color: tuple[int, int, int], size: tuple[int, int] = (32, 24)) -> Image.Image:
@@ -220,6 +222,191 @@ class TestSiblingOutputs:
         meta = create_handoff(manager, origin_kind="terminal_output")
         edit = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "composite")
         assert edit.sibling_output is None
+
+
+class TestMaskExtraction:
+    """Channel-based mask extraction on ingest (PROTOCOL.md §4).
+
+    ``create_handoff()`` (this module's own helper, wrapping
+    ``HandoffManager.create``) never writes ``source.psd`` itself -- that is
+    ``cpsb.psd_io.write_psd``, called by the route handler / bridge node
+    once ``create`` returns (see ``HandoffManager.create``'s own docstring)
+    -- so every test below that wants extraction to find something writes
+    ``source.psd`` into the handoff's folder directly first.
+    """
+
+    def test_no_source_psd_yields_null_mask(self, manager):
+        """No PSD on disk at all (Tier 2 remote-mode upload, or a bridge-
+        node origin before its own write_psd call in this test) is treated
+        the same as "PSD has no mask": a clean None, not an error.
+        """
+        meta = create_handoff(manager)
+        edit = manager.ingest_edit(meta.handoff_id, make_image((1, 2, 3)), "composite")
+        assert edit.mask is None
+        assert manager.get(meta.handoff_id).edits[0].mask is None
+
+    def test_flat_source_psd_yields_null_mask(self, manager):
+        """The common case: source.psd exists (Tier 1) but has no extra
+        channel -- the user never touched the Channels panel.
+        """
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        write_psd(psd_path, make_image((5, 5, 5)))
+
+        edit = manager.ingest_edit(meta.handoff_id, make_image((1, 2, 3)), "composite")
+
+        assert edit.mask is None
+
+    def test_extra_channel_written_alongside_edit(self, manager, psd_with_extra_channels):
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_with_extra_channels(
+            psd_path,
+            Image.new("RGB", (32, 24), (5, 5, 5)),
+            [("Mask", Image.new("L", (32, 24), 200))],
+        )
+
+        edit = manager.ingest_edit(meta.handoff_id, make_image((1, 2, 3)), "composite")
+
+        assert edit.mask is not None
+        assert edit.mask.filename == "mask_001.png"
+        mask_path = manager.handoff_dir(meta.handoff_id) / "mask_001.png"
+        assert mask_path.is_file()
+        with Image.open(mask_path) as mask_image:
+            assert mask_image.mode == "L"
+            assert mask_image.getpixel((0, 0)) == 200
+
+    def test_mask_recorded_in_meta_json(self, manager, context, psd_with_extra_channels):
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_with_extra_channels(
+            psd_path, Image.new("RGB", (8, 8), (0, 0, 0)), [("Mask", Image.new("L", (8, 8), 90))]
+        )
+
+        manager.ingest_edit(meta.handoff_id, make_image((1, 1, 1)), "composite")
+
+        stored = json.loads(
+            (context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text()
+        )
+        # On-disk EditRecord.mask is the lightweight {filename}-only form
+        # (PROTOCOL.md §1) -- subfolder/type are added only for the event.
+        assert stored["edits"][0]["mask"] == {"filename": "mask_001.png"}
+
+    def test_cpsb_updated_event_includes_full_mask_triple(
+        self, manager, events, psd_with_extra_channels
+    ):
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_with_extra_channels(
+            psd_path, Image.new("RGB", (8, 8), (0, 0, 0)), [("Mask", Image.new("L", (8, 8), 90))]
+        )
+
+        manager.ingest_edit(meta.handoff_id, make_image((1, 1, 1)), "composite")
+
+        payload = events.of_type("cpsb.updated")[-1]
+        assert payload["mask"] == {
+            "filename": "mask_001.png",
+            "subfolder": f"{DEFAULT_MANAGED_FOLDER_NAME}/{meta.handoff_id}",
+            "type": "input",
+        }
+
+    def test_cpsb_updated_event_mask_is_null_when_no_mask(self, manager, events):
+        meta = create_handoff(manager)
+
+        manager.ingest_edit(meta.handoff_id, make_image((1, 1, 1)), "composite")
+
+        payload = events.of_type("cpsb.updated")[-1]
+        assert payload["mask"] is None
+
+    def test_mask_index_matches_edit_index_on_second_edit(
+        self, manager, psd_with_extra_channels
+    ):
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_with_extra_channels(
+            psd_path, Image.new("RGB", (8, 8), (0, 0, 0)), [("Mask", Image.new("L", (8, 8), 1))]
+        )
+        manager.ingest_edit(meta.handoff_id, make_image((1, 1, 1)), "composite")
+
+        psd_with_extra_channels(
+            psd_path, Image.new("RGB", (8, 8), (0, 0, 0)), [("Mask", Image.new("L", (8, 8), 2))]
+        )
+        edit2 = manager.ingest_edit(meta.handoff_id, make_image((2, 2, 2)), "composite")
+
+        assert edit2.mask.filename == "mask_002.png"
+
+    def test_preferred_channel_name_setting_is_honored(
+        self, manager, context, psd_with_extra_channels
+    ):
+        context.settings.update({"mask_channel_name": "MyMask"})
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_with_extra_channels(
+            psd_path,
+            Image.new("RGB", (8, 8), (0, 0, 0)),
+            [("Alpha 1", Image.new("L", (8, 8), 10)), ("MyMask", Image.new("L", (8, 8), 240))],
+        )
+
+        edit = manager.ingest_edit(meta.handoff_id, make_image((1, 1, 1)), "composite")
+
+        with Image.open(manager.handoff_dir(meta.handoff_id) / edit.mask.filename) as mask_image:
+            assert mask_image.getpixel((0, 0)) == 240
+
+    def test_extraction_failure_is_non_fatal_edit_still_ingests(self, manager, caplog):
+        """A corrupt/unreadable source.psd must not stop the edit itself
+        from ingesting (PROTOCOL.md §4: "log + null, edit still ingests").
+        """
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_path.write_bytes(b"not actually a psd file")
+
+        with caplog.at_level(logging.WARNING, logger="cpsb"):
+            edit = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "composite")
+
+        assert edit is not None
+        assert edit.mask is None
+        assert manager.get(meta.handoff_id).status == "edited"
+        assert any("mask extraction" in record.message.lower() for record in caplog.records)
+
+    def test_mask_image_path_helper(self, manager, psd_with_extra_channels):
+        meta = create_handoff(manager)
+        assert manager.mask_image_path(meta.handoff_id) is None  # no edit yet
+
+        manager.ingest_edit(meta.handoff_id, make_image((1, 1, 1)), "composite")
+        assert manager.mask_image_path(meta.handoff_id) is None  # edit exists, no mask
+
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_with_extra_channels(
+            psd_path, Image.new("RGB", (8, 8), (0, 0, 0)), [("Mask", Image.new("L", (8, 8), 5))]
+        )
+        manager.ingest_edit(meta.handoff_id, make_image((2, 2, 2)), "composite")
+
+        mask_path = manager.mask_image_path(meta.handoff_id)
+        assert mask_path is not None
+        assert mask_path.name == "mask_002.png"
+        assert mask_path.is_file()
+
+    def test_duplicate_edit_does_not_reattempt_extraction(
+        self, manager, context, psd_with_extra_channels
+    ):
+        """PROTOCOL.md §4: "mask rides the edit's dedup" -- a duplicate
+        save is a no-op before mask extraction is even attempted.
+        """
+        meta = create_handoff(manager)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_with_extra_channels(
+            psd_path, Image.new("RGB", (8, 8), (0, 0, 0)), [("Mask", Image.new("L", (8, 8), 5))]
+        )
+        first = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "composite")
+        duplicate = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "composite")
+
+        assert first.mask is not None
+        assert duplicate is None
+        assert len(manager.get(meta.handoff_id).edits) == 1
+        # Only ONE mask file on disk -- no attempted re-extraction/overwrite.
+        assert list((context.cpsb_input_dir / meta.handoff_id).glob("mask_*.png")) == [
+            context.cpsb_input_dir / meta.handoff_id / "mask_001.png"
+        ]
 
 
 class TestSupersede:

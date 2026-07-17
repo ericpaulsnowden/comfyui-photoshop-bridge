@@ -24,6 +24,7 @@ import cpsb.routes as routes_module
 from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
 from cpsb.handoff import HandoffManager, WaitOutcome, compute_source_hash
 from cpsb.launcher import LaunchResult, Tier1Status
+from cpsb.version import __version__ as CPSB_VERSION
 
 SOURCE_FILENAME = "ComfyUI_00042_.png"
 
@@ -363,18 +364,20 @@ class TestAutoSupersedeOnChangedSource:
         assert manager.get(first["handoff_id"]).status == "superseded"
 
 
-async def _connect_tier2_plugin(ws, context: CpsbContext) -> None:
+async def _connect_tier2_plugin(ws, context: CpsbContext, local_mode: bool = True) -> None:
     """Minimal hello/ready handshake to register a ready Tier 2 plugin (PROTOCOL.md §3).
 
     A slimmer, standalone duplicate of ``TestPluginWebsocket.handshake`` --
     kept separate rather than shared so this module's other test classes
-    don't couple to that class's own helper.
+    don't couple to that class's own helper. *local_mode* controls the
+    ``ready`` message's own field (PROTOCOL.md §2, amended: this is what
+    decides whether the connected plugin bypasses the client-locality gate).
     """
     await ws.send_json(
         {"type": "hello", "plugin_version": "0.1.0", "ps_version": "26.5", "uxp_version": "8.1"}
     )
     await ws.receive_json(timeout=5)  # hello_ack
-    await ws.send_json({"type": "ready", "local_mode": True})
+    await ws.send_json({"type": "ready", "local_mode": local_mode})
 
 
 class TestClientLocalityGate:
@@ -384,6 +387,14 @@ class TestClientLocalityGate:
     ``cpsb.routes`` imports ``is_request_local`` into its own namespace
     (``from .locality import is_request_local``), so that -- not
     ``cpsb.locality`` -- is where these tests monkeypatch it.
+
+    PROTOCOL.md §2 was amended after this gate's first release: a connected
+    Tier 2 plugin bypasses the gate ONLY in REMOTE mode (``local_mode:
+    false`` -- the plugin runs on a different machine than the server,
+    almost certainly the browser's own). A LOCAL-mode plugin (``local_mode:
+    true``) sits on the SERVER's own machine, same as the Tier 1 OS-launch
+    path, so it is gated exactly like Tier 1 -- see
+    ``TestTier2LocalMode``/``TestTier2RemoteMode`` below for that split.
     """
 
     async def test_local_client_no_gate(self, client, source_image, launches):
@@ -442,23 +453,6 @@ class TestClientLocalityGate:
         assert data["tier"] == 1
         assert data["status"] == "pending"
 
-    async def test_tier2_connected_bypasses_gate_without_flag(
-        self, client, context, source_image, launches, monkeypatch
-    ):
-        """A connected Tier 2 plugin bypasses the gate entirely, flag or
-        not -- the document opens on the plugin's own machine, which is
-        wherever the user chose to install it.
-        """
-        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
-        async with client.ws_connect("/cpsb/ws") as ws:
-            await _connect_tier2_plugin(ws, context)
-            await wait_until(lambda: routes_module.tier2_connected(client.app))
-
-            response = await client.post("/cpsb/open", json=open_body())
-
-            assert response.status == 200
-            assert (await response.json())["tier"] == 2
-
     async def test_mode_original_gated_the_same(
         self, client, manager, source_image, launches, monkeypatch
     ):
@@ -481,6 +475,118 @@ class TestClientLocalityGate:
         )
         assert acknowledged.status == 200
         assert (await acknowledged.json())["handoff_id"] == first["handoff_id"]
+
+
+class TestTier2LocalMode:
+    """PROTOCOL.md §2 (amended): a Tier 2 plugin in LOCAL mode sits on the
+    SERVER's own machine, so it does NOT bypass the client-locality gate --
+    it is gated exactly like a Tier 1 OS-launch would be.
+    """
+
+    async def test_remote_client_gated_428(
+        self, client, context, source_image, launches, monkeypatch
+    ):
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=True)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            response = await client.post("/cpsb/open", json=open_body())
+
+            assert response.status == 428
+            body = await response.json()
+            assert body["reason"] == "client_remote"
+            assert body["server_name"] == platform.node()
+
+    async def test_remote_client_with_client_remote_ok_proceeds_as_tier2(
+        self, client, context, source_image, launches, monkeypatch
+    ):
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=True)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            response = await client.post("/cpsb/open", json=open_body(client_remote_ok=True))
+
+            assert response.status == 200
+            data = await response.json()
+            assert data["tier"] == 2
+            assert data["status"] == "pending"
+
+    async def test_local_client_no_gate(self, client, context, source_image, launches):
+        """The default aiohttp TestClient connects from loopback (local) --
+        a local-mode plugin's own machine, so no confirm is needed at all.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=True)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            response = await client.post("/cpsb/open", json=open_body())
+
+            assert response.status == 200
+            data = await response.json()
+            assert data["tier"] == 2
+            assert data["status"] == "pending"
+
+
+class TestTier2RemoteMode:
+    """PROTOCOL.md §2 (amended): a Tier 2 plugin in REMOTE mode DOES bypass
+    the client-locality gate -- the document opens wherever the plugin
+    runs, which is where the user chose to install it, almost certainly the
+    requesting browser's own machine.
+    """
+
+    async def test_remote_client_bypasses_gate_without_flag(
+        self, client, context, source_image, launches, monkeypatch
+    ):
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            response = await client.post("/cpsb/open", json=open_body())
+
+            assert response.status == 200
+            data = await response.json()
+            assert data["tier"] == 2
+            assert data["status"] == "pending"
+
+
+class TestTier2BypassesLocalityGateHelper:
+    """Direct unit coverage of ``_tier2_bypasses_locality_gate`` (PROTOCOL.md
+    §2, amended), isolating the "no plugin at all" / "plugin not ready yet"
+    branches the route-level Tier2LocalMode/RemoteMode tests above don't
+    exercise directly (a connected-but-not-ready plugin never reaches those
+    routes' assertions, since ``tier2_connected`` -- and therefore whether
+    Tier 2 is even selected -- also requires ``ready``).
+    """
+
+    def _app(self, context: CpsbContext, manager: HandoffManager) -> web.Application:
+        app = web.Application()
+        routes_module.install(app, context, manager)
+        return app
+
+    def test_no_plugin_connected_does_not_bypass(self, context, manager):
+        app = self._app(context, manager)
+        assert routes_module._tier2_bypasses_locality_gate(app) is False
+
+    def test_connected_but_not_ready_does_not_bypass(self, context, manager):
+        app = self._app(context, manager)
+        connection = routes_module.PluginConnection(ws=object(), local_mode=False, ready=False)
+        app[routes_module._APP_KEY_PLUGIN].connection = connection
+        assert routes_module._tier2_bypasses_locality_gate(app) is False
+
+    def test_ready_local_mode_does_not_bypass(self, context, manager):
+        app = self._app(context, manager)
+        connection = routes_module.PluginConnection(ws=object(), local_mode=True, ready=True)
+        app[routes_module._APP_KEY_PLUGIN].connection = connection
+        assert routes_module._tier2_bypasses_locality_gate(app) is False
+
+    def test_ready_remote_mode_bypasses(self, context, manager):
+        app = self._app(context, manager)
+        connection = routes_module.PluginConnection(ws=object(), local_mode=False, ready=True)
+        app[routes_module._APP_KEY_PLUGIN].connection = connection
+        assert routes_module._tier2_bypasses_locality_gate(app) is True
 
 
 class TestUpload:
@@ -685,6 +791,10 @@ class TestStatus:
         response = await client.get("/cpsb/status")
         assert response.status == 200
         data = await response.json()
+        assert data["server_version"] == routes_module._SERVER_VERSION
+        # Single source of truth (PROTOCOL.md §9): routes.py must not carry
+        # its own literal, only re-export cpsb.version.__version__.
+        assert data["server_version"] == CPSB_VERSION
         assert data["tier1_available"] is True
         assert data["tier1_reason"] is None
         assert data["tier2_connected"] is False
@@ -702,6 +812,7 @@ class TestSettings:
             "cleanup_days": 14,
             "sibling_outputs": True,
             "managed_folder_name": DEFAULT_MANAGED_FOLDER_NAME,
+            "mask_channel_name": "Mask",
         }
 
     async def test_post_merges_and_persists(self, client, context, launches):

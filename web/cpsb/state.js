@@ -26,6 +26,14 @@ const STALE_MS = 60 * 60 * 1000
 /** @type {Map<string, import('./api.js').CpsbHandoffMeta>} */
 const handoffsById = new Map()
 
+/**
+ * The backend's own reported version (`CpsbStatusResponse.server_version`,
+ * PROTOCOL.md §2/§9), or `null` before the first `/cpsb/status` response
+ * lands. See {@link getServerVersion}.
+ * @type {string | null}
+ */
+let serverVersion = null
+
 // Optimistic defaults until the first /cpsb/status response lands: menu.js
 // only uses these to *disable* an item early as a courtesy (see menu.js),
 // and /cpsb/open remains the authoritative gate either way — so defaulting
@@ -66,6 +74,7 @@ function applyStatusResponse(
   tier.tier1Reason = response.tier1_reason ?? null
   tier.tier2Connected = !!response.tier2_connected
   tier.psVersion = response.ps_version ?? null
+  serverVersion = response.server_version ?? null
 }
 
 /**
@@ -209,6 +218,16 @@ export function getAllHandoffs() {
 export function isRemoteBrowsingLikely() {
   const host = window.location.hostname
   return host !== '' && host !== 'localhost' && host !== '127.0.0.1' && host !== '::1'
+}
+
+/**
+ * @returns {string | null} The backend's own reported version
+ * (PROTOCOL.md §2/§9), or `null` before the first `/cpsb/status` response
+ * lands. Compare against `api.FRONTEND_VERSION` for the version-mismatch
+ * check (cpsb.js `setup`); surfaced read-only in settings.js and gallery.js.
+ */
+export function getServerVersion() {
+  return serverVersion
 }
 
 /**

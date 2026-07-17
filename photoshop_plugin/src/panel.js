@@ -1,12 +1,18 @@
 /**
  * @file Wires up the "ComfyUI" panel's DOM (panel.html) to live plugin
- * state: the connection pill, the active-handoffs list with per-document
- * "Send back now" buttons, and the Advanced section's log ring buffer. Pure
- * UI glue — holds no state of its own beyond the DOM it renders into, and
- * every element it needs already exists in panel.html's static markup (this
- * plugin has exactly one panel, which is also the plugin's one and only
- * HTML document, so there is no per-panel `rootNode` content to build up
- * dynamically).
+ * state: the connection pill with failure diagnostics (target URL, last
+ * error, retry countdown), the active-handoffs list with per-document
+ * "Send back now" buttons, and the Advanced section's log ring buffer.
+ * Pure UI glue — holds no state of its own beyond the DOM it renders into,
+ * and every element it needs already exists in panel.html's static markup
+ * (this plugin has exactly one panel, which is also the plugin's one and
+ * only HTML document).
+ *
+ * The Advanced disclosure is a plain div toggled from JS because UXP does
+ * not support `<details>`/`<summary>` (unsupported elements render as bare
+ * divs and never collapse) nor the `hidden` attribute — both per Adobe's
+ * uxp-api HTML reference ("Unsupported Elements" / "Unsupported
+ * Attributes").
  */
 
 const { connection } = require('./connection.js')
@@ -35,8 +41,36 @@ function initPanel() {
   const statusDot = /** @type {HTMLElement} */ (document.getElementById('cpsb-status-dot'))
   const statusText = /** @type {HTMLElement} */ (document.getElementById('cpsb-status-text'))
   const serverUrlEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-server-url'))
+  const lastErrorEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-last-error'))
+  const retryEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-retry-line'))
   const handoffList = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-list'))
   const logEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-log'))
+  const advancedToggle = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-advanced-toggle')
+  )
+  const advancedCaret = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-advanced-caret')
+  )
+
+  /** @type {ReturnType<typeof setInterval> | null} */
+  let retryTicker = null
+
+  /**
+   * Builds the retry/connecting line for a non-connected state.
+   * @param {import('./connection.js').CpsbConnectionState} state
+   * @returns {string} Empty string when there is nothing to show.
+   */
+  function retryText(state) {
+    const attemptNumber = state.attempts + 1
+    if (state.status === 'connecting') {
+      return `Connecting… (attempt ${attemptNumber})`
+    }
+    if (state.nextRetryAt != null) {
+      const seconds = Math.max(0, Math.ceil((state.nextRetryAt - Date.now()) / 1000))
+      return `Retrying in ${seconds}s (attempt ${attemptNumber})`
+    }
+    return ''
+  }
 
   /** @returns {void} */
   function renderConnection() {
@@ -44,14 +78,39 @@ function initPanel() {
     statusDot.className = `cpsb-dot cpsb-dot-${state.status}`
     statusText.textContent = STATUS_LABELS[state.status] || state.status
     serverUrlEl.textContent = state.url
+    if (state.status === 'connected') {
+      lastErrorEl.style.display = 'none'
+      retryEl.style.display = 'none'
+      if (retryTicker) {
+        clearInterval(retryTicker)
+        retryTicker = null
+      }
+      return
+    }
+    if (state.lastError) {
+      lastErrorEl.textContent = `Last error: ${state.lastError}`
+      lastErrorEl.style.display = 'block'
+    } else {
+      lastErrorEl.style.display = 'none'
+    }
+    const retry = retryText(state)
+    retryEl.textContent = retry
+    retryEl.style.display = retry ? 'block' : 'none'
+    // Tick once a second while not connected so the "Retrying in Ns"
+    // countdown counts down instead of freezing at its first value.
+    if (!retryTicker) {
+      retryTicker = setInterval(renderConnection, 1000)
+    }
   }
 
   /**
    * @param {import('./handoffs.js').CpsbHandoffRecord} record
-   * @returns {HTMLLIElement}
+   * @returns {HTMLElement}
    */
   function buildHandoffItem(record) {
-    const item = document.createElement('li')
+    // Plain divs, not <ul>/<li>: UXP treats list elements as bare divs
+    // anyway (uxp-api HTML reference, "Unsupported Elements").
+    const item = document.createElement('div')
     item.className = 'cpsb-handoff-item'
 
     const name = document.createElement('div')
@@ -83,7 +142,7 @@ function initPanel() {
     const records = getActiveHandoffs()
     handoffList.innerHTML = ''
     if (records.length === 0) {
-      const empty = document.createElement('li')
+      const empty = document.createElement('div')
       empty.className = 'cpsb-empty'
       empty.textContent = 'No documents from ComfyUI are currently open.'
       handoffList.appendChild(empty)
@@ -103,6 +162,12 @@ function initPanel() {
     logEl.textContent += `[${time}] ${line.level.toUpperCase()} ${line.message}\n`
     logEl.scrollTop = logEl.scrollHeight
   }
+
+  advancedToggle.addEventListener('click', () => {
+    const collapsed = logEl.className.indexOf('cpsb-collapsed') !== -1
+    logEl.className = collapsed ? 'cpsb-log' : 'cpsb-log cpsb-collapsed'
+    advancedCaret.textContent = collapsed ? '▾' : '▸'
+  })
 
   connection.addEventListener('statechange', renderConnection)
   registryEvents.addEventListener('change', renderHandoffs)
