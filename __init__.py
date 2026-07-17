@@ -12,12 +12,16 @@ tested) without ComfyUI -- see ``cpsb/context.py``.
 import logging
 
 try:
+    from .cpsb import annotate as _cpsb_annotate
+    from .cpsb import compose_psd as _cpsb_compose_psd
     from .cpsb import load_psd as _cpsb_load_psd
     from .cpsb import nodes as _cpsb_nodes
 except ImportError:
     # Imported without package context (e.g. pytest's rootdir Package setup,
     # or tooling that loads node-pack entry files flat). ComfyUI itself always
     # loads this file as a package, taking the relative-import branch above.
+    from cpsb import annotate as _cpsb_annotate
+    from cpsb import compose_psd as _cpsb_compose_psd
     from cpsb import load_psd as _cpsb_load_psd
     from cpsb import nodes as _cpsb_nodes
 
@@ -32,10 +36,14 @@ logger = logging.getLogger("cpsb")
 NODE_CLASS_MAPPINGS = {
     "PhotoshopBridge": _cpsb_nodes.PhotoshopBridge,
     "PhotoshopLoadPSD": _cpsb_load_psd.PhotoshopLoadPSD,
+    "PhotoshopComposePSD": _cpsb_compose_psd.PhotoshopComposePSD,
+    "PhotoshopAnnotate": _cpsb_annotate.PhotoshopAnnotate,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopBridge": "Edit in Photoshop",
     "PhotoshopLoadPSD": "Load PSD",
+    "PhotoshopComposePSD": "Compose Layers to PSD",
+    "PhotoshopAnnotate": "Annotate for Edit",
 }
 
 # ComfyUI checks os.path.isdir() on this itself (nodes.py load_custom_node),
@@ -87,17 +95,6 @@ def _wire_into_comfyui() -> None:
     )
     manager = HandoffManager(context)
 
-    # Custom nodes load before PromptServer.add_routes()/run, so adding to
-    # the app's router here lands our routes on ComfyUI's own port. We must
-    # register both the bare and /api-prefixed paths ourselves, because the
-    # frontend's api.fetchApi always calls /api/cpsb/... and registering our
-    # own RouteTableDef directly skips ComfyUI's /api mirroring (see
-    # cpsb.routes.add_routes_to_app).
-    cpsb_routes.install(server.app, context, manager)
-    cpsb_routes.add_routes_to_app(server.app)
-
-    _cpsb_nodes.configure(context, manager, server.app, server.loop)
-
     watcher = CpsbWatcher(context, manager)
     try:
         watcher.start()
@@ -105,6 +102,19 @@ def _wire_into_comfyui() -> None:
         # E.g. inotify watch limits. Tier 1 save detection degrades, but the
         # routes, node, and Tier 2 all still work -- keep the pack alive.
         logger.warning("cpsb: could not start the input/cpsb watcher: %s", exc)
+
+    # Custom nodes load before PromptServer.add_routes()/run, so adding to
+    # the app's router here lands our routes on ComfyUI's own port. We must
+    # register both the bare and /api-prefixed paths ourselves, because the
+    # frontend's api.fetchApi always calls /api/cpsb/... and registering our
+    # own RouteTableDef directly skips ComfyUI's /api mirroring (see
+    # cpsb.routes.add_routes_to_app). `watcher` is passed through so the
+    # open/cancel/discard handlers can maintain its PROTOCOL.md §6b
+    # edit_in_place watch set (cpsb.routes.install's own docstring).
+    cpsb_routes.install(server.app, context, manager, watcher)
+    cpsb_routes.add_routes_to_app(server.app)
+
+    _cpsb_nodes.configure(context, manager, server.app, server.loop)
 
     logger.info("cpsb: Photoshop bridge ready (watching %s)", context.cpsb_input_dir)
 

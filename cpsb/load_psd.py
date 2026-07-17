@@ -208,6 +208,15 @@ class PhotoshopLoadPSD:
     ignored here -- unlike the bridge node, this node never creates or
     supersedes handoffs itself, so there is nothing to reconcile beyond not
     serving pixels that don't belong to the current selection.
+
+    Edit-original option (PROTOCOL.md §6b): the ``edit_original`` BOOLEAN
+    widget (default ``False``) is read by the frontend at open time
+    (``web/cpsb/menu.js``/``loadpsd.js``), not by this class -- when
+    ``True``, the resulting handoff's edit target is the user's OWN
+    selected file rather than a managed copy (``cpsb.routes``' load_psd
+    branch, watched by ``cpsb.watcher``). The round-trip mechanics above are
+    unaffected either way: an edit always lands as an ``edit_%03d.png`` in
+    the handoff's managed folder regardless of where it was read from.
     """
 
     CATEGORY = "image/photoshop"
@@ -230,6 +239,15 @@ class PhotoshopLoadPSD:
         return {
             "required": {
                 "psd": (files,),
+                # PROTOCOL.md §6b "Edit-original option": default False (the
+                # safe, non-destructive copy-to-handoff behavior this node
+                # has always had). menu.js reads this widget's live value at
+                # right-click time (loadpsd.js's getEditOriginal) and threads
+                # it into `/cpsb/open` as `edit_in_place` -- this method's
+                # own execute()/IS_CHANGED never consult it (see their
+                # docstrings): it governs how a handoff gets OPENED, not
+                # what pixels this node returns once one exists.
+                "edit_original": ("BOOLEAN", {"default": False}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -257,7 +275,7 @@ class PhotoshopLoadPSD:
         return True
 
     @classmethod
-    def IS_CHANGED(cls, psd: str, unique_id: str) -> str:
+    def IS_CHANGED(cls, psd: str, unique_id: str, edit_original: bool = False) -> str:
         """sha256 of *psd*'s raw bytes, folding in the latest edit hash when consumable.
 
         An arriving edit must force this node (and everything downstream)
@@ -269,6 +287,18 @@ class PhotoshopLoadPSD:
         folder), so :func:`_find_matching_active_handoff`'s match folds the
         latest edit's own hash in whenever one is consumable (PROTOCOL.md
         §6b), changing the return value again on every subsequent save.
+
+        *edit_original* is accepted (mirroring
+        :meth:`cpsb.nodes.PhotoshopBridge.IS_CHANGED`'s identical convention
+        of declaring every currently-required ``INPUT_TYPES`` field, even
+        ones its own cache key doesn't depend on) but never folds into the
+        returned value: which pixels this node's own :meth:`execute` would
+        produce for a given *psd* selection never depends on it -- it only
+        governs how a handoff gets opened (menu.js's ``/cpsb/open`` request,
+        PROTOCOL.md §6b), a decision already made and recorded on the
+        handoff by the time any edit reaches this node's consume path.
+        Defaults ``False`` so every pre-existing caller (this node's own
+        tests included) that predates this input keeps working unchanged.
         """
         state = nodes._require_state()
         psd_path = _resolve_psd_path(state.context, psd)
@@ -287,7 +317,7 @@ class PhotoshopLoadPSD:
                 return f"{file_hash}:{edit_hash}"
         return file_hash
 
-    def execute(self, psd: str, unique_id: str) -> tuple[Any, Any]:
+    def execute(self, psd: str, unique_id: str, edit_original: bool = False) -> tuple[Any, Any]:
         """``(IMAGE, MASK)`` for the selected PSD (PROTOCOL.md §6b).
 
         Serves a consumable active edit first (see the class docstring's
@@ -298,6 +328,15 @@ class PhotoshopLoadPSD:
             psd: The selected combo filename.
             unique_id: This node instance's id (ComfyUI's hidden
                 ``UNIQUE_ID`` input), used to key its handoff lookup.
+            edit_original: The node's current ``edit_original`` widget
+                value (PROTOCOL.md §6b). Accepted for parity with every
+                declared ``INPUT_TYPES`` field -- ComfyUI passes it here as
+                a real keyword argument -- but not read: whichever way a
+                handoff was opened (copy vs. in-place), an arrived edit
+                always lands in the SAME place (an ``edit_%03d.png`` in the
+                handoff's managed folder), so the consume path above is
+                identical either way. Defaults ``False`` so every
+                pre-existing caller keeps working unchanged.
 
         Returns:
             ``(IMAGE, MASK)`` tensors.

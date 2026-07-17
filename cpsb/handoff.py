@@ -57,9 +57,7 @@ PURGEABLE_STATUSES: frozenset[str] = frozenset(
 #: must still be able to move `error` -> `editing` (PROTOCOL.md §3); see
 #: ``HandoffManager._transition``'s ``noop_if_terminal`` parameter, which
 #: only ``mark_cancelled`` sets.
-TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"cancelled", "discarded", "superseded", "error"}
-)
+TERMINAL_STATUSES: frozenset[str] = frozenset({"cancelled", "discarded", "superseded", "error"})
 
 _SECONDS_PER_DAY = 86400
 
@@ -155,6 +153,16 @@ class HandoffMeta:
     name is not re-derived from the current setting. ``None`` for handoffs
     recovered from a pre-``managed_dir`` ``meta.json``; consumers fall back to
     the current managed name for those.
+
+    ``edit_in_place`` / ``original_path`` implement the PROTOCOL.md §6b
+    "Edit-original option" (``load_psd`` origin only): when ``True``, this
+    handoff's edit target is the user's OWN file at ``original_path``
+    (absolute, resolved) rather than a managed ``source.psd`` copy -- no such
+    copy is ever written for such a handoff, and every delete path must never
+    touch ``original_path`` (see :meth:`HandoffManager._reject_unsafe_delete`).
+    ``edit_in_place`` defaults ``False`` and ``original_path`` defaults
+    ``None`` for every other origin and for any legacy ``meta.json`` recorded
+    before these fields existed -- both safe, non-destructive defaults.
     """
 
     handoff_id: str
@@ -168,6 +176,8 @@ class HandoffMeta:
     error: str | None = None
     source_hash: str | None = None
     managed_dir: str | None = None
+    edit_in_place: bool = False
+    original_path: str | None = None
     edits: list[EditRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -179,6 +189,8 @@ class HandoffMeta:
             "source": self.source.to_dict(),
             "source_hash": self.source_hash,
             "managed_dir": self.managed_dir,
+            "edit_in_place": self.edit_in_place,
+            "original_path": self.original_path,
             "created_ts": self.created_ts,
             "updated_ts": self.updated_ts,
             "status": self.status,
@@ -200,6 +212,8 @@ class HandoffMeta:
             error=data.get("error"),
             source_hash=data.get("source_hash"),
             managed_dir=data.get("managed_dir"),
+            edit_in_place=data.get("edit_in_place", False),
+            original_path=data.get("original_path"),
             edits=[EditRecord.from_dict(edit) for edit in data.get("edits", [])],
         )
 
@@ -318,12 +332,17 @@ class HandoffManager:
         source: SourceRef,
         original_image: Image.Image,
         source_hash: str | None = None,
+        edit_in_place: bool = False,
+        original_path: str | None = None,
     ) -> HandoffMeta:
         """Allocate a new handoff: id, folder, ``orig_thumb.png``, ``meta.json``.
 
         Does not write ``source.psd`` -- that is :func:`cpsb.psd_io.write_psd`,
         called by the route handler once this returns, since PSD encoding is
-        outside this module's job.
+        outside this module's job. For an ``edit_in_place`` handoff
+        (PROTOCOL.md §6b), the caller never writes a ``source.psd`` copy at
+        all -- ``orig_thumb.png``/``meta.json`` are still written here exactly
+        as for any other handoff, so the gallery keeps working unchanged.
 
         Args:
             origin_node_id: The graph node id (or bridge-node ``unique_id``)
@@ -343,6 +362,14 @@ class HandoffManager:
                 source check at ``POST /cpsb/open``, PROTOCOL.md §6) and
                 passing it avoids hashing the same pixels twice. Computed
                 from *original_image* when omitted.
+            edit_in_place: PROTOCOL.md §6b -- ``True`` only for a
+                ``load_psd`` origin whose ``/cpsb/open`` request asked to
+                edit the user's own selected file directly rather than a
+                managed copy. Defaults ``False`` (the safe, non-destructive
+                behavior every other origin always uses).
+            original_path: Absolute path to the user's own file. Required
+                (by the caller's own contract, not enforced here) whenever
+                *edit_in_place* is ``True``; ``None`` otherwise.
         """
         now = time.time()
         with self._lock:
@@ -362,12 +389,12 @@ class HandoffManager:
                 status="pending",
                 source_hash=source_hash or compute_source_hash(original_image),
                 managed_dir=managed_dir,
+                edit_in_place=edit_in_place,
+                original_path=original_path,
             )
             self._handoffs[handoff_id] = meta
             self._write_meta_locked(meta)
-        logger.info(
-            "Created handoff %s for node %s (%s)", handoff_id, origin_node_id, origin_kind
-        )
+        logger.info("Created handoff %s for node %s (%s)", handoff_id, origin_node_id, origin_kind)
         return meta
 
     def _allocate_id_locked(self) -> str:
@@ -434,6 +461,27 @@ class HandoffManager:
         with self._lock:
             ordered = sorted(self._handoffs.values(), key=lambda m: m.created_ts, reverse=True)
             return [HandoffMeta.from_dict(m.to_dict()) for m in ordered[:limit]]
+
+    def active_edit_in_place_originals(self) -> list[tuple[str, Path]]:
+        """``(handoff_id, original_path)`` for every ACTIVE ``edit_in_place`` handoff.
+
+        Used by :class:`~cpsb.watcher.CpsbWatcher` at startup (PROTOCOL.md
+        §6b) to re-establish a filesystem watch on each such handoff's own
+        file after a server restart -- these live OUTSIDE the managed
+        folder, so unlike a normal handoff's ``source.psd`` they are not
+        automatically covered by the watcher's single recursive watch over
+        it. This is a plain read of already-recovered in-memory state (see
+        :meth:`_scan_existing`), so it naturally reflects boot recovery with
+        no extra bookkeeping of its own.
+        """
+        with self._lock:
+            return [
+                (meta.handoff_id, Path(meta.original_path))
+                for meta in self._handoffs.values()
+                if meta.edit_in_place
+                and meta.original_path is not None
+                and meta.status in ACTIVE_STATUSES
+            ]
 
     def edit_image_path(self, handoff_id: str) -> Path | None:
         """Absolute path to the most recent edit's PNG, or ``None`` if none yet."""
@@ -503,7 +551,7 @@ class HandoffManager:
         return self._transition(handoff_id, status="discarded")
 
     def supersede(self, handoff_id: str) -> HandoffMeta:
-        """"Start Fresh Edit": retire the existing handoff so a new one can replace it."""
+        """ "Start Fresh Edit": retire the existing handoff so a new one can replace it."""
         return self._transition(handoff_id, status="superseded")
 
     def _transition(
@@ -578,9 +626,7 @@ class HandoffManager:
                 logger.warning("ingest_edit: unknown handoff %s", handoff_id)
                 return None
             if meta.status not in ACTIVE_STATUSES:
-                logger.info(
-                    "ingest_edit: ignoring edit for %s handoff %s", meta.status, handoff_id
-                )
+                logger.info("ingest_edit: ignoring edit for %s handoff %s", meta.status, handoff_id)
                 return None
 
             edit = self._append_edit_locked(meta, image, fidelity)
@@ -601,9 +647,7 @@ class HandoffManager:
         if meta.edits:
             previous_path = folder / meta.edits[-1].filename
             if previous_path.exists() and _hash_bytes(previous_path.read_bytes()) == new_hash:
-                logger.info(
-                    "ingest_edit: duplicate save for handoff %s, skipping", meta.handoff_id
-                )
+                logger.info("ingest_edit: duplicate save for handoff %s, skipping", meta.handoff_id)
                 return None
 
         index = len(meta.edits) + 1
@@ -801,6 +845,44 @@ class HandoffManager:
                 self._purge(handoff_id)
 
     def _purge(self, handoff_id: str) -> None:
-        shutil.rmtree(self.handoff_dir(handoff_id), ignore_errors=True)
+        meta = self._handoffs.get(handoff_id)
+        target = self.handoff_dir(handoff_id)
+        self._reject_unsafe_delete(target, meta)
+        shutil.rmtree(target, ignore_errors=True)
         self._handoffs.pop(handoff_id, None)
         logger.info("Purged stale handoff %s", handoff_id)
+
+    @staticmethod
+    def _reject_unsafe_delete(target: Path, meta: HandoffMeta | None) -> None:
+        """Refuse to delete *target* if it is, or contains, a user's own file.
+
+        PROTOCOL.md §6b: an ``edit_in_place`` handoff is "the only path
+        where a [handoff] points at a file the user owns -- guard every
+        delete accordingly." *target* is always
+        ``handoff_dir(handoff_id)`` -- the MANAGED folder -- by
+        construction of this method's only call site (:meth:`_purge`); this
+        check exists as a structural safety net against a future change
+        accidentally widening what gets deleted, not because today's call
+        sites are expected to ever trip it. Deliberately a real exception
+        rather than an ``assert`` (which ``python -O`` strips): irreversibly
+        deleting a user's own creative file is not a risk worth taking on a
+        strippable invariant check.
+
+        Args:
+            target: The directory about to be ``rmtree``'d.
+            meta: The handoff *target* belongs to, or ``None`` if already
+                forgotten (nothing to protect in that case).
+
+        Raises:
+            RuntimeError: *target* resolves to, or would take down,
+                *meta*'s recorded ``original_path``.
+        """
+        if meta is None or not meta.edit_in_place or not meta.original_path:
+            return
+        original = Path(meta.original_path).resolve()
+        resolved_target = target.resolve()
+        if resolved_target == original or resolved_target in original.parents:
+            raise RuntimeError(
+                f"Refusing to delete {resolved_target}: it is, or contains, "
+                f"handoff {meta.handoff_id}'s edit_in_place original file {original}"
+            )

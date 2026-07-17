@@ -112,6 +112,11 @@ export function warn(...args) {
  * @property {CpsbStatus} status
  * @property {string | null} error
  * @property {CpsbEdit[]} edits
+ * @property {boolean} [edit_in_place] - Load PSD "edit original" handoffs
+ * (PROTOCOL.md §6b): the handoff edits the user's real file in place rather
+ * than a managed copy. Absent/false on every other handoff.
+ * @property {string | null} [original_path] - Absolute path of the user's
+ * PSD when `edit_in_place` is true; `null`/absent otherwise.
  */
 
 /**
@@ -127,6 +132,10 @@ export function warn(...args) {
  * client-locality gate; default `false` server-side when omitted. Only set
  * this `true` once the user has agreed to open Photoshop on the server's
  * machine (menu.js remembers that choice per-browser in `localStorage`).
+ * @property {boolean} [edit_in_place] - Only meaningful when `origin_kind` is
+ * `"load_psd"` (PROTOCOL.md §6b): open and edit the user's ACTUAL selected
+ * PSD in place rather than a managed copy. Defaults `false` server-side when
+ * omitted.
  */
 
 /**

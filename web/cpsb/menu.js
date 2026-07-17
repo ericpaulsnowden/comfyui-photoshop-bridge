@@ -206,6 +206,13 @@ function resolveImageRef(node, imageIndex) {
  * (`open.openInteractive`), shared verbatim with gallery.js's card actions.
  * This function only contributes what is menu-specific: deriving the
  * request body from the clicked node.
+ *
+ * For a Load PSD node, the body also carries `edit_in_place` — the node's
+ * current `edit_original` widget value (PROTOCOL.md §6b "Edit-original
+ * option", `loadpsd.getEditOriginal`) — for every mode ('new'/'original'/
+ * 'fresh' all funnel through here), since the backend only ever consults it
+ * for a `load_psd` open (`cpsb/routes.py`) and ignores it otherwise; every
+ * other node type simply never sends the field at all.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @param {"new" | "original" | "fresh"} mode
  * @param {number} [imageIndex]
@@ -222,6 +229,7 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
     })
     return
   }
+  const isLoadPsd = loadpsd.isLoadPsdNode(node)
   await open.openInteractive({
     filename: ref.filename,
     subfolder: ref.subfolder,
@@ -229,7 +237,8 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
     origin_node_id: String(node.id),
     origin_kind: deriveOriginKind(node),
     workflow_name: state.getWorkflowName(),
-    mode
+    mode,
+    ...(isLoadPsd ? { edit_in_place: loadpsd.getEditOriginal(node) } : {})
   })
 }
 

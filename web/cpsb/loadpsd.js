@@ -130,6 +130,30 @@ export function getPsdFileRef(node) {
 }
 
 /**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {import('../../../scripts/app.js').IBaseWidget | undefined} The
+ * node's `edit_original` BOOLEAN widget (PROTOCOL.md §6b "Edit-original
+ * option") -- backend-owned (`cpsb/load_psd.py`'s `INPUT_TYPES`, out of
+ * scope for this file), read-only from here.
+ */
+export function getEditOriginalWidget(node) {
+  return node.widgets?.find((w) => w.name === 'edit_original')
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {boolean} The node's current `edit_original` widget value
+ * (PROTOCOL.md §6b) -- `false` (the safe, non-destructive default the
+ * widget itself defaults to) when the node has no such widget yet, e.g. a
+ * node instance restored from a workflow saved before this option existed.
+ * menu.js reads this to build the `/cpsb/open` request's `edit_in_place`
+ * flag; this file's own upload/combo logic never needs it.
+ */
+export function getEditOriginal(node) {
+  return getEditOriginalWidget(node)?.value === true
+}
+
+/**
  * @param {string | undefined} filename
  * @returns {boolean}
  */

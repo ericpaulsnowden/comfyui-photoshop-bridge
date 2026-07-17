@@ -210,3 +210,29 @@ _Descriptor contents observed, reliability across the multi-document tests, and 
 
 ### Results
 _Whether get/set worked, the exact descriptors used, and the final yes/no on automatic preference-setting go here._
+
+---
+
+## LIVE RESULTS (2026-07-17, Photoshop 27.8.0 on macOS, against scratch ComfyUI)
+
+Driven directly by Claude via UXP Developer Tool + computer-use; not user-reported.
+
+- **Spike 2 — UXP localhost WebSocket permission: PASS (was the #1 project risk).**
+  Root fixes: (a) plugin files must sit at the plugin ROOT next to manifest.json, not
+  in a src/ subfolder (UXP resolves the main document's relative sub-resources against
+  the plugin root — nesting made panel.css/index.js 404, so the panel rendered bare and
+  never even attempted a connection); (b) `requiredPermissions.network.domains` must be
+  the STRING `"all"` — the array form fails to parse in current UXP, yielding exactly
+  "Permission denied ... Manifest entry not found"; (c) connect to `ws://localhost:8188`,
+  NOT `ws://127.0.0.1:8188` — UXP disallows raw-IP data transfers. FOLLOW-UP: try to
+  narrow `"all"` to a scoped hostname allowance for the public release (least privilege).
+- **Spike 6 — batchPlay silent PNG export ("historically fiddly"): PASS.** A plain
+  Cmd+S on the opened handoff triggered the save listener; the flatten-duplicate →
+  batchPlay saveAs-PNG (dialogOptions dontDisplay) → upload pipeline produced a
+  pixel-accurate PNG. No dialog. fidelity="plugin".
+- **Spike 7 — save-event listener + document identity: PASS.** action save listener
+  fired on Cmd+S, matched the tracked document, ran the export. No spurious fires.
+- **Full Tier-2 round trip PROVEN:** API open (tier 2) → WS open_handoff → PS opened the
+  PSD → invert + Cmd+S → edit ingested, status "edited", pixels exactly the inverted
+  image (center (25,55,195) blue, corner (215,165,75) tan). ps_version 27.8.0 exchanged
+  via hello handshake; tier2_connected=true server-side.

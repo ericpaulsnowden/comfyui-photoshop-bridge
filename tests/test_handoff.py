@@ -73,9 +73,7 @@ class TestCreate:
         meta = create_handoff(manager, original_image=original)
         assert meta.source_hash == compute_source_hash(original)
         assert meta.source_hash != compute_source_hash(make_image((11, 20, 30)))
-        stored = json.loads(
-            (context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text()
-        )
+        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
         assert stored["source_hash"] == meta.source_hash
 
     def test_legacy_meta_without_source_hash_loads_as_none(self):
@@ -677,3 +675,201 @@ class TestIdempotentCancel:
 
         assert result.status == "editing"
         assert manager.get(meta.handoff_id).status == "editing"
+
+
+def load_psd_source(filename: str = "sample.psd") -> SourceRef:
+    return SourceRef(filename=filename, subfolder="", type="input")
+
+
+class TestEditInPlaceFields:
+    """PROTOCOL.md §6b "Edit-original option": ``edit_in_place``/
+    ``original_path`` on ``HandoffMeta``, and their default/legacy behavior.
+    """
+
+    def test_defaults_are_false_and_none(self, manager):
+        meta = create_handoff(manager, origin_kind="load_psd", source=load_psd_source())
+        assert meta.edit_in_place is False
+        assert meta.original_path is None
+
+    def test_create_records_edit_in_place_and_original_path(self, manager, context, tmp_path):
+        original = tmp_path / "art.psd"
+        original.write_bytes(b"not a real psd, just identity bytes")
+        meta = manager.create(
+            origin_node_id="1",
+            origin_kind="load_psd",
+            workflow_name="wf",
+            source=load_psd_source(),
+            original_image=make_image((1, 2, 3)),
+            source_hash="deadbeef" * 8,
+            edit_in_place=True,
+            original_path=str(original.resolve()),
+        )
+        assert meta.edit_in_place is True
+        assert meta.original_path == str(original.resolve())
+        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
+        assert stored["edit_in_place"] is True
+        assert stored["original_path"] == str(original.resolve())
+        # orig_thumb.png is still written -- the gallery keeps working even
+        # though there is no source.psd copy for this handoff.
+        assert (context.cpsb_input_dir / meta.handoff_id / "orig_thumb.png").is_file()
+
+    def test_to_dict_from_dict_round_trip(self, manager, tmp_path):
+        original = tmp_path / "art.psd"
+        meta = manager.create(
+            origin_node_id="1",
+            origin_kind="load_psd",
+            workflow_name="wf",
+            source=load_psd_source(),
+            original_image=make_image((1, 2, 3)),
+            source_hash="deadbeef" * 8,
+            edit_in_place=True,
+            original_path=str(original),
+        )
+        round_tripped = HandoffMeta.from_dict(meta.to_dict())
+        assert round_tripped.edit_in_place is True
+        assert round_tripped.original_path == str(original)
+
+    def test_legacy_meta_without_the_new_fields_defaults_to_safe(self):
+        """A meta.json written before this option existed must load as a
+        non-in-place handoff (PROTOCOL.md §6b: "legacy metas without them
+        default to non-in-place (safe)").
+        """
+        legacy = {
+            "handoff_id": "a1b2c3d4",
+            "origin_node_id": "1",
+            "origin_kind": "load_psd",
+            "workflow_name": "wf",
+            "source": {"filename": "sample.psd", "subfolder": "", "type": "input"},
+            "created_ts": 1.0,
+            "updated_ts": 2.0,
+            "status": "edited",
+            "error": None,
+            "edits": [],
+        }
+        meta = HandoffMeta.from_dict(legacy)
+        assert meta.edit_in_place is False
+        assert meta.original_path is None
+
+
+class TestActiveEditInPlaceOriginals:
+    def test_lists_only_active_edit_in_place_handoffs(self, manager, tmp_path):
+        original = tmp_path / "art.psd"
+        edit_in_place_meta = manager.create(
+            origin_node_id="1",
+            origin_kind="load_psd",
+            workflow_name="",
+            source=load_psd_source(),
+            original_image=make_image((1, 1, 1)),
+            source_hash="a" * 64,
+            edit_in_place=True,
+            original_path=str(original),
+        )
+        # A normal (copy) load_psd handoff -- must not appear.
+        manager.create(
+            origin_node_id="2",
+            origin_kind="load_psd",
+            workflow_name="",
+            source=load_psd_source("other.psd"),
+            original_image=make_image((2, 2, 2)),
+            source_hash="b" * 64,
+        )
+        # A terminal edit_in_place handoff -- must not appear either.
+        terminal = manager.create(
+            origin_node_id="3",
+            origin_kind="load_psd",
+            workflow_name="",
+            source=load_psd_source("gone.psd"),
+            original_image=make_image((3, 3, 3)),
+            source_hash="c" * 64,
+            edit_in_place=True,
+            original_path=str(tmp_path / "gone.psd"),
+        )
+        manager.mark_cancelled(terminal.handoff_id)
+
+        result = manager.active_edit_in_place_originals()
+
+        assert result == [(edit_in_place_meta.handoff_id, original.resolve())]
+
+    def test_empty_when_none_active(self, manager):
+        assert manager.active_edit_in_place_originals() == []
+
+
+class TestEditInPlaceDeleteSafety:
+    """PROTOCOL.md §6b (critical): cleanup must never delete a user's own
+    file -- only managed-folder artifacts.
+    """
+
+    def test_cleanup_purges_managed_folder_but_preserves_original_file(
+        self, manager, context, tmp_path
+    ):
+        original = tmp_path / "outside_comfy" / "art.psd"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(b"the user's real, irreplaceable file")
+
+        meta = manager.create(
+            origin_node_id="1",
+            origin_kind="load_psd",
+            workflow_name="wf",
+            source=load_psd_source(),
+            original_image=make_image((1, 2, 3)),
+            source_hash="deadbeef" * 8,
+            edit_in_place=True,
+            original_path=str(original.resolve()),
+        )
+        manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "composite")
+        TestCleanup._age_meta(context, meta.handoff_id, days=20)
+
+        rebooted = HandoffManager(context)
+
+        assert rebooted.get(meta.handoff_id) is None
+        assert not (context.cpsb_input_dir / meta.handoff_id).exists()  # managed folder gone
+        assert original.is_file()  # the user's real file survives, untouched
+        assert original.read_bytes() == b"the user's real, irreplaceable file"
+
+    def test_reject_unsafe_delete_raises_when_target_is_the_original(
+        self, manager, context, tmp_path
+    ):
+        original = tmp_path / "art.psd"
+        original.write_bytes(b"x")
+        meta = manager.create(
+            origin_node_id="1",
+            origin_kind="load_psd",
+            workflow_name="wf",
+            source=load_psd_source(),
+            original_image=make_image((1, 2, 3)),
+            source_hash="deadbeef" * 8,
+            edit_in_place=True,
+            original_path=str(original.resolve()),
+        )
+        stored = manager.get(meta.handoff_id)
+
+        with pytest.raises(RuntimeError, match="Refusing to delete"):
+            HandoffManager._reject_unsafe_delete(original.resolve(), stored)
+        with pytest.raises(RuntimeError, match="Refusing to delete"):
+            HandoffManager._reject_unsafe_delete(original.parent, stored)
+
+    def test_reject_unsafe_delete_allows_the_managed_folder(self, manager, context, tmp_path):
+        original = tmp_path / "art.psd"
+        meta = manager.create(
+            origin_node_id="1",
+            origin_kind="load_psd",
+            workflow_name="wf",
+            source=load_psd_source(),
+            original_image=make_image((1, 2, 3)),
+            source_hash="deadbeef" * 8,
+            edit_in_place=True,
+            original_path=str(original.resolve()),
+        )
+        stored = manager.get(meta.handoff_id)
+
+        HandoffManager._reject_unsafe_delete(context.cpsb_input_dir / meta.handoff_id, stored)
+        HandoffManager._reject_unsafe_delete(context.cpsb_input_dir / meta.handoff_id, None)
+
+    def test_reject_unsafe_delete_allows_non_edit_in_place_handoffs(self, manager, context):
+        meta = create_handoff(manager)
+        stored = manager.get(meta.handoff_id)
+        assert stored.edit_in_place is False
+
+        # Any target at all is fine for a handoff that never recorded an
+        # edit_in_place original_path -- nothing to protect.
+        HandoffManager._reject_unsafe_delete(context.input_dir / "anything", stored)

@@ -241,11 +241,11 @@ async function cancelHandoffCard(meta) {
  */
 async function discardHandoffCard(meta) {
   const confirmed = await ui.confirmDialog({
-    title: 'Discard this handoff?',
+    title: 'Remove from the Photoshop Edits list?',
     message:
-      `This removes "${meta.workflow_name || 'this handoff'}" (node ` +
-      `${meta.origin_node_id}) from the gallery and stops watching for ` +
-      'further edits. This cannot be undone.'
+      `This removes "${meta.workflow_name || 'this entry'}" (node ` +
+      `${meta.origin_node_id}) from the list and stops watching it for ` +
+      'further edits. Your images and workflow are untouched.'
   })
   if (!confirmed) return
   try {
@@ -389,6 +389,14 @@ function buildThumb(src, alt) {
 function buildCard(meta) {
   const latestEdit = meta.edits?.[meta.edits.length - 1]
   const capabilities = cardCapabilities(state.getDisplayStatus(meta))
+  // Reveal only makes sense when the origin node is actually in the graph
+  // that's open right now — otherwise `centerOnNode` has nothing to center
+  // on and the action just fails (the user's "Reveal fails most of the
+  // time"). `getNodeByIdFlexible` reads live `app.graph`, so this is the
+  // current-workflow check, and buildCard re-runs on every rebuild() (each
+  // cpsb.* event / tab mount), so a workflow switch while the gallery is
+  // open re-evaluates it — visibility is never cached across renders.
+  const originNodePresent = !!pasteback.getNodeByIdFlexible(meta.origin_node_id)
 
   const thumbs = ui.el('div', { className: 'cpsb-card-thumbs' })
   thumbs.appendChild(buildThumb(api.thumbUrl(meta.handoff_id), 'Original'))
@@ -423,16 +431,18 @@ function buildCard(meta) {
   })
 
   // Assembled strictly from the cardCapabilities table — see its doc for
-  // the per-status rationale. Reveal is unconditional; Add-as-node only
-  // needs an edit to exist.
+  // the per-status rationale. Reveal shows only when its origin node is in
+  // the current graph (above); Add-as-node only needs an edit to exist.
   const actions = ui.el('div', { className: 'cpsb-card-actions' })
-  actions.appendChild(
-    ui.el('button', {
-      className: 'cpsb-card-action',
-      text: 'Reveal',
-      on: { click: () => revealInWorkflow(meta) }
-    })
-  )
+  if (originNodePresent) {
+    actions.appendChild(
+      ui.el('button', {
+        className: 'cpsb-card-action',
+        text: 'Reveal',
+        on: { click: () => revealInWorkflow(meta) }
+      })
+    )
+  }
   if (capabilities.reopen) {
     actions.appendChild(
       ui.el('button', {
@@ -470,13 +480,20 @@ function buildCard(meta) {
     )
   }
   if (capabilities.discard) {
-    actions.appendChild(
-      ui.el('button', {
-        className: 'cpsb-card-action cpsb-card-action-danger',
-        text: 'Discard',
-        on: { click: () => discardHandoffCard(meta) }
-      })
-    )
+    // Labeled "Remove from list", not "Discard" — the user couldn't tell
+    // what Discard did. It only drops this entry from the gallery and stops
+    // watching the handoff; it touches no image or workflow the user cares
+    // about (the tooltip says so, and discardHandoffCard's confirm repeats
+    // it). Still routes to /cpsb/discard unchanged.
+    const removeButton = ui.el('button', {
+      className: 'cpsb-card-action cpsb-card-action-danger',
+      text: 'Remove from list',
+      on: { click: () => discardHandoffCard(meta) }
+    })
+    removeButton.title =
+      'Remove this entry from the Photoshop Edits list. Your images and ' +
+      'workflow are untouched.'
+    actions.appendChild(removeButton)
   }
 
   const card = ui.el('div', { className: 'cpsb-card', children: [thumbs, header, metaLine, actions] })

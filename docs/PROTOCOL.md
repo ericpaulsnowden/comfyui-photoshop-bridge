@@ -367,9 +367,67 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   original — the PhotoshopBridge consume pattern. `IS_CHANGED`: sha256 of the PSD
   file's raw bytes, combined with the latest edit hash when an active matching handoff
   exists.
+- **Edit-original option**: the node carries a BOOLEAN widget `edit_original` (default
+  False). Default (False) = the current copy-to-handoff behavior (non-destructive). When
+  True, `/cpsb/open` for this node does NOT copy — the handoff's watched target IS the
+  user's selected input PSD in place (`edit_in_place: true` + the source triple on the
+  open body); Photoshop opens the real file, plain Cmd+S overwrites it, and the watcher
+  must watch that exact file path (outside the managed folder), ingesting the user's own
+  saved PSD directly. On such a handoff, `orig_thumb`/`source.psd`-copy are skipped; the
+  edit is read from the original path. Terminal cleanup never deletes the user's file
+  (only managed-folder artifacts are ever purged). This is the only path where a bridge
+  handoff points at a file the user owns — guard every delete accordingly.
 - Frontend: the node type is allowlisted in `captureImageUploadType`'s detection (its
   hand-rolled widget bypasses the stock `image_upload` spec flag), and its context-menu
   origin_kind derives as `load_psd`.
+
+### 6c. Compose Layers to PSD node
+
+- Class `PhotoshopComposePSD`, display name "Compose Layers to PSD", category
+  `image/photoshop`.
+- Frontend gives it AUTO-GROWING image inputs: `image_1`, `image_2`, … — connecting one
+  reveals the next empty socket (pattern forked from rgthree's MIT implementation, with
+  attribution comment). Backend accepts any number ≥ 1 via optional inputs.
+- Widgets: `filename_prefix` (STRING, default "compose"), `group_name` (STRING, default
+  "ComfyUI Layers"), `edit_after` (BOOLEAN, default False).
+- Behavior: canvas = max width × max height across inputs; every image becomes one
+  pixel layer, CENTERED, never rescaled; `image_1` is the BOTTOM layer, higher indices
+  stack on top; all layers inside ONE group named `group_name`. Written via psd-tools
+  (`PSDImage.new` → `create_pixel_layer` → `create_group`) to
+  `input/<filename_prefix>_%05d.psd` (unique per execution). Outputs:
+  (IMAGE flattened composite, MASK = 1-alpha of composite else zeros, STRING = the
+  written psd filename, input-relative — usable by Load PSD / addressable by /view).
+- `edit_after=True`: after writing, the backend creates a `load_psd` handoff with
+  `edit_in_place: true` on the GENERATED file and opens Photoshop (non-blocking, "Open
+  only" semantics — saves ingest; the next queue consumes). The generated file is ours,
+  so in-place editing is safe by construction.
+- Consume semantics: `IS_CHANGED` hashes the input images + params, folded with the
+  latest-edit hash when an active matching handoff exists; execute() returns the latest
+  edit (flattened) when the active handoff's `source_hash` matches the current inputs'
+  hash — the §6/§6b consume pattern.
+
+### 6d. Annotate for Edit node
+
+- Class `PhotoshopAnnotate`, display name "Annotate for Edit", category
+  `image/photoshop`.
+- Inputs: `image` (IMAGE); `instruction` (STRING, multiline, default ""); optional
+  `mask` (MASK). Widgets: `annotate_mode` (COMBO: "Pass through" (default) |
+  "Open in Photoshop (mask from edits)"); `box_composite` (BOOLEAN, default False).
+  Hidden: `unique_id`.
+- Outputs: (IMAGE original passthrough, MASK, STRING instruction, IMAGE annotated) —
+  `annotated` is the original unless `box_composite` is True, in which case it is a
+  copy with a red rectangle at the final mask's bounding box (the mark convention
+  Kontext/Qwen-Image-Edit document responding to).
+- MASK resolution precedence: (1) Photoshop DIFF mask — when annotate_mode is the PS
+  mode and the node's active handoff (source_hash-matched) has an edit, mask = pixels
+  where |edit − source| exceeds a small threshold, morphologically closed and
+  hole-filled (scipy when available — ComfyUI ships it — guarded with a PIL-only
+  fallback), so the user may mark with ANY tool/color; (2) else the `mask` input
+  socket (ComfyUI-only tier: MaskEditor or any mask source upstream); (3) else zeros.
+- PS mode behavior: on execute with no matching edit, write the handoff
+  (origin_kind `bridge_node`), open Photoshop non-blocking, and return passthrough
+  outputs; the user paints marks and saves; the next queue derives the diff mask. No
+  auto-queue (bridge_node policy §5 — this node has no re-run mode).
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 

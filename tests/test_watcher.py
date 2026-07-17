@@ -54,6 +54,23 @@ def create_handoff_with_psd(manager: HandoffManager) -> tuple[HandoffMeta, Path]
     return meta, psd_path
 
 
+def create_edit_in_place_handoff(manager: HandoffManager, original_path: Path) -> HandoffMeta:
+    """A `load_psd` handoff whose edit target is *original_path* itself
+    (PROTOCOL.md §6b) -- never a managed `source.psd` copy, unlike
+    :func:`create_handoff_with_psd`.
+    """
+    return manager.create(
+        origin_node_id="1",
+        origin_kind="load_psd",
+        workflow_name="wf",
+        source=SourceRef(filename=original_path.name, subfolder="", type="input"),
+        original_image=Image.new("RGB", (24, 16), (10, 20, 30)),
+        source_hash="deadbeef" * 8,
+        edit_in_place=True,
+        original_path=str(original_path.resolve()),
+    )
+
+
 def wait_for_edit_count(manager: HandoffManager, handoff_id: str, count: int) -> None:
     deadline = time.monotonic() + SETTLE_TIMEOUT
     while time.monotonic() < deadline:
@@ -87,9 +104,7 @@ class TestInPlaceSave:
         assert len(refreshed.edits) == 1
         assert refreshed.status == "edited"
         assert refreshed.edits[0].fidelity == "composite"
-        with Image.open(
-            manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename
-        ) as edit:
+        with Image.open(manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename) as edit:
             assert edit.getpixel((0, 0)) == (200, 0, 0)
 
     def test_own_initial_write_is_not_ingested(self, watcher, manager):
@@ -115,9 +130,7 @@ class TestTempRenameSave:
 
         refreshed = manager.get(meta.handoff_id)
         assert len(refreshed.edits) == 1
-        with Image.open(
-            manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename
-        ) as edit:
+        with Image.open(manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename) as edit:
             assert edit.getpixel((0, 0)) == (0, 200, 0)
 
 
@@ -139,9 +152,7 @@ class TestDebounce:
 
         refreshed = manager.get(meta.handoff_id)
         assert len(refreshed.edits) == 1
-        with Image.open(
-            manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename
-        ) as edit:
+        with Image.open(manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename) as edit:
             assert edit.getpixel((0, 0)) == (3, 3, 3)
 
 
@@ -238,3 +249,124 @@ class TestStartStop:
         write_psd(psd_path, Image.new("RGB", (24, 16), (9, 9, 9)))
         settle_quietly(DEBOUNCE_MS / 1000 * 4)
         assert manager.get(meta.handoff_id).edits == []
+
+
+class TestEditInPlace:
+    """PROTOCOL.md §6b: a specific `edit_in_place` handoff's own original
+    file, watched independently of (but alongside) the managed-folder tree.
+    """
+
+    def test_watch_original_ingests_a_save_into_managed_storage(self, watcher, manager, tmp_path):
+        original = tmp_path / "art.psd"
+        write_psd(original, Image.new("RGB", (24, 16), (1, 1, 1)))
+        meta = create_edit_in_place_handoff(manager, original)
+        watcher.watch_original(meta.handoff_id, original)
+        settle_quietly(DEBOUNCE_MS / 1000 * 3)
+
+        # Simulate the user's plain Cmd+S on their OWN file.
+        write_psd(original, Image.new("RGB", (24, 16), (200, 0, 0)))
+
+        wait_for_edit_count(manager, meta.handoff_id, 1)
+        refreshed = manager.get(meta.handoff_id)
+        assert refreshed.status == "edited"
+        edit_path = manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename
+        with Image.open(edit_path) as edit:
+            assert edit.getpixel((0, 0)) == (200, 0, 0)
+        # This handoff never has a source.psd copy in the managed folder.
+        assert not (manager.handoff_dir(meta.handoff_id) / "source.psd").exists()
+        # And the original itself is exactly what was "saved" -- untouched
+        # by this package.
+        with Image.open(original) as saved:
+            assert saved.getpixel((0, 0)) == (200, 0, 0)
+
+    def test_unwatch_stops_further_ingestion(self, watcher, manager, tmp_path):
+        original = tmp_path / "art.psd"
+        write_psd(original, Image.new("RGB", (24, 16), (1, 1, 1)))
+        meta = create_edit_in_place_handoff(manager, original)
+        watcher.watch_original(meta.handoff_id, original)
+        settle_quietly(DEBOUNCE_MS / 1000 * 3)
+
+        watcher.unwatch_original(meta.handoff_id)
+        write_psd(original, Image.new("RGB", (24, 16), (0, 200, 0)))
+        settle_quietly(DEBOUNCE_MS / 1000 * 4)
+
+        assert manager.get(meta.handoff_id).edits == []
+
+    def test_unwatch_is_a_noop_for_an_unwatched_handoff(self, watcher):
+        watcher.unwatch_original("never-watched")  # must not raise
+
+    def test_refcounted_parent_shared_between_two_handoffs(self, watcher, manager, tmp_path):
+        """Two edit_in_place files sharing one parent directory (the common
+        case: both live directly under ComfyUI's `input/` root) must keep
+        working independently -- unwatching ONE must not disturb the
+        other's still-active watch on the same shared parent.
+        """
+        original_a = tmp_path / "a.psd"
+        original_b = tmp_path / "b.psd"
+        write_psd(original_a, Image.new("RGB", (8, 8), (1, 1, 1)))
+        write_psd(original_b, Image.new("RGB", (8, 8), (2, 2, 2)))
+        meta_a = create_edit_in_place_handoff(manager, original_a)
+        meta_b = create_edit_in_place_handoff(manager, original_b)
+        watcher.watch_original(meta_a.handoff_id, original_a)
+        watcher.watch_original(meta_b.handoff_id, original_b)
+        settle_quietly(DEBOUNCE_MS / 1000 * 3)
+
+        watcher.unwatch_original(meta_a.handoff_id)
+        write_psd(original_b, Image.new("RGB", (8, 8), (250, 250, 250)))
+        wait_for_edit_count(manager, meta_b.handoff_id, 1)
+
+        write_psd(original_a, Image.new("RGB", (8, 8), (100, 100, 100)))
+        settle_quietly(DEBOUNCE_MS / 1000 * 4)
+        assert manager.get(meta_a.handoff_id).edits == []  # unwatched, no ingest
+
+    def test_source_psd_and_edit_in_place_watches_coexist(self, watcher, manager, tmp_path):
+        """Regression: the edit_in_place watch must not disturb the
+        pre-existing managed-folder recursive watch, or vice versa.
+        """
+        normal_meta, normal_psd_path = create_handoff_with_psd(manager)
+        original = tmp_path / "art.psd"
+        write_psd(original, Image.new("RGB", (12, 12), (1, 1, 1)))
+        eip_meta = create_edit_in_place_handoff(manager, original)
+        watcher.watch_original(eip_meta.handoff_id, original)
+        settle_quietly(DEBOUNCE_MS / 1000 * 3)
+
+        write_psd(normal_psd_path, Image.new("RGB", (24, 16), (9, 9, 9)))
+        write_psd(original, Image.new("RGB", (12, 12), (99, 99, 99)))
+
+        wait_for_edit_count(manager, normal_meta.handoff_id, 1)
+        wait_for_edit_count(manager, eip_meta.handoff_id, 1)
+
+
+class TestEditInPlaceBootRecovery:
+    """PROTOCOL.md §6b: a server restart rebuilds `CpsbWatcher` from
+    scratch; :meth:`CpsbWatcher.start` alone must restore a watch for every
+    still-ACTIVE `edit_in_place` handoff, with no explicit
+    `watch_original()` call needed.
+    """
+
+    def test_active_handoff_watch_is_restored_on_start(self, context, manager, tmp_path):
+        original = tmp_path / "art.psd"
+        write_psd(original, Image.new("RGB", (16, 16), (5, 5, 5)))
+        meta = create_edit_in_place_handoff(manager, original)
+        manager.mark_editing(meta.handoff_id)  # an ordinary in-progress handoff
+
+        fresh_watcher = CpsbWatcher(context, manager)
+        fresh_watcher.start()
+        try:
+            write_psd(original, Image.new("RGB", (16, 16), (150, 20, 20)))
+            wait_for_edit_count(manager, meta.handoff_id, 1)
+        finally:
+            fresh_watcher.stop()
+
+    def test_terminal_handoff_is_not_restored(self, context, manager, tmp_path):
+        original = tmp_path / "art.psd"
+        write_psd(original, Image.new("RGB", (16, 16), (5, 5, 5)))
+        meta = create_edit_in_place_handoff(manager, original)
+        manager.mark_cancelled(meta.handoff_id)
+
+        fresh_watcher = CpsbWatcher(context, manager)
+        fresh_watcher.start()
+        try:
+            assert fresh_watcher._original_by_handoff == {}
+        finally:
+            fresh_watcher.stop()

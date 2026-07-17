@@ -86,6 +86,87 @@ class TestContractShape:
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
         assert spec["required"]["psd"] == ([],)
 
+    def test_input_types_declares_edit_original_boolean_default_false(self, configured):
+        """PROTOCOL.md §6b "Edit-original option": a BOOLEAN widget,
+        default False (the safe, non-destructive copy behavior).
+        """
+        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
+        assert spec["required"]["edit_original"] == ("BOOLEAN", {"default": False})
+
+
+class TestEditOriginalParam:
+    """`edit_original` is accepted by execute()/IS_CHANGED() (ComfyUI passes
+    every declared INPUT_TYPES field as a real keyword argument) but never
+    changes their behavior (PROTOCOL.md §6b): it only governs how a handoff
+    gets OPENED (menu.js's `/cpsb/open` request), a decision already made by
+    the time any edit reaches this node's consume path.
+    """
+
+    def test_execute_defaults_to_false_for_pre_existing_callers(self, context, manager, configured):
+        """Every call site written before this option existed omits the
+        argument entirely -- must keep working unchanged.
+        """
+        write_test_psd(context.input_dir / "flat.psd", color=(7, 7, 7), size=(4, 4))
+        node = load_psd_module.PhotoshopLoadPSD()
+        node.execute(psd="flat.psd", unique_id="1")  # no TypeError
+
+    def test_execute_accepts_edit_original_without_changing_flatten_output(
+        self, context, manager, configured
+    ):
+        pytest.importorskip("torch")
+        psd_path = context.input_dir / "flat.psd"
+        write_test_psd(psd_path, color=(40, 80, 120), size=(12, 8))
+
+        node = load_psd_module.PhotoshopLoadPSD()
+        image_tensor, _mask = node.execute(psd="flat.psd", unique_id="1", edit_original=True)
+
+        array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == (40, 80, 120)
+
+    def test_execute_accepts_edit_original_on_the_consume_path(self, context, manager, configured):
+        """edit_original must not disturb the "consume the latest edit"
+        path either -- an arrived edit always lands in the managed folder
+        the same way regardless of how the handoff was opened.
+        """
+        pytest.importorskip("torch")
+        psd_path = context.input_dir / "sample.psd"
+        write_test_psd(psd_path, color=(1, 1, 1), size=(8, 8))
+        raw_hash = hashlib.sha256(psd_path.read_bytes()).hexdigest()
+        meta = manager.create(
+            origin_node_id="1",
+            origin_kind="load_psd",
+            workflow_name="",
+            source=SourceRef(filename="sample.psd", subfolder="", type="input"),
+            original_image=Image.new("RGB", (8, 8), (1, 1, 1)),
+            source_hash=raw_hash,
+            edit_in_place=True,
+            original_path=str(psd_path.resolve()),
+        )
+        manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (200, 150, 100)), "plugin")
+
+        node = load_psd_module.PhotoshopLoadPSD()
+        image_tensor, _mask = node.execute(psd="sample.psd", unique_id="1", edit_original=True)
+
+        array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == (200, 150, 100)
+
+    def test_is_changed_defaults_to_false_for_pre_existing_callers(
+        self, context, manager, configured
+    ):
+        write_test_psd(context.input_dir / "sample.psd")
+        value = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(psd="sample.psd", unique_id="1")
+        assert len(value) == 64
+
+    def test_is_changed_accepts_edit_original_without_changing_the_value(
+        self, context, manager, configured
+    ):
+        write_test_psd(context.input_dir / "sample.psd", color=(3, 3, 3))
+        without = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(psd="sample.psd", unique_id="1")
+        with_flag = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(
+            psd="sample.psd", unique_id="1", edit_original=True
+        )
+        assert without == with_flag
+
 
 class TestListPsdFiles:
     def test_filters_to_psd_and_psb_case_insensitive(self, tmp_path):

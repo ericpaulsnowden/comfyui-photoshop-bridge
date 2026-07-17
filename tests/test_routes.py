@@ -29,6 +29,7 @@ from cpsb.handoff import HandoffManager, WaitOutcome, compute_source_hash
 from cpsb.launcher import LaunchResult, Tier1Status
 from cpsb.psd_io import write_psd
 from cpsb.version import __version__ as CPSB_VERSION
+from cpsb.watcher import CpsbWatcher
 
 SOURCE_FILENAME = "ComfyUI_00042_.png"
 
@@ -151,6 +152,30 @@ async def wait_until(predicate, timeout: float = 5.0) -> None:
 
 
 @pytest.fixture
+async def watcher_client(context: CpsbContext, manager: HandoffManager, launches: LaunchRecorder):
+    """Like ``client``, but wires a REAL, started :class:`CpsbWatcher` into
+    ``routes.install`` -- needed for PROTOCOL.md §6b ``edit_in_place`` tests
+    that exercise the watch_original/unwatch_original hooks (every other
+    fixture's unset watcher makes those a silent no-op by design, see
+    ``routes.install``'s own docstring). The watcher instance is attached as
+    ``.cpsb_watcher`` on the returned client for tests that need to poll it
+    directly.
+    """
+    context.settings.update({"debounce_ms": 200})
+    watcher = CpsbWatcher(context, manager)
+    watcher.start()
+    app = web.Application()
+    app.add_routes(routes_module.routes)
+    routes_module.install(app, context, manager, watcher)
+    test_client = TestClient(TestServer(app))
+    await test_client.start_server()
+    test_client.cpsb_watcher = watcher
+    yield test_client
+    await test_client.close()
+    watcher.stop()
+
+
+@pytest.fixture
 async def api_client(context: CpsbContext, manager: HandoffManager, launches: LaunchRecorder):
     """A client whose routes are mounted via ``add_routes_to_app`` -- i.e. under
     both the bare and ``/api``-prefixed paths, exactly as ``__init__.py`` wires
@@ -172,9 +197,7 @@ class TestApiPrefix:
     POST came back 405 from ComfyUI's static handler.
     """
 
-    async def test_open_answers_on_api_prefixed_path(
-        self, api_client, source_image, launches
-    ):
+    async def test_open_answers_on_api_prefixed_path(self, api_client, source_image, launches):
         response = await api_client.post("/api/cpsb/open", json=open_body())
         assert response.status == 200
 
@@ -278,16 +301,12 @@ class TestOpen:
         first = await client.post("/cpsb/open", json=open_body(workflow_name="workflow-a"))
         assert first.status == 200
 
-        other_workflow = await client.post(
-            "/cpsb/open", json=open_body(workflow_name="workflow-b")
-        )
+        other_workflow = await client.post("/cpsb/open", json=open_body(workflow_name="workflow-b"))
         assert other_workflow.status == 200
         assert (await other_workflow.json())["handoff_id"] != (await first.json())["handoff_id"]
 
         # Same workflow again -> the 409 conflict is still enforced.
-        same_workflow = await client.post(
-            "/cpsb/open", json=open_body(workflow_name="workflow-a")
-        )
+        same_workflow = await client.post("/cpsb/open", json=open_body(workflow_name="workflow-a"))
         assert same_workflow.status == 409
         body = await same_workflow.json()
         assert body["existing_handoff_id"] == (await first.json())["handoff_id"]
@@ -530,9 +549,10 @@ class TestOpenPsdNative:
         second_body = await second.json()
         assert second_body["handoff_id"] != first["handoff_id"]
         assert manager.get(first["handoff_id"]).status == "superseded"
-        assert manager.get(second_body["handoff_id"]).source_hash == hashlib.sha256(
-            new_bytes
-        ).hexdigest()
+        assert (
+            manager.get(second_body["handoff_id"]).source_hash
+            == hashlib.sha256(new_bytes).hexdigest()
+        )
 
     async def test_mode_original_reopens_the_same_copied_file(
         self, client, context, manager, launches, tmp_path
@@ -549,10 +569,241 @@ class TestOpenPsdNative:
         """`load_psd` must be a recognized `origin_kind` -- not rejected by
         the same 400 that an unrecognized value gets.
         """
-        response = await client.post(
-            "/cpsb/open", json=open_body_psd(filename="never-created.psd")
-        )
+        response = await client.post("/cpsb/open", json=open_body_psd(filename="never-created.psd"))
         assert response.status == 404  # got past body validation to file resolution
+
+
+class TestOpenPsdEditInPlace:
+    """PROTOCOL.md §6b "Edit-original option": ``edit_in_place: true`` on a
+    ``load_psd`` open skips the ``source.psd`` copy entirely and makes the
+    handoff's edit target the user's own original file.
+    """
+
+    async def test_default_false_keeps_copy_behavior(
+        self, client, context, manager, launches, tmp_path
+    ):
+        """Regression pin: omitting `edit_in_place` must be byte-identical
+        to every pre-existing TestOpenPsdNative assertion.
+        """
+        original = psd_bytes(tmp_path, color=(11, 22, 33))
+        (context.input_dir / "sample.psd").write_bytes(original)
+
+        response = await client.post("/cpsb/open", json=open_body_psd())
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        meta = manager.get(handoff_id)
+        assert meta.edit_in_place is False
+        assert meta.original_path is None
+        assert (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes() == original
+        assert launches.calls[0][0].endswith(f"{handoff_id}/source.psd")
+
+    async def test_edit_in_place_skips_the_copy(self, client, context, manager, launches, tmp_path):
+        original_file = context.input_dir / "sample.psd"
+        original_file.write_bytes(psd_bytes(tmp_path, color=(44, 55, 66)))
+
+        response = await client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        assert not (context.cpsb_input_dir / handoff_id / "source.psd").exists()
+        meta = manager.get(handoff_id)
+        assert meta.edit_in_place is True
+        assert meta.original_path == str(original_file.resolve())
+
+    async def test_edit_in_place_launches_photoshop_on_the_original_path(
+        self, client, context, launches, tmp_path
+    ):
+        original_file = context.input_dir / "sample.psd"
+        original_file.write_bytes(psd_bytes(tmp_path))
+
+        response = await client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+
+        assert response.status == 200
+        assert launches.calls[0][0] == str(original_file.resolve())
+
+    async def test_edit_in_place_still_writes_orig_thumb(
+        self, client, context, manager, launches, tmp_path
+    ):
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path, color=(1, 2, 3)))
+
+        response = await client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+
+        handoff_id = (await response.json())["handoff_id"]
+        thumb_path = context.cpsb_input_dir / handoff_id / "orig_thumb.png"
+        assert thumb_path.is_file()
+        with Image.open(thumb_path) as thumb:
+            assert thumb.getpixel((0, 0))[:3] == (1, 2, 3)
+
+    async def test_edit_in_place_never_writes_the_original_file(
+        self, client, context, launches, tmp_path
+    ):
+        """No write of ours ever touches the original -- there is nothing
+        for the watcher to suppress as "our own write" on this path.
+        """
+        original_file = context.input_dir / "sample.psd"
+        original_bytes = psd_bytes(tmp_path, color=(9, 9, 9))
+        original_file.write_bytes(original_bytes)
+
+        response = await client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+
+        assert response.status == 200
+        assert original_file.read_bytes() == original_bytes  # byte-for-byte untouched
+
+    async def test_edit_in_place_rejects_non_psd_extension(self, client, context, launches):
+        (context.input_dir / "photo.png").write_bytes(png_bytes((1, 2, 3)))
+
+        response = await client.post(
+            "/cpsb/open", json=open_body_psd(filename="photo.png", edit_in_place=True)
+        )
+
+        assert response.status == 400
+
+    async def test_edit_in_place_missing_file_404(self, client, context, launches):
+        response = await client.post(
+            "/cpsb/open", json=open_body_psd(filename="ghost.psd", edit_in_place=True)
+        )
+        assert response.status == 404
+
+    async def test_edit_in_place_ignored_for_non_load_psd_origin(
+        self, client, source_image, manager, launches
+    ):
+        """`edit_in_place` only means something for `origin_kind: load_psd`
+        -- a flat image has no PSD-native "original" to point at.
+        """
+        response = await client.post("/cpsb/open", json=open_body(edit_in_place=True))
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        meta = manager.get(handoff_id)
+        assert meta.edit_in_place is False
+        assert meta.original_path is None
+
+    async def test_mode_original_reopens_the_original_file_not_a_copy(
+        self, client, context, manager, launches, tmp_path
+    ):
+        original_file = context.input_dir / "sample.psd"
+        original_file.write_bytes(psd_bytes(tmp_path))
+        first = await (
+            await client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+        ).json()
+
+        reopened = await client.post("/cpsb/open", json=open_body_psd(mode="original"))
+
+        assert reopened.status == 200
+        assert (await reopened.json())["handoff_id"] == first["handoff_id"]
+        assert launches.calls[-1][0] == str(original_file.resolve())
+
+    async def test_file_route_serves_the_original_for_edit_in_place(
+        self, client, context, tmp_path
+    ):
+        """GET /cpsb/file/{id} (Tier 2 remote-mode download) must serve the
+        ORIGINAL bytes for an edit_in_place handoff -- there is no
+        source.psd copy to fall back to.
+        """
+        original = psd_bytes(tmp_path, color=(70, 80, 90))
+        (context.input_dir / "sample.psd").write_bytes(original)
+        handoff_id = (
+            await (await client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))).json()
+        )["handoff_id"]
+
+        response = await client.get(f"/cpsb/file/{handoff_id}")
+
+        assert response.status == 200
+        assert await response.read() == original
+
+    async def test_fresh_mode_unwatches_the_superseded_handoff(
+        self, watcher_client, context, manager, launches, tmp_path
+    ):
+        """Superseding an edit_in_place handoff must stop watching its
+        original file -- a later save of that (now-detached) file must not
+        land on the wrong (superseded) handoff.
+        """
+        original_file = context.input_dir / "sample.psd"
+        original_file.write_bytes(psd_bytes(tmp_path, color=(5, 5, 5)))
+        first = await (
+            await watcher_client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+        ).json()
+        first_id = first["handoff_id"]
+        assert watcher_client.cpsb_watcher._original_by_handoff.get(first_id) is not None
+
+        fresh = await watcher_client.post("/cpsb/open", json=open_body_psd(mode="fresh"))
+        assert fresh.status == 200
+
+        assert first_id not in watcher_client.cpsb_watcher._original_by_handoff
+
+
+class TestOpenPsdEditInPlaceWatcherIntegration:
+    """End-to-end: opening an edit_in_place handoff registers a live
+    filesystem watch, saving the ORIGINAL file ingests an edit into the
+    MANAGED folder, and cancel/discard stop that watch (PROTOCOL.md §6b).
+    """
+
+    SETTLE_TIMEOUT = 15.0
+
+    async def _wait_for_edit_count(self, manager, handoff_id: str, count: int) -> None:
+        deadline = time.monotonic() + self.SETTLE_TIMEOUT
+        while time.monotonic() < deadline:
+            meta = manager.get(handoff_id)
+            if meta is not None and len(meta.edits) >= count:
+                return
+            await asyncio.sleep(0.05)
+        meta = manager.get(handoff_id)
+        raise AssertionError(
+            f"Timed out waiting for {count} edit(s); have {len(meta.edits) if meta else 0}"
+        )
+
+    async def test_saving_the_original_ingests_an_edit_into_managed_storage(
+        self, watcher_client, context, manager, launches, tmp_path
+    ):
+        original_file = context.input_dir / "sample.psd"
+        original_file.write_bytes(psd_bytes(tmp_path, color=(1, 1, 1)))
+
+        response = await watcher_client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+        handoff_id = (await response.json())["handoff_id"]
+        await asyncio.sleep(0.3)  # let the initial open settle before the "save"
+
+        # Simulate the user's plain Cmd+S: Photoshop rewrites the ORIGINAL
+        # file in place, at its ORIGINAL path -- never a managed-folder path.
+        write_psd(original_file, Image.new("RGB", (16, 16), (200, 0, 0)))
+
+        await self._wait_for_edit_count(manager, handoff_id, 1)
+
+        refreshed = manager.get(handoff_id)
+        assert refreshed.status == "edited"
+        assert len(refreshed.edits) == 1
+        # The edit lands in MANAGED storage, addressable exactly like any
+        # other handoff's edit -- downstream/gallery consumption unchanged.
+        edit_path = context.cpsb_input_dir / handoff_id / refreshed.edits[0].filename
+        assert edit_path.is_file()
+        with Image.open(edit_path) as edit_image:
+            assert edit_image.getpixel((0, 0)) == (200, 0, 0)
+        # And the original itself is exactly what Photoshop "saved" -- this
+        # package never rewrites it.
+        with Image.open(original_file) as saved:
+            assert saved.getpixel((0, 0))[:3] == (200, 0, 0)
+
+    async def test_cancel_stops_the_watch_further_saves_are_not_ingested(
+        self, watcher_client, context, manager, launches, tmp_path
+    ):
+        original_file = context.input_dir / "sample.psd"
+        original_file.write_bytes(psd_bytes(tmp_path, color=(1, 1, 1)))
+        handoff_id = (
+            await (
+                await watcher_client.post("/cpsb/open", json=open_body_psd(edit_in_place=True))
+            ).json()
+        )["handoff_id"]
+        await asyncio.sleep(0.3)
+
+        cancel_response = await watcher_client.post(f"/cpsb/cancel/{handoff_id}")
+        assert cancel_response.status == 200
+
+        write_psd(original_file, Image.new("RGB", (16, 16), (0, 250, 0)))
+        await asyncio.sleep(0.3 + 0.2 * 4)  # generous settle window, nothing should arrive
+
+        refreshed = manager.get(handoff_id)
+        assert refreshed.status == "cancelled"
+        assert refreshed.edits == []
 
 
 async def _connect_tier2_plugin(ws, context: CpsbContext, local_mode: bool = True) -> None:
@@ -834,15 +1085,11 @@ class TestUpload:
 
     async def test_invalid_image_400(self, client, source_image):
         handoff_id = await self.create_handoff(client)
-        response = await client.post(
-            "/cpsb/upload", data=upload_form(handoff_id, b"not a png")
-        )
+        response = await client.post("/cpsb/upload", data=upload_form(handoff_id, b"not a png"))
         assert response.status == 400
 
     async def test_sibling_output_for_terminal_origin(self, client, context, source_image):
-        response = await client.post(
-            "/cpsb/open", json=open_body(origin_kind="terminal_output")
-        )
+        response = await client.post("/cpsb/open", json=open_body(origin_kind="terminal_output"))
         handoff_id = (await response.json())["handoff_id"]
         await client.post("/cpsb/upload", data=upload_form(handoff_id, png_bytes((5, 5, 5))))
         assert (context.output_dir / "ComfyUI_00042__ps1.png").is_file()
@@ -974,9 +1221,7 @@ class TestStatus:
     async def test_status_shape_and_ordering(self, client, source_image, launches):
         first = (await (await client.post("/cpsb/open", json=open_body())).json())["handoff_id"]
         second = (
-            await (
-                await client.post("/cpsb/open", json=open_body(origin_node_id="18"))
-            ).json()
+            await (await client.post("/cpsb/open", json=open_body(origin_node_id="18"))).json()
         )["handoff_id"]
 
         response = await client.get("/cpsb/status")
@@ -1032,9 +1277,7 @@ class TestPluginWebsocket:
     async def test_handshake_marks_tier2_connected(self, client, context, events, launches):
         async with client.ws_connect("/cpsb/ws") as ws:
             await self.handshake(ws, context)
-            await wait_until(
-                lambda: any(p.get("connected") for p in events.of_type("cpsb.tier2"))
-            )
+            await wait_until(lambda: any(p.get("connected") for p in events.of_type("cpsb.tier2")))
             status = await (await client.get("/cpsb/status")).json()
             assert status["tier2_connected"] is True
             assert status["ps_version"] == "26.5"
@@ -1184,9 +1427,7 @@ class TestPluginWebsocket:
     async def test_disconnect_emits_tier2_event(self, client, context, events, launches):
         async with client.ws_connect("/cpsb/ws") as ws:
             await self.handshake(ws, context)
-            await wait_until(
-                lambda: any(p.get("connected") for p in events.of_type("cpsb.tier2"))
-            )
+            await wait_until(lambda: any(p.get("connected") for p in events.of_type("cpsb.tier2")))
         await wait_until(
             lambda: any(p.get("connected") is False for p in events.of_type("cpsb.tier2"))
         )

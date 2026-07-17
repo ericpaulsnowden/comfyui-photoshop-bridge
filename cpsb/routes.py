@@ -44,6 +44,7 @@ from .launcher import launch_photoshop, tier1_status
 from .locality import is_request_local
 from .psd_io import read_edited_psd, write_psd
 from .version import __version__
+from .watcher import CpsbWatcher
 
 logger = logging.getLogger("cpsb")
 
@@ -108,17 +109,37 @@ class _PluginSlot:
 _APP_KEY_CONTEXT: web.AppKey[CpsbContext] = web.AppKey("cpsb_context", CpsbContext)
 _APP_KEY_MANAGER: web.AppKey[HandoffManager] = web.AppKey("cpsb_manager", HandoffManager)
 _APP_KEY_PLUGIN: web.AppKey[_PluginSlot] = web.AppKey("cpsb_plugin", _PluginSlot)
+_APP_KEY_WATCHER: web.AppKey[CpsbWatcher | None] = web.AppKey("cpsb_watcher", CpsbWatcher)
 
 
-def install(app: web.Application, context: CpsbContext, manager: HandoffManager) -> None:
-    """Attach *context* and *manager* to *app* so every route below can find them.
+def install(
+    app: web.Application,
+    context: CpsbContext,
+    manager: HandoffManager,
+    watcher: CpsbWatcher | None = None,
+) -> None:
+    """Attach *context*, *manager*, and *watcher* to *app* so every route below can find them.
 
     Call once (from the top-level ``__init__.py`` for the real ComfyUI app, or
     from a test's throwaway ``web.Application()``) before serving any request.
+
+    Args:
+        app: The aiohttp application every ``/cpsb/*`` route is registered on.
+        context: The active backend context.
+        manager: The handoff manager.
+        watcher: The Tier 1 save-detection watcher (PROTOCOL.md §6b), used
+            only for the ``edit_in_place`` open/close hooks
+            (:func:`open_handoff_route`, :func:`cancel_route`,
+            :func:`discard_route`). Optional and defaults to ``None`` so
+            every existing caller (real ``__init__.py`` wiring aside) and
+            every pre-existing test that never exercises ``edit_in_place``
+            keeps working unchanged; those hooks are simple no-ops when
+            unset.
     """
     app[_APP_KEY_CONTEXT] = context
     app[_APP_KEY_MANAGER] = manager
     app[_APP_KEY_PLUGIN] = _PluginSlot()
+    app[_APP_KEY_WATCHER] = watcher
 
 
 def add_routes_to_app(app: web.Application) -> None:
@@ -153,6 +174,16 @@ def _context(request: web.Request) -> CpsbContext:
 
 def _manager(request: web.Request) -> HandoffManager:
     return request.app[_APP_KEY_MANAGER]
+
+
+def _watcher(request: web.Request) -> CpsbWatcher | None:
+    """The Tier 1 watcher, or ``None`` when :func:`install` didn't get one.
+
+    Every call site below treats ``None`` as "nothing to do" -- see
+    :func:`install`'s docstring for why that's the right default rather
+    than a hard requirement.
+    """
+    return request.app[_APP_KEY_WATCHER]
 
 
 def _plugin(request: web.Request) -> PluginConnection | None:
@@ -228,6 +259,13 @@ def _parse_open_body(body: Any) -> tuple[dict[str, Any], str | None]:
     # frontend sets this once the user has confirmed opening Photoshop on
     # a machine other than the one they're browsing from.
     client_remote_ok = bool(body.get("client_remote_ok", False))
+    # PROTOCOL.md §6b "Edit-original option": only meaningful for
+    # `origin_kind: "load_psd"` (menu.js only ever sends it for a
+    # PhotoshopLoadPSD node's own widget value) -- parsed unconditionally
+    # here, gated to that origin_kind by the route handler below, so a
+    # stray/misapplied flag on any other origin is simply ignored rather
+    # than rejected.
+    edit_in_place = bool(body.get("edit_in_place", False))
 
     if source_type not in _VALID_SOURCE_TYPES:
         return {}, f"Invalid type: {source_type!r}"
@@ -246,6 +284,7 @@ def _parse_open_body(body: Any) -> tuple[dict[str, Any], str | None]:
             "workflow_name": workflow_name,
             "mode": mode,
             "client_remote_ok": client_remote_ok,
+            "edit_in_place": edit_in_place,
         },
         None,
     )
@@ -319,11 +358,16 @@ class ResolvedSource:
     route copies it verbatim as ``source.psd`` instead of calling
     :func:`cpsb.psd_io.write_psd` on the decoded pixels, so the handoff
     keeps the user's actual layers rather than flattening them away.
+    ``original_path`` mirrors ``raw_psd_bytes`` (populated for the same
+    psd-native case, alongside it) -- the resolved absolute path the bytes
+    were read from, reused verbatim as the edit target when the PROTOCOL.md
+    §6b ``edit_in_place`` option is requested, so it never needs re-resolving.
     """
 
     thumbnail_image: Image.Image
     source_hash: str
     raw_psd_bytes: bytes | None = None
+    original_path: Path | None = None
 
 
 def _placeholder_thumbnail_source() -> Image.Image:
@@ -389,7 +433,10 @@ def _resolve_psd_native_source(
     source_hash = hashlib.sha256(raw_bytes).hexdigest()
     return (
         ResolvedSource(
-            thumbnail_image=thumbnail_image, source_hash=source_hash, raw_psd_bytes=raw_bytes
+            thumbnail_image=thumbnail_image,
+            source_hash=source_hash,
+            raw_psd_bytes=raw_bytes,
+            original_path=source_path,
         ),
         None,
     )
@@ -414,6 +461,23 @@ def _resolve_source(
     if error_response is not None:
         return None, error_response
     return ResolvedSource(thumbnail_image=image, source_hash=compute_source_hash(image)), None
+
+
+def _psd_path_for_handoff(manager: HandoffManager, meta: HandoffMeta) -> Path:
+    """The path Photoshop should open (and the watcher should watch) for *meta*.
+
+    PROTOCOL.md §6b: an ``edit_in_place`` handoff's edit target IS the
+    user's own file (``meta.original_path``) -- it never has a managed
+    ``source.psd`` copy to fall back to. Every other handoff keeps opening
+    the managed copy exactly as before this option existed.
+    """
+    if meta.edit_in_place:
+        assert meta.original_path is not None, (
+            "an edit_in_place handoff always records original_path (see "
+            "open_handoff_route's creation branch, the only place edit_in_place is set)"
+        )
+        return Path(meta.original_path)
+    return manager.handoff_dir(meta.handoff_id) / "source.psd"
 
 
 @routes.post("/cpsb/open")
@@ -502,16 +566,30 @@ async def open_handoff_route(request: web.Request) -> web.Response:
     if mode == "original":
         if existing is None:
             return _error(404, "No active handoff for this node")
-        psd_path = manager.handoff_dir(existing.handoff_id) / "source.psd"
+        psd_path = _psd_path_for_handoff(manager, existing)
         return await _open_and_respond(request, context, manager, existing, psd_path)
 
     if supersede_existing or (mode == "fresh" and existing is not None):
         manager.supersede(existing.handoff_id)
+        # PROTOCOL.md §6b: an edit_in_place handoff being replaced here must
+        # stop being watched -- it's a no-op (and harmless) for every other
+        # handoff, since unwatch_original() no-ops for an id that was never
+        # registered in the first place.
+        watcher = _watcher(request)
+        if watcher is not None:
+            watcher.unwatch_original(existing.handoff_id)
 
     if resolved is None:
         resolved, error_response = _resolve_source(context, fields)
         if error_response is not None:
             return error_response
+
+    # PROTOCOL.md §6b "Edit-original option": only a load_psd open honors
+    # the flag -- `_resolve_source` guarantees `resolved.original_path` is
+    # set whenever origin_kind is load_psd, so this never reads a stale/
+    # unset value.
+    edit_in_place = fields["edit_in_place"] and fields["origin_kind"] == "load_psd"
+    original_path = str(resolved.original_path.resolve()) if edit_in_place else None
 
     meta = manager.create(
         origin_node_id=origin_node_id,
@@ -522,16 +600,28 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         ),
         original_image=resolved.thumbnail_image,
         source_hash=resolved.source_hash,
+        edit_in_place=edit_in_place,
+        original_path=original_path,
     )
-    psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
-    if resolved.raw_psd_bytes is not None:
-        # psd-native (PROTOCOL.md §2): copy the user's own layered file
-        # verbatim -- never write_psd/frompil, which would flatten it.
-        psd_path.parent.mkdir(parents=True, exist_ok=True)
-        psd_path.write_bytes(resolved.raw_psd_bytes)
+    if edit_in_place:
+        # The user's own file IS the edit target -- never copied, never
+        # written to by this package at all (PROTOCOL.md §6b). orig_thumb.png
+        # was still written by manager.create() above, from the §4 flatten
+        # of that same file, so the gallery keeps working unchanged.
+        psd_path = _psd_path_for_handoff(manager, meta)
+        watcher = _watcher(request)
+        if watcher is not None:
+            watcher.watch_original(meta.handoff_id, psd_path)
     else:
-        write_psd(psd_path, _normalize_for_psd_write(resolved.thumbnail_image))
-    manager.note_source_written(meta.handoff_id)
+        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        if resolved.raw_psd_bytes is not None:
+            # psd-native (PROTOCOL.md §2): copy the user's own layered file
+            # verbatim -- never write_psd/frompil, which would flatten it.
+            psd_path.parent.mkdir(parents=True, exist_ok=True)
+            psd_path.write_bytes(resolved.raw_psd_bytes)
+        else:
+            write_psd(psd_path, _normalize_for_psd_write(resolved.thumbnail_image))
+        manager.note_source_written(meta.handoff_id)
 
     return await _open_and_respond(request, context, manager, meta, psd_path)
 
@@ -703,7 +793,9 @@ async def file_route(request: web.Request) -> web.Response:
     meta = manager.get(handoff_id)
     if meta is None or meta.status not in ACTIVE_STATUSES:
         return _error(404, "Unknown or inactive handoff_id")
-    psd_path = manager.handoff_dir(handoff_id) / "source.psd"
+    # PROTOCOL.md §6b: an edit_in_place handoff has no source.psd copy at
+    # all -- Tier 2 remote-mode download must serve the user's own file.
+    psd_path = _psd_path_for_handoff(manager, meta)
     if not psd_path.is_file():
         return _error(404, "source.psd not found")
     return web.Response(body=psd_path.read_bytes(), content_type="image/vnd.adobe.photoshop")
@@ -720,6 +812,11 @@ async def cancel_route(request: web.Request) -> web.Response:
         manager.mark_cancelled(handoff_id)
     except HandoffNotFoundError:
         return _error(404, "Unknown handoff_id")
+    # PROTOCOL.md §6b: stop watching an edit_in_place handoff's original file
+    # once cancelled -- a no-op for every other handoff (never registered).
+    watcher = _watcher(request)
+    if watcher is not None:
+        watcher.unwatch_original(handoff_id)
     plugin = _plugin(request)
     if plugin is not None:
         await plugin.ws.send_json({"type": "handoff_cancelled", "handoff_id": handoff_id})
@@ -737,6 +834,10 @@ async def discard_route(request: web.Request) -> web.Response:
         manager.mark_discarded(handoff_id)
     except HandoffNotFoundError:
         return _error(404, "Unknown handoff_id")
+    # PROTOCOL.md §6b: same unwatch as cancel_route -- see its comment.
+    watcher = _watcher(request)
+    if watcher is not None:
+        watcher.unwatch_original(handoff_id)
     return web.json_response({"ok": True})
 
 

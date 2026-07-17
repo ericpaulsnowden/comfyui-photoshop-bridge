@@ -23,6 +23,7 @@ import * as pasteback from './cpsb/pasteback.js'
 import * as badges from './cpsb/badges.js'
 import * as gallery from './cpsb/gallery.js'
 import * as loadpsd from './cpsb/loadpsd.js'
+import * as compose from './cpsb/compose.js'
 import * as ui from './cpsb/ui.js'
 import { SETTINGS } from './cpsb/settings.js'
 
@@ -142,6 +143,7 @@ app.registerExtension({
   nodeCreated(node) {
     safely('badges.installBadgeHook', () => badges.installBadgeHook(node))
     safely('loadpsd.attachUploadWidget', () => loadpsd.attachUploadWidget(node))
+    safely('compose.attachAutoGrowInputs', () => compose.attachAutoGrowInputs(node))
   },
 
   /**
