@@ -62,6 +62,8 @@
  * `.options.values`.
  */
 
+import { app } from '../../../scripts/app.js'
+import { api as rawApi } from '../../../scripts/api.js'
 import * as api from './api.js'
 import * as ui from './ui.js'
 
@@ -330,6 +332,216 @@ function installDragAndDrop(node, onFile) {
 }
 
 /**
+ * Preview for the Load PSD node's selected file — not part of `docs/PROTOCOL.md`,
+ * a pure frontend nicety backed by the new `GET /cpsb/psd_preview` route
+ * (`cpsb/routes.py`). Without this, a Load PSD node shows nothing after a
+ * file is selected/uploaded, unlike `LoadImage` — its combo deliberately
+ * bypasses ComfyUI's stock image-preview pipeline (this file's own header).
+ *
+ * Mechanism verified against a fresh `Comfy-Org/ComfyUI_frontend` clone
+ * (v1.48.3 @ e6c0435, 2026-07-17) rather than assumed, since this file's own
+ * header already notes the modern frontend ships no dedicated `LoadImage`
+ * preview extension anymore — the behavior lives in the generic
+ * image-upload-widget machinery every `image_upload`-flagged COMBO gets:
+ * - `src/renderer/extensions/vueNodes/widgets/composables/useImageUploadWidget.ts`
+ *   lines 113-120: the file combo's OWN `.callback` is what triggers a
+ *   preview refresh on ANY value change (upload OR manual reselection) —
+ *   `fileComboWidget.callback = function () { node.imgs = undefined;
+ *   nodeOutputStore.setNodeOutputs(node, String(fileComboWidget.value), ...);
+ *   node.graph?.setDirtyCanvas(true) }`. {@link attachPreviewRefresh} below
+ *   wraps `psdWidget.callback` for the identical reason: it is the ONE hook
+ *   that fires for both an upload's own explicit `psdWidget.callback?.(...)`
+ *   call ({@link ingestFile}) and a user picking a different
+ *   already-uploaded file from the dropdown.
+ * - Same file, lines 125-130: the initial value is applied via
+ *   `requestAnimationFrame(() => { ...; showPreview({block: false}) })`,
+ *   commented "The value isn't set immediately so we need to wait a moment.
+ *   No change callbacks seem to be fired on initial setting of the value" —
+ *   exactly the restored-workflow race this file's own header already
+ *   documents for `ComfyExtension.init` vs. node deserialization timing.
+ *   {@link attachPreviewRefresh}'s own `requestAnimationFrame` call mirrors
+ *   this verbatim.
+ * - `src/composables/node/useNodeImage.ts` lines 113-117 (`onLoaded`):
+ *   `node.imageIndex = null; node.imgs = elements` — confirms `node.imgs`
+ *   holds real, already-loaded `HTMLImageElement`s (not bare URL strings)
+ *   and `node.imageIndex` addresses which one is shown.
+ * - `src/stores/nodeOutputStore.ts` `buildImageUrls`/`getNodeImageUrls`
+ *   (lines 107-129): every preview URL is built as
+ *   `` `/view?${new URLSearchParams(image)}` `` — ComfyUI's own `/view`,
+ *   the same one `api.viewUrl` (this package's `api.js`) already wraps.
+ *   `syncLegacyNodeImgs` (lines 408-423) is the same store's own bridge back
+ *   to plain `node.imgs = [element]; node.imageIndex = activeIndex` for
+ *   canvas-mode rendering, confirming that surface — not some Vue-node-only
+ *   internal — is the correct one for a third-party canvas extension like
+ *   this package to target.
+ *
+ * {@link applyPreviewImage} below additionally updates `app.nodeOutputs` the
+ * same way this package's OWN `pasteback.js::refreshNodePreview` already
+ * does for the identical "make a canvas node show this /view-addressable
+ * file" operation (itself verified against `ComfyApp.pasteFromClipspace`,
+ * see that file's own header). Not imported from here: `refreshNodePreview`
+ * is neither exported nor in this file's ownership scope for this change, so
+ * this is a small, deliberately-parallel implementation of the same
+ * already-established pattern rather than a copy.
+ *
+ * The actual `GET /cpsb/psd_preview` call in {@link fetchPsdPreviewRef}
+ * below is the one exception to "`cpsb/api.js` is the only module that
+ * talks to the network" (that file's own header) in this package: adding a
+ * route-specific helper there is out of scope for this change (ownership is
+ * scoped to this file, `cpsb/routes.py`, and `tests/test_routes.py` only),
+ * so this imports `Comfy-Org/ComfyUI_frontend`'s own `api` singleton
+ * directly for this one call — the same `fetchApi`/`apiURL` `cpsb/api.js`
+ * itself already builds on internally.
+ */
+
+/**
+ * Guards {@link fetchPsdPreviewRef}/{@link applyPreviewImage}'s one-time
+ * degraded-feature warning — this project's established "one [cpsb] warn per
+ * degraded feature" convention (see api.js `warn`, this file's own
+ * {@link init}).
+ */
+let previewWarned = false
+
+/**
+ * Debounce window for combo-driven preview refreshes: rapid dropdown
+ * scrubbing (or arrow-key cycling through options) must not fire one backend
+ * flatten per intermediate value.
+ */
+const PREVIEW_DEBOUNCE_MS = 150
+
+/**
+ * `GET /cpsb/psd_preview` for *ref*, returning the flattened-preview ref
+ * (always `type: "temp"`) on success, or `null` if the backend reports no
+ * preview (a flatten failure — 200 with no filename, `cpsb/routes.py`'s
+ * `psd_preview_route`) or the request itself fails for any reason. Every
+ * failure degrades silently to "no preview", with at most one `[cpsb]`
+ * console warning for the whole session (see {@link previewWarned}).
+ * @param {import('./api.js').CpsbImageRef} ref
+ * @returns {Promise<import('./api.js').CpsbImageRef | null>}
+ */
+async function fetchPsdPreviewRef(ref) {
+  try {
+    const params = new URLSearchParams({
+      filename: ref.filename,
+      subfolder: ref.subfolder,
+      type: ref.type
+    })
+    const response = await rawApi.fetchApi(`/cpsb/psd_preview?${params.toString()}`)
+    if (!response.ok) throw new Error(`psd_preview failed with HTTP ${response.status}`)
+    const body = await response.json()
+    if (!body?.filename) return null
+    return { filename: body.filename, subfolder: body.subfolder || '', type: 'temp' }
+  } catch (error) {
+    if (!previewWarned) {
+      previewWarned = true
+      api.warn('Load PSD preview request failed — no preview will be shown', error)
+    }
+    return null
+  }
+}
+
+/**
+ * Applies *ref* as *node*'s displayed preview image, mirroring
+ * `pasteback.js::refreshNodePreview`'s single-image case (see this section's
+ * header for the full citation trail): a fresh `<img>` sourced from
+ * `api.viewUrl`, `node.imgs`/`node.imageIndex`, the legacy `app.nodeOutputs`
+ * bridge, and a canvas repaint. If the image itself fails to load (e.g. the
+ * temp PNG was cleaned up between the backend response and this running),
+ * degrades silently back to no preview rather than showing a broken image.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {import('./api.js').CpsbImageRef} ref
+ */
+function applyPreviewImage(node, ref) {
+  const img = new Image()
+  img.onload = () => node.graph?.setDirtyCanvas(true, false)
+  img.onerror = () => {
+    node.imgs = undefined
+    if (app.nodeOutputs) delete app.nodeOutputs[String(node.id)]
+    if (!previewWarned) {
+      previewWarned = true
+      api.warn(`Load PSD preview image failed to load for node ${node.id}`)
+    }
+    node.graph?.setDirtyCanvas(true, false)
+  }
+  img.src = api.viewUrl(ref)
+  node.imgs = [img]
+  node.imageIndex = 0
+  if (app.nodeOutputs) {
+    app.nodeOutputs[String(node.id)] = {
+      images: [{ filename: ref.filename, subfolder: ref.subfolder, type: ref.type }]
+    }
+  }
+  node.graph?.setDirtyCanvas(true, false)
+}
+
+/**
+ * Fetches and applies the psd preview for *node*'s CURRENT `psd` widget
+ * value. Guards against rapid combo changes stacking overlapping requests
+ * with a token stamped fresh on every call: a response whose token has since
+ * been superseded (a newer selection arrived while this one was in-flight)
+ * is discarded on arrival rather than clobbering it, or reviving a preview
+ * for a file the user already navigated away from.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+async function refreshPsdPreview(node) {
+  const ref = getPsdFileRef(node)
+  if (!ref) return
+  const token = (node.__cpsbPsdPreviewToken || 0) + 1
+  node.__cpsbPsdPreviewToken = token
+  const previewRef = await fetchPsdPreviewRef(ref)
+  if (node.__cpsbPsdPreviewToken !== token) return // superseded meanwhile
+  if (!previewRef) return
+  applyPreviewImage(node, previewRef)
+}
+
+/**
+ * Debounces {@link refreshPsdPreview} by {@link PREVIEW_DEBOUNCE_MS} per node.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function schedulePreviewRefresh(node) {
+  if (node.__cpsbPsdPreviewTimer) clearTimeout(node.__cpsbPsdPreviewTimer)
+  node.__cpsbPsdPreviewTimer = setTimeout(() => {
+    node.__cpsbPsdPreviewTimer = null
+    refreshPsdPreview(node)
+  }, PREVIEW_DEBOUNCE_MS)
+}
+
+/**
+ * Wires the preview refresh into *node*: wraps *psdWidget*'s `.callback` (so
+ * an upload's own explicit callback invocation and a manual combo
+ * reselection both trigger exactly one debounced refresh), chains timer
+ * cleanup onto `node.onRemoved`, and checks for an already-restored value
+ * once the current animation frame settles (a saved workflow's combo value
+ * isn't applied yet at `nodeCreated` time — see this section's header).
+ * Call once per node, from {@link attachUploadWidget}.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {import('../../../scripts/app.js').IBaseWidget} psdWidget
+ */
+function attachPreviewRefresh(node, psdWidget) {
+  const originalCallback = psdWidget.callback
+  psdWidget.callback = function (value, ...rest) {
+    const result = originalCallback?.call(this, value, ...rest)
+    schedulePreviewRefresh(node)
+    return result
+  }
+
+  const originalOnRemoved = node.onRemoved
+  node.onRemoved = function () {
+    if (node.__cpsbPsdPreviewTimer) {
+      clearTimeout(node.__cpsbPsdPreviewTimer)
+      node.__cpsbPsdPreviewTimer = null
+    }
+    return originalOnRemoved?.call(this)
+  }
+
+  // Saved-workflow restore (see this section's header): wait a moment for
+  // the combo's deserialized value to land before checking it.
+  requestAnimationFrame(() => {
+    if (getPsdFileRef(node)) refreshPsdPreview(node)
+  })
+}
+
+/**
  * Attaches the hand-rolled upload affordance to one `PhotoshopLoadPSD` node
  * instance: a button widget opening a hidden file input, plus node-level
  * drag-and-drop — both funneling into the same {@link ingestFile} upload +
@@ -343,8 +555,6 @@ export function attachUploadWidget(node) {
   if (node.__cpsbPsdUploadAttached) return
   node.__cpsbPsdUploadAttached = true
 
-  if (!uploadSupported) return // already warned once, in init()
-
   const psdWidget = getPsdWidget(node)
   if (!psdWidget) {
     api.warn(
@@ -353,6 +563,14 @@ export function attachUploadWidget(node) {
     )
     return
   }
+
+  // Preview refresh (this file's "psd preview" section above) is wired
+  // unconditionally, before the upload-feature-detection gate below:
+  // showing a preview for the file the combo ALREADY points at has nothing
+  // to do with whether THIS browser can also upload a NEW one.
+  attachPreviewRefresh(node, psdWidget)
+
+  if (!uploadSupported) return // already warned once, in init()
 
   // uploadWidget is assigned immediately below; onFile/openFileDialog only
   // ever run later, in response to a user action (a click or a drop), by

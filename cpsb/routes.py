@@ -801,6 +801,101 @@ async def file_route(request: web.Request) -> web.Response:
     return web.Response(body=psd_path.read_bytes(), content_type="image/vnd.adobe.photoshop")
 
 
+# -- GET /cpsb/psd_preview -----------------------------------------------------
+
+#: Subfolder under ComfyUI's temp dir where flattened PSD previews are cached,
+#: content-addressed by the source file's own sha256 (`psdpreview_<hash>.png`)
+#: so a repeat request for unchanged bytes is a cache hit, never re-flattened.
+#: Not part of PROTOCOL.md -- this route is a pure frontend nicety for the
+#: Load PSD node (`web/cpsb/loadpsd.js`), which otherwise shows no preview at
+#: all (its combo deliberately bypasses ComfyUI's stock image-preview
+#: pipeline, `cpsb/load_psd.py`'s module docstring) -- no Photoshop plugin
+#: involvement either way; psd-tools does the flattening, same as every other
+#: read of a PSD in this package.
+_PSD_PREVIEW_SUBFOLDER = "cpsb"
+
+
+def _psd_preview_cache_path(context: CpsbContext, file_hash: str) -> Path:
+    """Where the flattened preview PNG for a PSD hashing to *file_hash* lives."""
+    return context.temp_dir / _PSD_PREVIEW_SUBFOLDER / f"psdpreview_{file_hash}.png"
+
+
+def _empty_psd_preview_response() -> web.Response:
+    """The flatten-failed response shape: 200, never 500 -- a corrupt or exotic
+    PSD must never turn a nice-to-have preview request into a hard failure for
+    the Load PSD node's upload/selection flow.
+    """
+    return web.json_response({"filename": None, "subfolder": None, "type": "temp"})
+
+
+@routes.get("/cpsb/psd_preview")
+async def psd_preview_route(request: web.Request) -> web.Response:
+    """Flatten a `.psd`/`.psb` into a cached, ComfyUI-addressable preview PNG.
+
+    Query params mirror ComfyUI's own ``GET /view``: ``filename`` (required),
+    ``subfolder`` (default ``""``), ``type`` (default ``"input"`` -- unlike
+    ``/view``'s own ``"output"`` default, since every file the Load PSD
+    node's combo can hold lives in the input directory, PROTOCOL.md §6b). The
+    file is resolved the same way ``POST /cpsb/open``'s psd-native path does
+    (:func:`_resolve_source_path`), rejecting a path that escapes its base
+    directory and anything that isn't a ``.psd``/``.psb``.
+
+    The flattened PNG is cached content-addressed by the source file's own
+    sha256 under ``<temp_dir>/cpsb/psdpreview_<hash>.png`` (see
+    :data:`_PSD_PREVIEW_SUBFOLDER`) -- a second request for unchanged bytes
+    is served from that cache without re-flattening.
+
+    Args:
+        request: Must carry ``filename`` (and optionally ``subfolder``,
+            ``type``) as query parameters.
+
+    Returns:
+        200 with ``{filename, subfolder, type: "temp"}`` addressing the
+        cached PNG via ComfyUI's own ``/view`` on success; 200 with
+        ``filename``/``subfolder`` both ``None`` if flattening fails (logged
+        as a warning, never a 500); 400 for a missing ``filename``, an
+        invalid ``type``, or a non-``.psd``/``.psb`` extension; 404 if the
+        resolved path doesn't exist or escapes its base directory.
+    """
+    filename = request.query.get("filename")
+    if not filename:
+        return _error(400, "filename is required")
+    subfolder = request.query.get("subfolder", "")
+    source_type = request.query.get("type", "input")
+    if source_type not in _VALID_SOURCE_TYPES:
+        return _error(400, f"Invalid type: {source_type!r}")
+
+    context = _context(request)
+    source_path = _resolve_source_path(context, filename, subfolder, source_type)
+    if source_path is None or not source_path.is_file():
+        return _error(404, f"PSD not found: {filename}")
+    if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS:
+        return _error(400, f"Not a .psd/.psb file: {filename}")
+
+    file_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    png_path = _psd_preview_cache_path(context, file_hash)
+
+    if png_path.is_file():
+        return web.json_response(
+            {"filename": png_path.name, "subfolder": _PSD_PREVIEW_SUBFOLDER, "type": "temp"}
+        )
+
+    try:
+        image, _fidelity = read_edited_psd(source_path)
+    except Exception:
+        # Deliberately broad, mirroring _open_psd_native_source: an
+        # unreadable or exotic PSD must not fail this request, only the
+        # preview it would have produced.
+        logger.warning("%s: could not flatten for a preview", source_path, exc_info=True)
+        return _empty_psd_preview_response()
+
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(png_path)
+    return web.json_response(
+        {"filename": png_path.name, "subfolder": _PSD_PREVIEW_SUBFOLDER, "type": "temp"}
+    )
+
+
 # -- POST /cpsb/cancel/{handoff_id} -------------------------------------------
 
 

@@ -387,6 +387,18 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 - Frontend: the node type is allowlisted in `captureImageUploadType`'s detection (its
   hand-rolled widget bypasses the stock `image_upload` spec flag), and its context-menu
   origin_kind derives as `load_psd`.
+- **Preview** (no Photoshop plugin required): the node shows a canvas preview of the
+  selected PSD, like LoadImage does for a PNG. `GET /cpsb/psd_preview?filename=&subfolder=&type=`
+  (defaults `subfolder=""`, `type="input"`; params mirror `/view` but default to the
+  `input/` tree the combo draws from) flattens the PSD server-side via §4's read path
+  (embedded composite → recomposite fallback — no plugin, no Photoshop) and caches the
+  result content-addressed under `<temp>/cpsb/psdpreview_<sha256>.png`. Response is
+  always 200: `{filename, subfolder:"cpsb", type:"temp"}` (addressable by ComfyUI's own
+  `/view`) on success, or an all-null triple if flattening fails (logged, never a 500);
+  400 for a missing/invalid `filename`/`type`/extension, 404 for a missing or
+  traversal-escaping file. The frontend refreshes the preview (debounced, with a
+  monotonic token guard against stale responses) whenever the combo value changes and
+  on workflow load; failures degrade silently to no preview.
 
 ### 6c. Compose Layers to PSD node
 

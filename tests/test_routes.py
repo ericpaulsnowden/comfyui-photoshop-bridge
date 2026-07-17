@@ -573,6 +573,125 @@ class TestOpenPsdNative:
         assert response.status == 404  # got past body validation to file resolution
 
 
+class TestPsdPreview:
+    """``GET /cpsb/psd_preview`` -- not part of PROTOCOL.md, a pure frontend
+    nicety for the Load PSD node (``web/cpsb/loadpsd.js``): flattens the
+    selected ``.psd``/``.psb`` into a cached, ComfyUI-``/view``-addressable
+    temp PNG, the same way ``psd_io.read_edited_psd`` flattens for every
+    other read of a PSD in this package -- no Photoshop plugin involved.
+    """
+
+    async def test_happy_path_returns_temp_png_of_the_right_size(
+        self, client, context, tmp_path
+    ):
+        (context.input_dir / "sample.psd").write_bytes(
+            psd_bytes(tmp_path, color=(50, 60, 70), size=(24, 12))
+        )
+
+        response = await client.get(
+            "/cpsb/psd_preview", params={"filename": "sample.psd", "subfolder": "", "type": "input"}
+        )
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["type"] == "temp"
+        assert data["subfolder"] == "cpsb"
+        assert data["filename"].startswith("psdpreview_")
+        assert data["filename"].endswith(".png")
+        png_path = context.temp_dir / "cpsb" / data["filename"]
+        assert png_path.is_file()
+        with Image.open(png_path) as preview:
+            preview.load()
+            assert preview.size == (24, 12)
+            assert preview.getpixel((0, 0))[:3] == (50, 60, 70)
+
+    async def test_default_subfolder_and_type_are_empty_and_input(self, client, context, tmp_path):
+        """``subfolder``/``type`` are optional query params -- default to
+        ``""``/``"input"`` (unlike ComfyUI's own ``/view``, which defaults
+        ``type`` to ``"output"``; PSDs the Load PSD combo can select always
+        live in the input directory).
+        """
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path))
+
+        response = await client.get("/cpsb/psd_preview", params={"filename": "sample.psd"})
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["filename"].startswith("psdpreview_")
+
+    async def test_missing_filename_400(self, client, context):
+        response = await client.get("/cpsb/psd_preview", params={})
+        assert response.status == 400
+
+    async def test_invalid_type_400(self, client, context, tmp_path):
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path))
+        response = await client.get(
+            "/cpsb/psd_preview", params={"filename": "sample.psd", "type": "banana"}
+        )
+        assert response.status == 400
+
+    async def test_rejects_non_psd_extension(self, client, context):
+        (context.input_dir / "photo.png").write_bytes(png_bytes((1, 2, 3)))
+
+        response = await client.get("/cpsb/psd_preview", params={"filename": "photo.png"})
+
+        assert response.status == 400
+
+    async def test_missing_file_404(self, client, context):
+        response = await client.get("/cpsb/psd_preview", params={"filename": "ghost.psd"})
+        assert response.status == 404
+
+    async def test_path_traversal_rejected(self, client, context, tmp_path):
+        (context.input_dir / "secret.psd").write_bytes(psd_bytes(tmp_path))
+
+        response = await client.get(
+            "/cpsb/psd_preview", params={"filename": "../secret.psd", "type": "input"}
+        )
+
+        assert response.status == 404
+
+    async def test_cache_hit_does_not_reflatten_on_second_call(
+        self, client, context, tmp_path, monkeypatch
+    ):
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path, color=(9, 9, 9)))
+
+        first = await client.get("/cpsb/psd_preview", params={"filename": "sample.psd"})
+        assert first.status == 200
+        first_data = await first.json()
+        png_path = context.temp_dir / "cpsb" / first_data["filename"]
+        mtime_after_first = png_path.stat().st_mtime_ns
+
+        # A cache hit must not call read_edited_psd (re-flatten) at all --
+        # not just "produce the same bytes."
+        def _fail_if_called(*_args, **_kwargs):
+            raise AssertionError("cache hit re-flattened the PSD")
+
+        monkeypatch.setattr(routes_module, "read_edited_psd", _fail_if_called)
+
+        second = await client.get("/cpsb/psd_preview", params={"filename": "sample.psd"})
+
+        assert second.status == 200
+        second_data = await second.json()
+        assert second_data == first_data
+        assert png_path.stat().st_mtime_ns == mtime_after_first
+
+    async def test_flatten_failure_returns_200_without_preview(self, client, context):
+        corrupt = b"8BPS" + b"\x00" * 4
+        (context.input_dir / "corrupt.psd").write_bytes(corrupt)
+
+        response = await client.get("/cpsb/psd_preview", params={"filename": "corrupt.psd"})
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["filename"] is None
+        assert data["subfolder"] is None
+        assert data["type"] == "temp"
+        # Nothing left behind in the preview cache for a failed flatten.
+        assert not (context.temp_dir / "cpsb").exists() or not list(
+            (context.temp_dir / "cpsb").glob("*.png")
+        )
+
+
 class TestOpenPsdEditInPlace:
     """PROTOCOL.md §6b "Edit-original option": ``edit_in_place: true`` on a
     ``load_psd`` open skips the ``source.psd`` copy entirely and makes the
