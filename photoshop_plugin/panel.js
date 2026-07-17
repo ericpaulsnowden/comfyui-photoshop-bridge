@@ -54,6 +54,10 @@ function initPanel() {
   const versionEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-version'))
   const handoffList = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-list'))
   const logEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-log'))
+  // The whole Advanced body (version, URL, log) collapses together.
+  const advancedBody = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-advanced-body')
+  )
   const advancedToggle = /** @type {HTMLElement} */ (
     document.getElementById('cpsb-advanced-toggle')
   )
@@ -200,8 +204,8 @@ function initPanel() {
   }
 
   advancedToggle.addEventListener('click', () => {
-    const collapsed = logEl.className.indexOf('cpsb-collapsed') !== -1
-    logEl.className = collapsed ? 'cpsb-log' : 'cpsb-log cpsb-collapsed'
+    const collapsed = advancedBody.className.indexOf('cpsb-collapsed') !== -1
+    advancedBody.className = collapsed ? '' : 'cpsb-collapsed'
     advancedCaret.textContent = collapsed ? '▾' : '▸'
   })
 

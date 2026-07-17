@@ -231,18 +231,18 @@
   </head>
   <body>
     <div class="cpsb-panel">
-      <!-- Boot banner + fatal surface: index.js writes the version into
-           #cpsb-version the instant it runs (proof fresh code loaded after a
-           reload), and any top-level throw during setup lands in #cpsb-fatal
-           instead of leaving the panel silently bare. -->
-      <div id="cpsb-version" class="cpsb-version cpsb-version-muted">Plugin loading…</div>
+      <!-- Fatal surface stays at top (critical): any top-level throw during
+           setup lands in #cpsb-fatal instead of leaving the panel silently
+           bare. The version banner + server URL are diagnostic, not everyday
+           info, so they live in ADVANCED below (index.js still writes the
+           version into #cpsb-version the instant it runs — proof fresh code
+           loaded — it's just tucked into Advanced now). -->
       <div id="cpsb-fatal" class="cpsb-fatal"></div>
 
       <div class="cpsb-status-pill">
         <span id="cpsb-status-dot" class="cpsb-dot cpsb-dot-disconnected"></span>
         <span id="cpsb-status-text" class="cpsb-status-text">Disconnected</span>
       </div>
-      <div id="cpsb-server-url" class="cpsb-muted cpsb-conn-line"></div>
       <div id="cpsb-last-error" class="cpsb-error-line cpsb-conn-line"></div>
       <div id="cpsb-retry-line" class="cpsb-muted cpsb-conn-line"></div>
 
@@ -259,12 +259,17 @@
 
       <!-- Plain div + JS click toggle: <details>/<summary> are unsupported
            in UXP (treated as bare divs, so the disclosure never collapses),
-           and the `hidden` attribute is documented as unsupported too. -->
+           and the `hidden` attribute is documented as unsupported too. The
+           whole #cpsb-advanced-body (version, URL, log) collapses together. -->
       <div id="cpsb-advanced-toggle" class="cpsb-advanced-toggle">
         <span id="cpsb-advanced-caret" class="cpsb-caret">&#9656;</span>
         <span class="cpsb-section-title">ADVANCED</span>
       </div>
-      <pre id="cpsb-log" class="cpsb-log cpsb-collapsed"></pre>
+      <div id="cpsb-advanced-body" class="cpsb-collapsed">
+        <div id="cpsb-version" class="cpsb-version cpsb-version-muted">Plugin loading…</div>
+        <div id="cpsb-server-url" class="cpsb-muted cpsb-conn-line"></div>
+        <pre id="cpsb-log" class="cpsb-log"></pre>
+      </div>
     </div>
     <!-- Classic script (NOT type="module": UXP does not support ES-module
          script tags; it uses CommonJS require(), which every module here
