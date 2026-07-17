@@ -1,0 +1,45 @@
+[project]
+name = "comfyui-photoshop-bridge"
+description = "Round-trip images between ComfyUI and Photoshop: right-click any image, edit it in Photoshop, and your save lands back on the originating node automatically."
+version = "0.1.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # torch is deliberately absent: ComfyUI itself provides it.
+    "watchdog",
+    "psd-tools>=1.9.24",
+    "pillow>=10.3.0",
+    "numpy",
+]
+
+[project.urls]
+Repository = "https://github.com/ericpaulsnowden/comfyui-photoshop-bridge"
+
+[tool.comfy]
+# PublisherId must match the publisher created at https://registry.comfy.org
+# before the first `comfy node publish`.
+PublisherId = "REPLACE_ME"
+DisplayName = "Photoshop Bridge"
+Icon = ""
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["web", "photoshop_plugin"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

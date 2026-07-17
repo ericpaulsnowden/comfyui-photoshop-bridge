@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="./panel.css" />
+  </head>
+  <body>
+    <div class="cpsb-panel">
+      <div class="cpsb-status-row">
+        <span id="cpsb-status-dot" class="cpsb-dot cpsb-dot-disconnected"></span>
+        <sp-body id="cpsb-status-text" size="S">Disconnected</sp-body>
+      </div>
+      <div id="cpsb-server-url" class="cpsb-muted"></div>
+
+      <sp-divider size="small"></sp-divider>
+
+      <div class="cpsb-section-title">Active handoffs</div>
+      <ul id="cpsb-handoff-list" class="cpsb-list">
+        <li class="cpsb-empty">No documents from ComfyUI are currently open.</li>
+      </ul>
+
+      <sp-divider size="small"></sp-divider>
+
+      <details class="cpsb-advanced">
+        <summary>Advanced</summary>
+        <div class="cpsb-log-wrap">
+          <pre id="cpsb-log" class="cpsb-log"></pre>
+        </div>
+      </details>
+    </div>
+    <script src="./index.js"></script>
+  </body>
+</html>

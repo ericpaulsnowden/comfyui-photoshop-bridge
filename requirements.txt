@@ -1,0 +1,5 @@
+# torch is deliberately not listed: ComfyUI itself provides it.
+watchdog
+psd-tools>=1.9.24
+pillow>=10.3.0
+numpy

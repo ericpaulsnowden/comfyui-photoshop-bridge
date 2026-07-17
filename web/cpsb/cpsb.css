@@ -1,0 +1,388 @@
+/*
+ * Styles for comfyui-photoshop-bridge's frontend extension. Every rule is
+ * scoped under a `cpsb-` class prefix. Colors reference ComfyUI's own CSS
+ * custom properties where available (verified in use across
+ * Comfy-Org/ComfyUI_frontend's `src/scripts/ui/menu/menu.css` and
+ * `src/lib/litegraph/public/css/litegraph.css`), each with a sensible
+ * hardcoded fallback so the UI still looks reasonable if a variable is
+ * renamed or absent on some frontend version.
+ */
+
+.cpsb-gallery-root {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  height: 100%;
+  min-width: 0;
+  padding: 10px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  color: var(--fg-color, #e6e6e6);
+  font-size: 12px;
+}
+
+.cpsb-gallery-header {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.cpsb-gallery-empty {
+  color: var(--muted-foreground, #888);
+  padding: 24px 8px;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.cpsb-gallery-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Connection pill */
+
+.cpsb-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.cpsb-pill::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.cpsb-pill-connected {
+  color: #4caf50;
+  background: rgba(76, 175, 80, 0.14);
+}
+
+.cpsb-pill-disconnected {
+  color: var(--muted-foreground, #888);
+  background: rgba(128, 128, 128, 0.14);
+}
+
+/* Upgrade banner */
+
+.cpsb-upgrade-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--comfy-input-bg, #1a1a1a);
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.12));
+}
+
+.cpsb-upgrade-banner-text {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.4;
+}
+
+/* Handoff cards */
+
+.cpsb-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--comfy-menu-bg, #202020);
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.1));
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.cpsb-card-dragover {
+  border-color: #5b9bd5;
+  background: rgba(91, 155, 213, 0.12);
+}
+
+.cpsb-card-thumbs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cpsb-card-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--comfy-input-bg, #111);
+  flex-shrink: 0;
+}
+
+.cpsb-card-thumb-arrow {
+  color: var(--muted-foreground, #888);
+  flex-shrink: 0;
+}
+
+.cpsb-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cpsb-card-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  min-width: 0;
+}
+
+.cpsb-card-meta {
+  color: var(--muted-foreground, #888);
+  font-size: 11px;
+}
+
+.cpsb-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cpsb-card-action {
+  padding: 4px 9px;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
+  background: var(--comfy-input-bg, #262626);
+  color: var(--fg-color, #e6e6e6);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.cpsb-card-action:hover {
+  background: var(--content-hover-fg, #333);
+}
+
+.cpsb-card-action-danger {
+  color: var(--error-text, #f66);
+}
+
+/* Status chips */
+
+.cpsb-chip {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.cpsb-chip-pending {
+  color: #b0b0b0;
+  background: rgba(176, 176, 176, 0.16);
+}
+
+.cpsb-chip-editing {
+  color: #5b9bd5;
+  background: rgba(91, 155, 213, 0.16);
+}
+
+.cpsb-chip-edited {
+  color: #4caf50;
+  background: rgba(76, 175, 80, 0.16);
+}
+
+.cpsb-chip-error {
+  color: var(--error-text, #f66);
+  background: rgba(255, 102, 102, 0.14);
+}
+
+.cpsb-chip-stale {
+  color: #e0a030;
+  background: rgba(224, 160, 48, 0.16);
+}
+
+.cpsb-chip-cancelled,
+.cpsb-chip-discarded,
+.cpsb-chip-superseded {
+  color: var(--muted-foreground, #888);
+  background: rgba(128, 128, 128, 0.14);
+}
+
+/* Toasts (fallback path when app.extensionManager.toast is unavailable, and
+   always for action toasts since the native toast has no action button) */
+
+.cpsb-toast-container {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 320px;
+  pointer-events: none;
+}
+
+.cpsb-toast {
+  pointer-events: auto;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--comfy-menu-bg, #202020);
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.12));
+  color: var(--fg-color, #e6e6e6);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.cpsb-toast-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.cpsb-toast-summary {
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.cpsb-toast-detail {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted-foreground, #aaa);
+  line-height: 1.4;
+}
+
+.cpsb-toast-info {
+  border-left: 3px solid #5b9bd5;
+}
+
+.cpsb-toast-success {
+  border-left: 3px solid #4caf50;
+}
+
+.cpsb-toast-warn {
+  border-left: 3px solid #e0a030;
+}
+
+.cpsb-toast-error {
+  border-left: 3px solid var(--error-text, #f66);
+}
+
+.cpsb-toast-action {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.cpsb-toast-body {
+  min-width: 0;
+}
+
+.cpsb-toast-action-button {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  border-radius: 5px;
+  border: 1px solid #5b9bd5;
+  background: rgba(91, 155, 213, 0.16);
+  color: #5b9bd5;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.cpsb-toast-action-button:hover {
+  background: rgba(91, 155, 213, 0.28);
+}
+
+/* Chooser / confirm overlay (Edit Original vs Start Fresh, etc.) */
+
+.cpsb-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+.cpsb-dialog-visible {
+  opacity: 1;
+}
+
+.cpsb-dialog {
+  width: min(360px, 90vw);
+  padding: 18px;
+  border-radius: 10px;
+  background: var(--comfy-menu-bg, #242424);
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
+  color: var(--fg-color, #e6e6e6);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+.cpsb-dialog-title {
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.cpsb-dialog-message {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--content-fg, #ccc);
+  margin-bottom: 16px;
+}
+
+.cpsb-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.cpsb-dialog-button {
+  padding: 6px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.18));
+  background: var(--comfy-input-bg, #2c2c2c);
+  color: var(--fg-color, #e6e6e6);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cpsb-dialog-button:hover {
+  background: var(--content-hover-fg, #383838);
+}
+
+.cpsb-dialog-button-primary {
+  border-color: #5b9bd5;
+  background: rgba(91, 155, 213, 0.2);
+  color: #cfe4f7;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cpsb-toast,
+  .cpsb-dialog-backdrop,
+  .cpsb-card {
+    transition: none;
+  }
+}
+
+@media (prefers-color-scheme: light) {
+  .cpsb-card-thumb {
+    background: #eee;
+  }
+}

@@ -1,0 +1,330 @@
+# cpsb Protocol & Interface Contract
+
+This document is the single source of truth for every interface between the three
+components of comfyui-photoshop-bridge: the Python backend (registered on ComfyUI's
+PromptServer), the ComfyUI frontend extension (`web/js/`), and the Photoshop UXP
+plugin (`photoshop_plugin/`). If an implementation and this document disagree, the
+implementation is wrong or this document must be amended first — never drift silently.
+
+Referenced design rationale lives in `/PLAN.md` (repo parent) — section numbers cited as (§N).
+
+---
+
+## 1. Identifiers & filesystem layout
+
+- `handoff_id`: 8-char lowercase hex, generated with `uuid.uuid4().hex[:8]`, unique per
+  handoff. Treated as an unguessable capability token (§3 security): routes that read or
+  mutate a specific handoff require it and return 404 for unknown/inactive ids.
+- Managed folder, one per handoff, under ComfyUI's input directory:
+
+```
+input/cpsb/<handoff_id>/
+    source.psd        # the PSD handed to Photoshop (Tier 1 opens this path directly)
+    meta.json         # authoritative handoff state (schema below)
+    orig_thumb.png    # thumbnail of the ORIGINAL image, max 256px long side (gallery before/after)
+    edit_001.png ...  # ingested edits, in arrival order (edit_%03d.png)
+```
+
+- There is **no separate session manifest file**: on server start, the backend rebuilds
+  its in-memory state by scanning `input/cpsb/*/meta.json` (the meta files are the
+  source of truth; this supersedes PLAN §3's `session_manifest.json` — one file fewer,
+  same restart guarantee).
+- Handoffs with status `edited`, `cancelled`, `discarded`, `superseded`, or `error` older
+  than `cleanup_days` (default 14) are purged (folder deleted) at server start.
+  `pending`/`editing` handoffs are never auto-purged.
+
+### meta.json schema
+
+```json
+{
+  "handoff_id": "a1b2c3d4",
+  "origin_node_id": "17",
+  "origin_kind": "load_image" | "terminal_output" | "bridge_node",
+  "workflow_name": "my-workflow",
+  "source_hash": "<sha256 hex of the original image's normalized PNG encoding>",
+  "source": {"filename": "ComfyUI_00042_.png", "subfolder": "", "type": "output"},
+  "created_ts": 1752680000.0,
+  "updated_ts": 1752680123.4,
+  "status": "pending" | "editing" | "edited" | "cancelled" | "discarded" | "superseded" | "error",
+  "error": null,
+  "edits": [
+    {"filename": "edit_001.png", "ts": 1752680123.4,
+     "fidelity": "composite" | "recomposite" | "plugin",
+     "sibling_output": {"filename": "ComfyUI_00042_ps1.png", "subfolder": ""} 
+    }
+  ]
+}
+```
+
+Status transitions:
+`pending` (created) → `editing` (open confirmed: Tier 1 OS-launch succeeded, or plugin sent
+`opened`) → `edited` (≥1 edit ingested; stays `edited` as further saves append to `edits`).
+`cancelled` (user cancel), `discarded` (gallery discard), `superseded` (replaced by a
+"Start Fresh Edit"), `error` (open/ingest failure, with `error` string) are terminal.
+"Stale" is **not** a status — the frontend derives it (`editing` and `updated_ts` older
+than 1h).
+
+`fidelity` records how the edit's pixels were produced: `composite` = embedded
+Maximize-Compatibility composite (Tier 1 best case), `recomposite` = psd-tools re-render
+fallback (Tier 1, user declined Maximize Compatibility — imperfect fidelity),
+`plugin` = final pixels delivered as-is via `/cpsb/upload` — both the UXP plugin's own
+flattened PNG export (Tier 2) and a manual gallery drag-drop import map here, since
+neither is derived by this backend.
+
+Additional field semantics:
+- `source_hash`: sha256 of the original image's normalized PNG bytes, written at
+  creation. The bridge node compares it against its current input to decide whether an
+  existing handoff still corresponds to the same image (§6); missing on legacy metas →
+  treated as matching.
+- Cleanup age is measured on `updated_ts` (last activity), not `created_ts`.
+- Active-handoff lookup (`mode:"new"` 409 check, "Edit Original" targeting) is scoped by
+  `workflow_name` when both the request's and the candidate's names are non-empty; an
+  empty name on either side is a wildcard (unsaved workflows, bridge handoffs).
+
+---
+
+## 2. HTTP routes
+
+All routes are registered on `PromptServer.instance.routes` (same port as ComfyUI, no
+extra server). JSON errors use `{"error": "<human-readable message>"}` with the status
+codes below.
+
+### POST `/cpsb/open`
+Create a handoff and open it in Photoshop. Body (JSON):
+
+```json
+{
+  "filename": "ComfyUI_00042_.png",
+  "subfolder": "",
+  "type": "output",              // "input" | "output" | "temp" — same triple as /view
+  "origin_node_id": "17",         // graph node id as string
+  "origin_kind": "load_image",    // "load_image" | "terminal_output" | "bridge_node"
+  "workflow_name": "my-workflow", // optional, for the gallery
+  "mode": "new"                   // "new" | "original" | "fresh"
+}
+```
+
+- `mode:"new"`: no active handoff expected for this node. If one exists (status
+  `pending`/`editing`/`edited`), respond **409** with
+  `{"error": ..., "existing_handoff_id": "..."}` — the frontend then shows
+  "Edit Original / Start Fresh" and re-calls with the chosen mode.
+- `mode:"original"`: re-open the existing handoff's `source.psd` (layers preserved).
+  Requires `existing` handoff for the node; 404 otherwise.
+- `mode:"fresh"`: mark the existing handoff `superseded`, then proceed as `new`.
+
+Success **200**: `{"handoff_id": "...", "tier": 1 | 2, "status": "pending"}`.
+Errors: **404** source image not found; **400** malformed body; **503** neither tier
+available (Tier 1 gated off — headless/container/remote — and no plugin connected),
+body includes `{"tier1_available": false, "tier2_connected": false}`.
+The response is **200 with `status:"pending"` even if the launch attempt itself then
+fails** — the contract's error codes cover pre-launch validation only; launch outcome
+is conveyed asynchronously via `cpsb.status` (`editing` on success, `error` on failure).
+
+Tier selection: if a UXP plugin websocket is currently connected → Tier 2 (send
+`open_handoff` over WS); else if Tier 1 available → OS-launch Photoshop with the PSD
+path. Tier 1's watchdog stays armed in both tiers (§5 — redundant detector; first
+ingest wins, duplicates are idempotent by file hash).
+
+### POST `/cpsb/upload`
+Deliver edited pixels (Tier 2 plugin, or manual gallery drag-drop import).
+`multipart/form-data`: `handoff_id` (field), `image` (PNG file part),
+`source` (field, `"plugin"` | `"manual"`).
+
+Accepted only when handoff status is `pending`, `editing`, or `edited` — otherwise
+**409**. Unknown id **404**. On success the backend ingests (see §4 of this doc),
+responds **200** `{"ok": true, "filename": "edit_002.png", "subfolder": "cpsb/<id>",
+"type": "input"}`. A duplicate upload (SHA256-identical to the latest edit — the
+watchdog and plugin may both report one save) is idempotent: **200** with the existing
+latest edit's filename, no new edit recorded.
+
+### GET `/cpsb/file/{handoff_id}`
+Returns `source.psd` bytes (`Content-Type: image/vnd.adobe.photoshop`). Used by the
+plugin in remote mode. 404 for unknown id or non-active status.
+
+### POST `/cpsb/cancel/{handoff_id}`
+Marks the handoff `cancelled`, unblocks a waiting bridge node (which then raises
+`InterruptProcessingException`), notifies the plugin (`handoff_cancelled`). 200
+`{"ok": true}`; 404 unknown.
+
+### POST `/cpsb/discard/{handoff_id}`
+Gallery "Discard" for stale handoffs: same as cancel but sets `discarded`. 200/404.
+
+### GET `/cpsb/status`
+```json
+{
+  "tier1_available": true,
+  "tier1_reason": null,            // or "headless-server" | "no-photoshop" | ...
+  "tier2_connected": false,
+  "ps_version": null,               // e.g. "26.5" when plugin connected
+  "handoffs": [ <meta.json objects, newest first, max 200> ]
+}
+```
+
+### GET `/cpsb/thumb/{handoff_id}`
+Returns `orig_thumb.png` bytes. (Edited-image thumbnails are fetched via ComfyUI's own
+`/view?filename=edit_00N.png&subfolder=cpsb/<id>&type=input`.)
+
+### GET `/cpsb/settings` / POST `/cpsb/settings`
+Backend-persisted settings (stored at `<user_dir>/cpsb.json`), JSON object:
+`{"photoshop_path": "", "debounce_ms": 800, "cleanup_days": 14, "sibling_outputs": true}`.
+POST merges partial updates and returns the full object. (Frontend-only preferences —
+auto-queue toggle — use ComfyUI's settings API instead, id prefix `cpsb.`.)
+
+### GET `/cpsb/ws`
+WebSocket upgrade endpoint for the UXP plugin. Protocol in §3 of this doc.
+
+---
+
+## 3. Plugin websocket protocol
+
+Text frames, one JSON object per frame, every message has `"type"`. Unknown types are
+ignored (forward compatibility). The server allows **one** plugin connection; a new
+connection replaces the old (old socket closed with code 4000).
+
+Plugin → server:
+- `{"type": "hello", "plugin_version": "0.1.0", "ps_version": "26.5", "uxp_version": "8.1"}`
+  Server replies `hello_ack`. Sent once per connection, first message.
+- `{"type": "ready", "local_mode": true}` — after the plugin probes whether
+  `input_cpsb_path` from `hello_ack` exists on its local filesystem. `local_mode:true`
+  → `open_handoff` uses the shared path; `false` → remote mode (fetch via `/cpsb/file/`).
+- `{"type": "opened", "handoff_id": "...", "document_id": 123}` — document open
+  succeeded; server sets status `editing`.
+- `{"type": "open_failed", "handoff_id": "...", "error": "..."}` — server sets status
+  `error`, falls back to Tier 1 OS-open if available.
+- `{"type": "save_detected", "handoff_id": "..."}` — informational (UI badge); pixels
+  follow via POST `/cpsb/upload`.
+- `{"type": "pong"}`
+
+Server → plugin:
+- `{"type": "hello_ack", "server_version": "0.1.0", "input_cpsb_path": "/abs/path/to/input/cpsb"}`
+- `{"type": "open_handoff", "handoff_id": "...", "psd_path": "/abs/.../source.psd", "file_url": "/cpsb/file/<id>"}`
+  Plugin opens `psd_path` directly in local mode, else downloads `file_url` into its
+  sandbox and opens that copy. Plugin records document↔handoff mapping either way
+  (path-keyed local, documentID-keyed remote) and replies `opened`/`open_failed`.
+- `{"type": "handoff_cancelled", "handoff_id": "..."}` — stop tracking that document.
+- `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
+  the socket (plugin reconnects with backoff).
+
+---
+
+## 4. Ingest pipeline (backend, both tiers)
+
+One function, `ingest_edit(handoff_id, pixels_or_path, fidelity)`, is the convergence
+point (PLAN §3 `mark_edited`): Tier 1 watchdog-settled PSD reads and Tier 2 uploads both
+end here. It:
+1. Writes `edit_%03d.png` into the handoff folder (which lives under `input/`, so the
+   result is addressable as `subfolder="cpsb/<id>", type="input"` by LoadImage widgets
+   and `/view`).
+2. Skips ingestion if the new edit's SHA256 equals the previous edit's (idempotency —
+   the watchdog and plugin may both fire for one save).
+3. If `origin_kind == "terminal_output"` and the source was in `output/` and setting
+   `sibling_outputs` is on: also writes `<origname>_ps<N>.png` next to the original
+   output file and records it as `sibling_output` in the edit entry.
+4. Updates `meta.json` (status `edited`, appends to `edits`).
+5. Unblocks a waiting bridge node for this handoff, if any.
+6. Emits `cpsb.updated` (below).
+
+Tier 1 PSD read: try the embedded Maximize-Compatibility composite first
+(fidelity `composite`); if absent, re-composite via psd-tools (fidelity `recomposite`).
+16-bit / non-RGB modes are converted to RGB8 (PLAN §4); alpha is preserved when present.
+A read that still fails after the retry budget is **non-terminal**: the watcher logs and
+leaves the handoff `editing` so the next save retries ingestion — it must never move a
+handoff to `error` (terminal statuses would silently drop all subsequent saves).
+
+---
+
+## 5. Frontend events (server → ComfyUI frontend via send_sync)
+
+- `"cpsb.updated"` — an edit arrived:
+  ```json
+  {"handoff_id": "...", "origin_node_id": "17", "origin_kind": "load_image",
+   "filename": "edit_002.png", "subfolder": "cpsb/a1b2c3d4", "type": "input",
+   "fidelity": "plugin",
+   "sibling_output": null }
+  ```
+- `"cpsb.status"` — handoff lifecycle changed (badge/gallery refresh):
+  `{"handoff_id": "...", "origin_node_id": "17", "status": "editing"}`
+- `"cpsb.tier2"` — plugin connection state changed:
+  `{"connected": true, "ps_version": "26.5"}`
+
+Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
+widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
+"[Add as node]" for `terminal_output`; auto-queue only for `load_image`/`bridge_node`
+when the `cpsb.autoQueue` setting is on).
+
+---
+
+## 6. Bridge node
+
+- Class `PhotoshopBridge`, display name "Photoshop Bridge", category `image/photoshop`.
+- Inputs: `image` (IMAGE); `wait_for_edit` (BOOLEAN, default True); `timeout_seconds`
+  (INT, default 1800, min 10, max 86400). Hidden: `unique_id` (UNIQUE_ID), `prompt`
+  (PROMPT), `extra_pnginfo` (EXTRA_PNGINFO).
+- Output: IMAGE.
+- Execute (edit-consumption semantics): if an active handoff for this node already has
+  an edit AND its `source_hash` matches the current input, that edit is returned
+  immediately WITHOUT re-opening Photoshop — re-execution is the "consume the edit"
+  path (a literal always-reopen reading would demand a new save on every re-queue, an
+  open loop). If the `source_hash` differs (upstream re-generated), the old handoff is
+  superseded and a fresh one is created and opened. Otherwise (no handoff, or no edit
+  yet): saves the incoming image to a handoff (origin_kind `bridge_node`, keyed to
+  `unique_id`), opens Photoshop (tier-selected), then if `wait_for_edit` blocks in a
+  `while ... time.sleep(0.2)` poll on the shared pending-table until edited / cancelled
+  / timeout (the latter two raise `InterruptProcessingException`; ComfyUI's own
+  interruption notice is the user-facing signal). The wait must also detect an edit
+  that landed between the open call and wait registration (edits-count snapshot, not
+  waiter-flag alone). On timeout the handoff stays `editing` — a later save or re-queue
+  resumes the same PSD with layers intact. If `wait_for_edit` is False: opens Photoshop
+  (fire-and-forget) and passes the input through unchanged; a prior matching edit, when
+  one exists, is returned as above.
+- `IS_CHANGED`: SHA256 of the latest edit file for this node's active handoff (or a
+  constant when none) — an arriving edit changes the hash and forces downstream
+  re-execution on the next queue, matching LoadImage semantics.
+
+---
+
+## 7. Photoshop discovery & launch (Tier 1, backend)
+
+Order: settings `photoshop_path` override → platform discovery → error.
+- macOS: `open -b com.adobe.Photoshop <psd>`; on failure enumerate installed apps via
+  `mdfind "kMDItemCFBundleIdentifier == 'com.adobe.Photoshop'"`, prefer the highest
+  year/version, `open -a <app path> <psd>`.
+- Windows: `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Photoshop.exe`,
+  else enumerate `HKLM\SOFTWARE\Adobe\Photoshop\<ver>` `ApplicationPath`, newest first;
+  launch `Popen([exe, psd])`. `os.startfile(psd)` only as a last resort (association may
+  not be Photoshop — surface a warning in the response so the frontend can toast it).
+- Tier 1 gating (`tier1_available:false`, with `tier1_reason` ∈ `"headless-server"` |
+  `"docker"` | `"wsl"` | `null`): Linux without `DISPLAY`/`WAYLAND_DISPLAY`;
+  `/.dockerenv` present; WSL (`microsoft` in `platform.release().lower()`).
+  "No Photoshop installed" is NOT a gating reason — it is only discoverable at launch
+  time and surfaces through the launch-failure path (§2 note). The frontend additionally
+  disables Tier 1 client-side when `window.location.hostname` is not localhost and shows
+  the §6-table tooltip. Launch calls are blocking subprocess work and MUST run off the
+  event loop (`asyncio.to_thread`) when invoked from route/websocket handlers.
+
+---
+
+## 8. Frontend ↔ backend conventions
+
+- All frontend calls go through `api.fetchApi("/cpsb/...")` (ComfyUI's wrapper — it
+  handles the api prefix and client id).
+- The context-menu integration registers via `getNodeMenuItems` when available,
+  falling back to a `getExtraMenuOptions` monkeypatch on older frontends (spike §8-1
+  will confirm image-region behavior; menu items appear regardless via the node menu).
+- Menu items offered on any node whose `node.imgs` is non-empty: "Open in Photoshop"
+  (no active handoff), or "Edit Original in Photoshop" + "Start Fresh in Photoshop"
+  (active handoff exists — tracked client-side from `cpsb.status` events + initial
+  `/cpsb/status` fetch).
+- Batch nodes (`node.imgs.length > 1`): open the **currently displayed** image
+  (`node.imageIndex ?? 0`); an "Open all N in Photoshop" item appears for N ≤ 8.
+- Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
+  `cpsb.showUpgradeBanner` (bool, default true).
+
+---
+
+## 9. Versioning
+
+Backend, frontend JS, and plugin each carry a semver string; `hello`/`hello_ack`
+exchange them. During 0.x, a minor-version mismatch between plugin and backend logs a
+console warning and shows a gallery banner ("Photoshop panel v0.1.0 ≠ server v0.2.0 —
+update the plugin") but does not refuse the connection.

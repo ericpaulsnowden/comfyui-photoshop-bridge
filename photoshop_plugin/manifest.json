@@ -1,0 +1,46 @@
+{
+  "manifestVersion": 5,
+  "id": "com.cpsb.comfyui-bridge",
+  "name": "ComfyUI Bridge",
+  "version": "0.1.0",
+  "main": "src/panel.html",
+  "host": {
+    "app": "PS",
+    "minVersion": "24.4.0",
+    "data": {
+      "apiVersion": 2,
+      "loadEvent": "startup"
+    }
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "comfyui",
+      "label": {
+        "default": "ComfyUI"
+      },
+      "minimumSize": { "width": 240, "height": 260 },
+      "maximumSize": { "width": 2000, "height": 2000 },
+      "preferredDockedSize": { "width": 280, "height": 400 },
+      "preferredFloatingSize": { "width": 280, "height": 400 }
+    },
+    {
+      "type": "command",
+      "id": "sendBackNow",
+      "label": {
+        "default": "Send back now"
+      }
+    }
+  ],
+  "requiredPermissions": {
+    "network": {
+      "domains": [
+        "http://127.0.0.1:8188",
+        "ws://127.0.0.1:8188",
+        "http://localhost:8188",
+        "ws://localhost:8188"
+      ]
+    },
+    "localFileSystem": "fullAccess"
+  }
+}

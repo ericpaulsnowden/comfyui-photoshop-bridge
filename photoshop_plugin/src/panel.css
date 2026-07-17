@@ -1,0 +1,133 @@
+/*
+ * Minimal styling layered on top of UXP's own theming. <sp-button>,
+ * <sp-divider>, and <sp-body> already track Photoshop's current theme with
+ * zero CSS of our own (they are Photoshop's native Spectrum UXP widgets,
+ * not a UI library this plugin ships). Everything below is either plain
+ * layout, or uses Photoshop's documented theme-aware CSS custom properties
+ * (--uxp-host-*, see the "Making your Plugin Theme-aware" guide) so this
+ * still reads correctly across all four Photoshop themes (darkest, dark,
+ * light, lightest), not just dark.
+ */
+
+body {
+  margin: 0;
+  padding: 12px;
+  color: var(--uxp-host-text-color);
+  font-size: var(--uxp-host-font-size, 12px);
+}
+
+.cpsb-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cpsb-status-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cpsb-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  background: #888888;
+}
+
+.cpsb-dot-connected {
+  background: #2ecc71;
+}
+
+.cpsb-dot-connecting {
+  background: #e6b800;
+}
+
+.cpsb-dot-disconnected {
+  background: #e74c3c;
+}
+
+.cpsb-muted {
+  color: var(--uxp-host-text-color-secondary, var(--uxp-host-text-color));
+  font-size: var(--uxp-host-font-size-smaller, 11px);
+}
+
+.cpsb-section-title {
+  font-weight: 600;
+  font-size: var(--uxp-host-font-size-smaller, 11px);
+  text-transform: uppercase;
+  color: var(--uxp-host-label-text-color, var(--uxp-host-text-color));
+  margin-top: 4px;
+}
+
+.cpsb-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cpsb-empty {
+  color: var(--uxp-host-text-color-secondary, var(--uxp-host-text-color));
+  font-size: var(--uxp-host-font-size-smaller, 11px);
+  padding: 4px 0;
+}
+
+.cpsb-handoff-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--uxp-host-border-color, rgba(128, 128, 128, 0.3));
+}
+
+.cpsb-handoff-item:last-child {
+  border-bottom: none;
+}
+
+.cpsb-handoff-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--uxp-host-font-size, 12px);
+}
+
+.cpsb-handoff-status {
+  flex: none;
+  color: var(--uxp-host-text-color-secondary, var(--uxp-host-text-color));
+  font-size: var(--uxp-host-font-size-smaller, 11px);
+}
+
+.cpsb-advanced {
+  margin-top: 4px;
+}
+
+.cpsb-advanced summary {
+  cursor: pointer;
+  font-size: var(--uxp-host-font-size-smaller, 11px);
+  text-transform: uppercase;
+  color: var(--uxp-host-label-text-color, var(--uxp-host-text-color));
+}
+
+.cpsb-log-wrap {
+  margin-top: 6px;
+}
+
+.cpsb-log {
+  margin: 0;
+  max-height: 160px;
+  overflow-y: auto;
+  font-size: 10px;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--uxp-host-background-color, rgba(128, 128, 128, 0.1));
+  border: 1px solid var(--uxp-host-border-color, rgba(128, 128, 128, 0.3));
+  border-radius: 4px;
+  padding: 6px;
+}
