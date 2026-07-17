@@ -21,8 +21,11 @@ except ImportError:
 
 logger = logging.getLogger("cpsb")
 
+# Display name only (PROTOCOL.md §6). The class id "PhotoshopBridge" below
+# MUST NOT change: saved workflows reference nodes by this id, and renaming
+# it would silently break every workflow that already has this node in it.
 NODE_CLASS_MAPPINGS = {"PhotoshopBridge": _cpsb_nodes.PhotoshopBridge}
-NODE_DISPLAY_NAME_MAPPINGS = {"PhotoshopBridge": "Photoshop Bridge"}
+NODE_DISPLAY_NAME_MAPPINGS = {"PhotoshopBridge": "Edit in Photoshop"}
 
 # ComfyUI checks os.path.isdir() on this itself (nodes.py load_custom_node),
 # so a missing/not-yet-built web/ folder is tolerated, never a crash.
