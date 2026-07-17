@@ -7,9 +7,18 @@ research/research-multilayer-compose.md §1.1/§3). Canvas size is the max
 width/height across every connected input; each layer keeps its own native
 resolution (never rescaled) and is centered on the shared canvas;
 ``image_1`` becomes the BOTTOM layer, higher indices stack on top, and every
-layer lands inside one named, expanded group. ``edit_after=True`` additionally
-opens the written file in Photoshop, non-blocking, the same way a right-click
-"Open in Photoshop" on a Load PSD node would.
+layer lands inside one named, expanded group. The ``mode`` COMBO
+(PROTOCOL.md §6c) then mirrors the "Edit in Photoshop" bridge node's three
+behaviors, applied to the freshly-written LAYERED file so the user
+composites/adjusts LAYERS in Photoshop and the node outputs the SAVED result
+flattened: "Wait for first save" (the default) BLOCKS ``execute()`` until the
+first save then continues with that edit; "Re-run on every save" opens
+Photoshop, passes the flat composite through, and relies on the frontend
+auto-queueing a re-run per save (each consuming the latest edit); "Don't open
+(composite only)" is the old always-flat behavior that never opens Photoshop.
+This replaces the earlier fire-and-forget ``edit_after`` BOOLEAN as a
+pre-release breaking change (the product owner's "doesn't make sense" call:
+the useful flow is the blocking stop-open-edit-continue one, now the default).
 
 **psd-tools group-write API, verified empirically against the installed
 1.17.4** (not taken from docs/tests alone -- research-multilayer-compose.md
@@ -48,7 +57,7 @@ from PIL import Image
 from psd_tools import PSDImage
 
 from . import nodes
-from .handoff import HandoffManager, HandoffMeta, SourceRef, compute_source_hash
+from .handoff import HandoffManager, HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
 
 logger = logging.getLogger("cpsb")
 
@@ -62,6 +71,16 @@ MAX_IMAGE_INPUTS = 20
 
 DEFAULT_FILENAME_PREFIX = "compose"
 DEFAULT_GROUP_NAME = "ComfyUI Layers"
+
+#: The Compose-node-specific third ``mode`` string (PROTOCOL.md §6c). The
+#: other two options reuse :class:`cpsb.nodes.BridgeMode`'s constants verbatim
+#: (``WAIT_FIRST_SAVE`` / ``RERUN_EVERY_SAVE``), but this one is deliberately
+#: NOT ``BridgeMode.OPEN_ONLY``: that bridge string is "Open only (don't wait)"
+#: and its meaning is "fire-and-forget open, then pass through", whereas this
+#: node's third mode is "never open Photoshop at all" (the old always-flat
+#: ``edit_after=False`` behavior). Different text, different behavior -- so it
+#: is its own constant rather than an alias of the bridge one.
+MODE_DONT_OPEN = "Don't open (composite only)"
 
 #: Per-layer opacity written into the PSD (PROTOCOL.md §6c says nothing
 #: about partial opacity, so every layer is fully opaque -- the visible
@@ -119,7 +138,7 @@ def _sanitize_filename_prefix(raw: str) -> str:
 
 
 def _compute_inputs_hash(
-    pil_images: list[Image.Image], filename_prefix: str, group_name: str, edit_after: bool
+    pil_images: list[Image.Image], filename_prefix: str, group_name: str, mode: str
 ) -> str:
     """A deterministic sha256 identity for "these inputs, these params".
 
@@ -137,11 +156,15 @@ def _compute_inputs_hash(
     ``source_hash``: any addition, removal, reorder, or pixel change of an
     input changes the combined result, matching what a single-image node's
     plain ``compute_source_hash`` comparison already guarantees (PROTOCOL.md
-    §1/§6). ``filename_prefix``/``group_name``/``edit_after`` are folded in
-    too, since a change to any of them should also force re-execution
-    (a different filename or group label is a different desired output, and
-    toggling ``edit_after`` changes what execute() does even for pixel-
-    identical inputs).
+    §1/§6). ``filename_prefix``/``group_name``/``mode`` are folded in too,
+    since a change to any of them should also force re-execution (a different
+    filename or group label is a different desired output, and switching
+    ``mode`` changes what execute() does even for pixel-identical inputs).
+    Folding ``mode`` in also keeps a handoff created under one mode from ever
+    being consumed by a run under a different mode: the recorded
+    ``source_hash`` bakes the mode in, so a stale handoff from a
+    since-switched-away-from mode simply fails the ``source_hash`` match in
+    :func:`_find_matching_active_handoff` rather than needing a separate guard.
 
     Note this is NOT literally "sha256 of the PSD bytes that would be
     written" -- computing that would require re-serializing a full PSD on
@@ -158,7 +181,9 @@ def _compute_inputs_hash(
         filename_prefix: The (already-:func:`_sanitize_filename_prefix`'d)
             filename prefix.
         group_name: The ``group_name`` widget value.
-        edit_after: The ``edit_after`` widget value.
+        mode: The ``mode`` widget value (one of :data:`MODE_DONT_OPEN`,
+            :attr:`cpsb.nodes.BridgeMode.WAIT_FIRST_SAVE`, or
+            :attr:`cpsb.nodes.BridgeMode.RERUN_EVERY_SAVE`).
 
     Returns:
         A 64-char lowercase hex sha256 digest.
@@ -170,24 +195,28 @@ def _compute_inputs_hash(
     hasher.update(b"\x00")
     hasher.update(group_name.encode("utf-8"))
     hasher.update(b"\x00")
-    hasher.update(b"1" if edit_after else b"0")
+    hasher.update(mode.encode("utf-8"))
     return hasher.hexdigest()
 
 
 def _find_matching_active_handoff(
     manager: HandoffManager, node_id: str, inputs_hash: str
 ) -> HandoffMeta | None:
-    """The active ``load_psd`` handoff for *node_id*, iff it has a consumable edit.
+    """The active ``bridge_node`` handoff for *node_id*, iff it has a consumable edit.
 
-    Mirrors :func:`cpsb.load_psd._find_matching_active_handoff`'s predicate
-    exactly (same shape, deliberately re-implemented rather than imported --
-    ``cpsb/load_psd.py`` is owned by another concurrent change; importing a
-    private helper from it would couple this module to that one's internals
-    for no real benefit, matching how ``cpsb/nodes.py`` and
-    ``cpsb/load_psd.py`` already keep small, parallel helpers rather than
-    sharing every last one). Shared by
-    :meth:`PhotoshopComposePSD.IS_CHANGED` and
+    Mirrors :meth:`cpsb.nodes.PhotoshopBridge.execute`'s consume predicate
+    (same shape, deliberately re-implemented rather than imported --
+    ``cpsb/nodes.py`` is owned elsewhere and keeps its check inline; a small
+    parallel helper here couples nothing to that module's internals). Shared
+    by :meth:`PhotoshopComposePSD.IS_CHANGED` and
     :meth:`PhotoshopComposePSD.execute`.
+
+    The ``origin_kind == "bridge_node"`` filter matches what this node's own
+    open paths now write (:meth:`PhotoshopComposePSD._create_bridge_handoff`,
+    PROTOCOL.md §6c: "The handoff uses origin_kind ``bridge_node``"), so the
+    just-opened handoff -- and any edit saved into it -- is recognized on the
+    next queue and its edit consumed. It replaces the earlier ``load_psd``
+    filter the fire-and-forget ``edit_after`` build used.
 
     Args:
         manager: The handoff manager.
@@ -196,15 +225,16 @@ def _find_matching_active_handoff(
 
     Returns:
         The matching handoff, or ``None`` when there is no active handoff for
-        this node, it isn't ``origin_kind == "load_psd"`` (defensive -- see
-        :func:`cpsb.load_psd._find_matching_active_handoff`'s identical
-        note), its recorded ``source_hash`` doesn't equal *inputs_hash*, or
-        it has no edits yet -- each meaning "write a fresh compose instead".
+        this node, it isn't ``origin_kind == "bridge_node"`` (defensive --
+        e.g. a leftover handoff of another kind for the same node id), its
+        recorded ``source_hash`` doesn't equal *inputs_hash* (different
+        inputs/params/mode), or it has no edits yet -- each meaning "write a
+        fresh compose instead".
     """
     active = manager.find_active_for_node(node_id)
     if (
         active is not None
-        and active.origin_kind == "load_psd"
+        and active.origin_kind == "bridge_node"
         and active.source_hash == inputs_hash
         and active.edits
     ):
@@ -389,19 +419,46 @@ class PhotoshopComposePSD:
     :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s ``psd`` combo or ComfyUI's
     own ``/view``.
 
-    ``edit_after=True`` additionally creates a ``load_psd`` handoff for the
-    just-written file and opens Photoshop non-blocking (PROTOCOL.md §6c;
-    see :meth:`_open_after_compose`'s docstring for exactly what "non-
-    blocking" and "managed copy, not edit-in-place" mean for this v1).
+    The ``mode`` COMBO (PROTOCOL.md §6c) mirrors the "Edit in Photoshop"
+    bridge node's three behaviors exactly, applied to the just-written
+    LAYERED file:
 
-    Consume semantics mirror :class:`~cpsb.load_psd.PhotoshopLoadPSD`
-    exactly, keyed off :func:`_compute_inputs_hash` instead of a single
-    file's raw bytes (PROTOCOL.md §6c): while an ACTIVE ``load_psd`` handoff
-    for this node has a ``source_hash`` matching the CURRENT inputs' combined
-    hash and at least one edit, :meth:`execute` returns that edit's pixels
+    * :attr:`cpsb.nodes.BridgeMode.WAIT_FIRST_SAVE` ("Wait for first save",
+      the DEFAULT) creates a ``bridge_node`` handoff for the file, opens
+      Photoshop, and BLOCKS :meth:`execute` in
+      :meth:`cpsb.handoff.HandoffManager.wait_for_edit` until the first save
+      -- then returns that SAVED edit (flattened) as the IMAGE/MASK outputs.
+      Cancel/timeout raise ComfyUI's own ``InterruptProcessingException`` via
+      :func:`cpsb.nodes._raise_interrupt`, exactly like the bridge node.
+    * :attr:`cpsb.nodes.BridgeMode.RERUN_EVERY_SAVE` ("Re-run on every save")
+      never blocks: it opens Photoshop once, passes the flat composite
+      through, and relies on the frontend auto-queueing a re-run per save
+      (PROTOCOL.md §5), each of which consumes the latest edit via the
+      consume path below.
+    * :data:`MODE_DONT_OPEN` ("Don't open (composite only)") is the old
+      always-flat behavior: build and return the flat composite, never touch
+      Photoshop, create no handoff.
+
+    The blocking-wait, open, and consume machinery is imported from
+    :mod:`cpsb.nodes` (:meth:`~cpsb.nodes.PhotoshopBridge._open_in_photoshop`,
+    :func:`~cpsb.nodes._raise_interrupt`) rather than duplicated, so this
+    node's Tier 1/Tier 2 behavior is identical to the bridge node's by
+    construction. **v1 uses a MANAGED COPY of the generated file, not
+    ``edit_in_place``** (see :meth:`_create_bridge_handoff` for why -- true
+    ``edit_in_place`` would mean touching ``cpsb/routes.py``/``cpsb/watcher.py``
+    plumbing this build does not own); the blocking round trip works
+    end-to-end all the same.
+
+    Consume semantics mirror :meth:`cpsb.nodes.PhotoshopBridge.execute`,
+    keyed off :func:`_compute_inputs_hash` instead of a single file's raw
+    bytes (PROTOCOL.md §6c): while an ACTIVE ``bridge_node`` handoff for this
+    node has a ``source_hash`` matching the CURRENT inputs' combined hash and
+    at least one edit, :meth:`execute` returns that edit's pixels (flattened)
     instead of composing fresh -- so re-queuing after a Photoshop save
     delivers the user's manual compositing/masking work, the same "consume
-    the edit" pattern PROTOCOL.md §6/§6b establish.
+    the edit" pattern PROTOCOL.md §6/§6b establish. This consume check runs
+    first for EVERY mode, so an already-saved edit is served without
+    re-opening Photoshop regardless of which mode is selected.
     """
 
     CATEGORY = "image/photoshop"
@@ -410,9 +467,17 @@ class PhotoshopComposePSD:
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
-        """``filename_prefix``/``group_name``/``edit_after`` + up to
-        :data:`MAX_IMAGE_INPUTS` optional ``image_N`` sockets + hidden
+        """``filename_prefix``/``group_name``/``mode``/``timeout_seconds`` + up
+        to :data:`MAX_IMAGE_INPUTS` optional ``image_N`` sockets + hidden
         ``unique_id`` (PROTOCOL.md §6c).
+
+        ``mode`` is a COMBO of the SAME three strings the "Edit in Photoshop"
+        node uses -- the first two reuse :class:`cpsb.nodes.BridgeMode`'s
+        constants verbatim (the frontend string-matches on them for its
+        auto-queue policy, PROTOCOL.md §5), the third is this node's own
+        :data:`MODE_DONT_OPEN`. ``timeout_seconds`` matches the bridge/annotate
+        nodes' bounds (default 1800, min 10, max 86400) and applies only to
+        "Wait for first save".
 
         Every ``image_N`` is declared optional so ComfyUI accepts any
         connected subset ``>= 1`` -- the frontend
@@ -426,7 +491,15 @@ class PhotoshopComposePSD:
             "required": {
                 "filename_prefix": ("STRING", {"default": DEFAULT_FILENAME_PREFIX}),
                 "group_name": ("STRING", {"default": DEFAULT_GROUP_NAME}),
-                "edit_after": ("BOOLEAN", {"default": False}),
+                "mode": (
+                    [
+                        nodes.BridgeMode.WAIT_FIRST_SAVE,
+                        nodes.BridgeMode.RERUN_EVERY_SAVE,
+                        MODE_DONT_OPEN,
+                    ],
+                    {"default": nodes.BridgeMode.WAIT_FIRST_SAVE},
+                ),
+                "timeout_seconds": ("INT", {"default": 1800, "min": 10, "max": 86400}),
             },
             "optional": optional,
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -437,7 +510,8 @@ class PhotoshopComposePSD:
         cls,
         filename_prefix: str,
         group_name: str,
-        edit_after: bool,
+        mode: str,
+        timeout_seconds: int,
         unique_id: str,
         **kwargs: Any,
     ) -> str:
@@ -454,10 +528,19 @@ class PhotoshopComposePSD:
         :meth:`~cpsb.load_psd.PhotoshopLoadPSD.IS_CHANGED`'s own
         ``_state_if_configured`` use) by returning just the bare inputs
         hash in that case, since there is no handoff manager to consult yet.
+
+        *timeout_seconds* is accepted (ComfyUI passes every declared input to
+        ``IS_CHANGED``) but deliberately NOT folded into the hash -- exactly
+        like the bridge and annotate nodes' own ``IS_CHANGED`` (PROTOCOL.md
+        §6/§6d): it only bounds how long a "Wait for first save" run waits,
+        never what a completed run produces, so hashing it would force
+        needless re-execution on a mere timeout tweak. *mode*, by contrast,
+        IS folded (through :func:`_compute_inputs_hash`) because switching it
+        genuinely changes the output.
         """
         pil_images = [nodes._tensor_to_pil(t) for t in _collect_connected_images(kwargs)]
         prefix = _sanitize_filename_prefix(filename_prefix)
-        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, edit_after)
+        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode)
 
         state = nodes._state_if_configured()
         if state is None:
@@ -473,22 +556,43 @@ class PhotoshopComposePSD:
         self,
         filename_prefix: str,
         group_name: str,
-        edit_after: bool,
+        mode: str,
+        timeout_seconds: int,
         unique_id: str,
         **kwargs: Any,
     ) -> tuple[Any, Any, str]:
         """Compose (or consume) and return ``(IMAGE, MASK, STRING)`` (PROTOCOL.md §6c).
 
-        Serves a consumable active edit first (see the class docstring's
-        "Consume semantics" paragraph); otherwise composes the connected
-        inputs fresh, writes the PSD, and -- when ``edit_after`` -- opens
-        Photoshop on it (:meth:`_open_after_compose`).
+        Serves a consumable active edit first (the class docstring's "Consume
+        semantics" paragraph -- this runs for EVERY mode, so an already-saved
+        edit is returned without re-opening Photoshop). Otherwise composes
+        the connected inputs fresh, writes the LAYERED PSD, and dispatches on
+        *mode*:
+
+        * :attr:`~cpsb.nodes.BridgeMode.WAIT_FIRST_SAVE`: open Photoshop and
+          BLOCK (:meth:`_open_and_wait_for_edit`) until the first save, then
+          return that SAVED edit (flattened) as the IMAGE/MASK outputs.
+          Cancel/timeout/open-failure raise ``InterruptProcessingException``.
+        * :attr:`~cpsb.nodes.BridgeMode.RERUN_EVERY_SAVE`: open Photoshop
+          non-blocking (:meth:`_open_passthrough`) and return the flat
+          composite; the frontend auto-queues a re-run per save (PROTOCOL.md
+          §5) which then takes the consume path above.
+        * :data:`MODE_DONT_OPEN`: return the flat composite, never open
+          Photoshop, create no handoff.
+
+        The STRING output is always the written PSD's filename, unchanged from
+        the old build -- including on the "Wait for first save" path, whose
+        IMAGE/MASK come from the saved edit but whose STRING still names the
+        file that was composed and handed off.
 
         Args:
             filename_prefix: Base name for the written file (sanitized via
                 :func:`_sanitize_filename_prefix` before use).
             group_name: Name of the single group every layer is placed in.
-            edit_after: Whether to open the written file in Photoshop.
+            mode: One of the three ``mode`` COMBO strings (see the class
+                docstring).
+            timeout_seconds: Bound on the "Wait for first save" blocking wait;
+                unused by the other two modes.
             unique_id: This node instance's id (ComfyUI's hidden
                 ``UNIQUE_ID`` input), used to key its handoff lookup.
             **kwargs: The connected ``image_N`` tensors, whichever subset
@@ -500,6 +604,10 @@ class PhotoshopComposePSD:
         Raises:
             ValueError: No ``image_N`` input is connected -- there is
                 nothing to compose.
+            comfy.model_management.InterruptProcessingException: "Wait for
+                first save" mode, when the open attempt fails or the wait ends
+                in cancel/timeout (via :func:`cpsb.nodes._raise_interrupt`) --
+                identical to the bridge node's own blocking behavior.
         """
         state = nodes._require_state()
         manager = state.manager
@@ -511,7 +619,7 @@ class PhotoshopComposePSD:
         pil_images = [nodes._tensor_to_pil(tensor) for tensor in tensors]
 
         prefix = _sanitize_filename_prefix(filename_prefix)
-        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, edit_after)
+        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode)
 
         active = _find_matching_active_handoff(manager, node_id, inputs_hash)
         if active is not None:
@@ -526,10 +634,11 @@ class PhotoshopComposePSD:
                 return image_tensor, mask_tensor, active.source.filename
 
         logger.info(
-            "cpsb compose_psd: node %s: composing %d layer(s) into group %r",
+            "cpsb compose_psd: node %s: composing %d layer(s) into group %r (mode=%r)",
             node_id,
             len(pil_images),
             group_name,
+            mode,
         )
         psd, canvas_width, canvas_height, placements = _build_group_psd(pil_images, group_name)
         output_path = _allocate_output_path(state.context.input_dir, prefix)
@@ -539,89 +648,102 @@ class PhotoshopComposePSD:
         flattened = _flatten_placements(placements, canvas_width, canvas_height)
         image_tensor, mask_tensor = nodes._tensors_from_image(flattened)
 
-        if edit_after:
-            try:
-                self._open_after_compose(state, node_id, output_path, inputs_hash, flattened)
-            except Exception:
-                # PROTOCOL.md §6c: "Failure to open = log + cpsb.status error
-                # event, never a node crash" -- the composed outputs above
-                # are already valid and must still be returned regardless of
-                # what happens here. _open_in_photoshop (below) already
-                # catches and marks its own ordinary failure modes; this is
-                # a last-resort guard against a genuinely unexpected one.
-                logger.exception(
-                    "cpsb compose_psd: node %s: opening Photoshop after compose failed",
-                    node_id,
-                )
+        if mode == MODE_DONT_OPEN:
+            # Old always-flat behavior: no Photoshop, no handoff.
+            return image_tensor, mask_tensor, output_path.name
+
+        if mode == nodes.BridgeMode.WAIT_FIRST_SAVE:
+            # BLOCKS until the first save; returns the SAVED edit (flattened).
+            # Deliberately NOT wrapped in try/except: an open failure or a
+            # cancel/timeout must propagate as InterruptProcessingException
+            # (the bridge/annotate contract), never be swallowed here.
+            image_tensor, mask_tensor = self._open_and_wait_for_edit(
+                state, node_id, output_path, inputs_hash, flattened, timeout_seconds
+            )
+            return image_tensor, mask_tensor, output_path.name
+
+        # mode == BridgeMode.RERUN_EVERY_SAVE: open non-blocking, pass the flat
+        # composite through. PROTOCOL.md §6c: "Failure to open = log + cpsb.status
+        # error event, never a node crash" -- the composed outputs above are
+        # already valid and must still be returned. _open_in_photoshop already
+        # catches and marks its own ordinary failure modes; this try/except is a
+        # last-resort guard against a genuinely unexpected one.
+        try:
+            self._open_passthrough(state, node_id, output_path, inputs_hash, flattened)
+        except Exception:
+            logger.exception(
+                "cpsb compose_psd: node %s: opening Photoshop after compose failed",
+                node_id,
+            )
 
         return image_tensor, mask_tensor, output_path.name
 
     @staticmethod
-    def _open_after_compose(
+    def _create_bridge_handoff(
         state: nodes._NodeState,
         node_id: str,
         psd_path: Path,
         inputs_hash: str,
         composite_image: Image.Image,
-    ) -> None:
-        """``edit_after=True``: hand *psd_path* off to Photoshop (PROTOCOL.md §6c).
+    ) -> HandoffMeta:
+        """Create the ``bridge_node`` handoff whose ``source.psd`` is *psd_path* copied.
 
-        Creates a ``load_psd``-origin handoff and opens it the same
-        tier-selected, non-blocking way "Open in Photoshop" would for any
-        other Load-PSD-style source -- reusing
-        :meth:`cpsb.nodes.PhotoshopBridge._open_in_photoshop` (the
-        restructured, tier-selecting, bounded open path
-        :class:`~cpsb.nodes.PhotoshopBridge` itself calls; there is no
-        narrower public seam exposed for this today -- see this package's
-        build report for the exact call made and why). "Non-blocking" here
-        means exactly what PROTOCOL.md §6's "Open only (don't wait)" mode
-        means for the bridge node: this call returns as soon as the OS
-        launch (Tier 1) or the plugin ``open_handoff`` send (Tier 2)
-        completes -- it never waits for a save.
+        Shared by both open paths (:meth:`_open_and_wait_for_edit`,
+        :meth:`_open_passthrough`). Mirrors
+        :meth:`cpsb.nodes.PhotoshopBridge._create_handoff` and
+        :func:`cpsb.annotate._create_handoff` -- the same ``origin_kind =
+        "bridge_node"`` this node's consume path now looks for (PROTOCOL.md
+        §6c) -- but with one deliberate difference: instead of a FLATTENED
+        ``write_psd(pil_image)`` (which is all a bridge/annotate input is,
+        an in-memory tensor), it copies the just-written LAYERED file
+        *psd_path* byte-for-byte, so the user opens the actual layer stack in
+        Photoshop and composites/adjusts LAYERS there -- the whole point of
+        this node. This is the same copy rule PROTOCOL.md §2 states for
+        psd-native sources ("COPIES that file verbatim -- never
+        write_psd/frompil").
 
-        **v1 uses a MANAGED COPY, not ``edit_in_place``**: the handoff's own
-        ``source.psd`` is a byte-for-byte copy of *psd_path* (written here,
-        via :func:`~pathlib.Path.write_bytes`, mirroring PROTOCOL.md §2's
-        "COPIES that file verbatim -- never write_psd/frompil" rule for
-        psd-native sources), not a pointer at *psd_path* itself. This is a
-        deliberate scope decision for this build, not an oversight: wiring
-        true ``edit_in_place`` here would mean setting
-        ``HandoffManager.create(edit_in_place=True, original_path=...)`` and
-        registering the path with ``CpsbWatcher.watch_original`` -- both are
-        reached through ``cpsb/routes.py`` /
-        ``cpsb/watcher.py``-adjacent plumbing this build does not own or
-        touch (see the file-ownership note in this package's build report).
-        Once that concurrent ``edit_in_place`` work has landed, upgrading
-        this method to point the handoff at *psd_path* directly (skipping
-        the copy) is the natural follow-up -- the generated file is this
-        node's own output, so editing it in place is safe by construction,
-        exactly as PROTOCOL.md §6c's own line about it says.
+        **v1 uses a MANAGED COPY, not ``edit_in_place``** (annotate-style
+        handoff creation, the fallback the build brief calls for): the
+        handoff's ``source.psd`` is a copy of *psd_path* rather than a pointer
+        at it. PROTOCOL.md §6c's own line says the generated file is this
+        node's own output, so editing it in place would be safe by
+        construction -- but wiring true ``edit_in_place`` means
+        ``HandoffManager.create(edit_in_place=True, original_path=...)`` PLUS
+        registering that out-of-managed-folder path with the watcher
+        (``CpsbWatcher.watch_original``), reached through
+        ``cpsb/routes.py``/``cpsb/watcher.py`` plumbing this change does not
+        own. The managed copy makes the blocking round trip work end-to-end
+        all the same (the watcher already covers the managed folder, so a
+        Photoshop save into ``source.psd`` is ingested and unblocks the wait);
+        pointing the handoff directly at *psd_path* is the natural follow-up
+        once that ``edit_in_place`` plumbing lands.
 
-        ``source_hash`` is set to *inputs_hash* (the SAME value
-        :func:`_compute_inputs_hash` produces for
-        :meth:`PhotoshopComposePSD.IS_CHANGED`/``execute``'s own consume
-        check) rather than a hash of *psd_path*'s bytes -- see
-        :func:`_compute_inputs_hash`'s docstring for why: the consume check
-        in ``execute()`` needs to recompute a comparable value cheaply from
-        the CURRENT inputs on every call, which a PSD-bytes hash cannot
-        support without re-serializing a file just to test equality.
+        ``source_hash`` is set to *inputs_hash* (the SAME value the consume
+        check recomputes from the current inputs) rather than a hash of
+        *psd_path*'s bytes -- see :func:`_compute_inputs_hash`'s docstring for
+        why a PSD-bytes hash cannot support the cheap per-call equality test
+        the consume path needs.
 
         Args:
             state: The shared backend state.
-            node_id: This node instance's id (for logging).
+            node_id: This node instance's id (the handoff's ``origin_node_id``).
             psd_path: The just-written compose output (already on disk).
             inputs_hash: :func:`_compute_inputs_hash` of the inputs that
                 produced *psd_path* -- recorded as the handoff's
                 ``source_hash``.
             composite_image: The flattened composite (for the handoff's
                 ``orig_thumb.png``).
+
+        Returns:
+            The newly created handoff's metadata (status ``pending`` until the
+            open attempt marks it ``editing``/``error``).
         """
         manager = state.manager
         psd_bytes = psd_path.read_bytes()
 
         meta = manager.create(
             origin_node_id=node_id,
-            origin_kind="load_psd",
+            origin_kind="bridge_node",
             workflow_name="",
             source=SourceRef(filename=psd_path.name, subfolder="", type="input"),
             original_image=composite_image,
@@ -631,6 +753,139 @@ class PhotoshopComposePSD:
         handoff_psd_path.parent.mkdir(parents=True, exist_ok=True)
         handoff_psd_path.write_bytes(psd_bytes)
         manager.note_source_written(meta.handoff_id)
+        return meta
+
+    @staticmethod
+    def _open_and_wait_for_edit(
+        state: nodes._NodeState,
+        node_id: str,
+        psd_path: Path,
+        inputs_hash: str,
+        composite_image: Image.Image,
+        timeout_seconds: int,
+    ) -> tuple[Any, Any]:
+        """"Wait for first save": open Photoshop and BLOCK until saved (PROTOCOL.md §6c).
+
+        Identical in shape to :meth:`cpsb.nodes.PhotoshopBridge.execute`'s
+        "Wait for first save" tail and :func:`cpsb.annotate._open_and_block_for_edit`:
+        create the handoff (:meth:`_create_bridge_handoff`), open via the
+        shared tier-selecting seam
+        (:meth:`cpsb.nodes.PhotoshopBridge._open_in_photoshop`, reused rather
+        than reimplemented -- it already logs tier selection and the launch
+        result), then poll :meth:`cpsb.handoff.HandoffManager.wait_for_edit`
+        on this (worker) thread until the first save. Every step is also
+        logged under ``cpsb compose_psd:`` so a "didn't open Photoshop" report
+        is diagnosable from this node's own log trail.
+
+        Args:
+            state: The shared backend state.
+            node_id: This node instance's id.
+            psd_path: The just-written compose output.
+            inputs_hash: Recorded as the handoff's ``source_hash``.
+            composite_image: The flattened composite (thumbnail, and the
+                fallback returned if the edit file races away after the wait).
+            timeout_seconds: Bound on the blocking wait.
+
+        Returns:
+            ``(IMAGE, MASK)`` tensors of the SAVED edit (flattened) -- a
+            normal return means the wait outcome was
+            :data:`~cpsb.handoff.WaitOutcome.EDITED`.
+
+        Raises:
+            Whatever :func:`cpsb.nodes._raise_interrupt` raises (ComfyUI's own
+            ``InterruptProcessingException`` inside ComfyUI): when the open
+            attempt fails (never reaches the wait), or the wait ends in
+            ``CANCELLED``/``TIMEOUT``.
+        """
+        manager = state.manager
+        meta = PhotoshopComposePSD._create_bridge_handoff(
+            state, node_id, psd_path, inputs_hash, composite_image
+        )
+        handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+
+        logger.info(
+            "cpsb compose_psd: node %s handoff %s: opening Photoshop", node_id, meta.handoff_id
+        )
+        attempt = nodes.PhotoshopBridge._open_in_photoshop(state, meta, handoff_psd_path)
+        if attempt.ok:
+            logger.info(
+                "cpsb compose_psd: node %s handoff %s: launch result ok (tier %d)",
+                node_id,
+                meta.handoff_id,
+                attempt.tier,
+            )
+        else:
+            logger.warning(
+                "cpsb compose_psd: node %s handoff %s: could not open Photoshop (tier %d): "
+                "%s, interrupting",
+                node_id,
+                meta.handoff_id,
+                attempt.tier,
+                attempt.error,
+            )
+            # _open_in_photoshop already called manager.mark_error(...); nothing
+            # left but to stop the workflow rather than hang waiting for a save
+            # that can never arrive.
+            nodes._raise_interrupt()
+
+        logger.info(
+            "cpsb compose_psd: node %s handoff %s: waiting for edit (timeout=%ss)",
+            node_id,
+            meta.handoff_id,
+            timeout_seconds,
+        )
+        outcome = manager.wait_for_edit(meta.handoff_id, float(timeout_seconds))
+        logger.info(
+            "cpsb compose_psd: node %s handoff %s: wait outcome '%s'",
+            node_id,
+            meta.handoff_id,
+            outcome,
+        )
+        if outcome != WaitOutcome.EDITED:
+            nodes._raise_interrupt()
+
+        # A normal return above means WaitOutcome.EDITED -- an edit is on disk.
+        consumed = _consume_active_edit(manager, meta.handoff_id)
+        if consumed is not None:
+            return consumed
+        # Filesystem race: the edit file vanished between ingest and read.
+        # Fall back to the flat composite so the outputs stay valid.
+        return nodes._tensors_from_image(composite_image)
+
+    @staticmethod
+    def _open_passthrough(
+        state: nodes._NodeState,
+        node_id: str,
+        psd_path: Path,
+        inputs_hash: str,
+        composite_image: Image.Image,
+    ) -> None:
+        """"Re-run on every save": open Photoshop non-blocking (PROTOCOL.md §6c).
+
+        Creates the ``bridge_node`` handoff (:meth:`_create_bridge_handoff`)
+        and opens it through the shared tier-selecting seam, returning as soon
+        as the OS launch (Tier 1) or the plugin ``open_handoff`` send (Tier 2)
+        completes -- it never waits for a save. The caller returns the flat
+        composite; each later save is auto-queued by the frontend (PROTOCOL.md
+        §5, keyed on this node's ``mode`` widget being "Re-run on every save")
+        and consumed on the resulting re-run via :meth:`execute`'s consume
+        path. A failed open is logged and left marked ``error`` by
+        :meth:`~cpsb.nodes.PhotoshopBridge._open_in_photoshop` (which emits the
+        ``cpsb.status`` event PROTOCOL.md §6c requires) -- never raised, so the
+        already-valid composite outputs are still returned.
+
+        Args:
+            state: The shared backend state.
+            node_id: This node instance's id.
+            psd_path: The just-written compose output.
+            inputs_hash: Recorded as the handoff's ``source_hash``.
+            composite_image: The flattened composite (for the thumbnail).
+        """
+        manager = state.manager
+        meta = PhotoshopComposePSD._create_bridge_handoff(
+            state, node_id, psd_path, inputs_hash, composite_image
+        )
+        handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
 
         attempt = nodes.PhotoshopBridge._open_in_photoshop(state, meta, handoff_psd_path)
         if attempt.ok:
@@ -641,10 +896,6 @@ class PhotoshopComposePSD:
                 attempt.tier,
             )
         else:
-            # _open_in_photoshop already called manager.mark_error(...)
-            # internally, which emits the cpsb.status error event
-            # PROTOCOL.md §6c requires -- this is an additional, module-
-            # local log line only.
             logger.warning(
                 "cpsb compose_psd: node %s handoff %s: could not open Photoshop (%s)",
                 node_id,

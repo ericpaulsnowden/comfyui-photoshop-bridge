@@ -1,7 +1,10 @@
 """PhotoshopComposePSD node (PROTOCOL.md §6c): torch-free import, contract
 shape, group-write structure/round-trip, centering math, flatten/mask
 outputs, IS_CHANGED sensitivity, the consume path, filename collision
-safety, and edit_after handoff creation.
+safety, and the three ``mode`` behaviors -- "Don't open (composite only)"
+(old always-flat), "Re-run on every save" (non-blocking open + passthrough),
+and "Wait for first save" (blocking open-then-wait) -- with their
+``bridge_node`` handoff creation.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ import asyncio
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import cast
 
@@ -28,6 +32,18 @@ from cpsb.launcher import LaunchResult
 
 ComposePSD = compose_module.PhotoshopComposePSD
 
+#: The three ``mode`` COMBO strings, named once here (the first two reuse
+#: ``BridgeMode``'s constants verbatim, the third is compose-specific).
+WAIT = nodes_module.BridgeMode.WAIT_FIRST_SAVE
+RERUN = nodes_module.BridgeMode.RERUN_EVERY_SAVE
+DONT_OPEN = compose_module.MODE_DONT_OPEN
+
+#: A short bound for the blocking-wait tests: they either deliver an
+#: edit/cancel from a background thread well before this elapses, or
+#: deliberately let it expire to exercise the TIMEOUT outcome -- keeping it
+#: small keeps the suite fast.
+_SHORT_TIMEOUT = 1
+
 
 def make_tensor(color: tuple[int, int, int], size: tuple[int, int] = (24, 16)) -> np.ndarray:
     """A 1xHxWx3 ComfyUI-layout float32 tensor of a solid color. *size* = (width, height)."""
@@ -40,6 +56,16 @@ GREEN = (0, 255, 0)
 BLUE = (0, 0, 255)
 
 
+def raises_interrupt():
+    """The interrupt this test environment surfaces as (no real ComfyUI installed).
+
+    ``nodes._raise_interrupt`` falls back to a plain ``RuntimeError`` when
+    ``comfy.model_management`` isn't importable -- exactly the same fallback
+    ``test_nodes.py``/``test_annotate.py``'s own blocking-wait tests rely on.
+    """
+    return pytest.raises(RuntimeError, match=r"comfy\.model_management")
+
+
 @pytest.fixture
 def manager(context: CpsbContext) -> HandoffManager:
     return HandoffManager(context)
@@ -48,7 +74,8 @@ def manager(context: CpsbContext) -> HandoffManager:
 @pytest.fixture
 def configured(context: CpsbContext, manager: HandoffManager):
     """Lightweight wiring: no real app/loop -- enough for IS_CHANGED/consume/compose
-    tests that never reach the ``edit_after`` open-Photoshop path.
+    tests that never reach an open-Photoshop path (i.e. "Don't open" mode, or a
+    consume against a handoff that already has an edit).
     """
     nodes_module.configure(context, manager, cast("object", None), cast("object", None))
     yield
@@ -84,7 +111,7 @@ def loop_thread():
 
 @pytest.fixture
 def configured_with_app(context: CpsbContext, manager: HandoffManager, loop_thread, launches):
-    """Full wiring (real loop + real routes app) for ``edit_after`` tests,
+    """Full wiring (real loop + real routes app) for the open-Photoshop modes,
     which need ``_open_in_photoshop`` -> ``routes.tier2_connected(state.app)``
     to have a real ``aiohttp.web.Application`` to inspect.
     """
@@ -126,8 +153,31 @@ class TestContractShape:
             {"default": "compose"},
         )
         assert spec["required"]["group_name"] == ("STRING", {"default": "ComfyUI Layers"})
-        assert spec["required"]["edit_after"] == ("BOOLEAN", {"default": False})
         assert spec["hidden"] == {"unique_id": "UNIQUE_ID"}
+
+    def test_mode_combo_is_the_three_protocol_strings(self):
+        """PROTOCOL.md §6c: the SAME two BridgeMode strings + the compose-only
+        third, default "Wait for first save".
+        """
+        mode_spec = ComposePSD.INPUT_TYPES()["required"]["mode"]
+        options, config = mode_spec
+        assert options == [WAIT, RERUN, DONT_OPEN]
+        assert options == [
+            "Wait for first save",
+            "Re-run on every save",
+            "Don't open (composite only)",
+        ]
+        assert config == {"default": WAIT}
+        # The third string is NOT the bridge node's OPEN_ONLY ("Open only (don't
+        # wait)") -- different text, different behavior (PROTOCOL.md §6c).
+        assert DONT_OPEN != nodes_module.BridgeMode.OPEN_ONLY
+
+    def test_timeout_seconds_input(self):
+        spec = ComposePSD.INPUT_TYPES()
+        assert spec["required"]["timeout_seconds"] == (
+            "INT",
+            {"default": 1800, "min": 10, "max": 86400},
+        )
 
     def test_optional_images_generous_and_all_image_type(self):
         spec = ComposePSD.INPUT_TYPES()
@@ -305,26 +355,26 @@ class TestAllocateOutputPath:
 class TestComputeInputsHash:
     def test_deterministic_for_identical_inputs(self):
         images = [Image.new("RGB", (4, 4), RED)]
-        h1 = compose_module._compute_inputs_hash(images, "compose", "Group", False)
-        h2 = compose_module._compute_inputs_hash(images, "compose", "Group", False)
+        h1 = compose_module._compute_inputs_hash(images, "compose", "Group", DONT_OPEN)
+        h2 = compose_module._compute_inputs_hash(images, "compose", "Group", DONT_OPEN)
         assert h1 == h2
         assert len(h1) == 64
 
     def test_changes_with_pixel_content(self):
         h_red = compose_module._compute_inputs_hash(
-            [Image.new("RGB", (4, 4), RED)], "compose", "Group", False
+            [Image.new("RGB", (4, 4), RED)], "compose", "Group", DONT_OPEN
         )
         h_blue = compose_module._compute_inputs_hash(
-            [Image.new("RGB", (4, 4), BLUE)], "compose", "Group", False
+            [Image.new("RGB", (4, 4), BLUE)], "compose", "Group", DONT_OPEN
         )
         assert h_red != h_blue
 
     def test_changes_with_image_count(self):
         one = compose_module._compute_inputs_hash(
-            [Image.new("RGB", (4, 4), RED)], "compose", "Group", False
+            [Image.new("RGB", (4, 4), RED)], "compose", "Group", DONT_OPEN
         )
         two = compose_module._compute_inputs_hash(
-            [Image.new("RGB", (4, 4), RED)] * 2, "compose", "Group", False
+            [Image.new("RGB", (4, 4), RED)] * 2, "compose", "Group", DONT_OPEN
         )
         assert one != two
 
@@ -333,33 +383,39 @@ class TestComputeInputsHash:
             [Image.new("RGB", (4, 4), RED), Image.new("RGB", (4, 4), BLUE)],
             "compose",
             "Group",
-            False,
+            DONT_OPEN,
         )
         b = compose_module._compute_inputs_hash(
             [Image.new("RGB", (4, 4), BLUE), Image.new("RGB", (4, 4), RED)],
             "compose",
             "Group",
-            False,
+            DONT_OPEN,
         )
         assert a != b
 
     def test_changes_with_filename_prefix(self):
         images = [Image.new("RGB", (4, 4), RED)]
-        a = compose_module._compute_inputs_hash(images, "compose", "Group", False)
-        b = compose_module._compute_inputs_hash(images, "other", "Group", False)
+        a = compose_module._compute_inputs_hash(images, "compose", "Group", DONT_OPEN)
+        b = compose_module._compute_inputs_hash(images, "other", "Group", DONT_OPEN)
         assert a != b
 
     def test_changes_with_group_name(self):
         images = [Image.new("RGB", (4, 4), RED)]
-        a = compose_module._compute_inputs_hash(images, "compose", "Group", False)
-        b = compose_module._compute_inputs_hash(images, "compose", "Other", False)
+        a = compose_module._compute_inputs_hash(images, "compose", "Group", DONT_OPEN)
+        b = compose_module._compute_inputs_hash(images, "compose", "Other", DONT_OPEN)
         assert a != b
 
-    def test_changes_with_edit_after(self):
+    def test_changes_with_mode(self):
+        """Switching mode changes the hash (so a handoff created under one mode
+        never matches a run under another, PROTOCOL.md §6c).
+        """
         images = [Image.new("RGB", (4, 4), RED)]
-        a = compose_module._compute_inputs_hash(images, "compose", "Group", False)
-        b = compose_module._compute_inputs_hash(images, "compose", "Group", True)
+        a = compose_module._compute_inputs_hash(images, "compose", "Group", DONT_OPEN)
+        b = compose_module._compute_inputs_hash(images, "compose", "Group", WAIT)
+        c = compose_module._compute_inputs_hash(images, "compose", "Group", RERUN)
         assert a != b
+        assert a != c
+        assert b != c
 
 
 class TestIsChanged:
@@ -367,7 +423,8 @@ class TestIsChanged:
         value = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED),
         )
@@ -377,14 +434,16 @@ class TestIsChanged:
         before = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED),
         )
         after = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(GREEN),
         )
@@ -394,29 +453,73 @@ class TestIsChanged:
         before = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED),
         )
         after = ComposePSD.IS_CHANGED(
             filename_prefix="other",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED),
         )
         assert before != after
 
+    def test_changes_when_mode_changes(self, configured):
+        before = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED),
+        )
+        after = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED),
+        )
+        assert before != after
+
+    def test_timeout_seconds_excluded_from_hash(self, configured):
+        """PROTOCOL.md §6c/§6: timeout only bounds the wait, never the output,
+        so it must NOT force re-execution -- mirrors the bridge/annotate nodes.
+        """
+        a = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=10,
+            unique_id="1",
+            image_1=make_tensor(RED),
+        )
+        b = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=54321,
+            unique_id="1",
+            image_1=make_tensor(RED),
+        )
+        assert a == b
+
     def test_changes_when_matching_edit_arrives(self, context, manager, configured):
         tensor = make_tensor(RED)
         pil_images = [nodes_module._tensor_to_pil(tensor)]
         prefix = compose_module._sanitize_filename_prefix("compose")
-        inputs_hash = compose_module._compute_inputs_hash(pil_images, prefix, "Group", False)
+        inputs_hash = compose_module._compute_inputs_hash(pil_images, prefix, "Group", WAIT)
 
         before = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
@@ -424,7 +527,7 @@ class TestIsChanged:
 
         meta = manager.create(
             origin_node_id="1",
-            origin_kind="load_psd",
+            origin_kind="bridge_node",
             workflow_name="",
             source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGBA", (4, 4), (0, 0, 0, 0)),
@@ -435,7 +538,8 @@ class TestIsChanged:
         after = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
@@ -447,7 +551,8 @@ class TestIsChanged:
         after2 = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
@@ -458,7 +563,7 @@ class TestIsChanged:
         tensor = make_tensor(RED)
         meta = manager.create(
             origin_node_id="1",
-            origin_kind="load_psd",
+            origin_kind="bridge_node",
             workflow_name="",
             source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGBA", (4, 4), (0, 0, 0, 0)),
@@ -467,25 +572,29 @@ class TestIsChanged:
         manager.ingest_edit(meta.handoff_id, Image.new("RGB", (4, 4), (5, 5, 5)), "plugin")
 
         pil_images = [nodes_module._tensor_to_pil(tensor)]
-        expected_bare = compose_module._compute_inputs_hash(pil_images, "compose", "Group", False)
+        expected_bare = compose_module._compute_inputs_hash(pil_images, "compose", "Group", WAIT)
         value = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
         assert value == expected_bare
 
     def test_wrong_origin_kind_handoff_is_ignored(self, context, manager, configured):
+        """A ``load_psd`` handoff (the wrong kind now -- this node writes
+        ``bridge_node``) must be ignored even with a matching source_hash+edit.
+        """
         tensor = make_tensor(RED)
         pil_images = [nodes_module._tensor_to_pil(tensor)]
-        inputs_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", False)
+        inputs_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", WAIT)
         meta = manager.create(
             origin_node_id="1",
-            origin_kind="bridge_node",
+            origin_kind="load_psd",
             workflow_name="",
-            source=SourceRef(filename="bridge_1.png", subfolder="", type="temp"),
+            source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGB", (4, 4), (0, 0, 0)),
             source_hash=inputs_hash,
         )
@@ -494,7 +603,8 @@ class TestIsChanged:
         value = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
@@ -505,7 +615,8 @@ class TestIsChanged:
         value = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED),
         )
@@ -517,7 +628,11 @@ class TestExecuteErrors:
         node = ComposePSD()
         with pytest.raises(ValueError, match="at least one"):
             node.execute(
-                filename_prefix="compose", group_name="Group", edit_after=False, unique_id="1"
+                filename_prefix="compose",
+                group_name="Group",
+                mode=DONT_OPEN,
+                timeout_seconds=1800,
+                unique_id="1",
             )
 
     def test_unconfigured_raises_runtime_error(self):
@@ -527,13 +642,19 @@ class TestExecuteErrors:
             node.execute(
                 filename_prefix="compose",
                 group_name="Group",
-                edit_after=False,
+                mode=DONT_OPEN,
+                timeout_seconds=1800,
                 unique_id="1",
                 image_1=make_tensor(RED),
             )
 
 
 class TestExecuteCompose:
+    """Compose-only behavior, exercised via "Don't open (composite only)"
+    mode: build/write the PSD and return the flat composite, never opening
+    Photoshop and never creating a handoff.
+    """
+
     @pytest.fixture(autouse=True)
     def _require_torch(self):
         pytest.importorskip("torch")
@@ -543,7 +664,8 @@ class TestExecuteCompose:
         image_out, mask_out, filename_out = node.execute(
             filename_prefix="compose",
             group_name="My Layers",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED, size=(10, 6)),
             image_2=make_tensor(BLUE, size=(6, 10)),
@@ -569,7 +691,8 @@ class TestExecuteCompose:
         image_out, _mask_out, _filename = node.execute(
             filename_prefix="stack",
             group_name="G",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED, size=(8, 8)),
             image_2=make_tensor(BLUE, size=(8, 8)),
@@ -582,7 +705,8 @@ class TestExecuteCompose:
         image_out, mask_out, filename_out = node.execute(
             filename_prefix="solo",
             group_name="G",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(GREEN, size=(12, 9)),
         )
@@ -603,7 +727,12 @@ class TestExecuteCompose:
             for i in range(1, 9)
         }
         _image_out, _mask_out, filename_out = node.execute(
-            filename_prefix="eight", group_name="G", edit_after=False, unique_id="1", **kwargs
+            filename_prefix="eight",
+            group_name="G",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            **kwargs,
         )
         reopened = PSDImage.open(context.input_dir / filename_out)
         group = reopened[0]
@@ -616,7 +745,8 @@ class TestExecuteCompose:
         _image_out, mask_out, _filename = node.execute(
             filename_prefix="uneven",
             group_name="G",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED, size=(20, 4)),
             image_2=make_tensor(BLUE, size=(4, 20)),
@@ -630,14 +760,16 @@ class TestExecuteCompose:
         _, _, first = node.execute(
             filename_prefix="dup",
             group_name="G",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED),
         )
         _, _, second = node.execute(
             filename_prefix="dup",
             group_name="G",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(GREEN),  # different pixels -> genuinely re-executes
         )
@@ -645,8 +777,31 @@ class TestExecuteCompose:
         assert first == "dup_00001.psd"
         assert second == "dup_00002.psd"
 
+    def test_dont_open_never_opens_or_hands_off(self, context, manager, configured):
+        """PROTOCOL.md §6c: "Don't open (composite only)" is the old always-flat
+        behavior -- no Photoshop, no handoff.
+        """
+        node = ComposePSD()
+        image_out, _mask_out, filename_out = node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        array = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == RED  # the flat composite, not an edit
+        assert filename_out == "compose_00001.psd"
+        assert manager.find_active_for_node("1") is None  # never handed off
+
 
 class TestExecuteConsumePath:
+    """The consume path fires FIRST for every mode: an active ``bridge_node``
+    handoff whose source_hash matches the current inputs and that carries an
+    edit is returned (flattened) without recomposing or reopening.
+    """
+
     @pytest.fixture(autouse=True)
     def _require_torch(self):
         pytest.importorskip("torch")
@@ -656,11 +811,13 @@ class TestExecuteConsumePath:
     ):
         tensor = make_tensor(RED, size=(8, 8))
         pil_images = [nodes_module._tensor_to_pil(tensor)]
-        inputs_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", False)
+        # WAIT mode (the blocking one) -- proving the consume check runs BEFORE
+        # any open/block: an already-saved edit is served without touching PS.
+        inputs_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", WAIT)
 
         meta = manager.create(
             origin_node_id="1",
-            origin_kind="load_psd",
+            origin_kind="bridge_node",
             workflow_name="",
             source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGBA", (8, 8), (0, 0, 0, 0)),
@@ -677,7 +834,8 @@ class TestExecuteConsumePath:
         image_out, _mask_out, filename_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=WAIT,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
@@ -691,7 +849,7 @@ class TestExecuteConsumePath:
         tensor = make_tensor(RED, size=(8, 8))
         meta = manager.create(
             origin_node_id="1",
-            origin_kind="load_psd",
+            origin_kind="bridge_node",
             workflow_name="",
             source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGBA", (8, 8), (0, 0, 0, 0)),
@@ -703,7 +861,8 @@ class TestExecuteConsumePath:
         image_out, _mask_out, filename_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
@@ -714,10 +873,10 @@ class TestExecuteConsumePath:
     def test_no_edits_yet_composes_fresh(self, context, manager, configured):
         tensor = make_tensor(RED, size=(8, 8))
         pil_images = [nodes_module._tensor_to_pil(tensor)]
-        inputs_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", False)
+        inputs_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", DONT_OPEN)
         manager.create(
             origin_node_id="1",
-            origin_kind="load_psd",
+            origin_kind="bridge_node",
             workflow_name="",
             source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGBA", (8, 8), (0, 0, 0, 0)),
@@ -728,7 +887,8 @@ class TestExecuteConsumePath:
         image_out, _mask_out, _filename = node.execute(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=False,
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
@@ -736,69 +896,83 @@ class TestExecuteConsumePath:
         assert tuple(array[0, 0]) == RED
 
 
-class TestEditAfter:
+class TestModeRerunEverySave:
+    """PROTOCOL.md §6c: "Re-run on every save" never blocks -- it opens
+    Photoshop once, passes the flat composite through, and relies on the
+    frontend auto-queueing a re-run per save (each consuming the latest edit).
+    """
+
     @pytest.fixture(autouse=True)
     def _require_torch(self):
         pytest.importorskip("torch")
 
-    def test_creates_handoff_and_opens_photoshop(
+    def test_opens_once_and_passes_flat_composite_through(
         self, context, manager, configured_with_app, launches
     ):
         node = ComposePSD()
-        _image_out, _mask_out, filename_out = node.execute(
+        image_out, _mask_out, filename_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=True,
+            mode=RERUN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED, size=(8, 8)),
         )
+        # Passthrough: the flat composite, NOT a blocked-for edit.
+        array = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == RED
+        assert filename_out == "compose_00001.psd"
 
         active = manager.find_active_for_node("1")
         assert active is not None
-        assert active.origin_kind == "load_psd"
+        assert active.origin_kind == "bridge_node"
         assert active.source.filename == filename_out
         assert active.source.subfolder == ""
         assert active.source.type == "input"
         assert active.status == "editing"  # launch_photoshop (fake) succeeded
 
-        # v1: a MANAGED COPY, not edit_in_place.
+        # The REAL Tier-1 launch seam fired exactly once, on the handoff's copy.
+        assert len(launches) == 1
+        handoff_psd = manager.handoff_dir(active.handoff_id) / "source.psd"
+        assert launches[0] == str(handoff_psd)
+
+    def test_handoff_is_a_managed_copy_not_edit_in_place(
+        self, context, manager, configured_with_app, launches
+    ):
+        # v1: a MANAGED COPY of the generated LAYERED file, not edit_in_place.
+        node = ComposePSD()
+        _image_out, _mask_out, filename_out = node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        active = manager.find_active_for_node("1")
         assert active.edit_in_place is False
         assert active.original_path is None
         handoff_psd = manager.handoff_dir(active.handoff_id) / "source.psd"
         assert handoff_psd.is_file()
+        # Byte-for-byte copy of the generated file (layers preserved).
         assert handoff_psd.read_bytes() == (context.input_dir / filename_out).read_bytes()
         assert active.handoff_id in manager._own_source_writes
 
-        assert len(launches) == 1
-        assert launches[0] == str(handoff_psd)
-
-    def test_source_hash_matches_inputs_hash_for_consume(
-        self, context, manager, configured_with_app
-    ):
+    def test_source_hash_folds_mode_for_consume(self, context, manager, configured_with_app):
         tensor = make_tensor(RED, size=(8, 8))
         node = ComposePSD()
         node.execute(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=True,
+            mode=RERUN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
         )
         active = manager.find_active_for_node("1")
         pil_images = [nodes_module._tensor_to_pil(tensor)]
-        expected_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", True)
+        expected_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", RERUN)
         assert active.source_hash == expected_hash
-
-    def test_edit_after_false_never_creates_a_handoff(self, context, manager, configured_with_app):
-        node = ComposePSD()
-        node.execute(
-            filename_prefix="compose",
-            group_name="Group",
-            edit_after=False,
-            unique_id="1",
-            image_1=make_tensor(RED, size=(8, 8)),
-        )
-        assert manager.find_active_for_node("1") is None
 
     def test_open_failure_is_logged_and_marked_error_not_a_crash(
         self, context, manager, configured_with_app, monkeypatch
@@ -813,12 +987,14 @@ class TestEditAfter:
         image_out, mask_out, filename_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
-            edit_after=True,
+            mode=RERUN,
+            timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED, size=(8, 8)),
         )
         assert filename_out == "compose_00001.psd"
-        assert image_out is not None
+        array = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == RED  # the flat composite still comes back
         assert mask_out is not None
 
         active = manager.find_active_for_node("1")
@@ -826,3 +1002,180 @@ class TestEditAfter:
         matching = [h for h in manager.list_all(limit=10) if h.origin_node_id == "1"]
         assert len(matching) == 1
         assert matching[0].status == "error"
+        assert matching[0].origin_kind == "bridge_node"
+
+
+class TestModeWaitFirstSave:
+    """PROTOCOL.md §6c (the default): "Wait for first save" BLOCKS execute()
+    in manager.wait_for_edit until the first save, then returns that SAVED
+    edit (flattened). Cancel/timeout/open-failure interrupt via
+    InterruptProcessingException. Mirrors the bridge/annotate nodes.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_blocks_until_edit_then_returns_saved_edit(
+        self, context, manager, configured_with_app, monkeypatch
+    ):
+        node_id = "1"
+        edit_color = (10, 20, 30)
+
+        def _save_shortly_after_open(psd_path, override=""):
+            # Deliver the edit from a delayed background thread: the launch
+            # returning "ok" (mark_editing) is visible before the edit lands,
+            # exactly as real Photoshop usage sequences.
+            def _do_ingest():
+                active = manager.find_active_for_node(node_id)
+                manager.ingest_edit(
+                    active.handoff_id, Image.new("RGB", (8, 8), edit_color), "plugin"
+                )
+
+            threading.Timer(0.3, _do_ingest).start()
+            return LaunchResult(ok=True)
+
+        monkeypatch.setattr(routes_module, "launch_photoshop", _save_shortly_after_open)
+
+        node = ComposePSD()
+        image_out, _mask_out, filename_out = node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=10,
+            unique_id=node_id,
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        # IMAGE is the SAVED edit's pixels, not the flat RED composite.
+        array = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == edit_color
+        # STRING is still the written psd filename (unchanged from the old build).
+        assert filename_out == "compose_00001.psd"
+
+        active = manager.find_active_for_node(node_id)
+        assert active is not None
+        assert active.status == "edited"
+        assert active.origin_kind == "bridge_node"
+
+    def test_reaches_the_real_bridge_open_seam(
+        self, context, manager, configured_with_app, monkeypatch
+    ):
+        """Regression: compose must reach ``nodes.PhotoshopBridge._open_in_photoshop``
+        (the shared tier-selecting seam) and, through it, the real Tier-1
+        launch -- not a private copy.
+        """
+        node_id = "1"
+        seam_calls: list[Path] = []
+        real_open = nodes_module.PhotoshopBridge._open_in_photoshop
+
+        def spy_open(state, meta, psd_path):
+            seam_calls.append(psd_path)
+            return real_open(state, meta, psd_path)
+
+        monkeypatch.setattr(
+            nodes_module.PhotoshopBridge, "_open_in_photoshop", staticmethod(spy_open)
+        )
+
+        launch_calls: list[str] = []
+
+        def _save_after_open(psd_path, override=""):
+            launch_calls.append(str(psd_path))
+
+            def _do_ingest():
+                active = manager.find_active_for_node(node_id)
+                edit = Image.new("RGB", (8, 8), (1, 2, 3))
+                manager.ingest_edit(active.handoff_id, edit, "plugin")
+
+            threading.Timer(0.2, _do_ingest).start()
+            return LaunchResult(ok=True)
+
+        monkeypatch.setattr(routes_module, "launch_photoshop", _save_after_open)
+
+        node = ComposePSD()
+        node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=10,
+            unique_id=node_id,
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        assert len(seam_calls) == 1  # the real bridge seam fired exactly once
+        assert len(launch_calls) == 1  # ... and reached the underlying Tier-1 launch
+        assert seam_calls[0] == Path(launch_calls[0])  # both on the handoff's own copy
+
+    def test_open_failure_marks_error_and_interrupts_without_hanging(
+        self, context, manager, configured_with_app, monkeypatch
+    ):
+        monkeypatch.setattr(
+            routes_module,
+            "launch_photoshop",
+            lambda psd_path, override="": LaunchResult(ok=False, error="no Photoshop found"),
+        )
+
+        node = ComposePSD()
+        with raises_interrupt():
+            node.execute(
+                filename_prefix="compose",
+                group_name="Group",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id="1",
+                image_1=make_tensor(RED, size=(8, 8)),
+            )
+
+        assert manager.find_active_for_node("1") is None  # error: no longer active
+        matching = [h for h in manager.list_all() if h.origin_node_id == "1"]
+        assert len(matching) == 1
+        assert matching[0].status == "error"
+
+    def test_timeout_interrupts_and_handoff_stays_editing(
+        self, context, manager, configured_with_app, launches
+    ):
+        """PROTOCOL.md §6c/§6: on timeout the handoff stays `editing`, so a
+        later save or re-queue resumes the same PSD.
+        """
+        node = ComposePSD()
+        with raises_interrupt():
+            node.execute(
+                filename_prefix="compose",
+                group_name="Group",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id="1",
+                image_1=make_tensor(RED, size=(8, 8)),
+            )
+        active = manager.find_active_for_node("1")
+        assert active is not None
+        assert active.status == "editing"
+        assert len(launches) == 1
+
+    def test_cancel_interrupts_promptly(self, context, manager, configured_with_app, monkeypatch):
+        """`/cpsb/cancel` (mark_cancelled) unblocks a waiting node immediately,
+        without waiting out the full timeout (PROTOCOL.md §2).
+        """
+        node_id = "1"
+
+        def _cancel_shortly_after_open(psd_path, override=""):
+            def _do_cancel():
+                active = manager.find_active_for_node(node_id)
+                manager.mark_cancelled(active.handoff_id)
+
+            threading.Timer(0.3, _do_cancel).start()
+            return LaunchResult(ok=True)
+
+        monkeypatch.setattr(routes_module, "launch_photoshop", _cancel_shortly_after_open)
+
+        node = ComposePSD()
+        start = time.monotonic()
+        with raises_interrupt():
+            node.execute(
+                filename_prefix="compose",
+                group_name="Group",
+                mode=WAIT,
+                timeout_seconds=30,
+                unique_id=node_id,
+                image_1=make_tensor(RED, size=(8, 8)),
+            )
+        elapsed = time.monotonic() - start
+        assert elapsed < 5  # unblocked by cancellation, not the 30s timeout

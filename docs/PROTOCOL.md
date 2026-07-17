@@ -408,7 +408,10 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   reveals the next empty socket (pattern forked from rgthree's MIT implementation, with
   attribution comment). Backend accepts any number ≥ 1 via optional inputs.
 - Widgets: `filename_prefix` (STRING, default "compose"), `group_name` (STRING, default
-  "ComfyUI Layers"), `edit_after` (BOOLEAN, default False).
+  "ComfyUI Layers"), `mode` (COMBO — the SAME three strings as the Edit in Photoshop
+  node's BridgeMode: "Wait for first save" (default) | "Re-run on every save" |
+  "Don't open (composite only)"). (Replaces the earlier `edit_after` BOOLEAN — pre-release
+  breaking change.) `timeout_seconds` (INT, default 1800) applies to "Wait for first save".
 - Behavior: canvas = max width × max height across inputs; every image becomes one
   pixel layer, CENTERED, never rescaled; `image_1` is the BOTTOM layer, higher indices
   stack on top; all layers inside ONE group named `group_name`. Written via psd-tools
@@ -416,10 +419,18 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `input/<filename_prefix>_%05d.psd` (unique per execution). Outputs:
   (IMAGE flattened composite, MASK = 1-alpha of composite else zeros, STRING = the
   written psd filename, input-relative — usable by Load PSD / addressable by /view).
-- `edit_after=True`: after writing, the backend creates a `load_psd` handoff with
-  `edit_in_place: true` on the GENERATED file and opens Photoshop (non-blocking, "Open
-  only" semantics — saves ingest; the next queue consumes). The generated file is ours,
-  so in-place editing is safe by construction.
+- Mode semantics MIRROR the Edit in Photoshop node (§6) exactly, applied to the
+  freshly-written LAYERED PSD (so the user composites/adjusts LAYERS in Photoshop, then
+  the node outputs the SAVED result, flattened): "Wait for first save" BLOCKS execute()
+  until the first save then continues the workflow with the edit; "Re-run on every save"
+  never blocks (first run opens PS, passes the flat composite through; each save
+  auto-queues a re-run consuming the latest edit); "Don't open (composite only)" is the
+  old always-flat behavior (never opens PS). The handoff uses origin_kind `bridge_node`
+  and edit_in_place on the generated file (ours → safe), so it shares the §6 bridge
+  node's blocking-wait, consume, IS_CHANGED, and frontend auto-queue machinery verbatim
+  (import from cpsb.nodes; do not duplicate). Default "Wait for first save" makes the
+  useful edit-in-Photoshop flow the out-of-box behavior — a flat composite is only ever
+  the output when the user has no edit yet or picked "Don't open".
 - Consume semantics: `IS_CHANGED` hashes the input images + params, folded with the
   latest-edit hash when an active matching handoff exists; execute() returns the latest
   edit (flattened) when the active handoff's `source_hash` matches the current inputs'
