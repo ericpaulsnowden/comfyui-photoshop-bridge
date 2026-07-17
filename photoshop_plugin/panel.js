@@ -58,6 +58,11 @@ function initPanel() {
     document.getElementById('cpsb-server-error')
   )
   const lastErrorEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-last-error'))
+  // Muted, Advanced-section home for a transient connection error's detail —
+  // the raw close code/reason lives here so the top line can stay calm.
+  const lastErrorAdvancedEl = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-last-error-advanced')
+  )
   const retryEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-retry-line'))
   // The always-visible boot banner index.js paints at load; panel.js takes
   // it over once connection state is known (adds the server version).
@@ -84,13 +89,14 @@ function initPanel() {
    * @returns {string} Empty string when there is nothing to show.
    */
   function retryText(state) {
-    const attemptNumber = state.attempts + 1
     if (state.status === 'connecting') {
-      return `Connecting… (attempt ${attemptNumber})`
+      return 'Connecting to ComfyUI…'
     }
     if (state.nextRetryAt != null) {
       const seconds = Math.max(0, Math.ceil((state.nextRetryAt - Date.now()) / 1000))
-      return `Retrying in ${seconds}s (attempt ${attemptNumber})`
+      // Phrased as waiting, not failing: a not-yet-reachable ComfyUI (still
+      // starting up) is the common case and is nothing the user must act on.
+      return `Waiting for ComfyUI — retrying in ${seconds}s`
     }
     return ''
   }
@@ -130,6 +136,7 @@ function initPanel() {
     renderVersionLine(state)
     if (state.status === 'connected') {
       lastErrorEl.style.display = 'none'
+      lastErrorAdvancedEl.style.display = 'none'
       retryEl.style.display = 'none'
       if (retryTicker) {
         clearInterval(retryTicker)
@@ -137,11 +144,23 @@ function initPanel() {
       }
       return
     }
-    if (state.lastError) {
-      lastErrorEl.textContent = `Last error: ${state.lastError}`
+    // A BLOCKING error (permission denial — the user must act) is the only one
+    // that breaks out to the top, in red. A TRANSIENT error (ComfyUI not up
+    // yet / retrying) stays out of the top entirely; its detail is mirrored
+    // into the muted Advanced line so it's available without shouting. The
+    // calm "Waiting for ComfyUI…" retry line below is the top-level signal
+    // that it's just something to wait for.
+    if (state.lastError && state.lastErrorBlocking) {
+      lastErrorEl.textContent = `Action needed: ${state.lastError}`
       lastErrorEl.style.display = 'block'
     } else {
       lastErrorEl.style.display = 'none'
+    }
+    if (state.lastError) {
+      lastErrorAdvancedEl.textContent = `Last connection error: ${state.lastError}`
+      lastErrorAdvancedEl.style.display = 'block'
+    } else {
+      lastErrorAdvancedEl.style.display = 'none'
     }
     const retry = retryText(state)
     retryEl.textContent = retry

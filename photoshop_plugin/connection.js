@@ -114,6 +114,10 @@ const WS_READY_STATE_OPEN = 1
  * @property {string | null} lastError - Human-readable description of the
  * most recent connection failure (constructor throw, failed attempt, or
  * dropped connection); `null` once connected.
+ * @property {boolean} lastErrorBlocking - Whether `lastError` is blocking
+ * (user must act — a permission denial) vs transient (server not up yet /
+ * retrying). The panel surfaces blocking errors prominently and keeps
+ * transient ones inside Advanced.
  * @property {number} attempts - Consecutive failed connection attempts
  * since the last successful handshake.
  * @property {number | null} nextRetryAt - Epoch ms of the next scheduled
@@ -251,6 +255,17 @@ class ConnectionManager extends EventTarget {
     this._lastFailureDetail = null
     /** @type {string | null} Detail stashed by an `error` event, if the runtime provided any. */
     this._socketErrorDetail = null
+    /**
+     * Whether the current `lastError` is BLOCKING (user must act) rather than
+     * transient (just wait / retrying). True only for the constructor-throw
+     * path in `_open` — a manifest/network-permission denial, the one failure
+     * the user has to fix. A connection-refused / server-not-up close (code
+     * 1006, the "ComfyUI is still starting" case) is transient, so this stays
+     * false. The panel uses it to decide whether the error breaks out of the
+     * Advanced section (blocking) or stays tucked inside it (transient).
+     * @type {boolean}
+     */
+    this._lastErrorBlocking = false
     this._started = false
   }
 
@@ -343,6 +358,7 @@ class ConnectionManager extends EventTarget {
     this.nextRetryAt = null
     this.lastError = null
     this._lastFailureDetail = null
+    this._lastErrorBlocking = false
     this._socketErrorDetail = null
     this.serverVersion = null
     this.localMode = null
@@ -370,6 +386,9 @@ class ConnectionManager extends EventTarget {
       // (connection refused / server absent, which reach `_onClose` with a
       // close code instead).
       this._recordFailure(describeError(error))
+      // Permission/constructor failures are the one BLOCKING case — the user
+      // has to fix the plugin's network permission; surfaced prominently.
+      this._lastErrorBlocking = true
       this._scheduleReconnect()
       this._setStatus('disconnected')
       return
@@ -471,6 +490,7 @@ class ConnectionManager extends EventTarget {
     this.nextRetryAt = null
     this.lastError = null
     this._lastFailureDetail = null
+    this._lastErrorBlocking = false
     this._setStatus('connected')
     logInfo(
       `connected to server ${msg.server_version} (${this.localMode ? 'local' : 'remote'} mode)`
@@ -502,6 +522,10 @@ class ConnectionManager extends EventTarget {
     const wasConnected = this.status === 'connected'
     this._socket = null
     this.localMode = null
+    // Every close-path failure is transient (server not up yet / refused /
+    // dropped) — the "just wait, it's retrying" case, NOT something the user
+    // must act on. Only the constructor-throw path in `_open` is blocking.
+    this._lastErrorBlocking = false
     const code = event ? event.code : undefined
     const reason = event ? event.reason : ''
     if (wasConnected) {
@@ -582,6 +606,7 @@ class ConnectionManager extends EventTarget {
       serverVersion: this.serverVersion,
       localMode: this.localMode,
       lastError: this.lastError,
+      lastErrorBlocking: this._lastErrorBlocking,
       attempts: this.attempts,
       nextRetryAt: this.nextRetryAt
     }

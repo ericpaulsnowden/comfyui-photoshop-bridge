@@ -316,6 +316,12 @@
         <div id="cpsb-server-error" class="cpsb-error-line cpsb-conn-line"></div>
 
         <div id="cpsb-server-url" class="cpsb-muted cpsb-conn-line"></div>
+        <!-- Diagnostic home for a TRANSIENT connection error (server not up
+             yet / retrying — the "just wait" case). It stays inside Advanced,
+             muted, so a temporary hiccup never shouts at the top of the panel.
+             Only a BLOCKING error (permission denial) is mirrored to the
+             prominent top #cpsb-last-error line — see panel.js. -->
+        <div id="cpsb-last-error-advanced" class="cpsb-muted cpsb-conn-line"></div>
         <pre id="cpsb-log" class="cpsb-log"></pre>
       </div>
     </div>
