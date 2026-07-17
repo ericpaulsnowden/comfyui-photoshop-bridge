@@ -2,9 +2,11 @@
 
 Before locking in the M1 implementation, we're validating eight assumptions the whole design leans on. Each one is small, throwaway, and answerable in isolation — pick one, follow its procedure, fill in its Results section, and check it off below.
 
+**Status as of 2026-07-17:** three of the eight spikes are proven live on Photoshop 27.8.0, and the full Tier-2 round trip works end to end — spike 2 (UXP localhost WebSocket permission, previously the #1 project risk), spike 6 (silent `batchPlay` PNG export), and spike 7 (save-event listener + document identity) all PASS. See the **LIVE RESULTS** section at the bottom of this file. Spikes 1, 3, 4, 5, and 8 remain open.
+
 The rule: **M1 design isn't final until every spike below has a written yes/no/workaround answer.**
 
-This project is pre-release — see the status note at the top of the [main README](../README.md). Right now, running one of these spikes and reporting real results is the single most valuable contribution available.
+This project is pre-release — see the status note at the top of the [main README](../README.md). With Tier 2's core path now proven, the most valuable contribution available is running one of the five still-open spikes (1, 3, 4, 5, 8) and reporting real results.
 
 ## Prerequisites
 
@@ -16,12 +18,12 @@ This project is pre-release — see the status note at the top of the [main READ
 ## Checklist
 
 - [ ] 1. Image-widget right-click menu hook
-- [ ] 2. UXP localhost WebSocket on target Photoshop versions
+- [x] 2. UXP localhost WebSocket on target Photoshop versions — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
 - [ ] 3. PSD write fidelity via `psd-tools` `frompil`
 - [ ] 4. Watchdog event pattern for Photoshop saves (macOS + Windows)
 - [ ] 5. Clipspace-style paste-back + auto-queue
-- [ ] 6. Silent PNG export via `batchPlay`
-- [ ] 7. Save-event listener + document identity
+- [x] 6. Silent PNG export via `batchPlay` — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
+- [x] 7. Save-event listener + document identity — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
 - [ ] 8. Programmatic Maximize Compatibility preference
 
 ---
@@ -75,10 +77,10 @@ _Date, frontend version tested, findings, and the decision (single image-scoped 
 7. Separately, read Adobe's Developer Distribution documentation (developer.adobe.com) and record whether it confirms unsigned `.ccx` plugins require Developer Mode for end users, or whether Developer Distribution signing avoids that requirement. Cite the URL and the date checked.
 
 **Status:**
-- [ ] Not started
+- [x] **PASS** — verified live 2026-07-17 on Photoshop 27.8.0 (macOS). See LIVE RESULTS at the bottom of this file.
 
 ### Results
-_Per-Photoshop-version pass/fail, any Permission Denied specifics, and the Developer Mode finding (with citation) go here._
+**PASS, verified live 2026-07-17 (PS 27.8.0, macOS)** — full detail in the LIVE RESULTS section below. The WebSocket opens with no Permission Denied error and the Tier-2 plugin round-trips end to end. Still open within this spike's original scope: the per-Photoshop-version sweep beyond 27.8, narrowing `network.domains` from `"all"` to a scoped host for release, and the unsigned-`.ccx` / Developer Mode documentation check.
 
 ---
 
@@ -164,10 +166,10 @@ _Confirmed call sequence (including any extra calls needed) and queuePrompt beha
 6. If the lean descriptor fails, re-test with the `saveStage` field the SuperPNG forum example carried (`saveStage: {_enum: 'saveStageType', _value: 'saveBegin'}`) before concluding batchPlay export is unviable.
 
 **Status:**
-- [ ] Not started
+- [x] **PASS** — verified live 2026-07-17 on Photoshop 27.8.0 (macOS). See LIVE RESULTS at the bottom of this file.
 
 ### Results
-_Pass/fail counts across the matrix, any failures and their descriptors, and the primary-vs-fallback decision go here._
+**PASS, verified live 2026-07-17 (PS 27.8.0, macOS)** — full detail in the LIVE RESULTS section below. The flatten-duplicate → `batchPlay` saveAs-PNG (`dialogOptions: "dontDisplay"`) → upload pipeline produced a pixel-accurate PNG with zero dialogs; the Imaging API `getPixels()` fallback was not needed. Still open within this spike's original scope: the full size × mode matrix and the 50×-run reliability count.
 
 ---
 
@@ -185,10 +187,10 @@ _Pass/fail counts across the matrix, any failures and their descriptors, and the
 5. If the descriptor's identity is missing or unreliable in any case, implement the `app.activeDocument`-at-event-time fallback, then test its race-safety: trigger saves on two different documents in rapid succession (switching the active document immediately after triggering the first save) and check whether the callback ever reports the wrong document.
 
 **Status:**
-- [ ] Not started
+- [x] **PASS** — verified live 2026-07-17 on Photoshop 27.8.0 (macOS). See LIVE RESULTS at the bottom of this file.
 
 ### Results
-_Descriptor contents observed, reliability across the multi-document tests, and whether the activeDocument fallback is needed/race-safe go here._
+**PASS, verified live 2026-07-17 (PS 27.8.0, macOS)** — full detail in the LIVE RESULTS section below. The `action` save listener fired on a plain Cmd+S, matched the tracked document, and triggered the export with no spurious fires. Still open within this spike's original scope: the multi-document identity test (three docs open at once) and the Save As / `app.activeDocument`-fallback race-safety checks.
 
 ---
 
