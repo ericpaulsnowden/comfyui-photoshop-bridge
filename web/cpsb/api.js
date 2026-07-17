@@ -54,7 +54,7 @@ export function warn(...args) {
  */
 
 /**
- * @typedef {"load_image" | "terminal_output" | "bridge_node"} CpsbOriginKind
+ * @typedef {"load_image" | "terminal_output" | "bridge_node" | "load_psd"} CpsbOriginKind
  */
 
 /**
@@ -81,26 +81,16 @@ export function warn(...args) {
  */
 
 /**
- * @typedef {Object} CpsbMaskFileRef
- * A mask file as recorded on a `meta.json` edit entry (PROTOCOL.md §1/§4).
- * Unlike {@link CpsbImageRef}, no `subfolder`/`type` is carried: the mask is
- * always written "beside the edit" it belongs to, i.e. into that edit's own
- * handoff folder — combine with {@link editSubfolder} for a full reference.
- * @property {string} filename
- */
-
-/**
  * @typedef {Object} CpsbEdit
  * @property {string} filename - `edit_%03d.png`, arrival order.
  * @property {number} ts
  * @property {CpsbFidelity} fidelity
  * @property {CpsbSiblingOutput | null} [sibling_output]
- * @property {CpsbMaskFileRef | null} [mask] - The extracted-channel mask
- * recorded for this edit (PROTOCOL.md §1/§4), or absent/`null` when none was
- * extracted (no qualifying channel, Tier 2 remote mode, or a non-fatal
- * extraction failure). Missing entirely on edits recorded before this field
- * existed. Same handoff folder as `filename` — see {@link editSubfolder}.
  */
+// NOTE: mask-channel extraction was REMOVED from the protocol (PROTOCOL.md
+// §4 removal note, owner's call 2026-07-17) — edits no longer carry a `mask`
+// field, and this frontend reads none. A legacy `meta.json` written by a
+// pre-removal backend may still contain one; it is simply ignored here.
 
 /**
  * @typedef {Object} CpsbHandoffMeta
@@ -179,12 +169,14 @@ export function warn(...args) {
 
 /**
  * @typedef {Object} CpsbBackendSettings
+ * Exactly the PROTOCOL.md §2 `GET/POST /cpsb/settings` object — no
+ * `mask_channel_name`: it left the contract with the §4 mask-extraction
+ * removal.
  * @property {string} photoshop_path
  * @property {number} debounce_ms
  * @property {number} cleanup_days
  * @property {boolean} sibling_outputs
  * @property {string} managed_folder_name
- * @property {string} mask_channel_name
  */
 
 /**
@@ -198,14 +190,6 @@ export function warn(...args) {
  * @property {CpsbFileType} type
  * @property {CpsbFidelity} fidelity
  * @property {CpsbSiblingOutput | null} sibling_output
- * @property {CpsbImageRef | null} mask - Full reference to the extracted
- * mask image (PROTOCOL.md §5), or `null` when this edit had no extractable
- * mask (§4). Unlike {@link CpsbEdit.mask}, this carries the complete
- * `{filename, subfolder, type}` triple since the event payload must be
- * self-contained. Mask *consumption* is entirely backend-side (the
- * Photoshop Bridge node's MASK output, PROTOCOL.md §6) — this frontend only
- * surfaces the mask's presence (gallery.js's "MASK" chip); pasteback.js is
- * intentionally unchanged.
  */
 
 /**
@@ -241,6 +225,31 @@ export class CpsbApiError extends Error {
     this.status = status
     this.body = body
   }
+}
+
+/**
+ * The most useful human-readable message an error can yield, for toast
+ * `detail` fields. Preference order: the SERVER's own `{"error": ...}` body
+ * message (PROTOCOL.md §2 — every `/cpsb/*` error carries one; this is what
+ * `request()` already promotes into {@link CpsbApiError#message}, restated
+ * here from `.body` so the guarantee is explicit and survives any future
+ * message-mangling), then `Error#message`, then a string coercion. Every UI
+ * error path (gallery.js, open.js) routes through this so a failure always
+ * shows the real reason — "Source image not found: x.png", "Handoff is
+ * cancelled, not accepting uploads" — never a bare generic failure line.
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function errorMessage(error) {
+  if (error instanceof CpsbApiError) {
+    const body = error.body
+    if (body && typeof body === 'object' && typeof body.error === 'string' && body.error) {
+      return body.error
+    }
+    return error.message
+  }
+  if (error instanceof Error) return error.message
+  return String(error)
 }
 
 /**
@@ -301,6 +310,49 @@ export async function uploadEdit(handoffId, file, source = 'manual') {
   formData.append('image', file, file.name || 'edit.png')
   formData.append('source', source)
   return request('/cpsb/upload', { method: 'POST', body: formData })
+}
+
+/**
+ * POST `/upload/image` — ComfyUI's own core upload route, not a `/cpsb/*`
+ * one, but centralized here anyway per this file's header ("the only
+ * module that talks to the network... so the wire format stays defined in
+ * exactly one place"). Used by loadpsd.js for the Load PSD node's
+ * hand-rolled upload widget (PROTOCOL.md §6b): the stock IMAGEUPLOAD widget
+ * hardcodes `accept="image/png,image/jpeg,image/webp"` and silently drops
+ * anything else (`Comfy-Org/ComfyUI_frontend` `src/utils/mediaUploadUtil.ts`
+ * `ACCEPTED_IMAGE_TYPES`), so a `.psd`/`.psb` can only reach the server
+ * through this route, called directly — see loadpsd.js's header for the
+ * full citation trail.
+ *
+ * Request/response shape verified against every current core caller of
+ * this route (`src/composables/node/useNodeImageUpload.ts`,
+ * `src/extensions/core/load3d/Load3dUtils.ts`,
+ * `src/extensions/core/webcamCapture.ts`): `multipart/form-data` with an
+ * `image` file part plus `subfolder`/`type` fields, no `Content-Type`
+ * header set (the browser fills in the multipart boundary itself) —
+ * `api.fetchApi` passes a `FormData` body through to `fetch` untouched, so
+ * this works exactly like {@link uploadEdit} above. Reuses the same
+ * `request()` helper, so a non-2xx response throws {@link CpsbApiError}
+ * the same way every other function in this file does. The JSON response
+ * is `{name, subfolder, type}` — notably `name`, NOT `filename`, unlike
+ * every `/cpsb/*` response in this file; that mismatch is normalized away
+ * here so callers only ever see this file's own {@link CpsbImageRef} shape.
+ * @param {File} file
+ * @param {{subfolder?: string, type?: CpsbFileType}} [options]
+ * @returns {Promise<CpsbImageRef>}
+ * @throws {CpsbApiError}
+ */
+export async function uploadInputFile(file, { subfolder = '', type = 'input' } = {}) {
+  const formData = new FormData()
+  formData.append('image', file, file.name || 'upload.psd')
+  formData.append('subfolder', subfolder)
+  formData.append('type', type)
+  const data = await request('/upload/image', { method: 'POST', body: formData })
+  return {
+    filename: data?.name ?? file.name,
+    subfolder: data?.subfolder ?? subfolder,
+    type: /** @type {CpsbFileType} */ (data?.type ?? type)
+  }
 }
 
 /**

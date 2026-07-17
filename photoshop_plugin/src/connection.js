@@ -263,6 +263,12 @@ class ConnectionManager extends EventTarget {
    */
   async _completeHandshake(msg) {
     this.serverVersion = msg.server_version
+    if (msg.server_version !== uxp.versions.plugin) {
+      // docs/PROTOCOL.md §9: during 0.x a plugin/server version mismatch
+      // warns but never refuses the connection. Ring buffer only — the
+      // panel's version line is the user-facing surface for this.
+      logWarn(`plugin v${uxp.versions.plugin} ≠ server v${msg.server_version} — update the plugin`)
+    }
     this.localMode = await this._probeLocalMode(msg.input_cpsb_path)
     /** @type {CpsbReadyMessage} */
     const ready = { type: 'ready', local_mode: this.localMode }

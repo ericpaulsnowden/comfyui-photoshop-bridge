@@ -46,7 +46,7 @@ input/<managed>/<handoff_id>/
 {
   "handoff_id": "a1b2c3d4",
   "origin_node_id": "17",
-  "origin_kind": "load_image" | "terminal_output" | "bridge_node",
+  "origin_kind": "load_image" | "terminal_output" | "bridge_node" | "load_psd",
   "workflow_name": "my-workflow",
   "source_hash": "<sha256 hex of the original image's normalized PNG encoding>",
   "source": {"filename": "ComfyUI_00042_.png", "subfolder": "", "type": "output"},
@@ -57,8 +57,7 @@ input/<managed>/<handoff_id>/
   "edits": [
     {"filename": "edit_001.png", "ts": 1752680123.4,
      "fidelity": "composite" | "recomposite" | "plugin",
-     "sibling_output": {"filename": "ComfyUI_00042_ps1.png", "subfolder": ""},
-     "mask": {"filename": "mask_001.png"} 
+     "sibling_output": {"filename": "ComfyUI_00042_ps1.png", "subfolder": ""}
     }
   ]
 }
@@ -139,6 +138,13 @@ The response is **200 with `status:"pending"` even if the launch attempt itself 
 fails** — the contract's error codes cover pre-launch validation only; launch outcome
 is conveyed asynchronously via `cpsb.status` (`editing` on success, `error` on failure).
 
+**PSD-native sources (`origin_kind: "load_psd"`)**: the `{filename, subfolder, type}`
+triple points at a `.psd`/`.psb` the user loaded (Load PSD node). Handoff creation
+COPIES that file verbatim as `source.psd` — never `write_psd`/`frompil` — so the user
+edits a file with their layers intact; the ORIGINAL stays untouched (non-destructive).
+`source_hash` = sha256 of the raw PSD bytes (not a PNG encoding). The thumbnail comes
+from the §4 flatten of the copy.
+
 Tier selection: if a UXP plugin websocket is currently connected → Tier 2 (send
 `open_handoff` over WS); else if Tier 1 available → OS-launch Photoshop with the PSD
 path. Tier 1's watchdog stays armed in both tiers (§5 — redundant detector; first
@@ -195,7 +201,7 @@ Returns `orig_thumb.png` bytes. (Edited-image thumbnails are fetched via ComfyUI
 ### GET `/cpsb/settings` / POST `/cpsb/settings`
 Backend-persisted settings (stored at `<user_dir>/cpsb.json`), JSON object:
 `{"photoshop_path": "", "debounce_ms": 800, "cleanup_days": 14, "sibling_outputs": true,
-"managed_folder_name": "photoshop", "mask_channel_name": "Mask"}`.
+"managed_folder_name": "photoshop"}`.
 POST merges partial updates and returns the full object. `managed_folder_name` is
 sanitized to a single safe path segment (no separators, no `..`); an invalid value falls
 back to the default. (Frontend-only preferences — auto-queue toggle — use ComfyUI's
@@ -262,19 +268,10 @@ A read that still fails after the retry budget is **non-terminal**: the watcher 
 leaves the handoff `editing` so the next save retries ingestion — it must never move a
 handoff to `error` (terminal statuses would silently drop all subsequent saves).
 
-**Mask extraction (channel-based, product owner's spec):** whenever the saved PSD is
-readable server-side (Tier 1 always; Tier 2 in local mode — the plugin saved to the
-shared `source.psd` path), ingest also inspects the document's EXTRA channels (alpha /
-spot channels beyond the core RGB and composite transparency):
-- exactly one extra channel → it is the mask;
-- more than one → the one whose name equals the `mask_channel_name` setting
-  (default `"Mask"`, case-insensitive) wins; if none match, no mask;
-- none → no mask.
-The winning channel's pixels are written as single-channel `mask_%03d.png` beside the
-edit (white = 1.0 mask, no inversion in the pipeline) and recorded on the edit entry
-(`mask`). Tier 2 remote mode has no server-side PSD → `mask: null` (plugin-side channel
-export is a future spike). Mask extraction failures are non-fatal: log, `mask: null`,
-the edit itself still ingests.
+**Mask channel extraction: REMOVED (owner's call, 2026-07-17)** — field testing showed
+transparency-based masking covers the need; extra-channel extraction was dropped for
+simplicity. MASK outputs derive from image alpha only (see §6/§6b). Git history and
+research/research-annotate-node.md retain the design if ever revisited.
 
 ---
 
@@ -285,8 +282,7 @@ the edit itself still ingests.
   {"handoff_id": "...", "origin_node_id": "17", "origin_kind": "load_image",
    "filename": "edit_002.png", "subfolder": "cpsb/a1b2c3d4", "type": "input",
    "fidelity": "plugin",
-   "sibling_output": null,
-   "mask": {"filename": "mask_002.png", "subfolder": "cpsb/a1b2c3d4", "type": "input"} }
+   "sibling_output": null }
   ```
 - `"cpsb.status"` — handoff lifecycle changed (badge/gallery refresh):
   `{"handoff_id": "...", "origin_node_id": "17", "status": "editing"}`
@@ -296,7 +292,9 @@ the edit itself still ingests.
 Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
 widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 "[Add as node]" for `terminal_output`). Auto-queue policy:
-- `load_image` origins: queue when the `cpsb.autoQueue` setting is on.
+- `load_image` and `load_psd` origins: queue when the `cpsb.autoQueue` setting is on.
+  (For `load_psd`, paste-back never rewrites the node's file widget — the edit is
+  consumed by the node's own execute()/IS_CHANGED, §6b.)
 - `bridge_node` origins: queue IFF the origin node's `mode` widget is
   `"Re-run on every save"` (§6) — the node-level mode overrides the global setting
   (an explicit per-node choice must not be silently disabled elsewhere). For the
@@ -329,9 +327,8 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     policy) which consumes the latest edit — live-iterate mode. No timeout involved.
   - "Open only (don't wait)": passthrough + fire-and-forget open; saves are ingested
     and consumed on the next manual queue only.
-- Outputs: (IMAGE, MASK). MASK preference order: the edit's extracted channel mask
-  (§4) → else `1 - alpha` of the edit image (LoadImage parity) → else an all-zero
-  mask sized to the image. White = 1.0; inversion is the consumer's job.
+- Outputs: (IMAGE, MASK). MASK = `1 - alpha` of the edit image (LoadImage parity)
+  when transparency is present, else an all-zero mask sized to the image.
 - Execute (edit-consumption semantics): if an active handoff for this node already has
   an edit AND its `source_hash` matches the current input, that edit is returned
   immediately WITHOUT re-opening Photoshop — re-execution is the "consume the edit"
@@ -353,6 +350,26 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   re-execution on the next queue, matching LoadImage semantics.
 
 ---
+
+### 6b. Load PSD node
+
+- Class `PhotoshopLoadPSD` (unique id — plain "LoadPSD" collides with other packs),
+  display name "Load PSD", category `image/photoshop`.
+- Inputs: `psd` (COMBO of `.psd`/`.psb` files in the input directory, refreshed like
+  LoadImage's combo) — the frontend adds a custom upload widget (accept `.psd,.psb`,
+  hand-rolled input + POST to ComfyUI's own `/upload/image`; the stock IMAGEUPLOAD
+  widget hardcodes png/jpeg/webp). Hidden: `unique_id`.
+- Outputs: (IMAGE, MASK) — §4 read path (embedded composite → recomposite fallback,
+  RGB8 normalize); MASK = `1 - alpha` of the flattened image, else zeros.
+- Round trip: right-click → Open in Photoshop creates a `load_psd` handoff (§2 copy
+  semantics). While an ACTIVE handoff for this node has a matching `source_hash` and
+  edits, execute() returns the latest edit (and its mask) instead of re-flattening the
+  original — the PhotoshopBridge consume pattern. `IS_CHANGED`: sha256 of the PSD
+  file's raw bytes, combined with the latest edit hash when an active matching handoff
+  exists.
+- Frontend: the node type is allowlisted in `captureImageUploadType`'s detection (its
+  hand-rolled widget bypasses the stock `image_upload` spec flag), and its context-menu
+  origin_kind derives as `load_psd`.
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 

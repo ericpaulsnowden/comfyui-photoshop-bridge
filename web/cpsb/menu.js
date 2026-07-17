@@ -1,10 +1,12 @@
 /**
  * @file Context-menu integration (PROTOCOL.md §8). Registers ONE top-level
- * "Open in Photoshop" item on any node whose `node.imgs` is non-empty — it
- * acts directly (plus a sibling "Open all N in Photoshop" when applicable)
- * when the node has no active handoff, or opens a submenu containing "Edit
- * Original in Photoshop" / "Start Fresh in Photoshop" (+ "Open all N", when
- * applicable) when one exists.
+ * "Open in Photoshop" item on any node whose `node.imgs` is non-empty — or,
+ * as of PROTOCOL.md §6b, any `PhotoshopLoadPSD` node regardless of
+ * `node.imgs` (see {@link getNodeMenuItems}'s own doc comment and
+ * loadpsd.js) — it acts directly (plus a sibling "Open all N in Photoshop"
+ * when applicable) when the node has no active handoff, or opens a submenu
+ * containing "Edit Original in Photoshop" / "Start Fresh in Photoshop" (+
+ * "Open all N", when applicable) when one exists.
  *
  * Menu registration: the modern frontend invokes **both**
  * `node.getExtraMenuOptions` (via litegraph's own `getNodeMenuOptions`) and
@@ -100,6 +102,8 @@
 
 import { app } from '../../../scripts/app.js'
 import * as api from './api.js'
+import * as loadpsd from './loadpsd.js'
+import * as open from './open.js'
 import * as state from './state.js'
 import * as ui from './ui.js'
 
@@ -159,12 +163,20 @@ function nodeHasImageUploadWidget(node) {
 
 /**
  * @param {import('../../../scripts/app.js').LGraphNode} node
- * @returns {import('./api.js').CpsbOriginKind} Always `load_image` or
+ * @returns {import('./api.js').CpsbOriginKind} `load_image`, `load_psd`, or
  * `terminal_output` — `bridge_node` is only ever assigned server-side, when
  * the handoff is created by a Photoshop Bridge node's own execution, never
  * from a menu click (see PROTOCOL.md §6).
  */
 export function deriveOriginKind(node) {
+  // Explicit allowlist entry (PROTOCOL.md §6b): Load PSD's `psd` COMBO is a
+  // plain combo, not one flagged `image_upload`/etc. in its INPUT_TYPES —
+  // its upload affordance is the hand-rolled widget loadpsd.js attaches
+  // from nodeCreated, which {@link captureImageUploadType}'s node-def scan
+  // (below) has no way to see. Checked before the generic detection so this
+  // node type is never accidentally reclassified as `load_image` by the
+  // `nodeHasImageUploadWidget` fallback.
+  if (loadpsd.isLoadPsdNode(node)) return 'load_psd'
   const typeKey = node.comfyClass || node.type
   if (typeKey && imageUploadNodeTypes.has(typeKey)) return 'load_image'
   if (nodeHasImageUploadWidget(node)) return 'load_image'
@@ -172,170 +184,45 @@ export function deriveOriginKind(node) {
 }
 
 /**
- * @param {import('./api.js').CpsbApiError["body"]} body - 503 response body.
- * @returns {string}
+ * The `{filename, subfolder, type}` a right-click open request should use
+ * for *node*. A Load PSD node has no `node.imgs` to read from at all in the
+ * common case (PROTOCOL.md §6b: its hand-rolled widget bypasses the stock
+ * image-preview pipeline entirely — see loadpsd.js's header) — its file
+ * lives on the `psd` COMBO widget's value instead, always `type: "input"`.
+ * Every other node type keeps the original `node.imgs`-based lookup.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {number} imageIndex
+ * @returns {import('./api.js').CpsbImageRef | null}
  */
-function describeUnavailable(body) {
-  if (body && typeof body === 'object' && body.error) return String(body.error)
-  return 'Neither Photoshop (Tier 1) nor the Photoshop panel plugin (Tier 2) is available.'
+function resolveImageRef(node, imageIndex) {
+  if (loadpsd.isLoadPsdNode(node)) return loadpsd.getPsdFileRef(node)
+  return api.parseImageRef(node.imgs?.[imageIndex]?.src)
 }
 
 /**
- * localStorage key remembering an affirmative answer to the PROTOCOL.md §2
- * remote-open confirm below, so a given browser is asked at most once. Only
- * the affirmative is ever written — there is no stored "no".
- */
-const REMOTE_OPEN_ALLOWED_KEY = 'cpsb.remoteOpenAllowed'
-
-/** Guards the warning below so a broken `localStorage` never spams the console. */
-let localStorageWarned = false
-
-/**
- * @param {unknown} error
- */
-function warnLocalStorageUnavailable(error) {
-  if (localStorageWarned) return
-  localStorageWarned = true
-  api.warn(
-    'localStorage is unavailable; the "open Photoshop on a different ' +
-      'computer" choice will not be remembered between opens',
-    error
-  )
-}
-
-/**
- * @returns {boolean} Whether this browser has already been told, and
- * agreed, that Photoshop opens on the ComfyUI server's machine
- * (PROTOCOL.md §2) — only the affirmative is ever persisted.
- * Feature-detected: some browser configurations (storage disabled by
- * policy, certain private-browsing modes) throw on `localStorage` access
- * rather than simply leaving it absent.
- */
-function isRemoteOpenAllowed() {
-  try {
-    return window.localStorage.getItem(REMOTE_OPEN_ALLOWED_KEY) === '1'
-  } catch (error) {
-    warnLocalStorageUnavailable(error)
-    return false
-  }
-}
-
-/**
- * Persists the user's "Open on <server_name>" choice so this browser is
- * never asked again (PROTOCOL.md §2: "choice remembered per-browser in
- * localStorage; only the affirmative is persisted").
- */
-function rememberRemoteOpenAllowed() {
-  try {
-    window.localStorage.setItem(REMOTE_OPEN_ALLOWED_KEY, '1')
-  } catch (error) {
-    warnLocalStorageUnavailable(error)
-  }
-}
-
-/**
- * Thrown internally by {@link openWithRemoteConfirm} when the user
- * dismisses or cancels the PROTOCOL.md §2 remote-open confirm. Callers
- * catch this specifically and stop silently — declining is a deliberate
- * answer, not a failure, so it shows no toast.
- */
-class RemoteOpenCancelled extends Error {
-  constructor() {
-    super('Remote-open confirm was cancelled')
-    this.name = 'RemoteOpenCancelled'
-  }
-}
-
-/**
- * Adds `client_remote_ok: true` to an open-request body when the user has
- * already agreed, in this browser, to open Photoshop on the server's
- * machine AND the page looks remotely browsed
- * ({@link state.isRemoteBrowsingLikely}) — a pure optimization so the
- * 428-then-retry round trip in {@link openWithRemoteConfirm} never happens
- * for a choice that's already known. Never required for correctness: a
- * body that omits the flag (e.g. an `isRemoteBrowsingLikely()`
- * false-negative — PROTOCOL.md §7 notes hostname can't perfectly determine
- * locality) still reaches the same outcome via the 428 branch below, just
- * one extra request later.
- * @param {import('./api.js').CpsbOpenRequest} body
- * @returns {import('./api.js').CpsbOpenRequest}
- */
-function withProactiveRemoteFlag(body) {
-  if (isRemoteOpenAllowed() && state.isRemoteBrowsingLikely()) {
-    return { ...body, client_remote_ok: true }
-  }
-  return body
-}
-
-/**
- * POSTs `/cpsb/open`, transparently resolving the PROTOCOL.md §2/§7
- * client-locality confirm. A 428 with `body.reason === "client_remote"` is
- * caught here: if this browser already agreed ({@link isRemoteOpenAllowed}),
- * the SAME open is retried immediately with `client_remote_ok: true`
- * (covers the case where {@link withProactiveRemoteFlag} didn't already
- * send it proactively, e.g. an `isRemoteBrowsingLikely()` false-negative);
- * otherwise the user is asked once via {@link ui.chooseDialog}, and on
- * "allow" the choice is persisted and the same retry happens. Every other
- * status (409, 503, or anything else) is rethrown untouched — this
- * function's only job is the 428 branch, so it composes transparently with
- * a caller's own 409/503 handling, including a 409-driven re-call that then
- * hits 428.
- * @param {import('./api.js').CpsbOpenRequest} body
- * @returns {Promise<import('./api.js').CpsbOpenResponse>}
- * @throws {RemoteOpenCancelled} The user declined the confirm.
- * @throws {import('./api.js').CpsbApiError} Any other non-2xx response.
- */
-async function openWithRemoteConfirm(body) {
-  try {
-    return await api.openHandoff(withProactiveRemoteFlag(body))
-  } catch (error) {
-    if (
-      error instanceof api.CpsbApiError &&
-      error.status === 428 &&
-      error.body &&
-      typeof error.body === 'object' &&
-      error.body.reason === 'client_remote'
-    ) {
-      const serverName = error.body.server_name
-      if (!isRemoteOpenAllowed()) {
-        const choice = await ui.chooseDialog({
-          title: 'Photoshop is on a different computer',
-          message:
-            `Photoshop will open on “${serverName}” — the machine running ` +
-            'ComfyUI — not on this computer. If you’re not at that machine, ' +
-            'cancel and install the Photoshop panel plugin there instead. ' +
-            '(Remote opening on THIS computer is planned.)',
-          choices: [{ label: `Open on ${serverName}`, value: 'allow', primary: true }]
-        })
-        if (choice !== 'allow') throw new RemoteOpenCancelled()
-        rememberRemoteOpenAllowed()
-      }
-      return api.openHandoff({ ...body, client_remote_ok: true })
-    }
-    throw error
-  }
-}
-
-/**
- * POSTs `/cpsb/open` for a single image on a node, handling the 409
- * existing-handoff response with the Edit Original / Start Fresh chooser,
- * and — via {@link openWithRemoteConfirm} — the PROTOCOL.md §2/§7 428
- * remote-open confirm.
+ * Opens a single image on a node via the shared `open.js` flow — the 409
+ * Edit Original / Start Fresh chooser, the PROTOCOL.md §2/§7 428
+ * remote-open confirm, and server-message error toasts all live there
+ * (`open.openInteractive`), shared verbatim with gallery.js's card actions.
+ * This function only contributes what is menu-specific: deriving the
+ * request body from the clicked node.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @param {"new" | "original" | "fresh"} mode
  * @param {number} [imageIndex]
  */
 async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
-  const ref = api.parseImageRef(node.imgs?.[imageIndex]?.src)
+  const ref = resolveImageRef(node, imageIndex)
   if (!ref) {
     ui.showToast({
       severity: 'error',
       summary: 'Could not open in Photoshop',
-      detail: 'This image has no resolvable file reference.'
+      detail: loadpsd.isLoadPsdNode(node)
+        ? 'Upload a PSD/PSB file to this node first.'
+        : 'This image has no resolvable file reference.'
     })
     return
   }
-  const body = {
+  await open.openInteractive({
     filename: ref.filename,
     subfolder: ref.subfolder,
     type: ref.type,
@@ -343,53 +230,7 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
     origin_kind: deriveOriginKind(node),
     workflow_name: state.getWorkflowName(),
     mode
-  }
-  try {
-    await openWithRemoteConfirm(body)
-    // Toast only after the POST succeeds — the 409 path below shows its own
-    // chooser instead (and the recursive re-call toasts exactly once), a
-    // declined remote-open confirm shows no toast at all (see
-    // openWithRemoteConfirm), and a 503/other failure must not be preceded
-    // by a false "Opening…".
-    ui.showToast({
-      severity: 'info',
-      summary: 'Opening in Photoshop…',
-      detail: 'ComfyUI will watch this file and bring back your edits automatically.'
-    })
-    // No further UI here by design — the cpsb.status/cpsb.updated events
-    // drive the node badge (badges.js) and the gallery (gallery.js).
-  } catch (error) {
-    if (error instanceof RemoteOpenCancelled) return
-    if (error instanceof api.CpsbApiError && error.status === 409) {
-      const choice = await ui.chooseDialog({
-        title: 'Already editing this image',
-        message:
-          'An edit is already in progress for this node. Continue editing ' +
-          'the same Photoshop document, or start over from the current image?',
-        choices: [
-          { label: 'Edit Original', value: 'original', primary: true },
-          { label: 'Start Fresh', value: 'fresh' }
-        ]
-      })
-      if (choice === 'original' || choice === 'fresh') {
-        await openInPhotoshop(node, choice, imageIndex)
-      }
-      return
-    }
-    if (error instanceof api.CpsbApiError && error.status === 503) {
-      ui.showToast({
-        severity: 'error',
-        summary: 'Photoshop not available',
-        detail: describeUnavailable(error.body)
-      })
-      return
-    }
-    ui.showToast({
-      severity: 'error',
-      summary: 'Failed to open in Photoshop',
-      detail: error instanceof Error ? error.message : String(error)
-    })
-  }
+  })
 }
 
 /**
@@ -399,11 +240,11 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
  * of popping the Edit Original / Start Fresh chooser N times. The
  * PROTOCOL.md §2 remote-open confirm is likewise resolved at most ONCE for
  * the whole batch, not per image: client locality can't change between
- * images in the same call, and {@link openWithRemoteConfirm} persists an
- * "allow" to `localStorage` before the next iteration's request even goes
- * out, so only the first 428 in the loop can ever show the dialog. If the
- * user declines it, {@link RemoteOpenCancelled} aborts the whole batch
- * immediately rather than continuing to the next image.
+ * images in the same call, and {@link open.openWithRemoteConfirm} persists
+ * an "allow" to `localStorage` before the next iteration's request even
+ * goes out, so only the first 428 in the loop can ever show the dialog. If
+ * the user declines it, {@link open.RemoteOpenCancelled} aborts the whole
+ * batch immediately rather than continuing to the next image.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 async function openAllInPhotoshop(node) {
@@ -424,17 +265,17 @@ async function openAllInPhotoshop(node) {
       mode: 'new'
     }
     try {
-      await openWithRemoteConfirm(body)
+      await open.openWithRemoteConfirm(body)
       opened++
     } catch (error) {
-      if (error instanceof RemoteOpenCancelled) break
+      if (error instanceof open.RemoteOpenCancelled) break
       if (error instanceof api.CpsbApiError && error.status === 409) {
         try {
-          await openWithRemoteConfirm({ ...body, mode: 'original' })
+          await open.openWithRemoteConfirm({ ...body, mode: 'original' })
           opened++
           continue
         } catch (retryError) {
-          if (retryError instanceof RemoteOpenCancelled) break
+          if (retryError instanceof open.RemoteOpenCancelled) break
           api.debugLog('batch re-open (original) failed', retryError)
         }
       } else {
@@ -480,18 +321,27 @@ async function openAllInPhotoshop(node) {
  * truth: `/cpsb/open` still authoritatively decides per request (see the 503
  * handling in {@link openInPhotoshop}), since a menu built from
  * slightly-stale client state could otherwise under- or over-disable.
+ *
+ * The `node.imgs?.length` gate below is allowlist-extended for Load PSD
+ * nodes (PROTOCOL.md §6b): that node type's hand-rolled upload widget never
+ * populates `node.imgs` (see loadpsd.js's header — it deliberately doesn't
+ * hook into the stock image-preview pipeline), so without this exception a
+ * freshly-added Load PSD node would never offer "Open in Photoshop" at all.
+ * `count` below naturally falls back to 0 for such a node, so the "Open all
+ * N" batch item — a concept that doesn't apply to a single-file COMBO —
+ * simply never appears for it, no extra branching needed there.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @returns {import('../../../scripts/app.js').IContextMenuValue[]}
  */
 export function getNodeMenuItems(node) {
-  if (!node.imgs?.length) return []
+  if (!node.imgs?.length && !loadpsd.isLoadPsdNode(node)) return []
 
   const activeHandoff = state.getActiveHandoffForNode(String(node.id))
   const tierInfo = state.getTierInfo()
   const unavailable = !tierInfo.tier1Effective && !tierInfo.tier2Connected
   const suffix = unavailable ? ' (unavailable)' : ''
 
-  const count = node.imgs.length
+  const count = node.imgs?.length ?? 0
   const batchItem =
     count >= 2 && count <= MAX_BATCH_OPEN
       ? {

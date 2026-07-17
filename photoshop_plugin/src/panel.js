@@ -19,6 +19,12 @@ const { connection } = require('./connection.js')
 const { getActiveHandoffs, registryEvents, deliverEdit } = require('./handoffs.js')
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
 
+// Same version source the `hello` handshake message uses (connection.js):
+// require('uxp').versions.plugin is documented to match manifest.json's
+// "version" field, so the panel's version line and the handshake can never
+// disagree.
+const uxp = require('uxp')
+
 /** @type {Record<import('./connection.js').CpsbConnectionState['status'], string>} */
 const STATUS_LABELS = {
   disconnected: 'Disconnected',
@@ -43,6 +49,7 @@ function initPanel() {
   const serverUrlEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-server-url'))
   const lastErrorEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-last-error'))
   const retryEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-retry-line'))
+  const versionEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-version-line'))
   const handoffList = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-list'))
   const logEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-log'))
   const advancedToggle = /** @type {HTMLElement} */ (
@@ -72,12 +79,39 @@ function initPanel() {
     return ''
   }
 
+  /**
+   * Renders the version self-identification line: plugin version alone
+   * while not connected, plugin + server versions once connected, with the
+   * error accent and an "(update mismatch)" note when the two differ
+   * (docs/PROTOCOL.md §9 — mismatches warn, never refuse the connection).
+   * @param {import('./connection.js').CpsbConnectionState} state
+   * @returns {void}
+   */
+  function renderVersionLine(state) {
+    const pluginVersion = uxp.versions.plugin
+    if (state.status === 'connected' && state.serverVersion) {
+      const mismatch = state.serverVersion !== pluginVersion
+      versionEl.textContent = mismatch
+        ? `Plugin v${pluginVersion} • Server v${state.serverVersion} (update mismatch)`
+        : `Plugin v${pluginVersion} • Server v${state.serverVersion}`
+      // On mismatch, cpsb-mismatch REPLACES cpsb-muted (rather than
+      // overriding it) so the accent never depends on CSS cascade order.
+      versionEl.className = mismatch
+        ? 'cpsb-conn-line cpsb-mismatch'
+        : 'cpsb-muted cpsb-conn-line'
+      return
+    }
+    versionEl.textContent = `Plugin v${pluginVersion}`
+    versionEl.className = 'cpsb-muted cpsb-conn-line'
+  }
+
   /** @returns {void} */
   function renderConnection() {
     const state = connection.getState()
     statusDot.className = `cpsb-dot cpsb-dot-${state.status}`
     statusText.textContent = STATUS_LABELS[state.status] || state.status
     serverUrlEl.textContent = state.url
+    renderVersionLine(state)
     if (state.status === 'connected') {
       lastErrorEl.style.display = 'none'
       retryEl.style.display = 'none'

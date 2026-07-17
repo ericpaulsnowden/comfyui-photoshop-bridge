@@ -22,6 +22,7 @@ import * as menu from './cpsb/menu.js'
 import * as pasteback from './cpsb/pasteback.js'
 import * as badges from './cpsb/badges.js'
 import * as gallery from './cpsb/gallery.js'
+import * as loadpsd from './cpsb/loadpsd.js'
 import * as ui from './cpsb/ui.js'
 import { SETTINGS } from './cpsb/settings.js'
 
@@ -90,6 +91,23 @@ app.registerExtension({
   ],
 
   /**
+   * Fires once, after the canvas is created but before any node type is
+   * registered or any node instance exists (`Comfy-Org/ComfyUI_frontend`
+   * `src/types/comfy.ts` `ComfyExtension.init` doc comment: "Called after
+   * the canvas is created but before nodes are added" — call order
+   * confirmed live in `src/scripts/app.ts` `ComfyApp.setup()`:
+   * `invokeExtensionsAsync('init')` precedes `registerNodes()`, itself where
+   * `beforeRegisterNodeDef` fires per type, which in turn precedes
+   * `invokeExtensionsAsync('setup')` — all of which complete before a
+   * restored workflow's own nodes are deserialized). Used only for
+   * loadpsd.js's one-time File/FormData feature-detection, which must
+   * finish before the first possible `nodeCreated` call below.
+   */
+  init() {
+    safely('loadpsd.init', () => loadpsd.init())
+  },
+
+  /**
    * Fires once per node type at startup (and again for any type re-sent by
    * `app.reloadNodeDefs()`). Captures image-upload-widget metadata for
    * `menu.js`'s origin-kind derivation and installs the legacy context-menu
@@ -116,10 +134,14 @@ app.registerExtension({
 
   /**
    * Fires once per node instance. Installs the chained `onDrawForeground`
-   * badge hook (badges.js).
+   * badge hook (badges.js) and, for Load PSD nodes only, the hand-rolled
+   * upload button + drag-and-drop (loadpsd.js — PROTOCOL.md §6b: the stock
+   * IMAGEUPLOAD widget can't accept `.psd`/`.psb`; see loadpsd.js's header
+   * for why).
    */
   nodeCreated(node) {
     safely('badges.installBadgeHook', () => badges.installBadgeHook(node))
+    safely('loadpsd.attachUploadWidget', () => loadpsd.attachUploadWidget(node))
   },
 
   /**

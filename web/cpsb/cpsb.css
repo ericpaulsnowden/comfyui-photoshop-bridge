@@ -25,8 +25,70 @@
 .cpsb-gallery-header {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 8px;
+}
+
+.cpsb-gallery-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Generic "Ps" text lettermark (gallery header identity; the tab-strip
+   sibling is .cpsb-ps-icon below). A plain rounded OUTLINE box drawing the
+   two letters in the inherited foreground color — deliberately NOT Adobe's
+   filled-square Photoshop logo or its brand colors (trademark). */
+
+.cpsb-brand-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: 1.5px solid currentColor;
+  color: var(--fg-color, #e6e6e6);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+/* Sidebar tab-strip icon: the same generic "Ps" lettermark, as an icon-font
+   -style class. ComfyUI_frontend's SidebarIcon.vue renders a string `icon`
+   as a bare, empty `<i :class="icon + ' side-bar-button-icon'">` (lines
+   21-24), so a ::before with text content renders exactly like a pi/mdi
+   glyph would. Sizing rides the strip's own `--sidebar-icon-size` (1rem —
+   SideToolbar.vue) via em units; the ::before's own font-size declaration
+   applies to the pseudo-element, so the strip's `!important` font-size on
+   the <i> scales it rather than fighting it. `font-style: normal` matters:
+   the host element is an <i>. Color is currentColor so the mark follows
+   the button's normal / hover / selected foreground like every other tab
+   icon. */
+
+.cpsb-ps-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25em;
+  height: 1.25em;
+  box-sizing: border-box;
+  border-radius: 0.25em;
+  border: 1.5px solid currentColor;
+}
+
+.cpsb-ps-icon::before {
+  content: 'Ps';
+  font-size: 0.6em;
+  font-weight: 700;
+  font-style: normal;
+  font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  letter-spacing: 0.02em;
+  line-height: 1;
 }
 
 .cpsb-gallery-version {
@@ -142,6 +204,24 @@
   flex-shrink: 0;
 }
 
+/* Placeholder shown in place of a thumbnail whose file is gone (purged
+   handoff folder, deleted input) — same footprint as .cpsb-card-thumb so
+   the card layout doesn't shift, but a labeled box instead of the
+   browser's broken-image glyph. */
+
+.cpsb-card-thumb-missing {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 4px;
+  box-sizing: border-box;
+  color: var(--muted-foreground, #777);
+  font-size: 10px;
+  line-height: 1.3;
+  border: 1px dashed var(--border-default, rgba(255, 255, 255, 0.18));
+}
+
 .cpsb-card-thumb-arrow {
   color: var(--muted-foreground, #888);
   flex-shrink: 0;
@@ -153,13 +233,6 @@
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
-}
-
-.cpsb-card-header-badges {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
 }
 
 .cpsb-card-title {
@@ -192,7 +265,7 @@
 }
 
 .cpsb-card-action:hover {
-  background: var(--content-hover-fg, #333);
+  background: var(--content-hover-bg, #333);
 }
 
 .cpsb-card-action-danger {
@@ -241,11 +314,6 @@
 .cpsb-chip-superseded {
   color: var(--muted-foreground, #888);
   background: rgba(128, 128, 128, 0.14);
-}
-
-.cpsb-chip-mask {
-  color: #b385e0;
-  background: rgba(179, 133, 224, 0.16);
 }
 
 /* Settings-panel read-only version row (settings.js `renderVersionRow`) */
@@ -402,7 +470,7 @@
 }
 
 .cpsb-dialog-button:hover {
-  background: var(--content-hover-fg, #383838);
+  background: var(--content-hover-bg, #383838);
 }
 
 .cpsb-dialog-button-primary {

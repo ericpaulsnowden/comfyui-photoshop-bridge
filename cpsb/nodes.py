@@ -144,6 +144,20 @@ def _require_state() -> _NodeState:
     return _state
 
 
+def _state_if_configured() -> _NodeState | None:
+    """Like :func:`_require_state`, but ``None`` instead of raising when unconfigured.
+
+    For call sites that may legitimately run before :func:`configure` --
+    e.g. a node's ``INPUT_TYPES()``/``VALIDATE_INPUTS()``, which ComfyUI-
+    adjacent tooling can probe without a live server (this package's own
+    top-level ``__init__.py`` already anticipates that: "Running outside
+    ComfyUI (tests, tooling): skip all wiring") -- as opposed to
+    ``execute()``/``IS_CHANGED()``, which only ever run inside an actual
+    queued prompt on a running server and so may safely demand one.
+    """
+    return _state
+
+
 def _tensor_to_pil(image: Any) -> Image.Image:
     """First frame of a ComfyUI ``IMAGE`` tensor (float32, [0, 1], NHWC) as a PIL image."""
     import numpy as np
@@ -169,25 +183,12 @@ def _image_tensor_size(image: Any) -> tuple[int, int]:
     return width, height
 
 
-def _mask_tensor_from_l(image: Image.Image) -> Any:
-    """A single-channel PIL image (white = 1.0) as a ComfyUI ``MASK`` tensor.
-
-    Used as-is, no inversion (PROTOCOL.md §6/§4) -- this is the extracted-
-    channel-mask preference, the first tier of the MASK output's preference
-    order.
-    """
-    import numpy as np
-    import torch
-
-    array = np.array(image.convert("L")).astype(np.float32) / 255.0
-    return torch.from_numpy(array)[None, ...]
-
-
 def _alpha_complement_mask_tensor(image: Image.Image) -> Any:
     """``1 - alpha`` of *image* as a ``MASK`` tensor (LoadImage parity, PROTOCOL.md §6).
 
-    The second tier of the MASK output's preference order. Callers only
-    invoke this once they've confirmed *image*'s mode carries an alpha band.
+    Callers only invoke this once they've confirmed *image*'s mode carries
+    an alpha band; otherwise the MASK output falls back to
+    :func:`_zeros_mask_tensor`.
     """
     import numpy as np
     import torch
@@ -199,12 +200,45 @@ def _alpha_complement_mask_tensor(image: Image.Image) -> Any:
 def _zeros_mask_tensor(width: int, height: int) -> Any:
     """An all-zero ``MASK`` tensor sized ``(1, height, width)`` (PROTOCOL.md §6).
 
-    The last tier of the MASK output's preference order -- also what a
+    The MASK output's fallback when *image* carries no alpha -- also what a
     passthrough run (no edit yet) always pairs with the input image.
     """
     import torch
 
     return torch.zeros((1, height, width), dtype=torch.float32)
+
+
+def _tensors_from_image(image: Image.Image) -> Any:
+    """``(IMAGE, MASK)`` tensors from an already-decoded image (PROTOCOL.md §6/§6b).
+
+    MASK is ``1 - alpha`` of *image* (LoadImage parity) when it carries
+    transparency, else an all-zero mask sized to *image*. (A prior third
+    tier -- an extracted document channel mask -- was removed, PROTOCOL.md
+    §4: "owner's call", plain alpha-based masking already covers the need.)
+    Takes an already-decoded PIL image rather than a path so it is equally
+    usable for an ingested edit PNG (:class:`PhotoshopBridge`, via
+    :func:`_tensors_from_edit_file` below) and a freshly-flattened source
+    PSD (:class:`~cpsb.load_psd.PhotoshopLoadPSD`) -- the two places this
+    project derives a MASK output from a resolved image.
+    """
+    image_tensor = _pil_to_tensor(image)
+    if "A" in image.mode:
+        return image_tensor, _alpha_complement_mask_tensor(image)
+    width, height = image.size
+    return image_tensor, _zeros_mask_tensor(width, height)
+
+
+def _tensors_from_edit_file(edit_path: Path) -> Any:
+    """``(IMAGE, MASK)`` tensors for an on-disk ingested edit PNG.
+
+    Shared by :meth:`PhotoshopBridge._load_edit_tensors`'s edit-found branch
+    and :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s consume path (PROTOCOL.md
+    §6/§6b) -- both read an ``edit_%03d.png`` off disk through the identical
+    MASK derivation (:func:`_tensors_from_image`).
+    """
+    with Image.open(edit_path) as edit_image:
+        edit_image.load()
+        return _tensors_from_image(edit_image)
 
 
 def _raise_interrupt() -> None:
@@ -296,12 +330,11 @@ class PhotoshopBridge:
     is simply still open and unsaved must not relaunch/refocus Photoshop on
     every single re-run (PROTOCOL.md §5/§6).
 
-    Outputs: ``(IMAGE, MASK)``. MASK preference order (PROTOCOL.md §6): the
-    edit's extracted channel mask (PROTOCOL.md §4) -> else ``1 - alpha`` of
-    the edit image (LoadImage parity) -> else an all-zero mask sized to the
-    image. White = 1.0; inversion is the consumer's job. A passthrough run
-    (no edit yet, either mode) returns an all-zero mask alongside the
-    unchanged input image.
+    Outputs: ``(IMAGE, MASK)``. MASK (PROTOCOL.md §6) is ``1 - alpha`` of
+    the edit image (LoadImage parity) when it carries transparency, else an
+    all-zero mask sized to the image. White = 1.0; inversion is the
+    consumer's job. A passthrough run (no edit yet, either mode) returns an
+    all-zero mask alongside the unchanged input image.
     """
 
     CATEGORY = "image/photoshop"
@@ -633,29 +666,15 @@ class PhotoshopBridge:
         paired with an all-zero mask when there is no edit on disk yet
         (shouldn't normally happen here -- every caller already confirmed
         ``active.edits`` or a successful wait first -- but a filesystem
-        race is cheap to guard against). MASK preference order once the
-        edit image itself is loaded: the edit's extracted channel mask
-        (PROTOCOL.md §4, via ``HandoffManager.mask_image_path``) -> else
-        ``1 - alpha`` of the edit image (LoadImage parity) -> else an
-        all-zero mask sized to the edit image.
+        race is cheap to guard against). Once an edit is confirmed present,
+        delegates to :func:`_tensors_from_edit_file` for the MASK
+        derivation (``1 - alpha``, else zeros) -- shared with
+        :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s own consume path, which
+        has an identical "an edit already arrived" case but a different
+        (non-tensor) fallback when it hasn't.
         """
         path = manager.edit_image_path(handoff_id)
         if path is None or not path.exists():
             width, height = _image_tensor_size(fallback_image)
             return fallback_image, _zeros_mask_tensor(width, height)
-
-        with Image.open(path) as edit_image:
-            edit_image.load()
-            image_tensor = _pil_to_tensor(edit_image)
-
-            mask_path = manager.mask_image_path(handoff_id)
-            if mask_path is not None and mask_path.exists():
-                with Image.open(mask_path) as mask_image:
-                    mask_image.load()
-                    return image_tensor, _mask_tensor_from_l(mask_image)
-
-            if "A" in edit_image.mode:
-                return image_tensor, _alpha_complement_mask_tensor(edit_image)
-
-            width, height = edit_image.size
-            return image_tensor, _zeros_mask_tensor(width, height)
+        return _tensors_from_edit_file(path)

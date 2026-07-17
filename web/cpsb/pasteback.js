@@ -273,9 +273,15 @@ const BRIDGE_MODE_RERUN = 'Re-run on every save'
  * `0` means "append normally", matching the long-standing extension
  * convention.
  *
- * Policy: `load_image` queues when the global `cpsb.autoQueue` setting is on.
- * `bridge_node` queues IFF the origin node's `mode` widget is
- * "Re-run on every save" — a per-node explicit choice that overrides the
+ * Policy: `load_image` and `load_psd` both queue when the global
+ * `cpsb.autoQueue` setting is on (PROTOCOL.md §5) — identical treatment
+ * despite `load_psd` never touching a widget (see {@link handleLoadPsd}):
+ * either way, an arriving edit only actually reaches the graph's outputs on
+ * the NEXT execution (a changed widget value for `load_image`, a changed
+ * `IS_CHANGED`/`execute()` result for `load_psd`, PROTOCOL.md §6b), so the
+ * same "queue automatically, or leave it for the user" choice applies
+ * equally to both. `bridge_node` queues IFF the origin node's `mode` widget
+ * is "Re-run on every save" — a per-node explicit choice that overrides the
  * global setting. In the bridge's other modes, never: a blocking bridge
  * delivers the arriving edit downstream inside the run finishing at this
  * very moment, so re-queueing would run the whole workflow (and its
@@ -288,7 +294,7 @@ const BRIDGE_MODE_RERUN = 'Re-run on every save'
  * a deleted bridge node simply never re-queues).
  */
 function maybeAutoQueue(originKind, node) {
-  if (originKind === 'load_image') {
+  if (originKind === 'load_image' || originKind === 'load_psd') {
     if (!settings.getAutoQueue()) return
   } else if (originKind === 'bridge_node') {
     const mode = node?.widgets?.find((w) => w.name === 'mode')?.value
@@ -380,11 +386,56 @@ function handleTerminalOutput(payload) {
 }
 
 /**
+ * Handles a `load_psd`-origin edit (PROTOCOL.md §5/§6b). Deliberately does
+ * NOT call {@link pasteToWidget}: "paste-back never rewrites the node's
+ * file widget — the edit is consumed by the node's own execute()/
+ * IS_CHANGED" — the `psd` COMBO widget must keep pointing at the ORIGINAL
+ * uploaded file, since that is what `source_hash` on the handoff was
+ * computed from (PROTOCOL.md §2/§6b); the Load PSD node's own backend
+ * execute() is what swaps in the latest edit, keyed off the same handoff.
+ *
+ * The preview refresh and toast are both purely cosmetic, unlike
+ * {@link handleLoadImageOrBridge}'s widget update: since the widget's
+ * displayed filename never changes for this origin, there is no other
+ * textual cue that an edit actually arrived (badges.js's "Edited" pill is
+ * the only other one, and it is easy to miss if the node isn't in view) —
+ * so both exist purely to make the round trip legible, and neither is
+ * required for correctness (the node's next execute() picks up the edit
+ * regardless of whether either one ran).
+ * @param {import('./api.js').CpsbUpdatedEvent} payload
+ */
+function handleLoadPsd(payload) {
+  const node = getNodeByIdFlexible(payload.origin_node_id)
+  const ref = { filename: payload.filename, subfolder: payload.subfolder, type: payload.type }
+
+  if (!node) {
+    // Same graceful degrade as the other origins (PLAN.md §6): the edit
+    // still lives in the gallery even if the node that started it is gone.
+    handleMissingNode(ref)
+    return
+  }
+
+  refreshNodePreview(node, ref, handoffContext(payload))
+
+  ui.showToast({
+    severity: 'info',
+    summary: 'Edit received from Photoshop',
+    detail: 'This Load PSD node will use it on the next queue.'
+  })
+
+  maybeAutoQueue(payload.origin_kind, node)
+}
+
+/**
  * @param {import('./api.js').CpsbUpdatedEvent} payload
  */
 function handleUpdated(payload) {
   if (payload.origin_kind === 'terminal_output') {
     handleTerminalOutput(payload)
+    return
+  }
+  if (payload.origin_kind === 'load_psd') {
+    handleLoadPsd(payload)
     return
   }
   handleLoadImageOrBridge(payload)

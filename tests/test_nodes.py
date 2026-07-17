@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import subprocess
 import sys
 import threading
 import time
@@ -22,6 +23,7 @@ import pytest
 from aiohttp import web
 from PIL import Image
 
+import cpsb.load_psd as load_psd_module
 import cpsb.nodes as nodes_module
 import cpsb.routes as routes_module
 from cpsb.context import CpsbContext
@@ -46,8 +48,32 @@ def configured(context: CpsbContext, manager: HandoffManager):
 
 class TestImportability:
     def test_module_imports_without_torch(self):
-        assert "torch" not in sys.modules
-        assert nodes_module.PhotoshopBridge is not None
+        """Importing ``cpsb.nodes`` alone must not pull in torch.
+
+        Checked in an isolated subprocess rather than this process's own
+        ``sys.modules``: a plain in-process check would be a false failure
+        whenever some OTHER, earlier-collected test file has already
+        imported torch for its own reasons by the time this test runs
+        (pytest collects files alphabetically, and this repo's tests span
+        several files -- e.g. ``tests/test_load_psd.py`` -- some of which
+        legitimately need torch for pixel-level tensor assertions). The
+        subprocess makes this assertion about ``cpsb.nodes``'s own import
+        graph, independent of whatever else the test session has done.
+        """
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import cpsb.nodes as m, sys\n"
+                "assert m.PhotoshopBridge is not None\n"
+                "print('torch' in sys.modules)",
+            ],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "False", result.stderr
 
 
 class TestContractShape:
@@ -103,10 +129,14 @@ class TestDisplayNameMapping:
 
     def test_display_name_renamed_class_id_stable(self):
         entry = self._load_top_level_init()
-        assert entry.NODE_DISPLAY_NAME_MAPPINGS == {"PhotoshopBridge": "Edit in Photoshop"}
-        # The class id itself -- what saved workflows reference -- must be untouched.
-        assert set(entry.NODE_CLASS_MAPPINGS) == {"PhotoshopBridge"}
+        assert entry.NODE_DISPLAY_NAME_MAPPINGS == {
+            "PhotoshopBridge": "Edit in Photoshop",
+            "PhotoshopLoadPSD": "Load PSD",
+        }
+        # The class ids themselves -- what saved workflows reference -- must be untouched.
+        assert set(entry.NODE_CLASS_MAPPINGS) == {"PhotoshopBridge", "PhotoshopLoadPSD"}
         assert entry.NODE_CLASS_MAPPINGS["PhotoshopBridge"] is nodes_module.PhotoshopBridge
+        assert entry.NODE_CLASS_MAPPINGS["PhotoshopLoadPSD"] is load_psd_module.PhotoshopLoadPSD
 
 
 class TestIsChanged:
@@ -574,12 +604,12 @@ def make_bridge_handoff(manager: HandoffManager, node_id: str) -> str:
 
 class TestLoadEditTensors:
     """Direct coverage of ``PhotoshopBridge._load_edit_tensors`` -- the MASK
-    preference-chain logic itself (PROTOCOL.md §6) -- without the
-    open/launch machinery ``TestExecute`` et al. already cover.
+    derivation logic itself (PROTOCOL.md §6) -- without the open/launch
+    machinery ``TestExecute`` et al. already cover.
 
     Needs real ``torch`` tensors to check actual mask *values* (the whole
-    point of "preference chain" coverage), so every test here skips
-    cleanly via the autouse fixture below when torch isn't installed --
+    point of this coverage), so every test here skips cleanly via the
+    autouse fixture below when torch isn't installed --
     this project deliberately doesn't declare it as a dependency (ComfyUI
     provides it at runtime) -- rather than failing the whole module import,
     which is exactly why ``import torch`` never happens at this file's
@@ -634,50 +664,6 @@ class TestLoadEditTensors:
         assert mask_out.shape == (1, 16, 24)
         assert torch.allclose(mask_out, torch.full((1, 16, 24), expected), atol=1e-4)
 
-    def test_extracted_channel_mask_wins_over_alpha(self, manager, psd_with_extra_channels):
-        """The extracted-channel mask is preference tier 1; the edit's own
-        alpha (tier 2) must be ignored once a real extracted mask exists,
-        even though this edit ALSO carries alpha (PROTOCOL.md §6).
-        """
-        import torch
-
-        handoff_id = make_bridge_handoff(manager, "4")
-        psd_path = manager.handoff_dir(handoff_id) / "source.psd"
-        psd_with_extra_channels(
-            psd_path,
-            Image.new("RGB", (24, 16), (0, 0, 0)),
-            [("Mask", Image.new("L", (24, 16), 222))],
-        )
-        manager.ingest_edit(handoff_id, Image.new("RGBA", (24, 16), (9, 9, 9, 64)), "plugin")
-
-        _, mask_out = nodes_module.PhotoshopBridge._load_edit_tensors(
-            manager, handoff_id, make_tensor(RED)
-        )
-
-        expected = 222 / 255.0
-        assert torch.allclose(mask_out, torch.full((1, 16, 24), expected), atol=1e-4)
-
-    def test_extracted_channel_mask_used_when_edit_has_no_alpha(
-        self, manager, psd_with_extra_channels
-    ):
-        import torch
-
-        handoff_id = make_bridge_handoff(manager, "5")
-        psd_path = manager.handoff_dir(handoff_id) / "source.psd"
-        psd_with_extra_channels(
-            psd_path,
-            Image.new("RGB", (24, 16), (0, 0, 0)),
-            [("Mask", Image.new("L", (24, 16), 128))],
-        )
-        manager.ingest_edit(handoff_id, Image.new("RGB", (24, 16), (9, 9, 9)), "plugin")
-
-        _, mask_out = nodes_module.PhotoshopBridge._load_edit_tensors(
-            manager, handoff_id, make_tensor(RED)
-        )
-
-        expected = 128 / 255.0
-        assert torch.allclose(mask_out, torch.full((1, 16, 24), expected), atol=1e-3)
-
     def test_image_tensor_still_comes_from_the_edit_file(self, manager, monkeypatch):
         handoff_id = make_bridge_handoff(manager, "6")
         manager.ingest_edit(handoff_id, Image.new("RGB", (24, 16), (9, 9, 9)), "plugin")
@@ -694,7 +680,7 @@ class TestLoadEditTensors:
 
 class TestMaskOutputEndToEnd:
     """``execute()``'s public ``(IMAGE, MASK)`` contract (PROTOCOL.md §6),
-    proving the preference chain is wired all the way through the real node
+    proving the MASK derivation is wired all the way through the real node
     entry point -- not just ``_load_edit_tensors`` in isolation above.
     """
 
@@ -715,9 +701,7 @@ class TestMaskOutputEndToEnd:
         assert mask_out.shape == (1, 16, 24)
         assert torch.count_nonzero(mask_out).item() == 0
 
-    def test_consumed_edit_carries_its_extracted_mask(
-        self, bridge, manager, launches, psd_with_extra_channels
-    ):
+    def test_consumed_edit_carries_its_alpha_mask(self, bridge, manager, launches):
         import torch
 
         tensor = make_tensor(RED)
@@ -725,19 +709,15 @@ class TestMaskOutputEndToEnd:
             image=tensor, mode=BridgeMode.OPEN_ONLY, timeout_seconds=60, unique_id="11"
         )
         active = manager.find_active_for_node("11")
-        psd_path = manager.handoff_dir(active.handoff_id) / "source.psd"
-        psd_with_extra_channels(
-            psd_path,
-            Image.new("RGB", (24, 16), (0, 0, 0)),
-            [("Mask", Image.new("L", (24, 16), 200))],
+        manager.ingest_edit(
+            active.handoff_id, Image.new("RGBA", (24, 16), (0, 0, 255, 64)), "plugin"
         )
-        manager.ingest_edit(active.handoff_id, Image.new("RGB", (24, 16), (0, 0, 255)), "plugin")
 
         _, mask_out = bridge.execute(
             image=tensor, mode=BridgeMode.OPEN_ONLY, timeout_seconds=60, unique_id="11"
         )
 
-        expected = 200 / 255.0
+        expected = 1.0 - 64 / 255.0
         assert torch.allclose(mask_out, torch.full((1, 16, 24), expected), atol=1e-4)
 
     def test_return_value_is_a_two_tuple(self, bridge, manager, launches):

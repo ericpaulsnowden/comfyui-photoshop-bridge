@@ -96,6 +96,14 @@ body {
   white-space: pre-wrap;
 }
 
+/* Version line on a plugin/server version mismatch. Self-sufficient
+   (color + size) and applied INSTEAD of .cpsb-muted by panel.js, so the
+   styling never depends on cascade order between competing classes. */
+.cpsb-mismatch {
+  color: #e74c3c;
+  font-size: var(--uxp-host-font-size-smaller, 11px);
+}
+
 /* --- Sections ------------------------------------------------------------ */
 
 .cpsb-rule {

@@ -6,6 +6,19 @@
  * manual import. Refreshes only from `state.js`'s change notifications
  * (themselves driven by the `cpsb.*` websocket events) — no polling.
  *
+ * Card actions are STATUS-SCOPED via one explicit table
+ * ({@link cardCapabilities}) rather than ad-hoc conditions — the first
+ * field round exposed exactly the failure class that invites: Re-open
+ * offered on a cancelled card 404s ("No active handoff for this node",
+ * `/cpsb/open mode:"original"` requires an ACTIVE handoff, PROTOCOL.md §2),
+ * Discard offered on an already-discarded card is a pointless no-op, a drop
+ * onto a terminal card 409s ("not accepting uploads"). Every open request
+ * goes through `open.js` (shared 428 remote-confirm / 409 chooser / server-
+ * message toasts — bypassing that shared flow here is precisely what broke
+ * gallery Re-open for remote browsers), and every remaining action is
+ * try/catch-wrapped with the server's own error message surfaced
+ * (`api.errorMessage`), never a generic failure line.
+ *
  * `registerSidebarTab` shape verified against `Comfy-Org/ComfyUI_frontend`
  * `src/types/extensionTypes.ts` (`CustomSidebarTabExtension`:
  * `render(container): void` + a separate `destroy(): void`, not a cleanup
@@ -13,11 +26,19 @@
  * `src/components/common/ExtensionSlot.vue` (confirms `destroy()` fires
  * `onBeforeUnmount` — i.e. `render`/`destroy` run on every tab
  * mount/unmount, not just once per page load, since the panel only mounts
- * whichever sidebar tab is currently active).
+ * whichever sidebar tab is currently active). Tab icon: `SidebarIcon.vue`
+ * renders a string `icon` as a bare `<i :class="icon">` in the same
+ * document (lines 21-24), so the custom `cpsb-ps-icon` class + this
+ * extension's injected stylesheet (a `::before { content: 'Ps' }`
+ * lettermark — a generic text mnemonic drawn here, deliberately NOT Adobe's
+ * trademarked Photoshop logo) renders in the tab strip exactly like an
+ * icon-font glyph; `registerGalleryTab` injects the styles at registration
+ * time since the strip renders long before this panel first mounts.
  */
 
 import { app } from '../../../scripts/app.js'
 import * as api from './api.js'
+import * as open from './open.js'
 import * as state from './state.js'
 import * as settings from './settings.js'
 import * as pasteback from './pasteback.js'
@@ -39,44 +60,157 @@ let rootEl = /** @type {HTMLElement | null} */ (null)
 let unsubscribeState = /** @type {(() => void) | null} */ (null)
 
 /**
- * @param {import('./api.js').CpsbHandoffMeta} meta
+ * @typedef {Object} CpsbCardCapabilities
+ * @property {boolean} reopen - "Re-open" (`mode:"original"` — same PSD,
+ * layers intact).
+ * @property {boolean} openFresh - "Open fresh copy" (`mode:"new"` from the
+ * card's recorded source triple).
+ * @property {boolean} cancel
+ * @property {boolean} discard
+ * @property {boolean} dropImport - Whether drag-and-drop manual import is
+ * accepted.
  */
-function revealInWorkflow(meta) {
-  const node = pasteback.getNodeByIdFlexible(meta.origin_node_id)
-  if (!node) {
-    ui.showToast({
-      severity: 'warn',
-      summary: 'Node no longer exists',
-      detail: 'The node this handoff belongs to was removed from the workflow.'
-    })
-    return
+
+/**
+ * THE per-status action table — one place, exhaustively enumerated, and
+ * deliberately dependency-free so it can be exercised outside a browser
+ * (review-time verification extracts this exact function text and asserts
+ * every status row plus the invariants: reopen/openFresh are mutually
+ * exclusive, and no terminal status offers Cancel, Discard, or drop
+ * import). Grounding, per PROTOCOL.md §2:
+ *
+ *  - `mode:"original"` requires an ACTIVE handoff (pending/editing/edited;
+ *    "stale" is display-only sugar over `editing`) — offering Re-open on a
+ *    terminal card guarantees a 404, the exact field bug this fixes. A
+ *    terminal card gets "Open fresh copy" instead (`mode:"new"` from the
+ *    recorded source triple; if that file has since been purged the server's
+ *    "Source image not found" message is surfaced verbatim).
+ *  - `/cpsb/cancel` is the escape hatch for a round trip that hasn't
+ *    delivered yet (pending/editing/stale). It's technically idempotent on
+ *    terminal handoffs, but a button that can only ever no-op is noise — and
+ *    on `edited` cards "cancel" is misleading (the edit already landed), so
+ *    those offer Discard.
+ *  - `/cpsb/discard` is the gallery's "remove this card / stop watching"
+ *    (§2): offered for stale (its PROTOCOL-described purpose) and for
+ *    `edited` (dismiss a finished round trip). NEVER on terminal cards — a
+ *    second terminal transition changes nothing the user can see (G2).
+ *  - `/cpsb/upload` (drag-drop import) 409s unless the handoff is active —
+ *    terminal cards don't register drop handlers at all.
+ *
+ * Reveal and Add-as-node are NOT status-gated: the origin node and any
+ * already-ingested edit files exist (or don't) independently of handoff
+ * status, and both actions carry their own guards.
+ *
+ * Kept dependency-free (plain switch on the display status string) so the
+ * matrix test can run it outside a browser.
+ * @param {import('./api.js').CpsbStatus | "stale"} displayStatus
+ * @returns {CpsbCardCapabilities}
+ */
+function cardCapabilities(displayStatus) {
+  switch (displayStatus) {
+    case 'pending':
+    case 'editing':
+      return { reopen: true, openFresh: false, cancel: true, discard: false, dropImport: true }
+    case 'stale':
+      return { reopen: true, openFresh: false, cancel: true, discard: true, dropImport: true }
+    case 'edited':
+      return { reopen: true, openFresh: false, cancel: false, discard: true, dropImport: true }
+    case 'cancelled':
+    case 'discarded':
+    case 'superseded':
+    case 'error':
+      return { reopen: false, openFresh: true, cancel: false, discard: false, dropImport: false }
+    default:
+      // Unknown/future status: safest is terminal-like (no state-changing
+      // buttons that could 404/409), but still allow starting over.
+      return { reopen: false, openFresh: true, cancel: false, discard: false, dropImport: false }
   }
-  app.canvas?.centerOnNode?.(node)
-  app.canvas?.selectNode?.(node)
 }
 
 /**
  * @param {import('./api.js').CpsbHandoffMeta} meta
  */
-async function reopenInPhotoshop(meta) {
+function revealInWorkflow(meta) {
   try {
-    await api.openHandoff({
-      filename: meta.source.filename,
-      subfolder: meta.source.subfolder,
-      type: meta.source.type,
-      origin_node_id: meta.origin_node_id,
-      origin_kind: meta.origin_kind,
-      workflow_name: meta.workflow_name,
-      mode: 'original'
-    })
-    ui.showToast({ severity: 'info', summary: 'Re-opening in Photoshop…' })
+    const node = pasteback.getNodeByIdFlexible(meta.origin_node_id)
+    if (!node) {
+      ui.showToast({
+        severity: 'warn',
+        summary: 'Node no longer exists',
+        detail:
+          'The node this handoff belongs to was removed from the workflow, ' +
+          'or belongs to a different workflow than the one that is open.'
+      })
+      return
+    }
+    const canvas = app.canvas
+    if (!canvas || typeof canvas.centerOnNode !== 'function') {
+      ui.showToast({
+        severity: 'warn',
+        summary: 'Cannot reveal node',
+        detail: 'This ComfyUI frontend does not expose canvas navigation.'
+      })
+      return
+    }
+    canvas.centerOnNode(node)
+    canvas.selectNode?.(node)
   } catch (error) {
+    api.warn('gallery Reveal failed', error)
     ui.showToast({
       severity: 'error',
-      summary: 'Failed to re-open in Photoshop',
-      detail: error instanceof Error ? error.message : String(error)
+      summary: 'Failed to reveal node',
+      detail: api.errorMessage(error)
     })
   }
+}
+
+/**
+ * Builds the `/cpsb/open` body shared by {@link reopenInPhotoshop} and
+ * {@link openFreshCopy} — always the handoff's own recorded source triple
+ * and origin, exactly what the handoff was created from.
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ * @param {"original" | "new"} mode
+ * @returns {import('./api.js').CpsbOpenRequest}
+ */
+function openBodyFromMeta(meta, mode) {
+  return {
+    filename: meta.source.filename,
+    subfolder: meta.source.subfolder,
+    type: meta.source.type,
+    origin_node_id: meta.origin_node_id,
+    origin_kind: meta.origin_kind,
+    workflow_name: meta.workflow_name,
+    mode
+  }
+}
+
+/**
+ * "Re-open" for ACTIVE cards only ({@link cardCapabilities}): same handoff,
+ * same PSD, layers intact (`mode:"original"`). Routed through the shared
+ * `open.js` flow — the 428 remote-open confirm, the 409 chooser, and
+ * server-message error toasts all apply here identically to the node
+ * context menu (the previous direct `api.openHandoff` call bypassed all
+ * three, which is what broke gallery Re-open on remote browsers).
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ */
+async function reopenInPhotoshop(meta) {
+  await open.openInteractive(openBodyFromMeta(meta, 'original'), {
+    successSummary: 'Re-opening in Photoshop…'
+  })
+}
+
+/**
+ * "Open fresh copy" for TERMINAL cards ({@link cardCapabilities}): a brand
+ * new handoff from this card's recorded source image (`mode:"new"`). If the
+ * node meanwhile has a NEWER active handoff, the shared flow's 409 chooser
+ * handles it; if the source file has been purged, the server's "Source
+ * image not found" message is shown verbatim.
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ */
+async function openFreshCopy(meta) {
+  await open.openInteractive(openBodyFromMeta(meta, 'new'), {
+    successSummary: 'Opening a fresh copy in Photoshop…'
+  })
 }
 
 /**
@@ -97,7 +231,7 @@ async function cancelHandoffCard(meta) {
     ui.showToast({
       severity: 'error',
       summary: 'Failed to cancel',
-      detail: error instanceof Error ? error.message : String(error)
+      detail: api.errorMessage(error)
     })
   }
 }
@@ -120,7 +254,7 @@ async function discardHandoffCard(meta) {
     ui.showToast({
       severity: 'error',
       summary: 'Failed to discard',
-      detail: error instanceof Error ? error.message : String(error)
+      detail: api.errorMessage(error)
     })
   }
 }
@@ -138,15 +272,33 @@ function addAsNode(meta) {
     })
     return
   }
-  const node = pasteback.getNodeByIdFlexible(meta.origin_node_id)
-  pasteback.addLoadImageNodeNear(node, {
-    filename: latestEdit.filename,
-    subfolder: api.editSubfolder(meta),
-    type: 'input'
-  })
+  try {
+    const node = pasteback.getNodeByIdFlexible(meta.origin_node_id)
+    pasteback.addLoadImageNodeNear(node, {
+      filename: latestEdit.filename,
+      subfolder: api.editSubfolder(meta),
+      type: 'input'
+    })
+  } catch (error) {
+    // addLoadImageNodeNear has its own feature-detect toasts for the known
+    // degradations (no graph, no LiteGraph.createNode, LoadImage type
+    // missing); this catch is the belt for anything it didn't foresee.
+    api.warn('gallery Add-as-node failed', error)
+    ui.showToast({
+      severity: 'error',
+      summary: 'Could not add node',
+      detail: api.errorMessage(error)
+    })
+  }
 }
 
 /**
+ * Drag-and-drop manual import — attached only for cards whose status still
+ * accepts uploads ({@link cardCapabilities}.dropImport; PROTOCOL.md §2:
+ * `/cpsb/upload` 409s on anything non-active). A race is still possible
+ * (status flips between render and drop), so the server's own 409 message
+ * — "Handoff is cancelled, not accepting uploads" — is surfaced verbatim
+ * when it happens.
  * @param {HTMLElement} card
  * @param {import('./api.js').CpsbHandoffMeta} meta
  */
@@ -161,14 +313,14 @@ function attachDropHandlers(card, meta) {
   card.addEventListener('drop', async (event) => {
     event.preventDefault()
     card.classList.remove('cpsb-card-dragover')
-    const file = Array.from(event.dataTransfer?.files ?? []).find((f) =>
-      f.type.startsWith('image/')
-    )
-    if (!file) {
-      ui.showToast({ severity: 'warn', summary: 'No image file found in that drop' })
-      return
-    }
     try {
+      const file = Array.from(event.dataTransfer?.files ?? []).find((f) =>
+        f.type.startsWith('image/')
+      )
+      if (!file) {
+        ui.showToast({ severity: 'warn', summary: 'No image file found in that drop' })
+        return
+      }
       await api.uploadEdit(meta.handoff_id, file, 'manual')
       ui.showToast({
         severity: 'success',
@@ -179,7 +331,7 @@ function attachDropHandlers(card, meta) {
       ui.showToast({
         severity: 'error',
         summary: 'Import failed',
-        detail: error instanceof Error ? error.message : String(error)
+        detail: api.errorMessage(error)
       })
     }
   })
@@ -198,18 +350,36 @@ function buildStatusChip(meta) {
 }
 
 /**
- * A small "Mask" chip for a card whose latest edit carries an extracted
- * mask (PROTOCOL.md §1/§4, `CpsbEdit.mask`) — presence-only signal, no
- * other behavior (mask *consumption* is the Photoshop Bridge node's MASK
- * output, entirely backend-side per PROTOCOL.md §6).
- * @param {import('./api.js').CpsbEdit | undefined} latestEdit
- * @returns {HTMLElement | null}
+ * An `<img>` thumbnail that degrades to a neutral placeholder box instead
+ * of the browser's broken-image glyph when its file no longer exists — a
+ * routine occurrence here, not an edge case: handoff folders are purged
+ * wholesale after `cleanup_days` while the card can still be on screen, and
+ * a terminal card's files can be gone while its meta survives the session.
+ * `error` doesn't bubble, but `ui.el` attaches directly to the element, so
+ * the swap is reliable.
+ * @param {string} src
+ * @param {string} alt
+ * @returns {HTMLElement}
  */
-function buildMaskChip(latestEdit) {
-  if (!latestEdit?.mask) return null
-  const chip = ui.el('span', { className: 'cpsb-chip cpsb-chip-mask', text: 'Mask' })
-  chip.title = latestEdit.mask.filename
-  return chip
+function buildThumb(src, alt) {
+  const img = ui.el('img', {
+    className: 'cpsb-card-thumb',
+    attrs: { src, alt, loading: 'lazy' }
+  })
+  img.addEventListener(
+    'error',
+    () => {
+      img.replaceWith(
+        ui.el('div', {
+          className: 'cpsb-card-thumb cpsb-card-thumb-missing',
+          text: 'No preview',
+          attrs: { title: 'The image file is no longer on the server.' }
+        })
+      )
+    },
+    { once: true }
+  )
+  return img
 }
 
 /**
@@ -218,41 +388,24 @@ function buildMaskChip(latestEdit) {
  */
 function buildCard(meta) {
   const latestEdit = meta.edits?.[meta.edits.length - 1]
+  const capabilities = cardCapabilities(state.getDisplayStatus(meta))
 
   const thumbs = ui.el('div', { className: 'cpsb-card-thumbs' })
-  thumbs.appendChild(
-    ui.el('img', {
-      className: 'cpsb-card-thumb',
-      attrs: { src: api.thumbUrl(meta.handoff_id), alt: 'Original', loading: 'lazy' }
-    })
-  )
+  thumbs.appendChild(buildThumb(api.thumbUrl(meta.handoff_id), 'Original'))
   if (latestEdit) {
     thumbs.appendChild(ui.el('span', { className: 'cpsb-card-thumb-arrow', text: '→' }))
     thumbs.appendChild(
-      ui.el('img', {
-        className: 'cpsb-card-thumb',
-        attrs: {
-          src: api.viewUrl({
-            filename: latestEdit.filename,
-            subfolder: api.editSubfolder(meta),
-            type: 'input'
-          }),
-          alt: 'Latest edit',
-          loading: 'lazy'
-        }
-      })
+      buildThumb(
+        api.viewUrl({
+          filename: latestEdit.filename,
+          subfolder: api.editSubfolder(meta),
+          type: 'input'
+        }),
+        'Latest edit'
+      )
     )
   }
 
-  // Grouped in their own flex row (rather than as two more direct children
-  // of `.cpsb-card-header`) so `justify-content: space-between` keeps
-  // pairing exactly two items — title vs. this group — instead of spacing
-  // three chips apart with the mask chip stranded in the middle.
-  const maskChip = buildMaskChip(latestEdit)
-  const headerBadges = ui.el('div', {
-    className: 'cpsb-card-header-badges',
-    children: [...(maskChip ? [maskChip] : []), buildStatusChip(meta)]
-  })
   const header = ui.el('div', {
     className: 'cpsb-card-header',
     children: [
@@ -260,7 +413,7 @@ function buildCard(meta) {
         className: 'cpsb-card-title',
         text: meta.workflow_name || 'Untitled workflow'
       }),
-      headerBadges
+      buildStatusChip(meta)
     ]
   })
 
@@ -269,19 +422,35 @@ function buildCard(meta) {
     text: `Node ${meta.origin_node_id} · ${ui.formatRelativeTime(meta.updated_ts)}`
   })
 
+  // Assembled strictly from the cardCapabilities table — see its doc for
+  // the per-status rationale. Reveal is unconditional; Add-as-node only
+  // needs an edit to exist.
   const actions = ui.el('div', { className: 'cpsb-card-actions' })
-  actions.append(
+  actions.appendChild(
     ui.el('button', {
       className: 'cpsb-card-action',
       text: 'Reveal',
       on: { click: () => revealInWorkflow(meta) }
-    }),
-    ui.el('button', {
-      className: 'cpsb-card-action',
-      text: 'Re-open',
-      on: { click: () => reopenInPhotoshop(meta) }
     })
   )
+  if (capabilities.reopen) {
+    actions.appendChild(
+      ui.el('button', {
+        className: 'cpsb-card-action',
+        text: 'Re-open',
+        on: { click: () => reopenInPhotoshop(meta) }
+      })
+    )
+  }
+  if (capabilities.openFresh) {
+    actions.appendChild(
+      ui.el('button', {
+        className: 'cpsb-card-action',
+        text: 'Open fresh copy',
+        on: { click: () => openFreshCopy(meta) }
+      })
+    )
+  }
   if (latestEdit) {
     actions.appendChild(
       ui.el('button', {
@@ -291,17 +460,7 @@ function buildCard(meta) {
       })
     )
   }
-  // Cancel vs Discard is status-scoped rather than always offering both:
-  // pending/editing (including stale, PROTOCOL.md §2) can still be actively
-  // waited on server-side, so Cancel is the meaningful action; a stale one
-  // additionally gets Discard, the gallery-specific "give up on this and
-  // remove it" cleanup PROTOCOL.md §2 describes Discard as being for. Every
-  // other (terminal) status only gets Discard — cancelling something already
-  // finished is a no-op the backend accepts idempotently, but not worth
-  // exposing as a button.
-  const isActive = meta.status === 'pending' || meta.status === 'editing'
-  const isStale = state.getDisplayStatus(meta) === 'stale'
-  if (isActive) {
+  if (capabilities.cancel) {
     actions.appendChild(
       ui.el('button', {
         className: 'cpsb-card-action',
@@ -310,7 +469,7 @@ function buildCard(meta) {
       })
     )
   }
-  if (!isActive || isStale) {
+  if (capabilities.discard) {
     actions.appendChild(
       ui.el('button', {
         className: 'cpsb-card-action cpsb-card-action-danger',
@@ -321,7 +480,7 @@ function buildCard(meta) {
   }
 
   const card = ui.el('div', { className: 'cpsb-card', children: [thumbs, header, metaLine, actions] })
-  attachDropHandlers(card, meta)
+  if (capabilities.dropImport) attachDropHandlers(card, meta)
   return card
 }
 
@@ -420,37 +579,91 @@ function renderUpgradeBanner(container) {
   container.appendChild(banner)
 }
 
+/**
+ * The generic "Ps" text lettermark (panel-header identity, mirroring the
+ * tab-strip icon). Drawn as styled text in a rounded outline box — a
+ * mnemonic of our own, NOT Adobe's trademarked Photoshop logo/brand asset.
+ * @returns {HTMLElement}
+ */
+function buildBrandMark() {
+  return ui.el('span', {
+    className: 'cpsb-brand-mark',
+    text: 'Ps',
+    attrs: { title: 'Photoshop Bridge', 'aria-hidden': 'true' }
+  })
+}
+
 function rebuild() {
   if (!rootEl) return
-  rootEl.replaceChildren()
+  try {
+    rootEl.replaceChildren()
 
-  rootEl.appendChild(
-    ui.el('div', {
-      className: 'cpsb-gallery-header',
-      children: [buildConnectionPill(), buildVersionLabel()]
-    })
-  )
-  if (isVersionMismatched()) {
-    rootEl.appendChild(buildVersionMismatchNotice())
-  }
-  renderUpgradeBanner(rootEl)
-
-  const handoffs = state.getAllHandoffs()
-  if (handoffs.length === 0) {
     rootEl.appendChild(
       ui.el('div', {
-        className: 'cpsb-gallery-empty',
-        text: 'No Photoshop round trips yet. Right-click an image on any node to get started.'
+        className: 'cpsb-gallery-header',
+        children: [
+          buildBrandMark(),
+          ui.el('div', {
+            className: 'cpsb-gallery-header-right',
+            children: [buildConnectionPill(), buildVersionLabel()]
+          })
+        ]
       })
     )
-    return
-  }
+    if (isVersionMismatched()) {
+      rootEl.appendChild(buildVersionMismatchNotice())
+    }
+    renderUpgradeBanner(rootEl)
 
-  const list = ui.el('div', { className: 'cpsb-gallery-list' })
-  for (const meta of handoffs) {
-    list.appendChild(buildCard(meta))
+    const handoffs = state.getAllHandoffs()
+    if (handoffs.length === 0) {
+      rootEl.appendChild(
+        ui.el('div', {
+          className: 'cpsb-gallery-empty',
+          text: 'No Photoshop round trips yet. Right-click an image on any node to get started.'
+        })
+      )
+      return
+    }
+
+    const list = ui.el('div', { className: 'cpsb-gallery-list' })
+    for (const meta of handoffs) {
+      // Per-card guard: one malformed meta (e.g. from a hand-edited or
+      // truncated meta.json the backend recovered) must degrade to one
+      // stub card, not blank the whole panel.
+      try {
+        list.appendChild(buildCard(meta))
+      } catch (error) {
+        api.warn('failed to render gallery card', meta?.handoff_id, error)
+        list.appendChild(
+          ui.el('div', {
+            className: 'cpsb-card',
+            children: [
+              ui.el('div', {
+                className: 'cpsb-card-meta',
+                text: `Handoff ${meta?.handoff_id ?? '(unknown)'} could not be displayed.`
+              })
+            ]
+          })
+        )
+      }
+    }
+    rootEl.appendChild(list)
+  } catch (error) {
+    // Last-ditch guard so a rendering bug reads as a message in the panel
+    // instead of a silently empty (or half-built) sidebar tab.
+    api.warn('gallery rebuild failed', error)
+    try {
+      rootEl.replaceChildren(
+        ui.el('div', {
+          className: 'cpsb-gallery-empty',
+          text: 'The Photoshop Edits panel hit an error — see the browser console.'
+        })
+      )
+    } catch {
+      /* container itself is gone; nothing left to do */
+    }
   }
-  rootEl.appendChild(list)
 }
 
 /**
@@ -495,11 +708,16 @@ export function registerGalleryTab() {
     return
   }
   registered = true
+  // The tab-strip button renders as soon as the tab is registered — long
+  // before renderGallery ever runs — so the stylesheet carrying the
+  // `.cpsb-ps-icon::before` lettermark must be in <head> NOW, not at first
+  // panel mount (see this file's header for the SidebarIcon.vue citation).
+  ui.injectStyles()
   extensionManager.registerSidebarTab({
     id: 'cpsb.gallery',
-    icon: 'pi pi-image',
+    icon: 'cpsb-ps-icon',
     title: 'Photoshop Edits',
-    tooltip: 'Photoshop round trips for this workflow',
+    tooltip: 'Photoshop Edits — round trips for this workflow',
     type: 'custom',
     render: renderGallery,
     destroy: destroyGallery

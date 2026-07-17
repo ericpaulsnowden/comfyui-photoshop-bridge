@@ -3,29 +3,40 @@
 This is the only file in the pack that touches ComfyUI's own modules
 (``server``, ``folder_paths``). It builds the real
 :class:`~cpsb.context.CpsbContext`, wires up the handoff manager, watcher,
-HTTP routes, and the Photoshop Bridge node, and exposes the standard
-``NODE_CLASS_MAPPINGS`` / ``WEB_DIRECTORY`` module attributes ComfyUI's
-loader looks for. Everything under ``cpsb/`` stays importable (and tested)
-without ComfyUI -- see ``cpsb/context.py``.
+HTTP routes, and the Photoshop Bridge / Load PSD nodes, and exposes the
+standard ``NODE_CLASS_MAPPINGS`` / ``WEB_DIRECTORY`` module attributes
+ComfyUI's loader looks for. Everything under ``cpsb/`` stays importable (and
+tested) without ComfyUI -- see ``cpsb/context.py``.
 """
 
 import logging
 
 try:
+    from .cpsb import load_psd as _cpsb_load_psd
     from .cpsb import nodes as _cpsb_nodes
 except ImportError:
     # Imported without package context (e.g. pytest's rootdir Package setup,
     # or tooling that loads node-pack entry files flat). ComfyUI itself always
     # loads this file as a package, taking the relative-import branch above.
+    from cpsb import load_psd as _cpsb_load_psd
     from cpsb import nodes as _cpsb_nodes
 
 logger = logging.getLogger("cpsb")
 
-# Display name only (PROTOCOL.md §6). The class id "PhotoshopBridge" below
-# MUST NOT change: saved workflows reference nodes by this id, and renaming
-# it would silently break every workflow that already has this node in it.
-NODE_CLASS_MAPPINGS = {"PhotoshopBridge": _cpsb_nodes.PhotoshopBridge}
-NODE_DISPLAY_NAME_MAPPINGS = {"PhotoshopBridge": "Edit in Photoshop"}
+# Display names only (PROTOCOL.md §6/§6b). The class ids "PhotoshopBridge"
+# and "PhotoshopLoadPSD" below MUST NOT change: saved workflows reference
+# nodes by this id, and renaming either would silently break every workflow
+# that already has that node in it. "PhotoshopLoadPSD" (not the shorter
+# "LoadPSD") specifically to avoid colliding with other packs' same-named
+# node (PROTOCOL.md §6b).
+NODE_CLASS_MAPPINGS = {
+    "PhotoshopBridge": _cpsb_nodes.PhotoshopBridge,
+    "PhotoshopLoadPSD": _cpsb_load_psd.PhotoshopLoadPSD,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "PhotoshopBridge": "Edit in Photoshop",
+    "PhotoshopLoadPSD": "Load PSD",
+}
 
 # ComfyUI checks os.path.isdir() on this itself (nodes.py load_custom_node),
 # so a missing/not-yet-built web/ folder is tolerated, never a crash.

@@ -26,14 +26,13 @@ from typing import Any, Literal
 from PIL import Image
 
 from .context import CpsbContext
-from .psd_io import extract_mask_channel
 
 logger = logging.getLogger("cpsb")
 
 HandoffStatus = Literal[
     "pending", "editing", "edited", "cancelled", "discarded", "superseded", "error"
 ]
-OriginKind = Literal["load_image", "terminal_output", "bridge_node"]
+OriginKind = Literal["load_image", "terminal_output", "bridge_node", "load_psd"]
 Fidelity = Literal["composite", "recomposite", "plugin"]
 
 #: Statuses under which a handoff still accepts new edits (PROTOCOL.md §2:
@@ -105,28 +104,6 @@ class SiblingOutput:
 
 
 @dataclass
-class MaskRef:
-    """Pointer to a ``mask_%03d.png`` extracted alongside an edit (PROTOCOL.md §1/§4).
-
-    Only ``filename`` is recorded on disk -- like :class:`EditRecord`'s own
-    ``filename``, the mask lives beside the edit it belongs to, so
-    ``subfolder``/``type`` are derived from the handoff's own folder rather
-    than duplicated here. Those two are added back only where PROTOCOL.md §5
-    requires the full ``{filename, subfolder, type}`` triple: the
-    ``cpsb.updated`` event (:meth:`HandoffManager._emit_updated`).
-    """
-
-    filename: str
-
-    def to_dict(self) -> dict[str, str]:
-        return {"filename": self.filename}
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> MaskRef:
-        return cls(filename=data["filename"])
-
-
-@dataclass
 class EditRecord:
     """One ingested edit, in arrival order (PROTOCOL.md §1 ``edits[]``)."""
 
@@ -134,7 +111,6 @@ class EditRecord:
     ts: float
     fidelity: Fidelity
     sibling_output: SiblingOutput | None = None
-    mask: MaskRef | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,19 +118,24 @@ class EditRecord:
             "ts": self.ts,
             "fidelity": self.fidelity,
             "sibling_output": self.sibling_output.to_dict() if self.sibling_output else None,
-            "mask": self.mask.to_dict() if self.mask else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> EditRecord:
+        """Build an :class:`EditRecord` from a decoded ``meta.json`` edit entry.
+
+        Only reads the keys this class still has (PROTOCOL.md §4: mask-
+        channel extraction was removed) -- any other key present in *data*,
+        notably a legacy ``"mask"`` entry written by a pre-removal version
+        of this package, is simply never looked at, so an old ``meta.json``
+        with that field still parses cleanly rather than raising.
+        """
         sibling = data.get("sibling_output")
-        mask = data.get("mask")
         return cls(
             filename=data["filename"],
             ts=data["ts"],
             fidelity=data["fidelity"],
             sibling_output=SiblingOutput.from_dict(sibling) if sibling else None,
-            mask=MaskRef.from_dict(mask) if mask else None,
         )
 
 
@@ -463,24 +444,6 @@ class HandoffManager:
             managed = self.managed_dir_for(meta)
         return self._ctx.input_dir / managed / handoff_id / meta.edits[-1].filename
 
-    def mask_image_path(self, handoff_id: str) -> Path | None:
-        """Absolute path to the most recent edit's extracted mask PNG, or ``None``.
-
-        ``None`` both when there is no edit yet and when the latest edit's
-        mask extraction found no usable channel (PROTOCOL.md §4) -- either
-        way, callers (the Photoshop Bridge node, PROTOCOL.md §6) fall back
-        to the alpha-derived or all-zero mask.
-        """
-        with self._lock:
-            meta = self._handoffs.get(handoff_id)
-            if meta is None or not meta.edits:
-                return None
-            mask = meta.edits[-1].mask
-            if mask is None:
-                return None
-            managed = self.managed_dir_for(meta)
-        return self._ctx.input_dir / managed / handoff_id / mask.filename
-
     def latest_edit_hash(self, handoff_id: str) -> str | None:
         """SHA256 hex digest of the most recent edit file (bridge node ``IS_CHANGED``)."""
         path = self.edit_image_path(handoff_id)
@@ -598,10 +561,9 @@ class HandoffManager:
 
         Implements PROTOCOL.md §4 exactly: writes ``edit_%03d.png``, dedupes
         by SHA256 against the previous edit, writes a sibling output for
-        ``terminal_output`` origins in ``output/`` when enabled, attempts
-        channel-based mask extraction from ``source.psd`` when that file is
-        present, updates ``meta.json``, unblocks a waiting Photoshop Bridge
-        node, and emits ``cpsb.updated``.
+        ``terminal_output`` origins in ``output/`` when enabled, updates
+        ``meta.json``, unblocks a waiting Photoshop Bridge node, and emits
+        ``cpsb.updated``.
 
         Returns:
             The new :class:`EditRecord`, or ``None`` if the edit was a
@@ -656,73 +618,17 @@ class HandoffManager:
         ):
             sibling = self._write_sibling_output(meta, png_bytes)
 
-        mask = self._extract_mask(meta, folder, index)
-
         edit = EditRecord(
             filename=filename,
             ts=time.time(),
             fidelity=fidelity,
             sibling_output=sibling,
-            mask=mask,
         )
         meta.edits.append(edit)
         meta.status = "edited"
         meta.updated_ts = edit.ts
         self._write_meta_locked(meta)
         return edit
-
-    def _extract_mask(self, meta: HandoffMeta, folder: Path, index: int) -> MaskRef | None:
-        """Attempt channel-based mask extraction from ``source.psd`` (PROTOCOL.md §4).
-
-        Whenever the handoff's ``source.psd`` is present in *folder* --
-        which covers the Tier 1 watcher path always (it just settled a
-        Photoshop save there) and Tier 2 uploads too when local mode meant
-        the plugin's own Photoshop instance saved onto that same shared
-        path -- this inspects it for a usable mask channel and, if found,
-        writes ``mask_%03d.png`` beside the edit using the SAME index as
-        ``edit_%03d.png``. In Tier 2 remote mode (no shared filesystem) or
-        for a handoff whose source.psd was never subsequently touched by
-        Photoshop, the file is either absent or still the original flat
-        (no-extra-channel) document this package wrote, both of which
-        extract_mask_channel already reports as "no mask" -- so no special
-        case is needed here for those.
-
-        Non-fatal by design (PROTOCOL.md §4: "Extraction failure = log +
-        null, edit still ingests"): any failure -- no PSD, no matching
-        channel, or an outright unreadable/corrupt file -- logs and returns
-        ``None`` rather than raising, exactly like a Tier 1 RGB read failure
-        never blocks the edit's own ingestion (see ``cpsb.watcher``).
-        """
-        psd_path = folder / "source.psd"
-        if not psd_path.is_file():
-            return None
-        preferred_name = self._ctx.settings.get("mask_channel_name", "Mask")
-        try:
-            mask_image = extract_mask_channel(psd_path, preferred_name)
-        except Exception:
-            # Deliberately broad, mirroring cpsb.watcher's own read-retry
-            # handler: a mid-write or otherwise malformed PSD can fail in
-            # many ways, none of which should stop the edit itself from
-            # ingesting (PROTOCOL.md §4).
-            logger.warning(
-                "Mask extraction failed for handoff %s, filename %s",
-                meta.handoff_id,
-                psd_path,
-                exc_info=True,
-            )
-            return None
-        if mask_image is None:
-            return None
-
-        filename = f"mask_{index:03d}.png"
-        try:
-            mask_image.save(folder / filename, format="PNG")
-        except OSError:
-            logger.warning(
-                "Could not write extracted mask for handoff %s", meta.handoff_id, exc_info=True
-            )
-            return None
-        return MaskRef(filename=filename)
 
     def _write_sibling_output(self, meta: HandoffMeta, png_bytes: bytes) -> SiblingOutput:
         sibling_index = sum(1 for e in meta.edits if e.sibling_output is not None) + 1
@@ -820,17 +726,6 @@ class HandoffManager:
 
     def _emit_updated(self, meta: HandoffMeta, edit: EditRecord) -> None:
         subfolder = f"{self.managed_dir_for(meta)}/{meta.handoff_id}"
-        mask_payload = None
-        if edit.mask is not None:
-            # Unlike the lightweight {filename}-only EditRecord.mask on disk
-            # (PROTOCOL.md §1), the event carries the full {filename,
-            # subfolder, type} triple every other image reference in this
-            # payload uses (PROTOCOL.md §5).
-            mask_payload = {
-                "filename": edit.mask.filename,
-                "subfolder": subfolder,
-                "type": "input",
-            }
         self._ctx.send_event(
             "cpsb.updated",
             {
@@ -842,7 +737,6 @@ class HandoffManager:
                 "type": "input",
                 "fidelity": edit.fidelity,
                 "sibling_output": edit.sibling_output.to_dict() if edit.sibling_output else None,
-                "mask": mask_payload,
             },
         )
 

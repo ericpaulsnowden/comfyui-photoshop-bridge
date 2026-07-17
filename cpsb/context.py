@@ -29,10 +29,6 @@ SendEvent = Callable[[str, dict], None]
 #: The managed-folder name used when the setting is empty or invalid.
 DEFAULT_MANAGED_FOLDER_NAME = "photoshop"
 
-#: The extra-channel name preferred for mask extraction when a saved PSD has
-#: more than one candidate (PROTOCOL.md §4/§2), case-insensitive.
-DEFAULT_MASK_CHANNEL_NAME = "Mask"
-
 #: Default values for every backend-persisted setting (PROTOCOL.md §2,
 #: ``GET/POST /cpsb/settings``).
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -41,7 +37,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "cleanup_days": 14,
     "sibling_outputs": True,
     "managed_folder_name": DEFAULT_MANAGED_FOLDER_NAME,
-    "mask_channel_name": DEFAULT_MASK_CHANNEL_NAME,
 }
 
 

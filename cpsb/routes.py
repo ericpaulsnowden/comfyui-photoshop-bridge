@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -41,7 +42,7 @@ from .handoff import (
 )
 from .launcher import launch_photoshop, tier1_status
 from .locality import is_request_local
-from .psd_io import write_psd
+from .psd_io import read_edited_psd, write_psd
 from .version import __version__
 
 logger = logging.getLogger("cpsb")
@@ -58,8 +59,20 @@ _PING_INTERVAL_SECONDS = 30
 _PONG_TIMEOUT_SECONDS = 15
 
 _VALID_SOURCE_TYPES = ("input", "output", "temp")
-_VALID_ORIGIN_KINDS = ("load_image", "terminal_output", "bridge_node")
+_VALID_ORIGIN_KINDS = ("load_image", "terminal_output", "bridge_node", "load_psd")
 _VALID_MODES = ("new", "original", "fresh")
+
+#: Extensions accepted for a psd-native (`origin_kind: "load_psd"`) source
+#: (PROTOCOL.md §2/§6b), case-insensitive.
+_PSD_NATIVE_EXTENSIONS = (".psd", ".psb")
+
+#: Fallback size for the psd-native placeholder thumbnail (PROTOCOL.md §2:
+#: "if flatten fails, a neutral placeholder thumb -- never fail the open for
+#: a thumbnail"). Matches `HandoffManager._write_thumbnail`'s own 256px cap
+#: exactly so a placeholder is never itself the one thumbnail that needed
+#: downsizing.
+_PLACEHOLDER_THUMBNAIL_SIZE = (256, 256)
+_PLACEHOLDER_THUMBNAIL_COLOR = (128, 128, 128)
 
 
 def _error(status: int, message: str, **extra: Any) -> web.Response:
@@ -295,6 +308,114 @@ def _open_source_image(
     return image, None
 
 
+@dataclass
+class ResolvedSource:
+    """Result of resolving a ``POST /cpsb/open`` request's source file.
+
+    ``thumbnail_image`` is what ``HandoffManager.create`` downsizes into
+    ``orig_thumb.png`` (PROTOCOL.md §1) -- always present on success, for
+    every origin kind. ``raw_psd_bytes`` is populated only for a psd-native
+    source (``origin_kind: "load_psd"``, PROTOCOL.md §2): when set, the
+    route copies it verbatim as ``source.psd`` instead of calling
+    :func:`cpsb.psd_io.write_psd` on the decoded pixels, so the handoff
+    keeps the user's actual layers rather than flattening them away.
+    """
+
+    thumbnail_image: Image.Image
+    source_hash: str
+    raw_psd_bytes: bytes | None = None
+
+
+def _placeholder_thumbnail_source() -> Image.Image:
+    """A small neutral image standing in for a psd-native thumbnail source.
+
+    Used only when the psd-native flatten below fails (PROTOCOL.md §2:
+    "if flatten fails, a neutral placeholder thumb -- never fail the open
+    for a thumbnail") -- the raw bytes that actually become ``source.psd``
+    are unaffected either way.
+    """
+    return Image.new("RGB", _PLACEHOLDER_THUMBNAIL_SIZE, _PLACEHOLDER_THUMBNAIL_COLOR)
+
+
+def _open_psd_native_source(source_path: Path) -> tuple[bytes, Image.Image]:
+    """Raw bytes + a best-effort thumbnail source for a psd-native open.
+
+    Reuses :func:`cpsb.psd_io.read_edited_psd` for the flatten (PROTOCOL.md
+    §2: "orig_thumb from the flatten (reuse psd_io)") -- the identical
+    embedded-composite-then-recomposite logic already used for the Tier 1
+    edit-ingest path (:mod:`cpsb.watcher`), just applied here to the file
+    being copied in rather than one coming back from Photoshop. A flatten
+    failure never fails the open itself: it falls back to a neutral
+    placeholder image so ``HandoffManager.create``'s thumbnail step always
+    has something to downsize, while the raw bytes -- the only thing that
+    actually becomes ``source.psd`` -- are read and returned regardless of
+    whether the flatten succeeded.
+    """
+    raw_bytes = source_path.read_bytes()
+    try:
+        image, _fidelity = read_edited_psd(source_path)
+    except Exception:
+        # Deliberately broad: an unreadable or exotic PSD must not turn
+        # into a failed open over a thumbnail (PROTOCOL.md §2).
+        logger.warning(
+            "%s: could not flatten for a thumbnail; using a placeholder",
+            source_path,
+            exc_info=True,
+        )
+        image = _placeholder_thumbnail_source()
+    return raw_bytes, image
+
+
+def _resolve_psd_native_source(
+    context: CpsbContext, fields: dict[str, Any]
+) -> tuple[ResolvedSource | None, web.Response | None]:
+    """:class:`ResolvedSource` for an ``origin_kind: "load_psd"`` open (PROTOCOL.md §2).
+
+    Returns ``(resolved, None)`` on success or ``(None, response)`` with a
+    ready-to-return error: **404** if the file doesn't exist, **400** if it
+    exists but isn't a ``.psd``/``.psb`` (checked by extension, matching
+    :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s own combo filter -- neither
+    this route nor that node sniffs file content).
+    """
+    source_path = _resolve_source_path(
+        context, fields["filename"], fields["subfolder"], fields["type"]
+    )
+    if source_path is None or not source_path.is_file():
+        return None, _error(404, f"Source PSD not found: {fields['filename']}")
+    if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS:
+        return None, _error(400, f"Not a .psd/.psb file: {fields['filename']}")
+
+    raw_bytes, thumbnail_image = _open_psd_native_source(source_path)
+    source_hash = hashlib.sha256(raw_bytes).hexdigest()
+    return (
+        ResolvedSource(
+            thumbnail_image=thumbnail_image, source_hash=source_hash, raw_psd_bytes=raw_bytes
+        ),
+        None,
+    )
+
+
+def _resolve_source(
+    context: CpsbContext, fields: dict[str, Any]
+) -> tuple[ResolvedSource | None, web.Response | None]:
+    """:class:`ResolvedSource` for any ``origin_kind`` (PROTOCOL.md §1/§2/§6b).
+
+    Dispatches to the psd-native path (raw-bytes identity, verbatim copy)
+    for ``origin_kind: "load_psd"``; every other origin keeps the existing
+    behavior -- decode via Pillow, hash the normalized PNG encoding
+    (:func:`cpsb.handoff.compute_source_hash`), later re-encoded as a flat
+    PSD by :func:`cpsb.psd_io.write_psd`. A single entry point here is what
+    lets the 409-vs-auto-supersede comparison and the final handoff-creation
+    step (both in :func:`open_handoff_route`) stay origin-agnostic.
+    """
+    if fields["origin_kind"] == "load_psd":
+        return _resolve_psd_native_source(context, fields)
+    image, error_response = _open_source_image(context, fields)
+    if error_response is not None:
+        return None, error_response
+    return ResolvedSource(thumbnail_image=image, source_hash=compute_source_hash(image)), None
+
+
 @routes.post("/cpsb/open")
 async def open_handoff_route(request: web.Request) -> web.Response:
     try:
@@ -314,13 +435,12 @@ async def open_handoff_route(request: web.Request) -> web.Response:
     # workflow B's node "17" must not adopt workflow A's active handoff.
     existing = manager.find_active_for_node(origin_node_id, fields["workflow_name"])
 
-    original_image: Image.Image | None = None
-    incoming_hash: str | None = None
+    resolved: ResolvedSource | None = None
     supersede_existing = False
 
     if mode == "new" and existing is not None:
-        # The incoming image must be resolved and hashed BEFORE deciding
-        # 409 vs. proceed: a re-open of the SAME image is the genuine
+        # The incoming source must be resolved and hashed BEFORE deciding
+        # 409 vs. proceed: a re-open of the SAME source is the genuine
         # conflict the "Edit Original / Start Fresh" chooser exists for,
         # but upstream regenerating the image under an unchanged filename
         # (the common case for counter-based or fixed-name SaveImage/
@@ -329,12 +449,13 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         # instead and proceed as new (mirrors the bridge node's identical
         # source_hash rule, PROTOCOL.md §6). A legacy handoff with no
         # recorded source_hash is treated as matching -- same documented
-        # choice as the bridge node.
-        original_image, error_response = _open_source_image(context, fields)
+        # choice as the bridge node. `_resolve_source` picks the raw-bytes
+        # (psd-native) vs. decoded-PNG hash scheme per `origin_kind`
+        # (PROTOCOL.md §1/§2), so this comparison is correct either way.
+        resolved, error_response = _resolve_source(context, fields)
         if error_response is not None:
             return error_response
-        incoming_hash = compute_source_hash(original_image)
-        if existing.source_hash is None or existing.source_hash == incoming_hash:
+        if existing.source_hash is None or existing.source_hash == resolved.source_hash:
             return web.json_response(
                 {
                     "error": "An edit is already in progress for this node",
@@ -387,11 +508,10 @@ async def open_handoff_route(request: web.Request) -> web.Response:
     if supersede_existing or (mode == "fresh" and existing is not None):
         manager.supersede(existing.handoff_id)
 
-    if original_image is None:
-        original_image, error_response = _open_source_image(context, fields)
+    if resolved is None:
+        resolved, error_response = _resolve_source(context, fields)
         if error_response is not None:
             return error_response
-        incoming_hash = compute_source_hash(original_image)
 
     meta = manager.create(
         origin_node_id=origin_node_id,
@@ -400,11 +520,17 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         source=SourceRef(
             filename=fields["filename"], subfolder=fields["subfolder"], type=fields["type"]
         ),
-        original_image=original_image,
-        source_hash=incoming_hash,
+        original_image=resolved.thumbnail_image,
+        source_hash=resolved.source_hash,
     )
     psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
-    write_psd(psd_path, _normalize_for_psd_write(original_image))
+    if resolved.raw_psd_bytes is not None:
+        # psd-native (PROTOCOL.md §2): copy the user's own layered file
+        # verbatim -- never write_psd/frompil, which would flatten it.
+        psd_path.parent.mkdir(parents=True, exist_ok=True)
+        psd_path.write_bytes(resolved.raw_psd_bytes)
+    else:
+        write_psd(psd_path, _normalize_for_psd_write(resolved.thumbnail_image))
     manager.note_source_written(meta.handoff_id)
 
     return await _open_and_respond(request, context, manager, meta, psd_path)

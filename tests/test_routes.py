@@ -9,21 +9,25 @@ into its own namespace, so that is where the patches land).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import platform
 import threading
 import time
+from pathlib import Path
 
 import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
+from psd_tools import PSDImage
 
 import cpsb.routes as routes_module
 from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
 from cpsb.handoff import HandoffManager, WaitOutcome, compute_source_hash
 from cpsb.launcher import LaunchResult, Tier1Status
+from cpsb.psd_io import write_psd
 from cpsb.version import __version__ as CPSB_VERSION
 
 SOURCE_FILENAME = "ComfyUI_00042_.png"
@@ -33,6 +37,15 @@ def png_bytes(color: tuple[int, int, int], size: tuple[int, int] = (24, 16)) -> 
     buf = io.BytesIO()
     Image.new("RGB", size, color).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def psd_bytes(
+    tmp_path: Path, color: tuple[int, int, int] = (10, 20, 30), size: tuple[int, int] = (16, 16)
+) -> bytes:
+    """Real, minimal PSD bytes via `write_psd` (a scratch file, read back and discarded)."""
+    scratch = tmp_path / f"scratch_{hashlib.sha1(repr((color, size)).encode()).hexdigest()}.psd"
+    write_psd(scratch, Image.new("RGB", size, color))
+    return scratch.read_bytes()
 
 
 class LaunchRecorder:
@@ -95,6 +108,24 @@ def open_body(**overrides) -> dict:
         "type": "output",
         "origin_node_id": "17",
         "origin_kind": "load_image",
+        "workflow_name": "wf",
+        "mode": "new",
+    }
+    body.update(overrides)
+    return body
+
+
+def open_body_psd(**overrides) -> dict:
+    """Like `open_body`, but for a psd-native (`origin_kind: "load_psd"`) open
+    (PROTOCOL.md §2/§6b) -- `type: "input"` since that's where the Load PSD
+    node's combo lists files from.
+    """
+    body = {
+        "filename": "sample.psd",
+        "subfolder": "",
+        "type": "input",
+        "origin_node_id": "5",
+        "origin_kind": "load_psd",
         "workflow_name": "wf",
         "mode": "new",
     }
@@ -362,6 +393,166 @@ class TestAutoSupersedeOnChangedSource:
         fresh_body = await fresh.json()
         assert fresh_body["handoff_id"] != first["handoff_id"]
         assert manager.get(first["handoff_id"]).status == "superseded"
+
+
+class TestOpenPsdNative:
+    """``POST /cpsb/open`` with ``origin_kind: "load_psd"`` (PROTOCOL.md §2/§6b):
+    the handoff's ``source.psd`` is a verbatim byte-for-byte copy of the
+    user's own file (never a re-encoded flatten), and ``source_hash`` is the
+    sha256 of those raw bytes rather than a PNG-encoding hash.
+    """
+
+    async def test_copies_bytes_verbatim(self, client, context, manager, launches, tmp_path):
+        original = psd_bytes(tmp_path, color=(11, 22, 33))
+        (context.input_dir / "sample.psd").write_bytes(original)
+
+        response = await client.post("/cpsb/open", json=open_body_psd())
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        copied = (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes()
+        assert copied == original
+        assert manager.get(handoff_id).source_hash == hashlib.sha256(original).hexdigest()
+
+    async def test_preserves_real_layers_not_flattened(
+        self, client, context, manager, launches, tmp_path
+    ):
+        """The headline product win (research-psd-loading.md §5): a
+        genuinely layered PSD survives the round trip un-flattened, unlike
+        every other origin (which always calls `write_psd`, layer-less by
+        construction).
+        """
+        psd = PSDImage.new("RGB", (20, 20), color=1.0, depth=8)
+        psd.create_pixel_layer(Image.new("RGB", (10, 10), (255, 0, 0)), name="Red", top=2, left=2)
+        scratch = tmp_path / "layered.psd"
+        psd.save(scratch)
+        original = scratch.read_bytes()
+        (context.input_dir / "layered.psd").write_bytes(original)
+
+        response = await client.post("/cpsb/open", json=open_body_psd(filename="layered.psd"))
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        copied_path = context.cpsb_input_dir / handoff_id / "source.psd"
+        assert copied_path.read_bytes() == original
+        assert len(list(PSDImage.open(copied_path))) == 1  # the "Red" layer, intact
+
+    async def test_rejects_non_psd_extension(self, client, context, launches):
+        (context.input_dir / "photo.png").write_bytes(png_bytes((1, 2, 3)))
+
+        response = await client.post("/cpsb/open", json=open_body_psd(filename="photo.png"))
+
+        assert response.status == 400
+
+    async def test_missing_file_404(self, client, context, launches):
+        response = await client.post("/cpsb/open", json=open_body_psd(filename="ghost.psd"))
+        assert response.status == 404
+
+    async def test_thumbnail_written_from_the_flatten(
+        self, client, context, manager, launches, tmp_path
+    ):
+        original = psd_bytes(tmp_path, color=(40, 80, 120))
+        (context.input_dir / "sample.psd").write_bytes(original)
+
+        response = await client.post("/cpsb/open", json=open_body_psd())
+
+        handoff_id = (await response.json())["handoff_id"]
+        thumb_path = context.cpsb_input_dir / handoff_id / "orig_thumb.png"
+        assert thumb_path.is_file()
+        with Image.open(thumb_path) as thumb:
+            assert thumb.getpixel((0, 0))[:3] == (40, 80, 120)
+
+    async def test_flatten_failure_still_succeeds_with_placeholder_thumbnail(
+        self, client, context, manager, launches
+    ):
+        """PROTOCOL.md §2: "never fail the open for a thumbnail" -- a PSD
+        with a valid signature but corrupt body still opens successfully,
+        with a placeholder thumbnail standing in for the failed flatten.
+        """
+        corrupt = b"8BPS" + b"\x00" * 4
+        (context.input_dir / "corrupt.psd").write_bytes(corrupt)
+
+        response = await client.post("/cpsb/open", json=open_body_psd(filename="corrupt.psd"))
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        thumb_path = context.cpsb_input_dir / handoff_id / "orig_thumb.png"
+        assert thumb_path.is_file()
+        with Image.open(thumb_path) as thumb:
+            thumb.load()  # a real, decodable PNG -- not a stub/empty file
+        # The raw bytes are still copied verbatim regardless of the flatten failure.
+        copied = (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes()
+        assert copied == corrupt
+
+    async def test_source_hash_is_raw_bytes_sha_not_png_encoding(
+        self, client, context, manager, launches, tmp_path
+    ):
+        original = psd_bytes(tmp_path, color=(7, 7, 7))
+        (context.input_dir / "sample.psd").write_bytes(original)
+
+        response = await client.post("/cpsb/open", json=open_body_psd())
+
+        handoff_id = (await response.json())["handoff_id"]
+        assert manager.get(handoff_id).source_hash == hashlib.sha256(original).hexdigest()
+        # Not the flattened-thumbnail PNG-encoding hash the non-psd-native
+        # path uses (`compute_source_hash`) -- confirms the raw-bytes scheme
+        # is genuinely in effect, not coincidentally equal to it.
+        with Image.open(context.cpsb_input_dir / handoff_id / "orig_thumb.png") as thumb:
+            assert manager.get(handoff_id).source_hash != compute_source_hash(thumb)
+
+    async def test_same_bytes_reopen_still_conflicts(self, client, context, launches, tmp_path):
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path))
+        first = await (await client.post("/cpsb/open", json=open_body_psd())).json()
+
+        conflict = await client.post("/cpsb/open", json=open_body_psd())
+
+        assert conflict.status == 409
+        assert (await conflict.json())["existing_handoff_id"] == first["handoff_id"]
+
+    async def test_changed_bytes_auto_supersedes_and_proceeds(
+        self, client, context, manager, launches, tmp_path
+    ):
+        """Auto-supersede on a changed source (PROTOCOL.md §6), mirrored for
+        psd-native sources: same shape as
+        ``TestAutoSupersedeOnChangedSource.test_changed_image_supersedes_and_proceeds``,
+        but keyed on raw PSD bytes instead of a decoded-pixel PNG hash.
+        """
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path, color=(1, 1, 1)))
+        first = await (await client.post("/cpsb/open", json=open_body_psd())).json()
+        assert manager.get(first["handoff_id"]).status == "editing"
+
+        new_bytes = psd_bytes(tmp_path, color=(2, 2, 2))
+        (context.input_dir / "sample.psd").write_bytes(new_bytes)
+
+        second = await client.post("/cpsb/open", json=open_body_psd())
+
+        assert second.status == 200
+        second_body = await second.json()
+        assert second_body["handoff_id"] != first["handoff_id"]
+        assert manager.get(first["handoff_id"]).status == "superseded"
+        assert manager.get(second_body["handoff_id"]).source_hash == hashlib.sha256(
+            new_bytes
+        ).hexdigest()
+
+    async def test_mode_original_reopens_the_same_copied_file(
+        self, client, context, manager, launches, tmp_path
+    ):
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path))
+        first = await (await client.post("/cpsb/open", json=open_body_psd())).json()
+
+        reopened = await client.post("/cpsb/open", json=open_body_psd(mode="original"))
+
+        assert reopened.status == 200
+        assert (await reopened.json())["handoff_id"] == first["handoff_id"]
+
+    async def test_origin_kind_accepted_by_body_validation(self, client, context, launches):
+        """`load_psd` must be a recognized `origin_kind` -- not rejected by
+        the same 400 that an unrecognized value gets.
+        """
+        response = await client.post(
+            "/cpsb/open", json=open_body_psd(filename="never-created.psd")
+        )
+        assert response.status == 404  # got past body validation to file resolution
 
 
 async def _connect_tier2_plugin(ws, context: CpsbContext, local_mode: bool = True) -> None:
@@ -812,7 +1003,6 @@ class TestSettings:
             "cleanup_days": 14,
             "sibling_outputs": True,
             "managed_folder_name": DEFAULT_MANAGED_FOLDER_NAME,
-            "mask_channel_name": "Mask",
         }
 
     async def test_post_merges_and_persists(self, client, context, launches):
