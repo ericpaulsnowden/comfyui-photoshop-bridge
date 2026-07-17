@@ -431,10 +431,17 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   hole-filled (scipy when available — ComfyUI ships it — guarded with a PIL-only
   fallback), so the user may mark with ANY tool/color; (2) else the `mask` input
   socket (ComfyUI-only tier: MaskEditor or any mask source upstream); (3) else zeros.
-- PS mode behavior: on execute with no matching edit, write the handoff
-  (origin_kind `bridge_node`), open Photoshop non-blocking, and return passthrough
-  outputs; the user paints marks and saves; the next queue derives the diff mask. No
-  auto-queue (bridge_node policy §5 — this node has no re-run mode).
+- PS mode behavior (BLOCKS, product-owner update 2026-07-17): on execute with no
+  matching edit, write the handoff (origin_kind `bridge_node`), open Photoshop, and
+  BLOCK the workflow via manager.wait_for_edit (identical to the §6 bridge node's "Wait
+  for first save") until the user marks up and saves; then derive the diff mask and
+  continue with the package outputs. Cancel/timeout interrupt via
+  InterruptProcessingException, exactly like the bridge node. (Was previously
+  non-blocking; the workflow must stop until save.) The open MUST reliably fire the
+  tier-selected launch and log each step (a `cpsb annotate:` trail like the bridge
+  node's, so a "didn't open" report is diagnosable). When browsed remotely, Photoshop
+  opens on the SERVER machine (cross-machine Tier 1 is Round 2) — which is exactly why
+  the editing badge must be cancelable from ComfyUI (§8 universal-cancel).
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 
