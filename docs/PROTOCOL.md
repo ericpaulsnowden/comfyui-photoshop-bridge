@@ -242,6 +242,21 @@ Server → plugin:
 - `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
   the socket (plugin reconnects with backoff).
 
+**Server address (plugin-side, user-configurable):** the plugin targets a single
+`host:port` base (default `localhost:8188`), from which it derives both the WebSocket
+URL (`ws://<base>/cpsb/ws`) and the HTTP origin (`http://<base>` for the `/cpsb/file/*`
+and `/cpsb/upload` routes). It is editable from the panel's Advanced section
+("ComfyUI server"); the value is persisted plugin-side under the `localStorage` key
+`cpsb.serverBase` (falling back to in-session-only if localStorage is unavailable) and
+applying a new address triggers a clean reconnect — the current socket is torn down,
+the backoff/attempt state reset, and the hello/ready handshake re-run against the new
+URL. Default localhost use is unchanged. Cross-machine use — Photoshop on one computer,
+ComfyUI on another — requires (a) the plugin manifest's `network.domains` set to the
+catch-all `"all"` (arbitrary user-entered hosts cannot be enumerated ahead of time, so
+the localhost-only allowlist is widened; a least-privilege allowlist is a possible
+follow-up for a locked-down release), and (b) the ComfyUI server reachable over the
+network, i.e. started with `--listen`.
+
 ---
 
 ## 4. Ingest pipeline (backend, both tiers)

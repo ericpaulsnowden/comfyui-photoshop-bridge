@@ -47,6 +47,16 @@ function initPanel() {
   const statusDot = /** @type {HTMLElement} */ (document.getElementById('cpsb-status-dot'))
   const statusText = /** @type {HTMLElement} */ (document.getElementById('cpsb-status-text'))
   const serverUrlEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-server-url'))
+  // Editable server-address field + its Apply button and inline error line
+  // (Advanced section). This is where the user points the plugin at another
+  // machine; the read-only serverUrlEl above shows the currently-active URL.
+  const serverInput = /** @type {HTMLInputElement} */ (
+    document.getElementById('cpsb-server-input')
+  )
+  const serverApply = /** @type {HTMLElement} */ (document.getElementById('cpsb-server-apply'))
+  const serverErrorEl = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-server-error')
+  )
   const lastErrorEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-last-error'))
   const retryEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-retry-line'))
   // The always-visible boot banner index.js paints at load; panel.js takes
@@ -208,6 +218,32 @@ function initPanel() {
     advancedBody.className = collapsed ? '' : 'cpsb-collapsed'
     advancedCaret.textContent = collapsed ? '▾' : '▸'
   })
+
+  /**
+   * Applies the server-address field: normalizes + reconnects via
+   * `connection.setServerBase`. Validation errors (empty/malformed input) are
+   * shown inline using the existing error styling; on success the field is
+   * rewritten with the normalized value and the normal statechange rendering
+   * (the pill, the active-URL line) shows the reconnect result.
+   * @returns {void}
+   */
+  function applyServerBase() {
+    try {
+      connection.setServerBase(serverInput.value)
+      serverErrorEl.textContent = ''
+      serverErrorEl.style.display = 'none'
+      // Reflect the normalized form back to the user (e.g. scheme/path stripped).
+      serverInput.value = connection.getServerBase()
+    } catch (error) {
+      serverErrorEl.textContent = describeError(error)
+      serverErrorEl.style.display = 'block'
+    }
+  }
+
+  serverApply.addEventListener('click', applyServerBase)
+  // Prefill with the active base and start with the error line hidden.
+  serverInput.value = connection.getServerBase()
+  serverErrorEl.style.display = 'none'
 
   connection.addEventListener('statechange', renderConnection)
   registryEvents.addEventListener('change', renderHandoffs)

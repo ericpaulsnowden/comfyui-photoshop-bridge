@@ -20,7 +20,7 @@ const { app, core } = require('photoshop')
 const uxp = require('uxp')
 const { localFileSystem, formats } = uxp.storage
 
-const { connection, pathToFileUrl, HTTP_ORIGIN } = require('./connection.js')
+const { connection, pathToFileUrl } = require('./connection.js')
 const { logInfo, logWarn, logError, describeError } = require('./log.js')
 const { runExport } = require('./exporter.js')
 const { uploadEdit } = require('./uploader.js')
@@ -152,7 +152,7 @@ async function openLocal(psdPath) {
  * @returns {Promise<import('photoshop').Document>}
  */
 async function openRemote(handoffId, fileUrl) {
-  const response = await fetch(`${HTTP_ORIGIN}${fileUrl}`)
+  const response = await fetch(`${connection.getHttpOrigin()}${fileUrl}`)
   if (!response.ok) {
     throw new Error(`GET ${fileUrl} failed: HTTP ${response.status}`)
   }

@@ -22,14 +22,33 @@ const uxp = require('uxp')
 const { localFileSystem } = uxp.storage
 
 /**
- * Default ComfyUI port (docs/PROTOCOL.md, PLAN.md §5). Tier 2's MVP does not
- * support a non-default port — see PLAN.md §6/§10 — so this is a constant,
- * not a setting.
+ * Default ComfyUI server base as `host:port` (docs/PROTOCOL.md §3). The plugin
+ * derives its WebSocket URL (`ws://<base>/cpsb/ws`) and HTTP origin
+ * (`http://<base>`) from this single value, so `host:port` is the one source
+ * of truth for the connection target. The default keeps existing localhost
+ * users on the exact same target as before; it is now user-configurable (panel
+ * Advanced section, `setServerBase`) so Photoshop on one machine can reach
+ * ComfyUI on another.
  */
-const WS_URL = 'ws://localhost:8188/cpsb/ws'
+const DEFAULT_SERVER_BASE = 'localhost:8188'
 
-/** HTTP origin for the `/cpsb/file/*` and `/cpsb/upload` routes (PROTOCOL.md §2). */
-const HTTP_ORIGIN = 'http://localhost:8188'
+/**
+ * localStorage key the configured server base persists under.
+ *
+ * Persistence choice: UXP for Photoshop exposes a Web-standard, SYNCHRONOUS
+ * `localStorage`, which fits this manager far better than an async plugin-data
+ * JSON file would — the persisted base must be known BEFORE the first
+ * connection attempt, and localStorage can be read inline in the constructor
+ * with no async bootstrap (the existing `start()`/`_open()` flow is entirely
+ * synchronous; an async file read would force it to become async or to open
+ * once on the default and then reconnect). ASSUMPTION to verify on real
+ * Photoshop: that `localStorage` both exists AND survives a Photoshop restart
+ * for this plugin. Every access is guarded (try/catch) so that if it is
+ * unavailable the plugin degrades to in-session-only — the setting still
+ * applies and reconnects for this session, it just won't persist across a
+ * restart.
+ */
+const SERVER_BASE_STORAGE_KEY = 'cpsb.serverBase'
 
 /** Exponential backoff schedule in ms, capping at 10s forever (PLAN.md §5). */
 const BACKOFF_STEPS_MS = [1000, 2000, 5000, 10000]
@@ -120,12 +139,98 @@ function pathToFileUrl(absolutePath) {
 }
 
 /**
+ * Normalizes a user-entered server address to a bare `host:port` base. Accepts
+ * forgiving forms — `192.168.1.50:8188`, `http://192.168.1.50:8188`,
+ * `ws://host:8188/cpsb/ws`, `localhost:8188`, or a bare host (port defaults to
+ * ComfyUI's 8188) — by stripping any scheme and any path/query/fragment and
+ * keeping only the authority. Throws an `Error` with a clear, user-facing
+ * message on empty or malformed input; the panel surfaces that message inline.
+ * @param {string} input
+ * @returns {string} `host:port`
+ */
+function normalizeServerBase(input) {
+  if (typeof input !== 'string') {
+    throw new Error('Server address must be text like "192.168.1.50:8188"')
+  }
+  let s = input.trim()
+  if (!s) throw new Error('Enter a server address, e.g. "192.168.1.50:8188"')
+  // Strip a leading scheme (http://, https://, ws://, wss://, …) if present.
+  s = s.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '')
+  // Keep only the authority — drop any /path, ?query, or #fragment.
+  s = s.replace(/[/?#].*$/, '')
+  if (!s) throw new Error(`"${input}" has no host part`)
+  // Split host from an optional :port on the LAST colon.
+  let host = s
+  let port = '8188'
+  const colon = s.lastIndexOf(':')
+  if (colon !== -1) {
+    host = s.slice(0, colon)
+    port = s.slice(colon + 1)
+  }
+  if (!host) throw new Error(`"${input}" has no host part`)
+  if (!/^[A-Za-z0-9.\-]+$/.test(host)) {
+    throw new Error(`"${host}" is not a valid host name or IP address`)
+  }
+  if (!/^[0-9]+$/.test(port)) {
+    throw new Error(`Port "${port}" must be a number`)
+  }
+  const portNum = Number(port)
+  if (portNum < 1 || portNum > 65535) {
+    throw new Error(`Port ${portNum} is out of range (1–65535)`)
+  }
+  return `${host}:${portNum}`
+}
+
+/**
+ * Reads the persisted server base, falling back to the default if nothing is
+ * stored or localStorage is unavailable / holds a bad value. See
+ * `SERVER_BASE_STORAGE_KEY` for the persistence rationale and assumptions.
+ * @returns {string} `host:port`
+ */
+function loadPersistedServerBase() {
+  try {
+    const stored =
+      typeof localStorage !== 'undefined' && localStorage.getItem(SERVER_BASE_STORAGE_KEY)
+    if (stored) return normalizeServerBase(stored)
+  } catch (_error) {
+    // localStorage unavailable, or a corrupt stored value — use the default.
+  }
+  return DEFAULT_SERVER_BASE
+}
+
+/**
+ * Persists the server base, best-effort. A failure here (localStorage absent
+ * in this UXP target) is non-fatal: the new base still applies for this
+ * session, it just won't survive a Photoshop restart.
+ * @param {string} base - Already-normalized `host:port`.
+ * @returns {void}
+ */
+function persistServerBase(base) {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(SERVER_BASE_STORAGE_KEY, base)
+    }
+  } catch (error) {
+    logWarn(
+      `could not persist server address (${describeError(error)}) — it will reset when Photoshop restarts`
+    )
+  }
+}
+
+/**
  * Manages the single websocket connection to ComfyUI. Import the shared
  * `connection` singleton below rather than constructing this directly.
  */
 class ConnectionManager extends EventTarget {
   constructor() {
     super()
+    /**
+     * Active server base as `host:port` — the single source of truth for the
+     * target URLs (`getWsUrl()`/`getHttpOrigin()`). Loaded from persistence
+     * (or the default) at construction; changed only via `setServerBase()`.
+     * @type {string}
+     */
+    this._serverBase = loadPersistedServerBase()
     /** @type {'disconnected' | 'connecting' | 'connected'} */
     this.status = 'disconnected'
     /** @type {string | null} */
@@ -161,6 +266,92 @@ class ConnectionManager extends EventTarget {
     this._open()
   }
 
+  /**
+   * The active server base (`host:port`) the plugin connects to. Prefill the
+   * panel's server field with this.
+   * @returns {string}
+   */
+  getServerBase() {
+    return this._serverBase
+  }
+
+  /**
+   * WebSocket URL derived from the current server base (docs/PROTOCOL.md §3).
+   * @returns {string}
+   */
+  getWsUrl() {
+    return `ws://${this._serverBase}/cpsb/ws`
+  }
+
+  /**
+   * HTTP origin derived from the current server base, for the `/cpsb/file/*`
+   * and `/cpsb/upload` routes (docs/PROTOCOL.md §2). Replaces the former
+   * module-level `HTTP_ORIGIN` constant with a getter so the origin tracks a
+   * reconfigured server base — every consumer (handoffs.js, uploader.js) calls
+   * this per request rather than capturing a value at load time.
+   * @returns {string}
+   */
+  getHttpOrigin() {
+    return `http://${this._serverBase}`
+  }
+
+  /**
+   * Points the plugin at a (possibly different) ComfyUI server. Validates and
+   * normalizes the input to `host:port` — throwing a clear `Error` on
+   * empty/malformed input, which the panel surfaces inline — persists it, and
+   * performs a clean reconnect against the new URL. `getState().url` reflects
+   * the new target immediately.
+   * @param {string} value - e.g. `192.168.1.50:8188` or `http://host:8188`.
+   * @returns {void}
+   */
+  setServerBase(value) {
+    const normalized = normalizeServerBase(value)
+    this._serverBase = normalized
+    persistServerBase(normalized)
+    logInfo(`server address set to ${normalized} — reconnecting`)
+    this._reconnectNow()
+  }
+
+  /**
+   * Tears down the current socket and any pending reconnect timer, resets all
+   * backoff/handshake state to a clean slate, and immediately opens a fresh
+   * connection against the current server base. Used by `setServerBase()`.
+   * @returns {void}
+   */
+  _reconnectNow() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer)
+      this._reconnectTimer = null
+    }
+    if (this._socket) {
+      const socket = this._socket
+      this._socket = null
+      // Detach handlers BEFORE closing so the imminent close does not run
+      // `_onClose` (which would record a failure and schedule its own
+      // reconnect, racing the fresh `_open()` below).
+      socket.onopen = null
+      socket.onmessage = null
+      socket.onclose = null
+      socket.onerror = null
+      try {
+        socket.close()
+      } catch (_error) {
+        // Already closing/closed — nothing to do.
+      }
+    }
+    this.attempts = 0
+    this.nextRetryAt = null
+    this.lastError = null
+    this._lastFailureDetail = null
+    this._socketErrorDetail = null
+    this.serverVersion = null
+    this.localMode = null
+    // Ensure a reconnect works even if `setServerBase` is somehow called
+    // before `start()` (start() is normally called first, from plugin.create).
+    this._started = true
+    this._open()
+  }
+
   /** @returns {void} */
   _open() {
     this.nextRetryAt = null
@@ -169,7 +360,7 @@ class ConnectionManager extends EventTarget {
     /** @type {WebSocket} */
     let socket
     try {
-      socket = new WebSocket(WS_URL)
+      socket = new WebSocket(this.getWsUrl())
     } catch (error) {
       // Constructor-throw path. This is where a manifest-permission denial
       // surfaces (UXP's WebSocket is documented to throw from the
@@ -387,7 +578,7 @@ class ConnectionManager extends EventTarget {
   getState() {
     return {
       status: this.status,
-      url: WS_URL,
+      url: this.getWsUrl(),
       serverVersion: this.serverVersion,
       localMode: this.localMode,
       lastError: this.lastError,
@@ -409,4 +600,4 @@ class ConnectionManager extends EventTarget {
 /** The one websocket connection this plugin maintains, for the lifetime of the plugin. */
 const connection = new ConnectionManager()
 
-module.exports = { HTTP_ORIGIN, pathToFileUrl, connection }
+module.exports = { pathToFileUrl, connection }

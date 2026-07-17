@@ -7,7 +7,7 @@
  * try/catch.
  */
 
-const { HTTP_ORIGIN } = require('./connection.js')
+const { connection } = require('./connection.js')
 const { logWarn, logError, describeError } = require('./log.js')
 
 /** Retry budget for a single upload (quality bar: "retry x3 with backoff"). */
@@ -41,7 +41,7 @@ async function uploadEdit(handoffId, pngBytes) {
       body.append('handoff_id', handoffId)
       body.append('image', new Blob([pngBytes], { type: 'image/png' }), 'edit.png')
       body.append('source', 'plugin')
-      const response = await fetch(`${HTTP_ORIGIN}/cpsb/upload`, { method: 'POST', body })
+      const response = await fetch(`${connection.getHttpOrigin()}/cpsb/upload`, { method: 'POST', body })
       if (response.ok) {
         return true
       }

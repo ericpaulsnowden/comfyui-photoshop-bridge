@@ -207,6 +207,33 @@
         color: var(--uxp-host-text-color-secondary);
       }
 
+      /* --- Server address field (point the plugin at another machine) --- */
+
+      .cpsb-field-label {
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+        font-weight: 700;
+        letter-spacing: 1px;
+        color: var(--uxp-host-label-text-color);
+        margin-top: 6px;
+        margin-bottom: 6px;
+      }
+
+      /* Row layout mirrors .cpsb-handoff-item (flex row + a flex:1 child + a
+         trailing sp-button), a pattern already proven to lay out correctly in
+         this panel. Spacing via margin-right (no `gap`, per the note above). */
+      .cpsb-server-row {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        margin-bottom: 6px;
+      }
+
+      .cpsb-server-input {
+        flex: 1;
+        min-width: 0;
+        margin-right: 8px;
+      }
+
       .cpsb-log {
         margin-top: 8px;
         max-height: 160px;
@@ -267,6 +294,27 @@
       </div>
       <div id="cpsb-advanced-body" class="cpsb-collapsed">
         <div id="cpsb-version" class="cpsb-version cpsb-version-muted">Plugin loading…</div>
+
+        <!-- Server address: THIS is where you point the plugin at a different
+             machine. Default is localhost:8188 (ComfyUI on this same
+             computer); enter another machine's host:port (e.g.
+             192.168.1.50:8188) to connect across the network. Applying it
+             reconnects (panel.js -> connection.setServerBase). -->
+        <div class="cpsb-field-label">COMFYUI SERVER (HOST:PORT)</div>
+        <div class="cpsb-server-row">
+          <sp-textfield
+            id="cpsb-server-input"
+            class="cpsb-server-input"
+            placeholder="localhost:8188"
+          ></sp-textfield>
+          <sp-button id="cpsb-server-apply">Apply / Connect</sp-button>
+        </div>
+        <div class="cpsb-muted cpsb-conn-line">
+          Point at ComfyUI on another computer, e.g. 192.168.1.50:8188 (that
+          server must be started with --listen). Applying reconnects.
+        </div>
+        <div id="cpsb-server-error" class="cpsb-error-line cpsb-conn-line"></div>
+
         <div id="cpsb-server-url" class="cpsb-muted cpsb-conn-line"></div>
         <pre id="cpsb-log" class="cpsb-log"></pre>
       </div>
