@@ -15,10 +15,15 @@ Referenced design rationale lives in `/PLAN.md` (repo parent) — section number
 - `handoff_id`: 8-char lowercase hex, generated with `uuid.uuid4().hex[:8]`, unique per
   handoff. Treated as an unguessable capability token (§3 security): routes that read or
   mutate a specific handoff require it and return 404 for unknown/inactive ids.
-- Managed folder, one per handoff, under ComfyUI's input directory:
+- Managed folder, one per handoff, under ComfyUI's input directory. The parent folder
+  name is the `managed_folder_name` setting (default `"photoshop"`; §2 settings). It is
+  written to `meta.json` per handoff (`managed_dir`) and included in the subfolder of
+  every emitted image reference, so the **frontend never hardcodes it** — it derives the
+  subfolder entirely from server events and `/cpsb/*` responses. `<managed>` below stands
+  for that configured name:
 
 ```
-input/cpsb/<handoff_id>/
+input/<managed>/<handoff_id>/
     source.psd        # the PSD handed to Photoshop (Tier 1 opens this path directly)
     meta.json         # authoritative handoff state (schema below)
     orig_thumb.png    # thumbnail of the ORIGINAL image, max 256px long side (gallery before/after)
@@ -26,9 +31,11 @@ input/cpsb/<handoff_id>/
 ```
 
 - There is **no separate session manifest file**: on server start, the backend rebuilds
-  its in-memory state by scanning `input/cpsb/*/meta.json` (the meta files are the
+  its in-memory state by scanning `input/<managed>/*/meta.json` (the meta files are the
   source of truth; this supersedes PLAN §3's `session_manifest.json` — one file fewer,
-  same restart guarantee).
+  same restart guarantee). Changing `managed_folder_name` takes effect at next server
+  start and applies to new handoffs; handoffs already living under the previous name stay
+  where they are (their `meta.managed_dir` records which folder they belong to).
 - Handoffs with status `edited`, `cancelled`, `discarded`, `superseded`, or `error` older
   than `cleanup_days` (default 14) are purged (folder deleted) at server start.
   `pending`/`editing` handoffs are never auto-purged.
@@ -143,8 +150,16 @@ plugin in remote mode. 404 for unknown id or non-active status.
 
 ### POST `/cpsb/cancel/{handoff_id}`
 Marks the handoff `cancelled`, unblocks a waiting bridge node (which then raises
-`InterruptProcessingException`), notifies the plugin (`handoff_cancelled`). 200
-`{"ok": true}`; 404 unknown.
+`InterruptProcessingException`), notifies the plugin (`handoff_cancelled`), and emits
+`cpsb.status` with `cancelled` so the node badge and gallery clear. 200 `{"ok": true}`;
+404 unknown. This is the authoritative way to clear a handoff stuck in `editing` — e.g.
+the user opened Photoshop and closed the document without saving, which produces no file
+event in Tier 1 and so would otherwise sit in `editing` indefinitely. The frontend
+surfaces it directly on the node's "Editing in Photoshop…" badge (hover → cancel) and in
+the gallery; cancelling is always available immediately, not gated on the stale timeout.
+Idempotent: cancelling an already-terminal handoff returns 200 and is a no-op. Any edit
+that arrives after cancellation (a late save landing on a cancelled handoff) is ignored
+by the ingest path (status not in `ACTIVE_STATUSES`).
 
 ### POST `/cpsb/discard/{handoff_id}`
 Gallery "Discard" for stale handoffs: same as cancel but sets `discarded`. 200/404.
@@ -166,9 +181,12 @@ Returns `orig_thumb.png` bytes. (Edited-image thumbnails are fetched via ComfyUI
 
 ### GET `/cpsb/settings` / POST `/cpsb/settings`
 Backend-persisted settings (stored at `<user_dir>/cpsb.json`), JSON object:
-`{"photoshop_path": "", "debounce_ms": 800, "cleanup_days": 14, "sibling_outputs": true}`.
-POST merges partial updates and returns the full object. (Frontend-only preferences —
-auto-queue toggle — use ComfyUI's settings API instead, id prefix `cpsb.`.)
+`{"photoshop_path": "", "debounce_ms": 800, "cleanup_days": 14, "sibling_outputs": true,
+"managed_folder_name": "photoshop"}`.
+POST merges partial updates and returns the full object. `managed_folder_name` is
+sanitized to a single safe path segment (no separators, no `..`); an invalid value falls
+back to the default. (Frontend-only preferences — auto-queue toggle — use ComfyUI's
+settings API instead, id prefix `cpsb.`.)
 
 ### GET `/cpsb/ws`
 WebSocket upgrade endpoint for the UXP plugin. Protocol in §3 of this doc.
@@ -297,10 +315,15 @@ Order: settings `photoshop_path` override → platform discovery → error.
   `"docker"` | `"wsl"` | `null`): Linux without `DISPLAY`/`WAYLAND_DISPLAY`;
   `/.dockerenv` present; WSL (`microsoft` in `platform.release().lower()`).
   "No Photoshop installed" is NOT a gating reason — it is only discoverable at launch
-  time and surfaces through the launch-failure path (§2 note). The frontend additionally
-  disables Tier 1 client-side when `window.location.hostname` is not localhost and shows
-  the §6-table tooltip. Launch calls are blocking subprocess work and MUST run off the
-  event loop (`asyncio.to_thread`) when invoked from route/websocket handlers.
+  time and surfaces through the launch-failure path (§2 note). The frontend must NOT
+  hard-disable Tier 1 based on `window.location.hostname` — a non-localhost hostname
+  (e.g. ComfyUI under `--listen`, browsed via a LAN address on the same machine) does
+  not imply Photoshop is elsewhere; Tier 1 only requires Photoshop on the SERVER's
+  machine, and the server-side gate above is the sole authority. A non-local hostname
+  may surface as an informational note ("Photoshop opens on the ComfyUI server's
+  machine"), shown at most once, never as a disable. Launch calls are blocking
+  subprocess work and MUST run off the event loop (`asyncio.to_thread`) when invoked
+  from route/websocket handlers.
 
 ---
 

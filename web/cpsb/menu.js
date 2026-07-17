@@ -107,6 +107,26 @@ function describeUnavailable(body) {
   return 'Neither Photoshop (Tier 1) nor the Photoshop panel plugin (Tier 2) is available.'
 }
 
+let remoteBrowsingNoted = false
+
+/**
+ * One-time-per-session heads-up when the page is browsed via a non-local
+ * hostname (e.g. `--listen` + LAN address): Photoshop opens on the SERVER's
+ * machine. Informational only — never gates anything (PROTOCOL.md §7); on
+ * the common same-machine-via-LAN-address setup the note is simply harmless.
+ */
+function maybeNoteRemoteBrowsing() {
+  if (remoteBrowsingNoted || !state.isRemoteBrowsingLikely()) return
+  remoteBrowsingNoted = true
+  ui.showToast({
+    severity: 'info',
+    summary: 'Photoshop opens on the ComfyUI server’s machine',
+    detail:
+      'You’re browsing ComfyUI via a network address. If Photoshop runs on a ' +
+      'different machine than the ComfyUI server, install the Photoshop panel plugin.'
+  })
+}
+
 /**
  * POSTs `/cpsb/open` for a single image on a node, handling the 409
  * existing-handoff response with the Edit Original / Start Fresh chooser.
@@ -143,6 +163,7 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
       summary: 'Opening in Photoshop…',
       detail: 'ComfyUI will watch this file and bring back your edits automatically.'
     })
+    maybeNoteRemoteBrowsing()
     // No further UI here by design — the cpsb.status/cpsb.updated events
     // drive the node badge (badges.js) and the gallery (gallery.js).
   } catch (error) {

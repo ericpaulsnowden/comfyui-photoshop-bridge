@@ -197,22 +197,27 @@ export function getAllHandoffs() {
 }
 
 /**
- * `window.location.hostname` values treated as "this browser is running on
- * the same machine as the ComfyUI server" (PROTOCOL.md §7).
+ * Whether the page is being browsed via a non-local hostname (e.g. ComfyUI
+ * started with `--listen`, reached by LAN address). PROTOCOL.md §7: this is
+ * an INFORMATIONAL signal only — it must never gate Tier 1, because Tier 1
+ * only requires Photoshop on the SERVER's machine, and a LAN hostname says
+ * nothing about where the server (or the user) physically is. A common
+ * false positive is browsing the same machine that runs both ComfyUI and
+ * Photoshop through its LAN address.
  * @returns {boolean}
  */
-function isNonLocalHostname() {
+export function isRemoteBrowsingLikely() {
   const host = window.location.hostname
   return host !== '' && host !== 'localhost' && host !== '127.0.0.1' && host !== '::1'
 }
 
 /**
  * @typedef {Object} CpsbTierInfo
- * @property {boolean} tier1Available - Raw server-reported availability.
+ * @property {boolean} tier1Available - Server-reported availability — the
+ * sole authority on Tier 1 (PROTOCOL.md §7); no client-side gating applies.
  * @property {string | null} tier1Reason - Server reason when unavailable.
- * @property {boolean} tier1Effective - `tier1Available` further gated by the
- * client-side non-localhost check (PROTOCOL.md §7); this is what menu.js
- * should actually branch on.
+ * @property {boolean} tier1Effective - Equal to `tier1Available`; retained
+ * as the name menu.js branches on.
  * @property {string} tier1EffectiveReason - Human-readable reason to show in
  * a disabled-menu-item tooltip; empty string when Tier 1 is available.
  * @property {boolean} tier2Connected
@@ -223,16 +228,10 @@ function isNonLocalHostname() {
  * @returns {CpsbTierInfo}
  */
 export function getTierInfo() {
-  const nonLocal = isNonLocalHostname()
-  const tier1Effective = tier.tier1Available && !nonLocal
-  let tier1EffectiveReason = ''
-  if (nonLocal) {
-    tier1EffectiveReason =
-      'ComfyUI is running on a remote server — Photoshop cannot be launched ' +
-      'from here without the Photoshop panel plugin (Tier 2).'
-  } else if (!tier.tier1Available) {
-    tier1EffectiveReason = tier.tier1Reason || 'Photoshop is not available on this server.'
-  }
+  const tier1Effective = tier.tier1Available
+  const tier1EffectiveReason = tier1Effective
+    ? ''
+    : tier.tier1Reason || 'Photoshop is not available on this server.'
   return {
     tier1Available: tier.tier1Available,
     tier1Reason: tier.tier1Reason,
