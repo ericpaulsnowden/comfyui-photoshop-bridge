@@ -37,14 +37,18 @@ import { warn } from './api.js'
 export const SETTINGS = [
   {
     id: 'cpsb.autoQueue',
-    name: 'Auto-queue after Photoshop edit',
+    name: 'Re-queue the workflow when an edit returns',
     type: 'boolean',
     defaultValue: true,
-    category: ['Photoshop Bridge', 'General', 'Auto-queue after edit'],
+    category: ['Photoshop Bridge', 'General', 'Re-queue after edit'],
     tooltip:
-      'When an edit arrives from Photoshop for a Load Image node or a ' +
-      'Photoshop Bridge node, automatically queue the workflow so ' +
-      'downstream nodes re-run. Has no effect for output-only nodes.'
+      'When on: as soon as an edit comes back from Photoshop, the workflow ' +
+      'automatically re-queues — ComfyUI’s own caching means only the ' +
+      'changed node and whatever is downstream of it actually re-run, not ' +
+      'the whole graph. When off: the edit still lands on the node right ' +
+      'away, but silently — nothing re-runs until you queue the workflow ' +
+      'yourself. Applies to Load Image nodes and Photoshop Bridge nodes; ' +
+      'has no effect for output-only (terminal) nodes.'
   },
   {
     id: 'cpsb.showUpgradeBanner',

@@ -1,7 +1,8 @@
-"""Tier 1 save detection: a watchdog Observer over ``input/cpsb/`` (PLAN.md §3).
+"""Tier 1 save detection: a watchdog Observer over the managed folder (PLAN.md §3).
 
-One :class:`~watchdog.observers.Observer` covers the whole ``input/cpsb/``
-tree rather than one per handoff -- cheaper, and directory-level events catch
+One :class:`~watchdog.observers.Observer` covers the whole managed-folder
+tree (``input/<managed_folder_name>/``, PROTOCOL.md §1) rather than one per
+handoff -- cheaper, and directory-level events catch
 both save-write patterns Photoshop might use (in-place modification, or
 write-to-temp-then-rename) without needing to know in advance which one a
 given OS/Photoshop version picks: every event type watchdog can raise
@@ -57,7 +58,7 @@ class _HandoffEventHandler(FileSystemEventHandler):
 
 
 class CpsbWatcher:
-    """Watches ``input/cpsb/`` for settled Photoshop saves and ingests them.
+    """Watches the managed folder for settled Photoshop saves and ingests them.
 
     Each handoff folder gets its own debounce timer (default 800ms, from
     settings): any event resets it, and it only fires once no further event
@@ -75,7 +76,7 @@ class CpsbWatcher:
         self._scheduled_mtimes: dict[str, int] = {}
 
     def start(self) -> None:
-        """Start watching ``input/cpsb/``. Idempotent -- a no-op if already running."""
+        """Start watching the managed folder. Idempotent -- a no-op if already running."""
         if self._observer is not None:
             return
         root = self._ctx.cpsb_input_dir

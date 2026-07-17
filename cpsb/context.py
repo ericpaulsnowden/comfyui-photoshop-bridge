@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,6 +26,9 @@ logger = logging.getLogger("cpsb")
 #: production).
 SendEvent = Callable[[str, dict], None]
 
+#: The managed-folder name used when the setting is empty or invalid.
+DEFAULT_MANAGED_FOLDER_NAME = "photoshop"
+
 #: Default values for every backend-persisted setting (PROTOCOL.md §2,
 #: ``GET/POST /cpsb/settings``).
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -32,7 +36,37 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "debounce_ms": 800,
     "cleanup_days": 14,
     "sibling_outputs": True,
+    "managed_folder_name": DEFAULT_MANAGED_FOLDER_NAME,
 }
+
+
+def sanitize_managed_name(raw: Any) -> str:
+    """Reduce a ``managed_folder_name`` value to one safe path segment.
+
+    The managed-folder name becomes a directory under ComfyUI's ``input/``
+    and is echoed into image subfolders the frontend fetches, so it must be
+    a single, benign path component. Anything containing a path separator or
+    a parent reference, or that is empty/whitespace once stripped, falls back
+    to :data:`DEFAULT_MANAGED_FOLDER_NAME`. Applied both when a value is
+    written (``POST /cpsb/settings``) and when it is read (defense in depth
+    against a hand-edited ``cpsb.json``).
+
+    Args:
+        raw: The candidate value (any type; non-strings are rejected).
+
+    Returns:
+        A safe single-segment folder name.
+    """
+    if not isinstance(raw, str):
+        return DEFAULT_MANAGED_FOLDER_NAME
+    name = raw.strip()
+    if not name:
+        return DEFAULT_MANAGED_FOLDER_NAME
+    if name in (".", ".."):
+        return DEFAULT_MANAGED_FOLDER_NAME
+    if any(sep in name for sep in ("/", "\\", os.sep)) or (os.altsep and os.altsep in name):
+        return DEFAULT_MANAGED_FOLDER_NAME
+    return name
 
 
 class SettingsStore:
@@ -115,7 +149,7 @@ class CpsbContext:
 
     Attributes:
         input_dir: ComfyUI's ``input/`` directory. Handoffs live under
-            ``input_dir / "cpsb"``.
+            ``input_dir / <managed_folder_name>`` (see :attr:`cpsb_input_dir`).
         output_dir: ComfyUI's ``output/`` directory (for sibling outputs).
         temp_dir: ComfyUI's ``temp/`` directory.
         user_dir: ComfyUI's per-user directory (settings persistence).
@@ -133,6 +167,23 @@ class CpsbContext:
     settings: SettingsStore
 
     @property
+    def managed_folder_name(self) -> str:
+        """The current, sanitized ``managed_folder_name`` setting.
+
+        Read (and re-sanitized) on every access so a live settings change is
+        picked up by the next handoff without a restart, and a hand-edited
+        ``cpsb.json`` can never smuggle in a path separator.
+        """
+        return sanitize_managed_name(
+            self.settings.get("managed_folder_name", DEFAULT_MANAGED_FOLDER_NAME)
+        )
+
+    @property
     def cpsb_input_dir(self) -> Path:
-        """The managed ``input/cpsb/`` folder holding every handoff."""
-        return self.input_dir / "cpsb"
+        """The managed ``input/<managed_folder_name>/`` folder holding every handoff.
+
+        The property name is stable (many call sites), but the folder it
+        points at is the configurable ``managed_folder_name`` (default
+        ``"photoshop"``), not a hardcoded ``"cpsb"``.
+        """
+        return self.input_dir / self.managed_folder_name

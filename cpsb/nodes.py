@@ -224,7 +224,7 @@ class PhotoshopBridge:
             return (self._load_edit_tensor(manager, active.handoff_id, image),)
 
         if active is None:
-            meta, psd_path = self._create_handoff(state, node_id, pil_image)
+            meta, psd_path = self._create_handoff(state, node_id, pil_image, incoming_hash)
         else:
             meta = active
             psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
@@ -249,18 +249,21 @@ class PhotoshopBridge:
 
     @staticmethod
     def _create_handoff(
-        state: _NodeState, node_id: str, pil_image: Image.Image
+        state: _NodeState, node_id: str, pil_image: Image.Image, source_hash: str
     ) -> tuple[HandoffMeta, Path]:
         # A bridge node's input is an in-memory tensor, not a file ComfyUI's
         # /view could address, so `source` is a descriptive placeholder --
         # it only matters for the gallery display and the sibling-output
         # step, and the latter is scoped to `terminal_output` origins only.
+        # source_hash is passed through rather than recomputed: execute()
+        # already hashed pil_image once to decide whether to supersede.
         meta = state.manager.create(
             origin_node_id=node_id,
             origin_kind="bridge_node",
             workflow_name="",
             source=SourceRef(filename=f"bridge_{node_id}.png", subfolder="", type="temp"),
             original_image=pil_image,
+            source_hash=source_hash,
         )
         psd_path = state.manager.handoff_dir(meta.handoff_id) / "source.psd"
         write_psd(psd_path, pil_image)

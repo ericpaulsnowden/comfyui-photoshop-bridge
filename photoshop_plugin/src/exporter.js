@@ -66,7 +66,10 @@ async function runExport(doc) {
  * `// VERIFY(spike-6):` the descriptor below is assembled from two
  * independently-confirmed but non-identical sources, not one authoritative
  * example — Adobe's own reference docs describe `batchPlay`'s general shape
- * and `_options.dialogOptions` but publish no save/export descriptor at all.
+ * and publish no save/export descriptor at all. (`_options.dialogOptions`
+ * itself IS first-class documented — the batchPlay reference enumerates
+ * "silent" (default) / "dontDisplay" / "display" — so the spike's remaining
+ * uncertainty is the save-descriptor SHAPE, not the dialog suppression.)
  * Source (a): an Adobe Community thread ("Export content credentials with
  * UXP") stating the DOM-API-equivalent of `activeDocument.saveAs.png()` is
  * `{_obj: "save", as: {_obj: "PNGFormat"}}`. Source (b): a Creative Cloud

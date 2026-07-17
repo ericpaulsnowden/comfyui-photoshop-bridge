@@ -80,6 +80,29 @@ async function reopenInPhotoshop(meta) {
 }
 
 /**
+ * Cancels a `pending`/`editing` handoff directly from its gallery card
+ * (PROTOCOL.md §2 `/cpsb/cancel`: "cancelling is always available
+ * immediately, not gated on the stale timeout"). No confirmation dialog, by
+ * design — this mirrors the one-click cancel affordance on the node's
+ * "Editing in Photoshop…" badge (`badges.js`) rather than `discardHandoffCard`'s
+ * confirm-then-destroy pattern, so the two entry points to the same action
+ * behave consistently and stay low-friction (the whole point of surfacing
+ * cancel at all is to give a stuck handoff an easy way out).
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ */
+async function cancelHandoffCard(meta) {
+  try {
+    await api.cancelHandoff(meta.handoff_id)
+  } catch (error) {
+    ui.showToast({
+      severity: 'error',
+      summary: 'Failed to cancel',
+      detail: error instanceof Error ? error.message : String(error)
+    })
+  }
+}
+
+/**
  * @param {import('./api.js').CpsbHandoffMeta} meta
  */
 async function discardHandoffCard(meta) {
@@ -118,7 +141,7 @@ function addAsNode(meta) {
   const node = pasteback.getNodeByIdFlexible(meta.origin_node_id)
   pasteback.addLoadImageNodeNear(node, {
     filename: latestEdit.filename,
-    subfolder: `cpsb/${meta.handoff_id}`,
+    subfolder: api.editSubfolder(meta),
     type: 'input'
   })
 }
@@ -196,7 +219,7 @@ function buildCard(meta) {
         attrs: {
           src: api.viewUrl({
             filename: latestEdit.filename,
-            subfolder: `cpsb/${meta.handoff_id}`,
+            subfolder: api.editSubfolder(meta),
             type: 'input'
           }),
           alt: 'Latest edit',
@@ -244,13 +267,34 @@ function buildCard(meta) {
       })
     )
   }
-  actions.appendChild(
-    ui.el('button', {
-      className: 'cpsb-card-action cpsb-card-action-danger',
-      text: 'Discard',
-      on: { click: () => discardHandoffCard(meta) }
-    })
-  )
+  // Cancel vs Discard is status-scoped rather than always offering both:
+  // pending/editing (including stale, PROTOCOL.md §2) can still be actively
+  // waited on server-side, so Cancel is the meaningful action; a stale one
+  // additionally gets Discard, the gallery-specific "give up on this and
+  // remove it" cleanup PROTOCOL.md §2 describes Discard as being for. Every
+  // other (terminal) status only gets Discard — cancelling something already
+  // finished is a no-op the backend accepts idempotently, but not worth
+  // exposing as a button.
+  const isActive = meta.status === 'pending' || meta.status === 'editing'
+  const isStale = state.getDisplayStatus(meta) === 'stale'
+  if (isActive) {
+    actions.appendChild(
+      ui.el('button', {
+        className: 'cpsb-card-action',
+        text: 'Cancel',
+        on: { click: () => cancelHandoffCard(meta) }
+      })
+    )
+  }
+  if (!isActive || isStale) {
+    actions.appendChild(
+      ui.el('button', {
+        className: 'cpsb-card-action cpsb-card-action-danger',
+        text: 'Discard',
+        on: { click: () => discardHandoffCard(meta) }
+      })
+    )
+  }
 
   const card = ui.el('div', { className: 'cpsb-card', children: [thumbs, header, metaLine, actions] })
   attachDropHandlers(card, meta)

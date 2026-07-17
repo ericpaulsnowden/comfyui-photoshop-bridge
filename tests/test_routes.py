@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import threading
 import time
 
 import aiohttp
@@ -19,8 +20,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 
 import cpsb.routes as routes_module
-from cpsb.context import CpsbContext
-from cpsb.handoff import HandoffManager
+from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
+from cpsb.handoff import HandoffManager, WaitOutcome, compute_source_hash
 from cpsb.launcher import LaunchResult, Tier1Status
 
 SOURCE_FILENAME = "ComfyUI_00042_.png"
@@ -271,6 +272,96 @@ class TestOpen:
         assert body["tier2_connected"] is False
 
 
+class TestAutoSupersedeOnChangedSource:
+    """PROTOCOL.md §6's bridge-node rule, mirrored at ``POST /cpsb/open``:
+    ``mode:"new"`` against an active handoff only 409s when the incoming
+    image is genuinely the SAME one. If upstream regenerated the image
+    under the same filename (a fixed-name SaveImage/PreviewImage, or a
+    counter that happened to repeat), the stale handoff is auto-superseded
+    and the request proceeds as a fresh 200.
+    """
+
+    async def test_same_image_reopen_still_conflicts(self, client, manager, source_image, launches):
+        first = await (await client.post("/cpsb/open", json=open_body())).json()
+
+        conflict = await client.post("/cpsb/open", json=open_body())
+
+        assert conflict.status == 409
+        body = await conflict.json()
+        assert body["existing_handoff_id"] == first["handoff_id"]
+        assert manager.get(first["handoff_id"]).status == "editing"  # untouched
+
+    async def test_changed_image_supersedes_and_proceeds(
+        self, client, context, manager, source_image, launches
+    ):
+        first = await (await client.post("/cpsb/open", json=open_body())).json()
+        assert manager.get(first["handoff_id"]).status == "editing"
+
+        # Upstream re-generated the image under the SAME filename.
+        (context.output_dir / SOURCE_FILENAME).write_bytes(png_bytes((1, 2, 3)))
+
+        second = await client.post("/cpsb/open", json=open_body())
+
+        assert second.status == 200
+        second_body = await second.json()
+        assert second_body["handoff_id"] != first["handoff_id"]
+        assert manager.get(first["handoff_id"]).status == "superseded"
+        assert manager.get(second_body["handoff_id"]).status == "editing"
+        with Image.open(context.output_dir / SOURCE_FILENAME) as new_source:
+            expected_hash = compute_source_hash(new_source)
+        assert manager.get(second_body["handoff_id"]).source_hash == expected_hash
+
+    async def test_changed_image_missing_source_404s_before_superseding(
+        self, client, context, manager, source_image, launches
+    ):
+        """Resolving/hashing the new image happens BEFORE any supersede, so
+        a bad follow-up request can't destroy the still-valid old handoff.
+        """
+        first = await (await client.post("/cpsb/open", json=open_body())).json()
+
+        # The file that would need to be re-read to decide same-vs-changed
+        # has vanished.
+        (context.output_dir / SOURCE_FILENAME).unlink()
+
+        response = await client.post("/cpsb/open", json=open_body())
+
+        assert response.status == 404
+        assert manager.get(first["handoff_id"]).status == "editing"  # NOT superseded
+
+    async def test_legacy_handoff_without_source_hash_still_conflicts(
+        self, client, context, manager, source_image, launches
+    ):
+        """A pre-source_hash handoff (``None``) is treated as matching, even
+        when the image actually changed -- the same documented legacy-
+        tolerance choice as the bridge node (PROTOCOL.md §1).
+        """
+        first = await (await client.post("/cpsb/open", json=open_body())).json()
+        with manager._lock:
+            manager._handoffs[first["handoff_id"]].source_hash = None
+
+        (context.output_dir / SOURCE_FILENAME).write_bytes(png_bytes((9, 9, 9)))
+        conflict = await client.post("/cpsb/open", json=open_body())
+
+        assert conflict.status == 409
+        assert (await conflict.json())["existing_handoff_id"] == first["handoff_id"]
+        assert manager.get(first["handoff_id"]).status == "editing"  # not superseded
+
+    async def test_mode_fresh_unaffected_by_hash_comparison(
+        self, client, manager, source_image, launches
+    ):
+        """mode:"fresh" is an explicit, unconditional supersede -- it must
+        not be gated on the image having changed.
+        """
+        first = await (await client.post("/cpsb/open", json=open_body())).json()
+
+        fresh = await client.post("/cpsb/open", json=open_body(mode="fresh"))
+
+        assert fresh.status == 200
+        fresh_body = await fresh.json()
+        assert fresh_body["handoff_id"] != first["handoff_id"]
+        assert manager.get(first["handoff_id"]).status == "superseded"
+
+
 class TestUpload:
     async def create_handoff(self, client) -> str:
         response = await client.post("/cpsb/open", json=open_body())
@@ -286,7 +377,7 @@ class TestUpload:
         assert data == {
             "ok": True,
             "filename": "edit_001.png",
-            "subfolder": f"cpsb/{handoff_id}",
+            "subfolder": f"{DEFAULT_MANAGED_FOLDER_NAME}/{handoff_id}",
             "type": "input",
         }
         meta = manager.get(handoff_id)
@@ -337,6 +428,29 @@ class TestUpload:
         handoff_id = (await response.json())["handoff_id"]
         await client.post("/cpsb/upload", data=upload_form(handoff_id, png_bytes((5, 5, 5))))
         assert (context.output_dir / "ComfyUI_00042__ps1.png").is_file()
+
+    async def test_upload_subfolder_reflects_creation_time_setting(
+        self, client, context, source_image
+    ):
+        """The subfolder in the upload response must name the folder the
+        handoff actually lives in, not whatever managed_folder_name
+        currently is -- exactly the ``handoff_dir``/``managed_dir_for``
+        contract exercised for the ``cpsb.updated`` event in
+        test_handoff.py::TestManagedFolderSwitch, but for this second,
+        independent literal at the /cpsb/upload route.
+        """
+        context.settings.update({"managed_folder_name": "folder-a"})
+        handoff_id = await self.create_handoff(client)
+
+        context.settings.update({"managed_folder_name": "folder-b"})
+        response = await client.post(
+            "/cpsb/upload", data=upload_form(handoff_id, png_bytes((7, 7, 7)))
+        )
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["subfolder"] == f"folder-a/{handoff_id}"
+        assert (context.input_dir / "folder-a" / handoff_id / data["filename"]).is_file()
 
 
 class TestFileAndThumb:
@@ -391,6 +505,52 @@ class TestCancelAndDiscard:
         assert manager.get(handoff_id).status == "discarded"
         assert (await client.post("/cpsb/discard/deadbeef")).status == 404
 
+    async def test_cancel_is_idempotent_200_when_already_terminal(
+        self, client, manager, source_image
+    ):
+        """PROTOCOL.md §2: cancelling an already-terminal handoff returns
+        200 and is a no-op -- cancel must be safe to mash (double-click,
+        the gallery and the node badge both firing it, etc.).
+        """
+        handoff_id = (await (await client.post("/cpsb/open", json=open_body())).json())[
+            "handoff_id"
+        ]
+        first = await client.post(f"/cpsb/cancel/{handoff_id}")
+        assert first.status == 200
+
+        second = await client.post(f"/cpsb/cancel/{handoff_id}")
+        third = await client.post(f"/cpsb/cancel/{handoff_id}")
+
+        assert second.status == 200
+        assert (await second.json()) == {"ok": True}
+        assert third.status == 200
+        assert manager.get(handoff_id).status == "cancelled"
+
+    async def test_cancel_after_discard_is_idempotent_not_a_revival(
+        self, client, manager, source_image
+    ):
+        handoff_id = (await (await client.post("/cpsb/open", json=open_body())).json())[
+            "handoff_id"
+        ]
+        await client.post(f"/cpsb/discard/{handoff_id}")
+
+        response = await client.post(f"/cpsb/cancel/{handoff_id}")
+
+        assert response.status == 200
+        assert manager.get(handoff_id).status == "discarded"  # NOT overwritten to cancelled
+
+    async def test_cancel_unknown_id_still_404s_even_after_a_real_cancel(
+        self, client, manager, source_image
+    ):
+        handoff_id = (await (await client.post("/cpsb/open", json=open_body())).json())[
+            "handoff_id"
+        ]
+        await client.post(f"/cpsb/cancel/{handoff_id}")
+
+        response = await client.post("/cpsb/cancel/deadbeef")
+
+        assert response.status == 404
+
 
 class TestStatus:
     async def test_status_shape_and_ordering(self, client, source_image, launches):
@@ -420,6 +580,7 @@ class TestSettings:
             "debounce_ms": 800,
             "cleanup_days": 14,
             "sibling_outputs": True,
+            "managed_folder_name": DEFAULT_MANAGED_FOLDER_NAME,
         }
 
     async def test_post_merges_and_persists(self, client, context, launches):
@@ -514,6 +675,74 @@ class TestPluginWebsocket:
                 "type": "handoff_cancelled",
                 "handoff_id": data["handoff_id"],
             }
+
+    async def test_full_cancel_unwind(
+        self, client, manager, context, events, source_image, launches
+    ):
+        """PROTOCOL.md §2: cancel is the authoritative unstick for a handoff.
+        One /cpsb/cancel call must, together: emit exactly one cpsb.status
+        event, unblock a blocked wait_for_edit() with CANCELLED, notify a
+        connected plugin exactly once, and leave the handoff immune to a
+        late upload landing afterward (the upload/watcher-vs-cancel race
+        PROTOCOL.md §2 calls out) -- status stays cancelled, no edit
+        recorded. (The watcher-settle side of that race is already covered
+        end-to-end by test_watcher.py::TestIgnoredFiles::
+        test_save_for_inactive_handoff_ignored; this test adds the upload,
+        blocking-wait, and websocket angles combined.)
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            # A bridge-node-style blocking wait, registered before cancel.
+            outcomes: list[str] = []
+
+            def waiter() -> None:
+                outcomes.append(manager.wait_for_edit(handoff_id, 10, poll_interval=0.02))
+
+            wait_thread = threading.Thread(target=waiter)
+            wait_thread.start()
+            await asyncio.sleep(0.1)  # let the waiter register
+
+            status_events_before = len(events.of_type("cpsb.status"))
+
+            response = await client.post(f"/cpsb/cancel/{handoff_id}")
+            assert response.status == 200
+            assert (await response.json()) == {"ok": True}
+
+            # The connected plugin is notified exactly once.
+            notification = await ws.receive_json(timeout=5)
+            assert notification == {"type": "handoff_cancelled", "handoff_id": handoff_id}
+
+            # The blocked waiter unblocks with CANCELLED, not a timeout.
+            wait_thread.join(timeout=5)
+            assert not wait_thread.is_alive()
+            assert outcomes == [WaitOutcome.CANCELLED]
+
+            # Exactly one new cpsb.status event, and it says "cancelled".
+            status_events_after = events.of_type("cpsb.status")
+            assert len(status_events_after) == status_events_before + 1
+            assert status_events_after[-1]["status"] == "cancelled"
+            assert status_events_after[-1]["handoff_id"] == handoff_id
+
+            # A late upload arriving after cancel is rejected outright and
+            # records no edit -- the handoff must not be revived.
+            upload_response = await client.post(
+                "/cpsb/upload", data=upload_form(handoff_id, png_bytes((250, 10, 10)))
+            )
+            assert upload_response.status == 409
+            refreshed = manager.get(handoff_id)
+            assert refreshed.status == "cancelled"
+            assert refreshed.edits == []
+
+            # Mashing cancel again afterward stays a clean no-op.
+            second_cancel = await client.post(f"/cpsb/cancel/{handoff_id}")
+            assert second_cancel.status == 200
+            assert len(events.of_type("cpsb.status")) == len(status_events_after)
 
     async def test_new_plugin_replaces_old_with_close_4000(self, client, context, launches):
         ws1 = await client.ws_connect("/cpsb/ws")

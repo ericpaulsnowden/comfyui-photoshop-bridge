@@ -9,8 +9,9 @@ import time
 import pytest
 from PIL import Image
 
-from cpsb.context import CpsbContext
+from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
 from cpsb.handoff import (
+    TERMINAL_STATUSES,
     HandoffManager,
     HandoffMeta,
     HandoffNotFoundError,
@@ -119,7 +120,7 @@ class TestLifecycle:
         assert payload["origin_node_id"] == "17"
         assert payload["origin_kind"] == "load_image"
         assert payload["filename"] == "edit_001.png"
-        assert payload["subfolder"] == f"cpsb/{meta.handoff_id}"
+        assert payload["subfolder"] == f"{DEFAULT_MANAGED_FOLDER_NAME}/{meta.handoff_id}"
         assert payload["type"] == "input"
         assert payload["fidelity"] == "composite"
         assert payload["sibling_output"] is None
@@ -275,6 +276,63 @@ class TestWorkflowScoping:
         assert manager.find_active_for_node("17", "workflow-b").handoff_id == second.handoff_id
 
 
+class TestManagedFolderSwitch:
+    """A handoff keeps resolving to the folder it was created under even
+    after ``managed_folder_name`` changes underneath it, without a restart
+    (PROTOCOL.md §1: ``managed_dir`` is recorded per handoff precisely so
+    this holds).
+    """
+
+    def test_handoff_dir_survives_a_setting_switch(self, context, manager):
+        context.settings.update({"managed_folder_name": "folder-a"})
+        meta = create_handoff(manager)
+        assert meta.managed_dir == "folder-a"
+        original_dir = manager.handoff_dir(meta.handoff_id)
+        assert original_dir == context.input_dir / "folder-a" / meta.handoff_id
+        assert original_dir.is_dir()
+
+        context.settings.update({"managed_folder_name": "folder-b"})
+        assert context.managed_folder_name == "folder-b"
+        # The EXISTING handoff still resolves under folder-a, not folder-b.
+        assert manager.handoff_dir(meta.handoff_id) == original_dir
+        assert manager.handoff_dir(meta.handoff_id).is_dir()
+
+    def test_emitted_subfolder_survives_a_setting_switch(self, context, manager, events):
+        context.settings.update({"managed_folder_name": "folder-a"})
+        meta = create_handoff(manager)
+
+        context.settings.update({"managed_folder_name": "folder-b"})
+        edit = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "plugin")
+        assert edit is not None
+
+        payload = events.of_type("cpsb.updated")[-1]
+        assert payload["subfolder"] == f"folder-a/{meta.handoff_id}"
+        # The edit file itself was written into folder-a, not folder-b.
+        assert (context.input_dir / "folder-a" / meta.handoff_id / edit.filename).is_file()
+        assert not (context.input_dir / "folder-b").exists()
+
+    def test_meta_json_survives_a_setting_switch(self, context, manager):
+        context.settings.update({"managed_folder_name": "folder-a"})
+        meta = create_handoff(manager)
+
+        context.settings.update({"managed_folder_name": "folder-b"})
+        manager.mark_editing(meta.handoff_id)  # a second write, post-switch
+
+        assert (context.input_dir / "folder-a" / meta.handoff_id / "meta.json").is_file()
+        assert manager.get(meta.handoff_id).status == "editing"
+
+    def test_new_handoff_after_switch_uses_the_new_folder(self, context, manager):
+        context.settings.update({"managed_folder_name": "folder-a"})
+        create_handoff(manager)
+
+        context.settings.update({"managed_folder_name": "folder-b"})
+        second = create_handoff(manager, origin_node_id="99")
+        assert second.managed_dir == "folder-b"
+        assert manager.handoff_dir(second.handoff_id) == (
+            context.input_dir / "folder-b" / second.handoff_id
+        )
+
+
 class TestScanOnBoot:
     def test_state_recovered_from_meta_files(self, context):
         first_manager = HandoffManager(context)
@@ -301,6 +359,53 @@ class TestScanOnBoot:
         (broken_dir / "meta.json").write_text("{not json", encoding="utf-8")
         manager = HandoffManager(context)
         assert manager.get("deadbeef") is None
+
+    def test_boot_scan_only_finds_handoffs_under_the_current_setting(self, context):
+        """PROTOCOL.md §1: changing ``managed_folder_name`` takes effect at
+        the next server start for NEW handoffs; a handoff already living
+        under the previous name "stays where it is" rather than being
+        rediscovered -- the boot scan globs only the CURRENT setting's
+        folder.
+        """
+        context.settings.update({"managed_folder_name": "folder-a"})
+        first_manager = HandoffManager(context)
+        meta = first_manager.create(
+            origin_node_id="17",
+            origin_kind="load_image",
+            workflow_name="wf",
+            source=output_source(),
+            original_image=make_image((10, 20, 30)),
+        )
+
+        context.settings.update({"managed_folder_name": "folder-b"})
+        rebooted = HandoffManager(context)
+
+        assert rebooted.get(meta.handoff_id) is None
+        assert rebooted.find_active_for_node("17") is None
+        # Untouched on disk -- not purged, just not rescanned into memory.
+        assert (context.input_dir / "folder-a" / meta.handoff_id / "meta.json").is_file()
+
+    def test_boot_scan_finds_handoffs_when_setting_reverted(self, context):
+        """The corollary of the above: switching BACK to the folder a
+        handoff was created under makes it discoverable again, since the
+        scan is purely a function of the current setting at boot time.
+        """
+        context.settings.update({"managed_folder_name": "folder-a"})
+        first_manager = HandoffManager(context)
+        meta = first_manager.create(
+            origin_node_id="17",
+            origin_kind="load_image",
+            workflow_name="wf",
+            source=output_source(),
+            original_image=make_image((10, 20, 30)),
+        )
+
+        context.settings.update({"managed_folder_name": "folder-b"})
+        HandoffManager(context)  # a reboot under folder-b, handoff not seen
+
+        context.settings.update({"managed_folder_name": "folder-a"})
+        rebooted_again = HandoffManager(context)
+        assert rebooted_again.get(meta.handoff_id) is not None
 
 
 class TestCleanup:
@@ -452,3 +557,86 @@ class TestOwnSourceWrites:
         assert not manager.is_own_source_write(
             meta.handoff_id, new_stat.st_size, new_stat.st_mtime_ns
         )
+
+
+class TestIdempotentCancel:
+    """mark_cancelled must be safe to mash (PROTOCOL.md §2): calling it again
+    on an already-terminal handoff is a pure no-op, not a re-transition.
+    """
+
+    @pytest.mark.parametrize("terminal_status", sorted(TERMINAL_STATUSES))
+    def test_cancel_on_terminal_handoff_is_a_noop(self, manager, events, terminal_status):
+        meta = create_handoff(manager)
+        if terminal_status == "error":
+            manager.mark_error(meta.handoff_id, "boom")
+        elif terminal_status == "cancelled":
+            manager.mark_cancelled(meta.handoff_id)
+        elif terminal_status == "discarded":
+            manager.mark_discarded(meta.handoff_id)
+        elif terminal_status == "superseded":
+            manager.supersede(meta.handoff_id)
+        before = manager.get(meta.handoff_id)
+        assert before.status == terminal_status
+        status_events_before = len(events.of_type("cpsb.status"))
+
+        result = manager.mark_cancelled(meta.handoff_id)
+
+        assert result.status == terminal_status  # unchanged, NOT "cancelled"
+        assert result.error == before.error
+        assert result.updated_ts == before.updated_ts  # no bump
+        after = manager.get(meta.handoff_id)
+        assert after.status == terminal_status
+        assert after.updated_ts == before.updated_ts
+        # No duplicate cpsb.status event for the no-op.
+        assert len(events.of_type("cpsb.status")) == status_events_before
+
+    def test_cancel_on_pending_handoff_transitions_normally(self, manager, events):
+        """Sanity check that the idempotency guard doesn't over-fire: a
+        genuinely active (non-terminal) handoff still transitions.
+        """
+        meta = create_handoff(manager)
+        assert meta.status == "pending"
+
+        result = manager.mark_cancelled(meta.handoff_id)
+
+        assert result.status == "cancelled"
+        assert manager.get(meta.handoff_id).status == "cancelled"
+        assert [p["status"] for p in events.of_type("cpsb.status")] == ["cancelled"]
+
+    def test_double_cancel_emits_exactly_one_status_event(self, manager, events):
+        meta = create_handoff(manager)
+        manager.mark_cancelled(meta.handoff_id)
+        manager.mark_cancelled(meta.handoff_id)
+        manager.mark_cancelled(meta.handoff_id)
+
+        assert [p["status"] for p in events.of_type("cpsb.status")] == ["cancelled"]
+        assert manager.get(meta.handoff_id).status == "cancelled"
+
+    def test_cancel_unknown_id_still_raises(self, manager):
+        with pytest.raises(HandoffNotFoundError):
+            manager.mark_cancelled("deadbeef")
+
+    def test_cancel_on_terminal_handoff_does_not_rewrite_meta_json(self, manager, context):
+        meta = create_handoff(manager)
+        manager.mark_cancelled(meta.handoff_id)
+        meta_path = context.cpsb_input_dir / meta.handoff_id / "meta.json"
+        written_before = meta_path.read_text()
+
+        manager.mark_cancelled(meta.handoff_id)
+
+        assert meta_path.read_text() == written_before
+
+    def test_tier1_fallback_recovery_from_error_is_not_blocked(self, manager):
+        """The idempotency guard is scoped to mark_cancelled only: a handoff
+        in 'error' must still be able to move to 'editing' (the Tier 2
+        open_failed -> Tier 1 fallback-succeeds path, PROTOCOL.md §3) --
+        this is NOT the same kind of no-op as cancel-on-terminal.
+        """
+        meta = create_handoff(manager)
+        manager.mark_error(meta.handoff_id, "plugin open failed")
+        assert manager.get(meta.handoff_id).status == "error"
+
+        result = manager.mark_editing(meta.handoff_id)
+
+        assert result.status == "editing"
+        assert manager.get(meta.handoff_id).status == "editing"

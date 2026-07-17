@@ -37,7 +37,9 @@ import * as ui from './ui.js'
 
 /**
  * @param {import('./api.js').CpsbImageRef} ref
- * @returns {string} e.g. `"cpsb/a1b2c3d4/edit_002.png [input]"`.
+ * @returns {string} e.g. `"photoshop/a1b2c3d4/edit_002.png [input]"` (the
+ * managed-folder segment is whatever `ref.subfolder` actually says, per
+ * `docs/PROTOCOL.md` §1/§2 — server-configurable, default `"photoshop"`).
  */
 function buildWidgetValue({ filename, subfolder, type }) {
   return `${subfolder ? subfolder + '/' : ''}${filename}${type ? ` [${type}]` : ''}`
@@ -86,22 +88,30 @@ function sameImageRef(a, b) {
 /**
  * Locates which of the node's currently displayed images belongs to this
  * handoff: the slot either still shows the handoff's original source image,
- * or already shows a *previous* edit of the same handoff (its subfolder is
- * `cpsb/<handoff_id>`) from an earlier round trip — without the second
- * clause, a multi-save session would stop matching after the first edit
- * replaced the source in that slot.
+ * or already shows a *previous* edit of the same handoff from an earlier
+ * round trip — without the second clause, a multi-save session would stop
+ * matching after the first edit replaced the source in that slot.
+ *
+ * Every edit of one handoff lives in the same on-disk folder for the
+ * handoff's whole lifetime (PROTOCOL.md §1), so the just-arrived edit's own
+ * `subfolder` — read verbatim from the triggering `cpsb.updated` payload,
+ * never reconstructed from a hardcoded literal — is also every earlier
+ * edit's subfolder. The managed folder name is server-configurable (default
+ * `"photoshop"`, PROTOCOL.md §1/§2), so this must never assume a literal
+ * like `"cpsb"`.
  * @param {import('../../../scripts/app.js').LGraphNode} node
- * @param {string} handoffId
+ * @param {string} editSubfolder - The handoff's actual edit subfolder, taken
+ * verbatim from the triggering event (see {@link refreshNodePreview}).
  * @param {import('./api.js').CpsbImageRef | null} sourceRef
  * @returns {number} Index into `node.imgs`, or -1 if no slot matches.
  */
-function findEditedSlot(node, handoffId, sourceRef) {
+function findEditedSlot(node, editSubfolder, sourceRef) {
   if (!Array.isArray(node.imgs)) return -1
-  const editSubfolder = `cpsb/${handoffId}`
   for (let i = 0; i < node.imgs.length; i++) {
     const parsed = api.parseImageRef(node.imgs[i]?.src)
     if (!parsed) continue
-    if (sameImageRef(parsed, sourceRef) || parsed.subfolder === editSubfolder) return i
+    if (sameImageRef(parsed, sourceRef) || (editSubfolder && parsed.subfolder === editSubfolder))
+      return i
   }
   return -1
 }
@@ -136,7 +146,10 @@ function refreshNodePreview(node, ref, { handoffId, sourceRef } = {}) {
   const img = new Image()
   img.src = api.viewUrl(ref)
   const entry = { filename: ref.filename, subfolder: ref.subfolder, type: ref.type }
-  const slot = handoffId ? findEditedSlot(node, handoffId, sourceRef ?? null) : -1
+  // ref.subfolder is this handoff's actual edit subfolder, taken verbatim
+  // from the triggering event/response payload (see findEditedSlot) — never
+  // a hardcoded literal.
+  const slot = handoffId ? findEditedSlot(node, ref.subfolder, sourceRef ?? null) : -1
 
   if (slot >= 0) {
     node.imgs[slot] = img
@@ -146,10 +159,9 @@ function refreshNodePreview(node, ref, { handoffId, sourceRef } = {}) {
       // Prefer matching the entry by its own {filename, subfolder, type}
       // fields (same predicate as findEditedSlot); fall back to the parallel
       // index when the arrays are congruent.
-      const editSubfolder = `cpsb/${handoffId}`
       const outIdx = outputs.images.findIndex(
         (im) =>
-          im && (sameImageRef(im, sourceRef) || (im.subfolder || '') === editSubfolder)
+          im && (sameImageRef(im, sourceRef) || (im.subfolder || '') === ref.subfolder)
       )
       if (outIdx >= 0) {
         outputs.images[outIdx] = entry

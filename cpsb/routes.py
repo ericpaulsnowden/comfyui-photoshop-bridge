@@ -36,6 +36,7 @@ from .handoff import (
     HandoffMeta,
     HandoffNotFoundError,
     SourceRef,
+    compute_source_hash,
 )
 from .launcher import launch_photoshop, tier1_status
 from .psd_io import write_psd
@@ -229,6 +230,30 @@ def _normalize_for_psd_write(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
+def _open_source_image(
+    context: CpsbContext, fields: dict[str, Any]
+) -> tuple[Image.Image | None, web.Response | None]:
+    """Resolve and decode the request's source image.
+
+    Returns ``(image, None)`` on success or ``(None, response)`` with a
+    ready-to-return 404 on failure. Factored out so both the early
+    same-vs-changed-image hash check and the later handoff-creation step
+    below can resolve the same image without duplicating the path-
+    resolution/decode-error handling.
+    """
+    source_path = _resolve_source_path(
+        context, fields["filename"], fields["subfolder"], fields["type"]
+    )
+    if source_path is None or not source_path.is_file():
+        return None, _error(404, f"Source image not found: {fields['filename']}")
+    try:
+        image = Image.open(source_path)
+        image.load()
+    except (OSError, ValueError) as exc:
+        return None, _error(404, f"Could not read source image: {exc}")
+    return image, None
+
+
 @routes.post("/cpsb/open")
 async def open_handoff_route(request: web.Request) -> web.Response:
     try:
@@ -248,14 +273,38 @@ async def open_handoff_route(request: web.Request) -> web.Response:
     # workflow B's node "17" must not adopt workflow A's active handoff.
     existing = manager.find_active_for_node(origin_node_id, fields["workflow_name"])
 
+    original_image: Image.Image | None = None
+    incoming_hash: str | None = None
+    supersede_existing = False
+
     if mode == "new" and existing is not None:
-        return web.json_response(
-            {
-                "error": "An edit is already in progress for this node",
-                "existing_handoff_id": existing.handoff_id,
-            },
-            status=409,
-        )
+        # The incoming image must be resolved and hashed BEFORE deciding
+        # 409 vs. proceed: a re-open of the SAME image is the genuine
+        # conflict the "Edit Original / Start Fresh" chooser exists for,
+        # but upstream regenerating the image under an unchanged filename
+        # (the common case for counter-based or fixed-name SaveImage/
+        # PreviewImage nodes) must not block on a stale handoff the user
+        # would just dismiss via "Start Fresh" anyway -- auto-supersede
+        # instead and proceed as new (mirrors the bridge node's identical
+        # source_hash rule, PROTOCOL.md §6). A legacy handoff with no
+        # recorded source_hash is treated as matching -- same documented
+        # choice as the bridge node.
+        original_image, error_response = _open_source_image(context, fields)
+        if error_response is not None:
+            return error_response
+        incoming_hash = compute_source_hash(original_image)
+        if existing.source_hash is None or existing.source_hash == incoming_hash:
+            return web.json_response(
+                {
+                    "error": "An edit is already in progress for this node",
+                    "existing_handoff_id": existing.handoff_id,
+                },
+                status=409,
+            )
+        # Actually superseding is deferred until after the tier-availability
+        # check below, so a 503 never leaves the node with no active
+        # handoff at all (mirrors mode:"fresh"'s existing ordering).
+        supersede_existing = True
 
     if not tier2_connected(request.app) and not tier1_status().available:
         return _error(
@@ -271,20 +320,14 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         psd_path = manager.handoff_dir(existing.handoff_id) / "source.psd"
         return await _open_and_respond(request, context, manager, existing, psd_path)
 
-    if mode == "fresh" and existing is not None:
+    if supersede_existing or (mode == "fresh" and existing is not None):
         manager.supersede(existing.handoff_id)
 
-    source_path = _resolve_source_path(
-        context, fields["filename"], fields["subfolder"], fields["type"]
-    )
-    if source_path is None or not source_path.is_file():
-        return _error(404, f"Source image not found: {fields['filename']}")
-
-    try:
-        original_image = Image.open(source_path)
-        original_image.load()
-    except (OSError, ValueError) as exc:
-        return _error(404, f"Could not read source image: {exc}")
+    if original_image is None:
+        original_image, error_response = _open_source_image(context, fields)
+        if error_response is not None:
+            return error_response
+        incoming_hash = compute_source_hash(original_image)
 
     meta = manager.create(
         origin_node_id=origin_node_id,
@@ -294,6 +337,7 @@ async def open_handoff_route(request: web.Request) -> web.Response:
             filename=fields["filename"], subfolder=fields["subfolder"], type=fields["type"]
         ),
         original_image=original_image,
+        source_hash=incoming_hash,
     )
     psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
     write_psd(psd_path, _normalize_for_psd_write(original_image))
@@ -451,8 +495,11 @@ async def upload_route(request: web.Request) -> web.Response:
         else:
             return _error(409, "Handoff is no longer active")
 
+    # meta was fetched before ingest_edit(), but managed_dir is set once at
+    # creation and never changes afterward, so it is still authoritative.
+    subfolder = f"{manager.managed_dir_for(meta)}/{handoff_id}"
     return web.json_response(
-        {"ok": True, "filename": edit.filename, "subfolder": f"cpsb/{handoff_id}", "type": "input"}
+        {"ok": True, "filename": edit.filename, "subfolder": subfolder, "type": "input"}
     )
 
 

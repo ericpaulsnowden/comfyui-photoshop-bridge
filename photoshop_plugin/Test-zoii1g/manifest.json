@@ -1,0 +1,111 @@
+{
+  "id": "Test-zoii1g",
+  "name": "Comfy + Photoshop",
+  "version": "1.0.0",
+  "main": "index.html",
+  "manifestVersion": 5,
+  "host": {
+    "app": "PS",
+    "minVersion": "26"
+  },
+  "requiredPermissions": {
+    "webview": {
+      "allow": "yes",
+      "domains": [
+        "http://127.0.0.1:7724"
+      ],
+      "enableMessageBridge": "localAndRemote"
+    }
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "mainPanel",
+      "label": "WebView Sample",
+      "minimumSize": {
+        "width": 600,
+        "height": 850
+      },
+      "maximumSize": {
+        "width": 2000,
+        "height": 2000
+      },
+      "preferredDockedSize": {
+        "width": 600,
+        "height": 700
+      },
+      "preferredFloatingSize": {
+        "width": 600,
+        "height": 700
+      },
+      "icons": [
+        {
+          "width": 32,
+          "height": 32,
+          "path": "images/icon@1x.png",
+          "scale": [
+            1,
+            2
+          ],
+          "theme": [
+            "dark",
+            "darkest"
+          ],
+          "species": [
+            "generic"
+          ]
+        },
+        {
+          "width": 32,
+          "height": 32,
+          "path": "images/icon@2x.png",
+          "scale": [
+            1,
+            2
+          ],
+          "theme": [
+            "lightest",
+            "light"
+          ],
+          "species": [
+            "generic"
+          ]
+        }
+      ]
+    }
+  ],
+  "icons": [
+    {
+      "width": 32,
+      "height": 32,
+      "path": "images/icon@1x.png",
+      "scale": [
+        1,
+        2
+      ],
+      "theme": [
+        "dark",
+        "darkest"
+      ],
+      "species": [
+        "generic"
+      ]
+    },
+    {
+      "width": 32,
+      "height": 32,
+      "path": "images/icon@2x.png",
+      "scale": [
+        1,
+        2
+      ],
+      "theme": [
+        "lightest",
+        "light"
+      ],
+      "species": [
+        "generic"
+      ]
+    }
+  ]
+}

@@ -84,6 +84,13 @@ export function warn(...args) {
  * @property {CpsbOriginKind} origin_kind
  * @property {string} workflow_name
  * @property {CpsbImageRef} source
+ * @property {string | null} [source_hash]
+ * @property {string | null} [managed_dir] - The `managed_folder_name`
+ * (PROTOCOL.md §1/§2) in effect when this handoff was created — the actual
+ * folder under `input/` its files live in, which is `null` only for a
+ * handoff recovered from a `meta.json` predating this field. Use
+ * {@link editSubfolder}, never a hardcoded literal, to build the subfolder
+ * for one of this handoff's edits.
  * @property {number} created_ts
  * @property {number} updated_ts
  * @property {CpsbStatus} status
@@ -300,6 +307,32 @@ export async function updateBackendSettings(partial) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(partial)
   })
+}
+
+/**
+ * `managed_folder_name`'s documented default (PROTOCOL.md §1/§2) — used only
+ * as a last-resort fallback in {@link editSubfolder} for a `meta.json`
+ * recovered before the `managed_dir` field existed (`managed_dir: null`).
+ * Every handoff created going forward always carries its own `managed_dir`,
+ * so this constant is never the primary source of truth, only a documented
+ * fallback for old data — the managed folder itself remains fully
+ * server-configurable and is never otherwise assumed by this frontend.
+ */
+const DEFAULT_MANAGED_FOLDER_NAME = 'photoshop'
+
+/**
+ * The subfolder every edit of *meta* lives under. All of a handoff's edits
+ * share one on-disk folder for its whole lifetime (PROTOCOL.md §1), so this
+ * is valid for any of `meta.edits`, not just the latest. Derived from the
+ * handoff's own recorded `managed_dir` — never a hardcoded literal — so this
+ * keeps working regardless of the server's configured `managed_folder_name`
+ * (default `"photoshop"`, but admin-configurable and not necessarily
+ * `"cpsb"`, a name this folder has never had in the current protocol).
+ * @param {CpsbHandoffMeta} meta
+ * @returns {string}
+ */
+export function editSubfolder(meta) {
+  return `${meta.managed_dir || DEFAULT_MANAGED_FOLDER_NAME}/${meta.handoff_id}`
 }
 
 /**

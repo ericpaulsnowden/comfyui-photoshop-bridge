@@ -1,7 +1,10 @@
 /**
- * @file Context-menu integration (PROTOCOL.md §8). Registers "Open in
- * Photoshop" / "Edit Original in Photoshop" + "Start Fresh in Photoshop" /
- * "Open all N in Photoshop" on any node whose `node.imgs` is non-empty.
+ * @file Context-menu integration (PROTOCOL.md §8). Registers ONE top-level
+ * "Open in Photoshop" item on any node whose `node.imgs` is non-empty — it
+ * acts directly (plus a sibling "Open all N in Photoshop" when applicable)
+ * when the node has no active handoff, or opens a submenu containing "Edit
+ * Original in Photoshop" / "Start Fresh in Photoshop" (+ "Open all N", when
+ * applicable) when one exists.
  *
  * Menu registration: the modern frontend invokes **both**
  * `node.getExtraMenuOptions` (via litegraph's own `getNodeMenuOptions`) and
@@ -16,6 +19,76 @@
  * used as the feature-detection gate: the legacy `getExtraMenuOptions`
  * monkeypatch is installed only when that method is absent (older
  * frontends, where it is the sole mechanism).
+ *
+ * ROOT CAUSE of "Edit Original"/"Start Fresh" appearing separated by other
+ * packs' items in a user's screenshot: the whole node context menu is ONE
+ * flat, unnamespaced array assembled by concatenating three independently-
+ * ordered sources, with no grouping/section-header mechanism at any stage —
+ * verified end to end in `ComfyUI_frontend`:
+ *   1. `LGraphCanvas.prototype.getNodeMenuOptions` (`LGraphCanvas.ts` ~line
+ *      8537-8660) builds litegraph's native items (Properties/Title/Mode/
+ *      Colors/Shapes/Remove/…), then at ~line 8625-8628 calls
+ *      `node.getExtraMenuOptions?.(this, options)` — the classic, still
+ *      fully-supported per-node hook every legacy-style pack (including our
+ *      own `installLegacyFallback` below, and, going by the reported
+ *      screenshot, evidently pysssss/KJNodes' relevant features too) chains
+ *      onto — and PREPENDS its result before the native items
+ *      (`options = extra.concat(options)`), i.e. every `getExtraMenuOptions`
+ *      contributor's items land at the very TOP of the menu, in prototype-
+ *      patch chain order (which pack patched a given node type's prototype
+ *      last — itself a function of custom_nodes directory scan order, not
+ *      anything any one pack controls).
+ *   2. `useContextMenuTranslation.ts`'s `getNodeMenuOptionsWithExtensions`
+ *      (~line 68-93) then appends `app.collectNodeMenuItems(node)` — every
+ *      extension's `getNodeMenuItems(node)` hook result, our own included —
+ *      AFTER all of the above (so after native items AND every
+ *      `getExtraMenuOptions` contributor, i.e. at the very BOTTOM by
+ *      default). `collectNodeMenuItems` itself (`app.ts` ~line 2149-2153) is
+ *      `invokeExtensions('getNodeMenuItems', node).flat()` — a flat
+ *      concatenation in EXTENSION-REGISTRATION order, again not ours to
+ *      control, and, critically, ANOTHER bucket a pack's items can land in
+ *      independently of its `getExtraMenuOptions` items (an actively
+ *      maintained pack can easily have both legacy and modern-hook code for
+ *      different features).
+ *   3. Finally `legacyMenuCompat.extractLegacyItems(...)` appends items from
+ *      any pack that monkeypatched `LGraphCanvas.prototype.getNodeMenuOptions`
+ *      itself (canvas-level, yet another independent bucket).
+ * Litegraph's `ContextMenu` (`ContextMenu.ts` `addItem`, ~line 240-383)
+ * then renders every entry in that single merged array as an equally-styled
+ * flat row — no per-extension header, indentation, or divider. So even
+ * though OUR OWN two items are always contiguous with each other (both
+ * always come from one call to `getNodeMenuItems` below, in whichever of
+ * the two buckets we're using — never both, see above), THEIR shared
+ * position in that undifferentiated, registration-order-dependent list can
+ * land anywhere relative to every other pack's equally-flat, equally
+ * ungrouped items. Two flat top-level rows with nothing visually anchoring
+ * them together will always read as "scattered among everything else" in a
+ * 15-25 row menu — this is inherent to the flat single-array design, not a
+ * bug in any one contributing pack, and no ordering trick fixes it (we
+ * don't control global registration order, nor do other packs). The durable
+ * fix is structural: collapse to ONE top-level entry, which — regardless of
+ * how many unrelated rows land above, below, or (for other packs, if they
+ * also emit ≥2 flat rows) *between* whatever surrounds our old position —
+ * can no longer itself be "split apart", because its two actions now only
+ * ever render together, in their own popout, on hover/click of that single
+ * row.
+ *
+ * Submenu mechanism (`IContextMenuValue.has_submenu`/`.submenu`) verified
+ * against `interfaces.ts` (~line 447-474: `submenu?: {options, callback?,
+ * title?, extra?, …}`, `options` being the same array shape the top-level
+ * menu itself takes) and `ContextMenu.ts` `addItem`/`inner_onclick`
+ * (~line 273: either `submenu` or `has_submenu` adds the `.has_submenu` CSS
+ * class + `aria-haspopup`; ~line 308-315: pointer-hover auto-open
+ * (`inner_over`) checks `has_submenu` specifically, so BOTH fields are
+ * needed together for full native-feeling behaviour; ~line 363-376: a click
+ * with `value.submenu` set constructs a new `ContextMenu` from
+ * `value.submenu.options` — this is item-SHAPE-driven, with no branch
+ * anywhere on which mechanism contributed the item). Since both our
+ * registration paths (the modern `getNodeMenuItems` hook and the legacy
+ * `getExtraMenuOptions` fallback below) ultimately feed the exact same
+ * merged array into this one rendering pipeline, a `has_submenu`/`submenu`
+ * item behaves identically either way — confirmed, not assumed; no
+ * adjacent-flat-items fallback is needed for the legacy path.
  *
  * Image-upload-widget detection mirrors the core `Comfy.UploadImage`
  * extension (`src/extensions/core/uploadImage.ts`): scan the raw node
@@ -249,18 +322,34 @@ async function openAllInPhotoshop(node) {
 }
 
 /**
- * Builds the context-menu items for one node. Shared by both registration
+ * Builds the context-menu item(s) for one node. Shared by both registration
  * paths (the modern `getNodeMenuItems` hook and the legacy
- * `getExtraMenuOptions` monkeypatch).
+ * `getExtraMenuOptions` monkeypatch) — and, per this file's header, a
+ * `has_submenu`/`submenu` item built here renders identically in both, so
+ * neither path needs its own variant.
+ *
+ * Always exactly ONE top-level entry (see this file's header for why: the
+ * shared node-menu array has no grouping mechanism, so two-or-more flat
+ * siblings from the same extension read as scattered among every other
+ * pack's equally-flat items). With no active handoff it acts directly
+ * ("Open in Photoshop", plus a sibling "Open all N" when applicable — there
+ * is nothing to disambiguate, so no submenu is needed). With an active
+ * handoff, the SAME top-level label opens a submenu grouping "Edit
+ * Original"/"Start Fresh" (plus "Open all N" when applicable) — the two
+ * choices a 409 from `/cpsb/open` would otherwise force the user through a
+ * dialog to make (see {@link openInPhotoshop}'s 409 handling), now reachable
+ * directly from the menu instead.
  *
  * When `state.js` already knows neither tier is reachable (Tier 1 gated by
  * the server or the PROTOCOL.md §7 client-side non-localhost check, and no
- * Tier 2 plugin connected), the items are shown disabled with an inline
- * reason rather than left clickable to fail every time — `tier2Connected`
- * in particular is updated instantly by the dedicated `cpsb.tier2` event, so
- * this is not meaningfully stale. This is deliberately a courtesy, not the
- * source of truth: `/cpsb/open` still authoritatively decides per request
- * (see the 503 handling in {@link openInPhotoshop}), since a menu built from
+ * Tier 2 plugin connected), every item — including the top-level one, which
+ * also disables its submenu, since drilling into an all-disabled submenu
+ * would serve no purpose — is shown disabled with an inline reason rather
+ * than left clickable to fail every time. `tier2Connected` in particular is
+ * updated instantly by the dedicated `cpsb.tier2` event, so this is not
+ * meaningfully stale. This is deliberately a courtesy, not the source of
+ * truth: `/cpsb/open` still authoritatively decides per request (see the 503
+ * handling in {@link openInPhotoshop}), since a menu built from
  * slightly-stale client state could otherwise under- or over-disable.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @returns {import('../../../scripts/app.js').IContextMenuValue[]}
@@ -268,41 +357,55 @@ async function openAllInPhotoshop(node) {
 export function getNodeMenuItems(node) {
   if (!node.imgs?.length) return []
 
-  const items = []
   const activeHandoff = state.getActiveHandoffForNode(String(node.id))
   const tierInfo = state.getTierInfo()
   const unavailable = !tierInfo.tier1Effective && !tierInfo.tier2Connected
   const suffix = unavailable ? ' (unavailable)' : ''
 
-  if (activeHandoff) {
-    items.push({
+  const count = node.imgs.length
+  const batchItem =
+    count >= 2 && count <= MAX_BATCH_OPEN
+      ? {
+          content: `Open all ${count} in Photoshop${suffix}`,
+          disabled: unavailable,
+          callback: () => openAllInPhotoshop(node)
+        }
+      : null
+
+  if (!activeHandoff) {
+    const items = [
+      {
+        content: `Open in Photoshop${suffix}`,
+        disabled: unavailable,
+        callback: () => openInPhotoshop(node, 'new')
+      }
+    ]
+    if (batchItem) items.push(batchItem)
+    return items
+  }
+
+  const submenuOptions = [
+    {
       content: `Edit Original in Photoshop${suffix}`,
       disabled: unavailable,
       callback: () => openInPhotoshop(node, 'original')
-    })
-    items.push({
+    },
+    {
       content: `Start Fresh in Photoshop${suffix}`,
       disabled: unavailable,
       callback: () => openInPhotoshop(node, 'fresh')
-    })
-  } else {
-    items.push({
+    }
+  ]
+  if (batchItem) submenuOptions.push(batchItem)
+
+  return [
+    {
       content: `Open in Photoshop${suffix}`,
       disabled: unavailable,
-      callback: () => openInPhotoshop(node, 'new')
-    })
-  }
-
-  const count = node.imgs.length
-  if (count >= 2 && count <= MAX_BATCH_OPEN) {
-    items.push({
-      content: `Open all ${count} in Photoshop${suffix}`,
-      disabled: unavailable,
-      callback: () => openAllInPhotoshop(node)
-    })
-  }
-
-  return items
+      has_submenu: true,
+      submenu: { options: submenuOptions }
+    }
+  ]
 }
 
 /**

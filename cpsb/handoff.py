@@ -48,6 +48,19 @@ PURGEABLE_STATUSES: frozenset[str] = frozenset(
     {"edited", "cancelled", "discarded", "superseded", "error"}
 )
 
+#: Terminal statuses in the PROTOCOL.md §1 lifecycle sense (no further save/
+#: ingest activity is expected). ``HandoffManager.mark_cancelled`` is
+#: idempotent against these -- a no-op, not a transition -- since PROTOCOL.md
+#: §2 requires cancel to be safe to mash. This is deliberately NOT a blanket
+#: "no transition may ever leave this set": e.g. a Tier 2 ``open_failed``
+#: (status ``error``) falling back to a Tier 1 launch that then succeeds
+#: must still be able to move `error` -> `editing` (PROTOCOL.md §3); see
+#: ``HandoffManager._transition``'s ``noop_if_terminal`` parameter, which
+#: only ``mark_cancelled`` sets.
+TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"cancelled", "discarded", "superseded", "error"}
+)
+
 _SECONDS_PER_DAY = 86400
 
 
@@ -127,6 +140,13 @@ class HandoffMeta:
     pre-``source_hash`` ``meta.json``; consumers treat ``None`` as matching
     any input (see :meth:`~cpsb.nodes.PhotoshopBridge.execute`) so an upgrade
     never mass-supersedes existing handoffs.
+
+    ``managed_dir`` is the ``managed_folder_name`` in effect when the handoff
+    was created -- the folder under ``input/`` it physically lives in. It is
+    recorded so a handoff still resolves after the setting changes: the folder
+    name is not re-derived from the current setting. ``None`` for handoffs
+    recovered from a pre-``managed_dir`` ``meta.json``; consumers fall back to
+    the current managed name for those.
     """
 
     handoff_id: str
@@ -139,6 +159,7 @@ class HandoffMeta:
     status: HandoffStatus = "pending"
     error: str | None = None
     source_hash: str | None = None
+    managed_dir: str | None = None
     edits: list[EditRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -149,6 +170,7 @@ class HandoffMeta:
             "workflow_name": self.workflow_name,
             "source": self.source.to_dict(),
             "source_hash": self.source_hash,
+            "managed_dir": self.managed_dir,
             "created_ts": self.created_ts,
             "updated_ts": self.updated_ts,
             "status": self.status,
@@ -169,6 +191,7 @@ class HandoffMeta:
             status=data.get("status", "pending"),
             error=data.get("error"),
             source_hash=data.get("source_hash"),
+            managed_dir=data.get("managed_dir"),
             edits=[EditRecord.from_dict(edit) for edit in data.get("edits", [])],
         )
 
@@ -241,9 +264,37 @@ class HandoffManager:
 
     # -- paths ---------------------------------------------------------
 
+    def managed_dir_for(self, meta: HandoffMeta) -> str:
+        """Resolve *meta*'s managed-folder name.
+
+        Prefers the value recorded on the handoff itself -- the
+        ``managed_folder_name`` in effect when it was created (PROTOCOL.md
+        §1) -- so a handoff keeps resolving to the folder it actually lives
+        in even after the setting changes. Falls back to the CURRENT
+        setting for a legacy meta recorded before ``managed_dir`` existed
+        (``None``).
+        """
+        return meta.managed_dir or self._ctx.managed_folder_name
+
     def handoff_dir(self, handoff_id: str) -> Path:
-        """Absolute path to ``input/cpsb/<handoff_id>/``."""
-        return self._ctx.cpsb_input_dir / handoff_id
+        """Absolute path to the handoff's managed folder, ``<managed>/<handoff_id>/``.
+
+        Thread-safe (may be called with the manager's lock held elsewhere
+        or not at all). Looks up *handoff_id*'s own recorded
+        ``managed_dir`` (see :meth:`managed_dir_for`) rather than always
+        trusting the CURRENT ``managed_folder_name`` setting, so a handoff
+        created before a since-changed setting still resolves to where it
+        actually lives. An id this manager has never seen (not yet
+        created, or already purged) falls back to the current setting,
+        matching where a brand-new handoff of that id would be created.
+        """
+        with self._lock:
+            meta = self._handoffs.get(handoff_id)
+            if meta is not None:
+                managed = self.managed_dir_for(meta)
+            else:
+                managed = self._ctx.managed_folder_name
+        return self._ctx.input_dir / managed / handoff_id
 
     def meta_path(self, handoff_id: str) -> Path:
         return self.handoff_dir(handoff_id) / "meta.json"
@@ -258,17 +309,38 @@ class HandoffManager:
         workflow_name: str,
         source: SourceRef,
         original_image: Image.Image,
+        source_hash: str | None = None,
     ) -> HandoffMeta:
         """Allocate a new handoff: id, folder, ``orig_thumb.png``, ``meta.json``.
 
         Does not write ``source.psd`` -- that is :func:`cpsb.psd_io.write_psd`,
         called by the route handler once this returns, since PSD encoding is
         outside this module's job.
+
+        Args:
+            origin_node_id: The graph node id (or bridge-node ``unique_id``)
+                this handoff belongs to.
+            origin_kind: Where the source image came from.
+            workflow_name: The saved workflow's name, or ``""`` (wildcard --
+                see :meth:`find_active_for_node`).
+            source: The ``{filename, subfolder, type}`` triple ComfyUI's own
+                ``/view`` uses to locate the source image (bridge-node
+                handoffs use a descriptive placeholder, PROTOCOL.md §6).
+            original_image: The decoded source pixels, used for the
+                thumbnail and, absent an explicit *source_hash*, the
+                recorded ``source_hash``.
+            source_hash: Precomputed :func:`compute_source_hash` of
+                *original_image*, when the caller already hashed it for
+                some other decision (e.g. the auto-supersede-on-changed-
+                source check at ``POST /cpsb/open``, PROTOCOL.md §6) and
+                passing it avoids hashing the same pixels twice. Computed
+                from *original_image* when omitted.
         """
         now = time.time()
         with self._lock:
             handoff_id = self._allocate_id_locked()
-            folder = self.handoff_dir(handoff_id)
+            managed_dir = self._ctx.managed_folder_name
+            folder = self._ctx.input_dir / managed_dir / handoff_id
             folder.mkdir(parents=True, exist_ok=True)
             self._write_thumbnail(folder / "orig_thumb.png", original_image)
             meta = HandoffMeta(
@@ -280,7 +352,8 @@ class HandoffManager:
                 created_ts=now,
                 updated_ts=now,
                 status="pending",
-                source_hash=compute_source_hash(original_image),
+                source_hash=source_hash or compute_source_hash(original_image),
+                managed_dir=managed_dir,
             )
             self._handoffs[handoff_id] = meta
             self._write_meta_locked(meta)
@@ -292,7 +365,8 @@ class HandoffManager:
     def _allocate_id_locked(self) -> str:
         while True:
             handoff_id = uuid.uuid4().hex[:8]
-            if handoff_id not in self._handoffs and not self.handoff_dir(handoff_id).exists():
+            candidate_dir = self._ctx.cpsb_input_dir / handoff_id
+            if handoff_id not in self._handoffs and not candidate_dir.exists():
                 return handoff_id
 
     @staticmethod
@@ -359,7 +433,8 @@ class HandoffManager:
             meta = self._handoffs.get(handoff_id)
             if meta is None or not meta.edits:
                 return None
-            return self.handoff_dir(handoff_id) / meta.edits[-1].filename
+            managed = self.managed_dir_for(meta)
+        return self._ctx.input_dir / managed / handoff_id / meta.edits[-1].filename
 
     def latest_edit_hash(self, handoff_id: str) -> str | None:
         """SHA256 hex digest of the most recent edit file (bridge node ``IS_CHANGED``)."""
@@ -403,9 +478,18 @@ class HandoffManager:
         return self._transition(handoff_id, status="error", error=error)
 
     def mark_cancelled(self, handoff_id: str) -> HandoffMeta:
-        meta = self._transition(handoff_id, status="cancelled")
-        self._cancel_waiter(handoff_id)
-        return meta
+        """Mark *handoff_id* cancelled: unblocks any waiter, notifies the UI.
+
+        Idempotent against an already-terminal handoff (PROTOCOL.md §2:
+        cancel must be safe to mash -- e.g. the gallery and the node badge
+        both firing it, or a user double-clicking): a handoff already
+        ``cancelled``, ``discarded``, ``superseded``, or ``error`` is
+        returned completely unchanged, with no ``updated_ts`` bump, no disk
+        write, and no duplicate ``cpsb.status`` event. An unknown
+        *handoff_id* still raises :class:`HandoffNotFoundError` (the route
+        maps that to 404, never 200).
+        """
+        return self._transition(handoff_id, status="cancelled", noop_if_terminal=True)
 
     def mark_discarded(self, handoff_id: str) -> HandoffMeta:
         return self._transition(handoff_id, status="discarded")
@@ -415,16 +499,47 @@ class HandoffManager:
         return self._transition(handoff_id, status="superseded")
 
     def _transition(
-        self, handoff_id: str, *, status: HandoffStatus, error: str | None = None
+        self,
+        handoff_id: str,
+        *,
+        status: HandoffStatus,
+        error: str | None = None,
+        noop_if_terminal: bool = False,
     ) -> HandoffMeta:
+        """Apply a status transition: mutate, persist, and emit ``cpsb.status``.
+
+        Args:
+            handoff_id: The handoff to transition.
+            status: The new status.
+            error: The new ``error`` string (cleared to ``None`` when
+                omitted).
+            noop_if_terminal: When ``True``, a handoff already in
+                :data:`TERMINAL_STATUSES` is left exactly as it is instead
+                of being overwritten. Only :meth:`mark_cancelled` sets
+                this: the other transitions must still be able to fire on
+                a terminal handoff by design -- notably a Tier 2
+                ``open_failed`` (status ``error``) falling back to a
+                Tier 1 launch that then succeeds needs `error` ->
+                `editing` to go through (PROTOCOL.md §3).
+
+        Raises:
+            HandoffNotFoundError: *handoff_id* is not a known handoff.
+        """
         with self._lock:
             meta = self._handoffs.get(handoff_id)
             if meta is None:
                 raise HandoffNotFoundError(handoff_id)
+            if noop_if_terminal and meta.status in TERMINAL_STATUSES:
+                return HandoffMeta.from_dict(meta.to_dict())
             meta.status = status
             meta.error = error
             meta.updated_ts = time.time()
             self._write_meta_locked(meta)
+            if status == "cancelled":
+                # Folded into the same lock acquisition as the status
+                # write so a concurrent wait_for_edit() can never observe
+                # "status == cancelled" with the waiter not yet unblocked.
+                self._cancel_waiter_locked(handoff_id)
             snapshot = HandoffMeta.from_dict(meta.to_dict())
         self._emit_status(snapshot)
         return snapshot
@@ -472,7 +587,7 @@ class HandoffManager:
     def _append_edit_locked(
         self, meta: HandoffMeta, image: Image.Image, fidelity: Fidelity
     ) -> EditRecord | None:
-        folder = self.handoff_dir(meta.handoff_id)
+        folder = self._ctx.input_dir / self.managed_dir_for(meta) / meta.handoff_id
         png_bytes = _encode_png(image)
         new_hash = _hash_bytes(png_bytes)
         if meta.edits:
@@ -531,16 +646,15 @@ class HandoffManager:
         with self._lock:
             self._waiters[handoff_id] = _Waiter(baseline_edits=baseline_edits)
 
-    def cancel_wait(self, handoff_id: str) -> None:
-        """Unblock a waiter with :data:`WaitOutcome.CANCELLED` (``/cpsb/cancel``)."""
-        with self._lock:
-            self._cancel_waiter_locked(handoff_id)
-
-    def _cancel_waiter(self, handoff_id: str) -> None:
-        with self._lock:
-            self._cancel_waiter_locked(handoff_id)
-
     def _cancel_waiter_locked(self, handoff_id: str) -> None:
+        """Flip a registered waiter to cancelled. Assumes the lock is held.
+
+        Called from :meth:`_transition` as part of the same locked section
+        that writes ``status: "cancelled"``, so a concurrent
+        :meth:`wait_for_edit` can never observe the status change without
+        the waiter also being unblocked. Mirrors
+        :meth:`_unblock_waiter_locked`, the analogous "edit arrived" signal.
+        """
         waiter = self._waiters.get(handoff_id)
         if waiter is not None:
             waiter.status = "cancelled"
@@ -607,7 +721,7 @@ class HandoffManager:
                 "origin_node_id": meta.origin_node_id,
                 "origin_kind": meta.origin_kind,
                 "filename": edit.filename,
-                "subfolder": f"cpsb/{meta.handoff_id}",
+                "subfolder": f"{self.managed_dir_for(meta)}/{meta.handoff_id}",
                 "type": "input",
                 "fidelity": edit.fidelity,
                 "sibling_output": edit.sibling_output.to_dict() if edit.sibling_output else None,
@@ -627,7 +741,13 @@ class HandoffManager:
     # -- persistence -----------------------------------------------------
 
     def _write_meta_locked(self, meta: HandoffMeta) -> None:
-        path = self.meta_path(meta.handoff_id)
+        # Deliberately not routed through the public, lock-acquiring
+        # handoff_dir()/meta_path() -- every caller of this method already
+        # holds self._lock, and meta's own managed_dir (authoritative for
+        # an already-created handoff) resolves the path just as correctly
+        # without a second, deadlocking lock acquisition.
+        folder = self._ctx.input_dir / self.managed_dir_for(meta) / meta.handoff_id
+        path = folder / "meta.json"
         tmp_path = path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(meta.to_dict(), indent=2), encoding="utf-8")
         tmp_path.replace(path)
@@ -635,11 +755,14 @@ class HandoffManager:
     # -- scan-on-boot recovery & cleanup -----------------------------------
 
     def _scan_existing(self) -> None:
-        """Rebuild in-memory state from ``input/cpsb/*/meta.json`` (PROTOCOL.md §1).
+        """Rebuild in-memory state from the managed folder's ``*/meta.json`` files.
 
-        There is no separate manifest file: the meta files are themselves
-        the source of truth, so a server restart mid-edit reattaches to
-        whatever Photoshop does next without losing track of the handoff.
+        PROTOCOL.md §1: there is no separate manifest file, the meta files
+        are themselves the source of truth, so a server restart mid-edit
+        reattaches to whatever Photoshop does next without losing track of
+        the handoff. Scoped to the CURRENT ``managed_folder_name`` setting
+        only -- a handoff living under a since-changed former folder name
+        is not rediscovered here (PROTOCOL.md §1: it "stays where it is").
         """
         root = self._ctx.cpsb_input_dir
         if not root.is_dir():
