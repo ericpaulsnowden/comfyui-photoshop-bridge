@@ -65,8 +65,18 @@ let unsubscribeState = /** @type {(() => void) | null} */ (null)
  * layers intact).
  * @property {boolean} openFresh - "Open fresh copy" (`mode:"new"` from the
  * card's recorded source triple).
- * @property {boolean} cancel
- * @property {boolean} discard
+ * @property {boolean} cancel - Separate "Cancel" button: stop a round trip
+ * that hasn't delivered yet. Never combined with `remove` into one action —
+ * PROTOCOL.md §8 keeps them distinct ("KEEP the separate Cancel action on
+ * active cards too... Cancel = stop the PS edit; Remove = take off the
+ * gallery").
+ * @property {boolean} remove - "Remove from list" — offered on EVERY status
+ * (PROTOCOL.md §8 "Remove-from-list"), unlike the old `discard` field this
+ * replaces, which was withheld on most rows.
+ * @property {boolean} removeCancelsFirst - True exactly when `cancel` is
+ * (i.e. the handoff is still active: pending/editing/stale). See
+ * {@link removeFromList} for why an active handoff must be cancelled before
+ * it's discarded, not discarded directly.
  * @property {boolean} dropImport - Whether drag-and-drop manual import is
  * accepted.
  */
@@ -76,8 +86,10 @@ let unsubscribeState = /** @type {(() => void) | null} */ (null)
  * deliberately dependency-free so it can be exercised outside a browser
  * (review-time verification extracts this exact function text and asserts
  * every status row plus the invariants: reopen/openFresh are mutually
- * exclusive, and no terminal status offers Cancel, Discard, or drop
- * import). Grounding, per PROTOCOL.md §2:
+ * exclusive; `remove` is true for EVERY status (PROTOCOL.md §8 — "Remove
+ * from list" must appear on every card, regardless of status); and
+ * `removeCancelsFirst` is true iff `cancel` is true). Grounding, per
+ * PROTOCOL.md §2/§8:
  *
  *  - `mode:"original"` requires an ACTIVE handoff (pending/editing/edited;
  *    "stale" is display-only sugar over `editing`) — offering Re-open on a
@@ -89,11 +101,25 @@ let unsubscribeState = /** @type {(() => void) | null} */ (null)
  *    delivered yet (pending/editing/stale). It's technically idempotent on
  *    terminal handoffs, but a button that can only ever no-op is noise — and
  *    on `edited` cards "cancel" is misleading (the edit already landed), so
- *    those offer Discard.
- *  - `/cpsb/discard` is the gallery's "remove this card / stop watching"
- *    (§2): offered for stale (its PROTOCOL-described purpose) and for
- *    `edited` (dismiss a finished round trip). NEVER on terminal cards — a
- *    second terminal transition changes nothing the user can see (G2).
+ *    those offer only Remove.
+ *  - `remove` ("Remove from list", routes to `/cpsb/discard` — §2's "remove
+ *    this card / stop watching") is now offered on every row — a prior
+ *    version restricted it to stale/edited cards, which was the second half
+ *    of the field bug this fixes ("doesn't appear for every image").
+ *    `/cpsb/discard` doesn't itself gate on status server-side
+ *    (`HandoffManager.mark_discarded` leaves `_transition`'s
+ *    `noop_if_terminal` at its `False` default, unlike `mark_cancelled`) —
+ *    but discarding a still-ACTIVE handoff directly would silently strand a
+ *    blocking Photoshop Bridge node: `_transition` only unblocks a waiter
+ *    (`_cancel_waiter_locked`) when the new status is literally
+ *    `"cancelled"`, and only `cancel_route` (never `discard_route`) notifies
+ *    the plugin. So `removeCancelsFirst` (pending/editing/stale) makes
+ *    {@link removeFromList} call `/cpsb/cancel` FIRST — same unblock/notify
+ *    as the separate Cancel button — and only then `/cpsb/discard`, which
+ *    lands the handoff on `discarded`, the one status `rebuild()` filters out
+ *    of the rendered list (see its comment). That's what makes "Remove from
+ *    list" actually drop an active card, not just flip its status
+ *    underneath it.
  *  - `/cpsb/upload` (drag-drop import) 409s unless the handoff is active —
  *    terminal cards don't register drop handlers at all.
  *
@@ -110,20 +136,49 @@ function cardCapabilities(displayStatus) {
   switch (displayStatus) {
     case 'pending':
     case 'editing':
-      return { reopen: true, openFresh: false, cancel: true, discard: false, dropImport: true }
     case 'stale':
-      return { reopen: true, openFresh: false, cancel: true, discard: true, dropImport: true }
+      return {
+        reopen: true,
+        openFresh: false,
+        cancel: true,
+        remove: true,
+        removeCancelsFirst: true,
+        dropImport: true
+      }
     case 'edited':
-      return { reopen: true, openFresh: false, cancel: false, discard: true, dropImport: true }
+      return {
+        reopen: true,
+        openFresh: false,
+        cancel: false,
+        remove: true,
+        removeCancelsFirst: false,
+        dropImport: true
+      }
     case 'cancelled':
-    case 'discarded':
+    case 'discarded': // never actually rendered — rebuild() filters it out — kept here so the switch stays exhaustive over every known status.
     case 'superseded':
     case 'error':
-      return { reopen: false, openFresh: true, cancel: false, discard: false, dropImport: false }
+      return {
+        reopen: false,
+        openFresh: true,
+        cancel: false,
+        remove: true,
+        removeCancelsFirst: false,
+        dropImport: false
+      }
     default:
       // Unknown/future status: safest is terminal-like (no state-changing
-      // buttons that could 404/409), but still allow starting over.
-      return { reopen: false, openFresh: true, cancel: false, discard: false, dropImport: false }
+      // buttons that could 404/409 besides Remove, which /cpsb/discard
+      // accepts unconditionally), but still offer both Remove and starting
+      // over.
+      return {
+        reopen: false,
+        openFresh: true,
+        cancel: false,
+        remove: true,
+        removeCancelsFirst: false,
+        dropImport: false
+      }
   }
 }
 
@@ -218,10 +273,14 @@ async function openFreshCopy(meta) {
  * (PROTOCOL.md §2 `/cpsb/cancel`: "cancelling is always available
  * immediately, not gated on the stale timeout"). No confirmation dialog, by
  * design — this mirrors the one-click cancel affordance on the node's
- * "Editing in Photoshop…" badge (`badges.js`) rather than `discardHandoffCard`'s
+ * "Editing in Photoshop…" badge (`badges.js`) rather than {@link removeFromList}'s
  * confirm-then-destroy pattern, so the two entry points to the same action
  * behave consistently and stay low-friction (the whole point of surfacing
- * cancel at all is to give a stuck handoff an easy way out).
+ * cancel at all is to give a stuck handoff an easy way out). Kept as a
+ * separate action from "Remove from list" per PROTOCOL.md §8: Cancel stops
+ * the Photoshop edit but leaves the card in the gallery (now `cancelled`,
+ * offering "Open fresh copy"); Remove takes the card off the gallery
+ * entirely.
  * @param {import('./api.js').CpsbHandoffMeta} meta
  */
 async function cancelHandoffCard(meta) {
@@ -237,23 +296,51 @@ async function cancelHandoffCard(meta) {
 }
 
 /**
+ * "Remove from list" — the {@link cardCapabilities}.remove action, now
+ * offered on every card (PROTOCOL.md §8). Always ends with
+ * `/cpsb/discard`, which lands the handoff on status `discarded` — the one
+ * status `rebuild()` filters out of the rendered list (see its comment) —
+ * so the card is guaranteed to actually vanish, not just have its status
+ * flip underneath it while it stays on screen.
+ *
+ * For a still-ACTIVE handoff (`capabilities.removeCancelsFirst`: pending,
+ * editing, or stale) `/cpsb/cancel` runs FIRST. `/cpsb/discard` alone does
+ * NOT unblock a waiting Photoshop Bridge node or notify the plugin — in
+ * `cpsb/handoff.py`, `HandoffManager._transition` only calls
+ * `_cancel_waiter_locked` when the new status is literally `"cancelled"`,
+ * and only `cancel_route` (never `discard_route`) sends
+ * `handoff_cancelled` over the plugin websocket — so discarding an active
+ * handoff directly would remove it from the gallery while silently
+ * stranding the workflow run and leaving Photoshop none the wiser. If the
+ * cancel call itself fails, discard is skipped (the `await` throws before
+ * reaching it) so a still-active handoff is never marked discarded without
+ * having actually been unblocked first; the error surfaces the same way
+ * every other gallery action's does.
  * @param {import('./api.js').CpsbHandoffMeta} meta
+ * @param {CpsbCardCapabilities} capabilities
  */
-async function discardHandoffCard(meta) {
+async function removeFromList(meta, capabilities) {
+  const name = meta.workflow_name || 'this entry'
   const confirmed = await ui.confirmDialog({
     title: 'Remove from the Photoshop Edits list?',
-    message:
-      `This removes "${meta.workflow_name || 'this entry'}" (node ` +
-      `${meta.origin_node_id}) from the list and stops watching it for ` +
-      'further edits. Your images and workflow are untouched.'
+    message: capabilities.removeCancelsFirst
+      ? `This stops the current Photoshop edit for "${name}" (node ` +
+        `${meta.origin_node_id}) and removes it from the list. Your images ` +
+        'and workflow are untouched.'
+      : `This removes "${name}" (node ${meta.origin_node_id}) from the list ` +
+        'and stops watching it for further edits. Your images and workflow ' +
+        'are untouched.'
   })
   if (!confirmed) return
   try {
+    if (capabilities.removeCancelsFirst) {
+      await api.cancelHandoff(meta.handoff_id)
+    }
     await api.discardHandoff(meta.handoff_id)
   } catch (error) {
     ui.showToast({
       severity: 'error',
-      summary: 'Failed to discard',
+      summary: 'Failed to remove',
       detail: api.errorMessage(error)
     })
   }
@@ -479,16 +566,20 @@ function buildCard(meta) {
       })
     )
   }
-  if (capabilities.discard) {
+  if (capabilities.remove) {
     // Labeled "Remove from list", not "Discard" — the user couldn't tell
-    // what Discard did. It only drops this entry from the gallery and stops
-    // watching the handoff; it touches no image or workflow the user cares
-    // about (the tooltip says so, and discardHandoffCard's confirm repeats
-    // it). Still routes to /cpsb/discard unchanged.
+    // what Discard did. Now offered on EVERY status (PROTOCOL.md §8): a
+    // prior version only showed this for stale/edited cards ("doesn't
+    // appear for every image", the other half of the field bug this fixes).
+    // On an active card this first cancels the Photoshop edit (see
+    // {@link removeFromList}) before dropping it from the gallery; the
+    // separate Cancel button above (when present) stops the edit without
+    // leaving the gallery. It touches no image or workflow the user cares
+    // about (the tooltip says so, and removeFromList's confirm repeats it).
     const removeButton = ui.el('button', {
       className: 'cpsb-card-action cpsb-card-action-danger',
       text: 'Remove from list',
-      on: { click: () => discardHandoffCard(meta) }
+      on: { click: () => removeFromList(meta, capabilities) }
     })
     removeButton.title =
       'Remove this entry from the Photoshop Edits list. Your images and ' +
@@ -632,7 +723,19 @@ function rebuild() {
     }
     renderUpgradeBanner(rootEl)
 
-    const handoffs = state.getAllHandoffs()
+    // A `discarded` handoff is "removed from the list" by definition — that
+    // is what /cpsb/discard means (PROTOCOL.md §2/§8) — but the backend
+    // still returns it from /cpsb/status until cleanup (meta.json only
+    // disappears at the §1 cleanup pass), so this filter is the one place
+    // that actually drops it from what the user sees. Every other status
+    // still renders; without this, "Remove from list" would flip the
+    // handoff's status server-side but leave its card sitting in the
+    // gallery, exactly the "doesn't appear to take something off the list"
+    // field bug this fixes. `state.subscribe(rebuild)` re-runs this on every
+    // `cpsb.status` event (see `mark_discarded` -> `_transition` ->
+    // `_emit_status`, always fired, never a noop), so the card vanishes on
+    // the very next event after the discard call resolves.
+    const handoffs = state.getAllHandoffs().filter((meta) => meta.status !== 'discarded')
     if (handoffs.length === 0) {
       rootEl.appendChild(
         ui.el('div', {

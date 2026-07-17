@@ -47,13 +47,28 @@
  * NO image preview at all (e.g. a Photoshop Bridge node mid-wait), there is
  * no image region to center over and the node body is fully occupied by
  * slot rows + widgets — so the pill instead anchors strictly BELOW the last
- * widget row (`getBelowWidgetsRect`), never over slots or widgets, growing
- * past the node's bottom edge when the node is too short for it to fit
- * inside (litegraph only clips node drawing when `node.clip_area` is set —
- * `LGraphCanvas.ts` `drawNode`, ~line 5673 — which ComfyUI nodes don't set,
- * so a pill slightly past the body renders fine, and overflowing DOWN into
- * empty canvas is harmless where overflowing UP would cover the output
- * slot).
+ * widget row (`getBelowWidgetsRect`), never over slots or widgets.
+ *
+ * `drawBadge` then CLAMPS the anchored position to stay fully inside the
+ * node's own body (`node.size`, both x and y) before drawing — this used to
+ * be x-only, letting the y position grow past the node's bottom edge on a
+ * short node (litegraph only clips node DRAWING when `node.clip_area` is
+ * set — `LGraphCanvas.ts` `drawNode`, ~line 5673 — which ComfyUI nodes don't
+ * set, so the overflow rendered fine). The clamp is required for
+ * correctness, not just cosmetics: litegraph resolves which node a
+ * click/hover belongs to via `LGraph.getNodeOnPos` -> `LGraphNode
+ * .isPointInside`, which tests the pointer against `node.boundingRect` —
+ * bounded by `pos[1] + size[1]`, the node's bottom edge, with no margin
+ * below it (confirmed in a fresh `Comfy-Org/ComfyUI_frontend` checkout,
+ * `src/lib/litegraph/src/LGraph.ts` ~line 1239 and `LGraphNode.ts` ~line
+ * 2091/2162). A badge drawn past that edge is never routed to this node's
+ * `onMouseDown`/`onMouseMove` at all (not a wrong-coordinate-space bug — the
+ * event is attributed to a different node, or none). That was the exact
+ * regression on short, imageless nodes (Edit in Photoshop / Annotate for
+ * Edit / Compose Layers to PSD with only a few widgets): the ✕ drew fine but
+ * could never be clicked or even hover-revealed. See `drawBadge`'s `maxY`
+ * for the fix — clickable now wins over letting the pill grow past the
+ * bottom.
  *
  * The spinner needs to animate while the canvas would otherwise sit
  * perfectly idle for however long the user takes in Photoshop, so a single
@@ -331,10 +346,16 @@ function getFallbackImageRect(node) {
  * widget row, so the pill can never cover the node's slot rows or widgets
  * ("the loader should be after the two UI fields"). Returning a strip of
  * exactly `PILL_HEIGHT` makes `drawBadge`'s shared centering math place the
- * pill at precisely this strip's `y` — and since `drawBadge` never clamps
- * the pill's y UPWARD, a node too short to fit it inside the body simply
- * has the pill extend past its bottom edge (acceptable; overflowing upward
- * over the output slot is not — the exact bug this fixes).
+ * pill at precisely this strip's `y` when it fits — on a node too short for
+ * that (the common case for a bare 2-4-widget bridge/annotate/compose node),
+ * `drawBadge` now clamps the pill's y back up so it stays inside the node's
+ * clickable body (never upward past the top, where it would cover the input
+ * slots) rather than letting it extend past the bottom edge: overflowing the
+ * body used to render harmlessly but made the cancel ✕ (and its hover
+ * reveal) permanently unreachable, since litegraph's own click/hover
+ * routing never attributes a point past `node.size[1]` to this node at all
+ * — see `drawBadge`'s `maxY` comment and this file's header for the fuller
+ * explanation and the regression this fixes.
  *
  * Widget bottom-edge geometry, verified in `Comfy-Org/ComfyUI_frontend`
  * `src/lib/litegraph/src/LGraphNode.ts`:
@@ -431,7 +452,32 @@ function drawBadge(ctx, node) {
   const anchor = getBadgeAnchorRect(node)
   const maxX = Math.max(4, node.size[0] - pillWidth - 4)
   const x = Math.min(Math.max(anchor.x + (anchor.w - pillWidth) / 2, 4), maxX)
-  const y = Math.max(4, anchor.y + (anchor.h - PILL_HEIGHT) / 2)
+  // Clamped to the node's own body (never past `node.size[1]`), NOT just
+  // floored at 4 like `x` used to be alone — see this file's header
+  // ("Universal cancel") for why: litegraph's own click/hover routing
+  // (`LGraph.getNodeOnPos` -> `LGraphNode.isPointInside`, confirmed in a
+  // fresh `Comfy-Org/ComfyUI_frontend` checkout,
+  // `src/lib/litegraph/src/LGraph.ts` ~line 1239 and
+  // `src/lib/litegraph/src/LGraphNode.ts` ~line 2162) tests the pointer
+  // against `node.boundingRect`, which `measure()` populates as exactly
+  // `[pos[0], pos[1] - titleHeight, size[0], size[1] + titleHeight]`
+  // (`LGraphNode.ts` ~line 2091) — i.e. it stops dead at the node's bottom
+  // edge, `pos[1] + size[1]`, with no margin below it. `LGraphCanvas`
+  // resolves which node a mousedown/mousemove even belongs to via that same
+  // `getNodeOnPos` call BEFORE ever reaching `_processNodeClick`/
+  // `node.onMouseDown` (`LGraphCanvas.ts` ~line 2291) or `node.onMouseMove`
+  // (~line 3328/3401) — so a badge drawn past the bottom edge isn't hit-
+  // tested in the wrong coordinate space, it is never routed to this node's
+  // mouse hooks AT ALL, for both click and hover. That is exactly what
+  // {@link getBelowWidgetsRect} used to produce on a short, imageless node
+  // (Edit in Photoshop / Annotate for Edit / Compose Layers to PSD with only
+  // a few widgets): its own JSDoc previously called the overflow "harmless"
+  // for drawing, but it silently made the cancel ✕ (and its hover reveal)
+  // completely unreachable — the exact regression report ("can't cancel...
+  // this needs to be universal any time it shows up"). Clickable now wins
+  // over that old "grow past the bottom" allowance.
+  const maxY = Math.max(4, node.size[1] - PILL_HEIGHT - 4)
+  const y = Math.min(Math.max(anchor.y + (anchor.h - PILL_HEIGHT) / 2, 4), maxY)
 
   ctx.fillStyle = 'rgba(20, 20, 24, 0.85)'
   ctx.strokeStyle = badge.kind === 'editing' ? '#5b9bd5' : '#4caf50'

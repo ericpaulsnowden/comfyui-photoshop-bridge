@@ -289,6 +289,13 @@ research/research-annotate-node.md retain the design if ever revisited.
 - `"cpsb.tier2"` — plugin connection state changed:
   `{"connected": true, "ps_version": "26.5"}`
 
+**Universal cancel (product-owner requirement 2026-07-17):** ANY node that shows the
+"Editing in Photoshop…" badge (badges.js) MUST expose a working cancel ✕, regardless of
+node type or whether the node has an image preview — imageless nodes (Edit in Photoshop,
+Annotate for Edit, Compose Layers to PSD) included. A stuck editing badge with no cancel
+is the worst failure mode, especially when Photoshop opened on a different (server)
+machine the user can't reach. Cancel calls /cpsb/cancel (§2).
+
 Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
 widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 "[Add as node]" for `terminal_output`). Auto-queue policy:
