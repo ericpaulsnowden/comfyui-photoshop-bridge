@@ -9,6 +9,7 @@ import time
 import pytest
 from PIL import Image
 
+import cpsb.handoff as handoff_module
 from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
 from cpsb.handoff import (
     TERMINAL_STATUSES,
@@ -549,6 +550,36 @@ class TestWaitTable:
         outcome = manager.wait_for_edit(meta.handoff_id, 0.2, poll_interval=0.02)
         assert outcome == WaitOutcome.TIMEOUT
         assert time.monotonic() - start >= 0.2
+
+    def test_wait_unblocked_by_error(self, manager):
+        """An open failure (mark_error) must stop the wait AT ONCE with ERROR,
+        not spin until timeout -- the compose/annotate/bridge hang the plugin's
+        open_failed used to cause (30-min timeout with no way to cancel)."""
+        meta = create_handoff(manager)
+        outcomes: list[str] = []
+
+        def waiter() -> None:
+            outcomes.append(manager.wait_for_edit(meta.handoff_id, 30, poll_interval=0.02))
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        time.sleep(0.1)
+        start = time.monotonic()
+        manager.mark_error(meta.handoff_id, "plugin open failed")
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert outcomes == [WaitOutcome.ERROR]
+        assert time.monotonic() - start < 2.0  # returned promptly, not at timeout
+
+    def test_wait_honors_native_interrupt(self, manager, monkeypatch):
+        """ComfyUI's own 'Cancel current run' (processing_interrupted) breaks a
+        blocking wait -- returned as CANCELLED so the node interrupts."""
+        meta = create_handoff(manager)
+        monkeypatch.setattr(handoff_module, "_processing_interrupted", lambda: True)
+        start = time.monotonic()
+        outcome = manager.wait_for_edit(meta.handoff_id, 30, poll_interval=0.02)
+        assert outcome == WaitOutcome.CANCELLED
+        assert time.monotonic() - start < 2.0
 
     def test_edit_landing_before_wait_registers_still_unblocks(self, manager):
         """The open-vs-wait race: an edit arriving before the waiter exists.

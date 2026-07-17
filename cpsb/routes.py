@@ -1062,9 +1062,10 @@ async def _handle_plugin_message(
                 logger.warning("Plugin opened unknown handoff %s", handoff_id)
     elif msg_type == "open_failed":
         handoff_id = msg.get("handoff_id")
+        error_text = str(msg.get("error") or "Plugin failed to open")
         if handoff_id:
             try:
-                manager.mark_error(handoff_id, str(msg.get("error") or "Plugin failed to open"))
+                manager.mark_error(handoff_id, error_text)
             except HandoffNotFoundError:
                 logger.warning("Plugin reported open_failed for unknown handoff %s", handoff_id)
             else:
@@ -1074,12 +1075,14 @@ async def _handle_plugin_message(
                 # the wrong machine (the user is at the plugin's machine, not
                 # the server). In that case leave the handoff in `error` with
                 # the plugin's own message so the real failure is visible,
-                # instead of silently opening on the server.
+                # instead of silently opening on the server. Log the plugin's
+                # error text (WARNING) so it shows up in the ComfyUI log.
                 if connection.local_mode is False:
-                    logger.info(
-                        "cpsb: remote plugin open_failed for %s -- NOT falling back to a "
+                    logger.warning(
+                        "cpsb: remote plugin open_failed for %s: %s -- NOT falling back to a "
                         "server-side Tier 1 launch (would open on the wrong machine)",
                         handoff_id,
+                        error_text,
                     )
                 else:
                     await _fallback_to_tier1(context, manager, handoff_id)

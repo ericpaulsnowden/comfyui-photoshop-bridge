@@ -315,6 +315,14 @@ Annotate for Edit, Compose Layers to PSD) included. A stuck editing badge with n
 is the worst failure mode, especially when Photoshop opened on a different (server)
 machine the user can't reach. Cancel calls /cpsb/cancel (§2).
 
+A blocking wait (`HandoffManager.wait_for_edit`) must ALSO honor two non-badge escape
+hatches, so a node can never wedge until its timeout: (a) ComfyUI's OWN "Cancel current
+run" — the wait polls `comfy.model_management.processing_interrupted()` and returns
+promptly; and (b) the handoff transitioning to a terminal ERROR (e.g. the plugin's
+`open_failed`) — the wait returns `WaitOutcome.ERROR` at once instead of spinning until
+`timeout_seconds`. Both, like cancel/timeout, make the node raise
+`InterruptProcessingException`.
+
 Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
 widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 "[Add as node]" for `terminal_output`). Auto-queue policy:

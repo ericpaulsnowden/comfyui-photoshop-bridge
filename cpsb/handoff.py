@@ -237,6 +237,30 @@ class WaitOutcome:
     EDITED = "edited"
     CANCELLED = "cancelled"
     TIMEOUT = "timeout"
+    #: The handoff transitioned to a terminal ERROR (e.g. the open failed) while
+    #: a node was blocking on it -- returned so the node stops waiting at once
+    #: instead of spinning until `timeout_seconds`. Callers treat it like any
+    #: other non-EDITED outcome (interrupt the run).
+    ERROR = "error"
+
+
+def _processing_interrupted() -> bool:
+    """Whether ComfyUI's own execution interrupt is set (its "Cancel current
+    run" button / ``interrupt_processing``).
+
+    A blocking :meth:`HandoffManager.wait_for_edit` polls this so ComfyUI's
+    NATIVE cancel actually breaks the wait -- without it, only a `/cpsb/cancel`
+    or the handoff's own terminal transition could. Guarded so the manager
+    stays importable and unit-testable without ComfyUI present (returns False).
+    """
+    try:
+        import comfy.model_management as model_management
+    except Exception:
+        return False
+    try:
+        return bool(model_management.processing_interrupted())
+    except Exception:
+        return False
 
 
 def _encode_png(image: Image.Image) -> bytes:
@@ -755,9 +779,25 @@ class HandoffManager:
                         status = "cancelled"
                     elif waiter is not None and len(meta.edits) > waiter.baseline_edits:
                         status = "edited"
+                    elif meta.status == "error":
+                        # The open (or a later step) failed. Stop waiting NOW --
+                        # otherwise an open_failed handoff spins for the full
+                        # timeout_seconds with no edit ever coming.
+                        status = "error"
+                    elif meta.status in ("cancelled", "discarded", "superseded"):
+                        # Any terminal non-edited state unblocks the wait (a
+                        # gallery discard / Start-Fresh, not just an explicit
+                        # /cpsb/cancel that flips the waiter's own status).
+                        status = "cancelled"
                 if status == "edited":
                     return WaitOutcome.EDITED
+                if status == "error":
+                    return WaitOutcome.ERROR
                 if status == "cancelled":
+                    return WaitOutcome.CANCELLED
+                # Honor ComfyUI's native "Cancel current run": without this a
+                # blocking wait ignores the host's own interrupt entirely.
+                if _processing_interrupted():
                     return WaitOutcome.CANCELLED
                 if time.monotonic() - start >= timeout_seconds:
                     return WaitOutcome.TIMEOUT
