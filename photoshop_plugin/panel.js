@@ -64,6 +64,13 @@ function initPanel() {
     document.getElementById('cpsb-last-error-advanced')
   )
   const retryEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-retry-line'))
+  // Connect/Disconnect control (the user "cancel") + the calm standby message.
+  const connectToggle = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-connect-toggle')
+  )
+  const standbyLine = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-standby-line')
+  )
   // The always-visible boot banner index.js paints at load; panel.js takes
   // it over once connection state is known (adds the server version).
   const versionEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-version'))
@@ -130,11 +137,41 @@ function initPanel() {
   /** @returns {void} */
   function renderConnection() {
     const state = connection.getState()
-    statusDot.className = `cpsb-dot cpsb-dot-${state.status}`
-    statusText.textContent = STATUS_LABELS[state.status] || state.status
+    const standby = state.standby // 'superseded' | 'manual' | null
     serverUrlEl.textContent = state.url
     renderVersionLine(state)
-    if (state.status === 'connected') {
+
+    // The connection control toggles by intent: Connect while standing by
+    // (idle, awaiting the user), Disconnect otherwise (so a stuck retry or a
+    // tug-of-war can be stopped).
+    connectToggle.textContent = standby ? 'Connect' : 'Disconnect'
+
+    // Status pill. Standby is idle, NOT a fault, so it shows a neutral (grey)
+    // dot rather than the red disconnected dot.
+    if (standby) {
+      statusDot.className = 'cpsb-dot'
+      statusText.textContent = standby === 'superseded' ? 'Standing by' : 'Disconnected'
+    } else {
+      statusDot.className = `cpsb-dot cpsb-dot-${state.status}`
+      statusText.textContent = STATUS_LABELS[state.status] || state.status
+    }
+
+    // Standby explanation — a state, not an error.
+    if (standby === 'superseded') {
+      standbyLine.textContent =
+        'Another Photoshop is connected to this ComfyUI. This one is standing by — ' +
+        'press Connect to take over.'
+      standbyLine.style.display = 'block'
+    } else if (standby === 'manual') {
+      standbyLine.textContent = 'Disconnected. Press Connect to reconnect.'
+      standbyLine.style.display = 'block'
+    } else {
+      standbyLine.style.display = 'none'
+    }
+
+    // When connected, or when standing by (idle — no retrying), there is no
+    // error/retry chatter to show; clear it all and stop the countdown ticker.
+    if (state.status === 'connected' || standby) {
       lastErrorEl.style.display = 'none'
       lastErrorAdvancedEl.style.display = 'none'
       retryEl.style.display = 'none'
@@ -263,6 +300,17 @@ function initPanel() {
   // Prefill with the active base and start with the error line hidden.
   serverInput.value = connection.getServerBase()
   serverErrorEl.style.display = 'none'
+
+  // Connect/Disconnect: Connect when standing by (reclaim the slot), otherwise
+  // Disconnect (bow out / stop retrying). The label is kept in sync by
+  // renderConnection; this reads the live state so a mid-render click is safe.
+  connectToggle.addEventListener('click', () => {
+    if (connection.getState().standby) {
+      connection.connect()
+    } else {
+      connection.disconnect()
+    }
+  })
 
   connection.addEventListener('statechange', renderConnection)
   registryEvents.addEventListener('change', renderHandoffs)

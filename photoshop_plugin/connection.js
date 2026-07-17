@@ -57,6 +57,17 @@ const BACKOFF_STEPS_MS = [1000, 2000, 5000, 10000]
 const WS_READY_STATE_OPEN = 1
 
 /**
+ * Application close code the SERVER uses when a NEW plugin connection displaces
+ * this one (cpsb/routes.py: `ws.close(code=4000, "replaced by a new
+ * connection")`). The server allows only one plugin socket at a time. When this
+ * plugin receives it, another Photoshop (e.g. on another machine, both pointed
+ * at the same ComfyUI) has taken over — so this plugin STANDS BY instead of
+ * auto-reconnecting, which would kick the other one off and start an infinite
+ * tug-of-war. The user re-claims with the panel's Connect button.
+ */
+const WS_CLOSE_REPLACED = 4000
+
+/**
  * @typedef {Object} CpsbHelloMessage
  * @property {'hello'} type
  * @property {string} plugin_version
@@ -118,6 +129,10 @@ const WS_READY_STATE_OPEN = 1
  * (user must act — a permission denial) vs transient (server not up yet /
  * retrying). The panel surfaces blocking errors prominently and keeps
  * transient ones inside Advanced.
+ * @property {'superseded' | 'manual' | null} standby - Non-null when the
+ * plugin is intentionally idle awaiting an explicit Connect: `'superseded'`
+ * (another plugin took over this ComfyUI) or `'manual'` (user disconnected).
+ * Null during normal auto-connect/retry.
  * @property {number} attempts - Consecutive failed connection attempts
  * since the last successful handshake.
  * @property {number | null} nextRetryAt - Epoch ms of the next scheduled
@@ -266,6 +281,17 @@ class ConnectionManager extends EventTarget {
      * @type {boolean}
      */
     this._lastErrorBlocking = false
+    /**
+     * Non-null when the plugin is intentionally NOT connected and NOT
+     * auto-retrying, awaiting an explicit user Connect:
+     *  - `'superseded'`: the server closed us (code 4000) because another
+     *    plugin took over this ComfyUI; standing by avoids a reconnect
+     *    tug-of-war between two machines.
+     *  - `'manual'`: the user pressed Disconnect.
+     * `null` means normal auto-connect/auto-retry behavior.
+     * @type {'superseded' | 'manual' | null}
+     */
+    this._standby = null
     this._started = false
   }
 
@@ -279,6 +305,67 @@ class ConnectionManager extends EventTarget {
     if (this._started) return
     this._started = true
     this._open()
+  }
+
+  /**
+   * User-initiated Disconnect (the panel's "cancel"): stop connecting, stop
+   * auto-retrying, and tear down any socket. The plugin stays off until an
+   * explicit {@link connect}. Use it to bow out of a two-machine tug-of-war,
+   * or to stop a stuck retry loop.
+   * @returns {void}
+   */
+  disconnect() {
+    this._standby = 'manual'
+    this._teardownSocket()
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer)
+      this._reconnectTimer = null
+    }
+    this.attempts = 0
+    this.nextRetryAt = null
+    this.lastError = null
+    this._lastFailureDetail = null
+    this._lastErrorBlocking = false
+    this.serverVersion = null
+    this.localMode = null
+    logInfo('disconnected by user — standing by until Connect')
+    this._setStatus('disconnected')
+  }
+
+  /**
+   * User-initiated Connect / Take over: clears any standby (manual or
+   * superseded) and (re)connects to the current server base. When another
+   * Photoshop currently holds the connection, this reclaims it — the server
+   * hands the single plugin slot to the newest connector; the previously
+   * connected plugin then stands by rather than fighting back.
+   * @returns {void}
+   */
+  connect() {
+    this._standby = null
+    this._started = true
+    this._reconnectNow()
+  }
+
+  /**
+   * Detaches handlers from the current socket and closes it. Handlers are
+   * removed BEFORE closing so the imminent close does not run `_onClose`
+   * (which would record a failure and schedule its own reconnect). No-op when
+   * there is no socket.
+   * @returns {void}
+   */
+  _teardownSocket() {
+    if (!this._socket) return
+    const socket = this._socket
+    this._socket = null
+    socket.onopen = null
+    socket.onmessage = null
+    socket.onclose = null
+    socket.onerror = null
+    try {
+      socket.close()
+    } catch (_error) {
+      // Already closing/closed — nothing to do.
+    }
   }
 
   /**
@@ -338,22 +425,7 @@ class ConnectionManager extends EventTarget {
       clearTimeout(this._reconnectTimer)
       this._reconnectTimer = null
     }
-    if (this._socket) {
-      const socket = this._socket
-      this._socket = null
-      // Detach handlers BEFORE closing so the imminent close does not run
-      // `_onClose` (which would record a failure and schedule its own
-      // reconnect, racing the fresh `_open()` below).
-      socket.onopen = null
-      socket.onmessage = null
-      socket.onclose = null
-      socket.onerror = null
-      try {
-        socket.close()
-      } catch (_error) {
-        // Already closing/closed — nothing to do.
-      }
-    }
+    this._teardownSocket()
     this.attempts = 0
     this.nextRetryAt = null
     this.lastError = null
@@ -491,6 +563,7 @@ class ConnectionManager extends EventTarget {
     this.lastError = null
     this._lastFailureDetail = null
     this._lastErrorBlocking = false
+    this._standby = null
     this._setStatus('connected')
     logInfo(
       `connected to server ${msg.server_version} (${this.localMode ? 'local' : 'remote'} mode)`
@@ -528,6 +601,26 @@ class ConnectionManager extends EventTarget {
     this._lastErrorBlocking = false
     const code = event ? event.code : undefined
     const reason = event ? event.reason : ''
+    // Match the server's replace-close by code OR reason. Real UXP delivers
+    // code 4000 + this reason (observed in the field); the reason match is
+    // insurance against a client that surfaces the coded close as a bare 1006
+    // but still carries the reason text.
+    const superseded =
+      code === WS_CLOSE_REPLACED ||
+      (typeof reason === 'string' && reason.indexOf('replaced by a new connection') !== -1)
+    if (superseded) {
+      // Another plugin (e.g. Photoshop on another machine, same ComfyUI) took
+      // over the server's single plugin slot. STAND BY instead of reconnecting
+      // — auto-reconnecting here would kick the other one off and spin up an
+      // endless two-machine tug-of-war. The user re-claims with Connect.
+      this._standby = 'superseded'
+      // Not an error — a state. The panel's standby line carries the message;
+      // clearing lastError keeps it out of the Advanced diagnostic line.
+      this.lastError = null
+      logInfo('superseded by another plugin connection — standing by')
+      this._setStatus('disconnected')
+      return
+    }
     if (wasConnected) {
       // An established connection dropped — not a failed attempt, so the
       // attempt counter stays at 0 and the next retry starts the backoff
@@ -573,6 +666,9 @@ class ConnectionManager extends EventTarget {
 
   /** @returns {void} */
   _scheduleReconnect() {
+    // Standing by (superseded by another plugin, or user-disconnected) means
+    // no auto-retry — only an explicit `connect()` brings it back.
+    if (this._standby) return
     if (this._reconnectTimer) return
     const delay =
       BACKOFF_STEPS_MS[Math.min(Math.max(this.attempts - 1, 0), BACKOFF_STEPS_MS.length - 1)]
@@ -607,6 +703,7 @@ class ConnectionManager extends EventTarget {
       localMode: this.localMode,
       lastError: this.lastError,
       lastErrorBlocking: this._lastErrorBlocking,
+      standby: this._standby,
       attempts: this.attempts,
       nextRetryAt: this.nextRetryAt
     }

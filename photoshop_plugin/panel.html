@@ -103,6 +103,11 @@
         font-weight: 600;
       }
 
+      .cpsb-conn-actions {
+        margin-top: 6px;
+        margin-bottom: 6px;
+      }
+
       /* --- Connection detail lines (URL, last error, retry state) --- */
 
       .cpsb-conn-line {
@@ -270,6 +275,16 @@
         <span id="cpsb-status-dot" class="cpsb-dot cpsb-dot-disconnected"></span>
         <span id="cpsb-status-text" class="cpsb-status-text">Disconnected</span>
       </div>
+      <!-- User connection control (the "cancel"): Disconnect stops a stuck
+           retry loop or bows out of a two-machine tug-of-war; Connect
+           (re)connects / takes over the single plugin slot. panel.js flips the
+           label from connection state. -->
+      <div class="cpsb-conn-actions">
+        <sp-button id="cpsb-connect-toggle">Disconnect</sp-button>
+      </div>
+      <!-- Calm explanation shown when standing by (superseded by another
+           Photoshop, or user-disconnected) — a state, not a fault. -->
+      <div id="cpsb-standby-line" class="cpsb-muted cpsb-conn-line"></div>
       <div id="cpsb-last-error" class="cpsb-error-line cpsb-conn-line"></div>
       <div id="cpsb-retry-line" class="cpsb-muted cpsb-conn-line"></div>
 
