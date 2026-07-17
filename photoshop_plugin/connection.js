@@ -26,10 +26,10 @@ const { localFileSystem } = uxp.storage
  * support a non-default port — see PLAN.md §6/§10 — so this is a constant,
  * not a setting.
  */
-const WS_URL = 'ws://127.0.0.1:8188/cpsb/ws'
+const WS_URL = 'ws://localhost:8188/cpsb/ws'
 
 /** HTTP origin for the `/cpsb/file/*` and `/cpsb/upload` routes (PROTOCOL.md §2). */
-const HTTP_ORIGIN = 'http://127.0.0.1:8188'
+const HTTP_ORIGIN = 'http://localhost:8188'
 
 /** Exponential backoff schedule in ms, capping at 10s forever (PLAN.md §5). */
 const BACKOFF_STEPS_MS = [1000, 2000, 5000, 10000]

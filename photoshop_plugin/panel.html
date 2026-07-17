@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      CSS is INLINED here (not an external <link>) so it can never fail to
+      load: an inline <style> cannot 404, whereas an external stylesheet
+      depends on relative-path resolution that historically rendered this
+      panel bare. This is the pattern Adobe's own io-websocket-example
+      sample uses (its index.html carries a <style> block, not a <link>).
+      <style> is a documented, supported UXP element (uxp-api HTML
+      reference, "style", since UXP v2.0).
+
+      Property subset note: everything below appears in Adobe's CSS property
+      reference (uxp-api/reference-css/styles/). Deliberately avoided because
+      they are undocumented and silently no-op in a real Photoshop panel:
+      `gap` (spacing via margins instead), `text-transform` (headings are
+      written uppercase directly), the bare `border:` shorthand (only
+      per-side shorthands + width/style/color longhands are documented),
+      `cursor`, `list-style`. Colors come only from Photoshop's documented
+      theme-aware variables (--uxp-host-*), so the panel reads correctly in
+      all four PS themes; the only fixed colors are the semantic status-dot
+      fills and the error accent.
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+      }
+
+      .cpsb-panel {
+        height: 100%;
+        overflow-y: auto;
+        padding: 14px;
+        color: var(--uxp-host-text-color);
+        background-color: var(--uxp-host-background-color);
+        font-size: var(--uxp-host-font-size, 12px);
+      }
+
+      /* --- Boot banner: always-visible build identity (proof of life) --- */
+
+      .cpsb-version {
+        font-weight: 700;
+        margin-bottom: 10px;
+      }
+
+      .cpsb-version-muted {
+        color: var(--uxp-host-text-color-secondary);
+      }
+
+      /* --- Fatal-error surface: hidden until index.js catches a throw --- */
+
+      .cpsb-fatal {
+        display: none;
+        color: #e74c3c;
+        white-space: pre-wrap;
+        margin-bottom: 10px;
+        padding: 8px;
+        border-width: 1px;
+        border-style: solid;
+        border-color: #e74c3c;
+        border-radius: 4px;
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+      }
+
+      /* --- Connection pill --- */
+
+      .cpsb-status-pill {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        border-width: 1px;
+        border-style: solid;
+        border-color: var(--uxp-host-border-color);
+        border-radius: 12px;
+        padding: 5px 12px;
+        margin-bottom: 8px;
+      }
+
+      .cpsb-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        margin-right: 8px;
+        background-color: #808080;
+      }
+
+      .cpsb-dot-connected {
+        background-color: #2ecc71;
+      }
+
+      .cpsb-dot-connecting {
+        background-color: #e6b800;
+      }
+
+      .cpsb-dot-disconnected {
+        background-color: #e74c3c;
+      }
+
+      .cpsb-status-text {
+        font-weight: 600;
+      }
+
+      /* --- Connection detail lines (URL, last error, retry state) --- */
+
+      .cpsb-conn-line {
+        margin-top: 2px;
+        margin-bottom: 2px;
+      }
+
+      .cpsb-muted {
+        color: var(--uxp-host-text-color-secondary);
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+      }
+
+      .cpsb-error-line {
+        color: #e74c3c;
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+        white-space: pre-wrap;
+      }
+
+      /* Accent added to the version banner on a plugin/server mismatch.
+         Color only — it sits alongside .cpsb-version (which keeps the
+         banner's weight and size) and is self-sufficient, so the accent
+         never depends on cascade order between competing classes. */
+      .cpsb-version-mismatch {
+        color: #e74c3c;
+      }
+
+      /* --- Sections --- */
+
+      .cpsb-rule {
+        height: 1px;
+        background-color: var(--uxp-host-border-color);
+        margin-top: 12px;
+        margin-bottom: 12px;
+      }
+
+      .cpsb-section-title {
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+        font-weight: 700;
+        letter-spacing: 1px;
+        color: var(--uxp-host-label-text-color);
+        margin-bottom: 8px;
+      }
+
+      /* --- Handoff list (plain divs: UXP treats ul/li as divs anyway) --- */
+
+      .cpsb-empty {
+        color: var(--uxp-host-text-color-secondary);
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+        padding-top: 2px;
+        padding-bottom: 2px;
+      }
+
+      .cpsb-handoff-item {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        border-bottom-width: 1px;
+        border-bottom-style: solid;
+        border-bottom-color: var(--uxp-host-border-color);
+      }
+
+      .cpsb-handoff-item:last-child {
+        border-bottom-width: 0;
+      }
+
+      .cpsb-handoff-name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        margin-right: 8px;
+      }
+
+      .cpsb-handoff-status {
+        color: var(--uxp-host-text-color-secondary);
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+        margin-right: 8px;
+      }
+
+      /* --- Advanced section (JS-driven disclosure: <details> unsupported) --- */
+
+      .cpsb-advanced-toggle {
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+      }
+
+      .cpsb-advanced-toggle .cpsb-section-title {
+        margin-bottom: 0;
+      }
+
+      .cpsb-caret {
+        margin-right: 6px;
+        font-size: var(--uxp-host-font-size-smaller, 11px);
+        color: var(--uxp-host-text-color-secondary);
+      }
+
+      .cpsb-log {
+        margin-top: 8px;
+        max-height: 160px;
+        overflow-y: auto;
+        overflow-x: auto;
+        padding: 6px;
+        font-size: 10px;
+        font-family: Courier, monospace;
+        white-space: pre-wrap;
+        color: var(--uxp-host-text-color-secondary);
+        background-color: var(--uxp-host-widget-hover-background-color);
+        border-width: 1px;
+        border-style: solid;
+        border-color: var(--uxp-host-border-color);
+        border-radius: 4px;
+      }
+
+      .cpsb-collapsed {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="cpsb-panel">
+      <!-- Boot banner + fatal surface: index.js writes the version into
+           #cpsb-version the instant it runs (proof fresh code loaded after a
+           reload), and any top-level throw during setup lands in #cpsb-fatal
+           instead of leaving the panel silently bare. -->
+      <div id="cpsb-version" class="cpsb-version cpsb-version-muted">Plugin loading…</div>
+      <div id="cpsb-fatal" class="cpsb-fatal"></div>
+
+      <div class="cpsb-status-pill">
+        <span id="cpsb-status-dot" class="cpsb-dot cpsb-dot-disconnected"></span>
+        <span id="cpsb-status-text" class="cpsb-status-text">Disconnected</span>
+      </div>
+      <div id="cpsb-server-url" class="cpsb-muted cpsb-conn-line"></div>
+      <div id="cpsb-last-error" class="cpsb-error-line cpsb-conn-line"></div>
+      <div id="cpsb-retry-line" class="cpsb-muted cpsb-conn-line"></div>
+
+      <div class="cpsb-rule"></div>
+
+      <!-- Headings written uppercase directly: text-transform is not in
+           UXP's documented CSS property set. -->
+      <div class="cpsb-section-title">ACTIVE HANDOFFS</div>
+      <div id="cpsb-handoff-list">
+        <div class="cpsb-empty">No documents from ComfyUI are currently open.</div>
+      </div>
+
+      <div class="cpsb-rule"></div>
+
+      <!-- Plain div + JS click toggle: <details>/<summary> are unsupported
+           in UXP (treated as bare divs, so the disclosure never collapses),
+           and the `hidden` attribute is documented as unsupported too. -->
+      <div id="cpsb-advanced-toggle" class="cpsb-advanced-toggle">
+        <span id="cpsb-advanced-caret" class="cpsb-caret">&#9656;</span>
+        <span class="cpsb-section-title">ADVANCED</span>
+      </div>
+      <pre id="cpsb-log" class="cpsb-log cpsb-collapsed"></pre>
+    </div>
+    <!-- Classic script (NOT type="module": UXP does not support ES-module
+         script tags; it uses CommonJS require(), which every module here
+         does). Placed at end of <body> so the DOM exists when index.js's
+         top-level boot code writes the version banner. -->
+    <script src="index.js"></script>
+  </body>
+</html>

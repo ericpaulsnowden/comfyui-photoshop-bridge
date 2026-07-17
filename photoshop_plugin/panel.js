@@ -49,7 +49,9 @@ function initPanel() {
   const serverUrlEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-server-url'))
   const lastErrorEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-last-error'))
   const retryEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-retry-line'))
-  const versionEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-version-line'))
+  // The always-visible boot banner index.js paints at load; panel.js takes
+  // it over once connection state is known (adds the server version).
+  const versionEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-version'))
   const handoffList = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-list'))
   const logEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-log'))
   const advancedToggle = /** @type {HTMLElement} */ (
@@ -94,15 +96,14 @@ function initPanel() {
       versionEl.textContent = mismatch
         ? `Plugin v${pluginVersion} • Server v${state.serverVersion} (update mismatch)`
         : `Plugin v${pluginVersion} • Server v${state.serverVersion}`
-      // On mismatch, cpsb-mismatch REPLACES cpsb-muted (rather than
-      // overriding it) so the accent never depends on CSS cascade order.
-      versionEl.className = mismatch
-        ? 'cpsb-conn-line cpsb-mismatch'
-        : 'cpsb-muted cpsb-conn-line'
+      // On mismatch, add the color-only accent class alongside the banner
+      // class (which keeps the banner's weight/size); the accent is
+      // self-sufficient so styling never depends on CSS cascade order.
+      versionEl.className = mismatch ? 'cpsb-version cpsb-version-mismatch' : 'cpsb-version'
       return
     }
     versionEl.textContent = `Plugin v${pluginVersion}`
-    versionEl.className = 'cpsb-muted cpsb-conn-line'
+    versionEl.className = 'cpsb-version'
   }
 
   /** @returns {void} */

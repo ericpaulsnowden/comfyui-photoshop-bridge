@@ -37,6 +37,18 @@ if [[ -n "${stray_node_modules}" ]]; then
   exit 1
 fi
 
+# A .ccx must contain exactly one manifest.json, at the archive root. A
+# manifest nested in a subdirectory means stray/foreign plugin files snuck
+# into photoshop_plugin/ (e.g. a UDT scratch plugin) and would be packaged
+# into a corrupt multi-manifest .ccx. Refuse rather than ship that.
+stray_manifest="$(find "${plugin_dir}" -mindepth 2 -name manifest.json -print -quit)"
+if [[ -n "${stray_manifest}" ]]; then
+  echo "error: found a nested manifest.json under ${plugin_dir}" \
+    "(${stray_manifest}) -- only the top-level manifest.json belongs in a" \
+    ".ccx; remove the stray plugin directory before packaging" >&2
+  exit 1
+fi
+
 version="$(grep -m1 '"version"' "${manifest}" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
 if [[ -z "${version}" ]]; then
   echo "error: could not read a \"version\" field out of ${manifest}" >&2
