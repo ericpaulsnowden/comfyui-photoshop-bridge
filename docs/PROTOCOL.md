@@ -541,27 +541,37 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `mask` (MASK). Widgets: `annotate_mode` (COMBO: "Pass through" (default) |
   "Open in Photoshop (mask from edits)"); `box_composite` (BOOLEAN, default False).
   Hidden: `unique_id`.
-- Outputs: (IMAGE original passthrough, MASK, STRING instruction, IMAGE annotated) —
-  `annotated` is the original unless `box_composite` is True, in which case it is a
-  copy with a red rectangle at the final mask's bounding box (the mark convention
-  Kontext/Qwen-Image-Edit document responding to).
-- MASK resolution precedence: (1) Photoshop DIFF mask — when annotate_mode is the PS
-  mode and the node's active handoff (source_hash-matched) has an edit, mask = pixels
-  where |edit − source| exceeds a small threshold, morphologically closed and
-  hole-filled (scipy when available — ComfyUI ships it — guarded with a PIL-only
-  fallback), so the user may mark with ANY tool/color; (2) else the `mask` input
-  socket (ComfyUI-only tier: MaskEditor or any mask source upstream); (3) else zeros.
-- PS mode behavior (BLOCKS, product-owner update 2026-07-17): on execute with no
-  matching edit, write the handoff (origin_kind `bridge_node`), open Photoshop, and
-  BLOCK the workflow via manager.wait_for_edit (identical to the §6 bridge node's "Wait
-  for first save") until the user marks up and saves; then derive the diff mask and
-  continue with the package outputs. Cancel/timeout interrupt via
-  InterruptProcessingException, exactly like the bridge node. (Was previously
-  non-blocking; the workflow must stop until save.) The open MUST reliably fire the
-  tier-selected launch and log each step (a `cpsb annotate:` trail like the bridge
-  node's, so a "didn't open" report is diagnosable). When browsed remotely, Photoshop
-  opens on the SERVER machine (cross-machine Tier 1 is Round 2) — which is exactly why
-  the editing badge must be cancelable from ComfyUI (§8 universal-cancel).
+- Outputs: (IMAGE, MASK, STRING instruction, IMAGE annotated). In PS mode the IMAGE is
+  the SAVED composite EXCLUDING the `Instructions` layer (so any edit the user made to
+  the base image BAKES IN); pass-through mode passes the input image through unchanged.
+  `annotated` is the IMAGE unless `box_composite` is True, in which case it is a copy
+  with a red rectangle at the final mask's bounding box (the mark convention
+  Kontext/Qwen-Image-Edit document responding to). STRING is the instruction verbatim.
+- PS-mode markup uses a dedicated **`Instructions` LAYER** (product-owner redesign
+  2026-07-17, replacing the old whole-image pixel diff + scipy morphology, all removed):
+  on open the node writes `source.psd` LAYERED — the input image as a base layer + a
+  fully-transparent top layer named exactly `Instructions`. The user draws on that layer
+  to mark the region (any color) and may also edit the base image. On save the node
+  reopens the saved layered `source.psd`:
+  - **`Instructions` top-level layer found** → MASK = that layer's alpha (read via
+    `layer.composite(viewport=psd.viewbox)` — in an RGB-mode document psd-tools stores the
+    paint's transparency as a layer mask, so `.composite()`, not `.topil()`, reads it
+    back, and the viewport re-expands Photoshop's trimmed layer bounds to the full canvas);
+    IMAGE = composite of all OTHER layers (`layer_filter` excluding it by identity).
+  - **renamed/deleted** → treated as a plain image: IMAGE = full composite, MASK = None →
+    falls through to the mask precedence below.
+  - NB: REMOTE Tier 2 degrades to the empty-`Instructions` case (the plugin uploads a flat
+    PNG and never overwrites the server-side layered `source.psd`) until layered upload
+    lands.
+- MASK resolution precedence: (1) the PS-mode `Instructions`-layer mask above; (2) else
+  the `mask` input socket (ComfyUI-only tier: MaskEditor or any mask source upstream);
+  (3) else zeros.
+- PS mode BLOCKS (product-owner update 2026-07-17): on execute with no matching edit,
+  write the LAYERED handoff (origin_kind `bridge_node`), open Photoshop, and BLOCK via
+  `manager.wait_for_edit` (like the §6 bridge node's "Wait for first save") until the user
+  marks up and saves; then read the saved PSD (above). Cancel/timeout/error interrupt via
+  InterruptProcessingException (§8, incl. ComfyUI's native cancel). The open logs a
+  `cpsb annotate:` trail so a "didn't open" report is diagnosable.
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 

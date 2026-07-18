@@ -10,11 +10,24 @@ loop is needed here: with no Tier 2 plugin ever connected in these tests,
 every open this node attempts takes the synchronous Tier 1 path, which never
 touches the loop at all (see ``cpsb.nodes``'s own module docstring).
 
-PS mode now BLOCKS (PROTOCOL.md §6d, 2026-07-17 update), so its tests mirror
+PS mode BLOCKS (PROTOCOL.md §6d, 2026-07-17 update), so its tests mirror
 ``test_nodes.py``'s ``TestWaitForFirstSaveMode`` shape too: a
 ``threading.Timer`` delivers a delayed edit/cancel from a background thread
 while ``execute()`` blocks on the main thread, exactly like real Photoshop
 usage (a human's save always arrives long after the launch call returns).
+
+**The "Instructions" layer redesign (product-owner spec, 2026-07-17).** PS
+mode no longer diffs the whole image against a flat re-save; it writes the
+handoff PSD LAYERED (input image + a blank top-level "Instructions" layer)
+and, on save, reopens that same file with psd-tools to read the Instructions
+layer's own painted pixels as the MASK and the composite of every OTHER
+layer as the IMAGE. ``make_layered_psd``/``make_handoff_with_layered_edit``
+below build those saved-PSD fixtures directly (independent of the node's own
+write helper, ``cpsb.annotate._write_instructions_psd``) so the READ path is
+never just asserted against itself. The old whole-image diff machinery
+(``_raw_diff_mask``, ``_close_and_fill_mask``, the scipy/PIL-fallback
+morphology, and their dedicated test classes) is gone along with the
+feature it implemented.
 """
 
 from __future__ import annotations
@@ -31,6 +44,7 @@ import numpy as np
 import pytest
 from aiohttp import web
 from PIL import Image, ImageDraw
+from psd_tools import PSDImage
 
 import cpsb.annotate as annotate_module
 import cpsb.nodes as nodes_module
@@ -40,9 +54,11 @@ from cpsb.handoff import HandoffManager, SourceRef
 from cpsb.launcher import LaunchResult
 
 AnnotateMode = annotate_module.AnnotateMode
+INSTRUCTIONS_LAYER_NAME = annotate_module.INSTRUCTIONS_LAYER_NAME
 
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
 
 #: A short bound for every blocking-wait test below: real tests either
 #: deliver an edit/cancel from a background thread well before this elapses,
@@ -69,6 +85,55 @@ def tensor_from_image(image: Image.Image) -> np.ndarray:
     return np.asarray(image.convert("RGB"), dtype=np.float32)[None, ...] / 255.0
 
 
+def image_tensor_to_uint8_array(image_tensor) -> np.ndarray:
+    """A resolved ``IMAGE`` tensor's first frame as an ``(H, W, 3)`` uint8 array."""
+    return (image_tensor[0].numpy() * 255).round().astype(np.uint8)
+
+
+def make_layered_psd(
+    psd_path: Path,
+    base_image: Image.Image,
+    instructions_image: Image.Image | None = None,
+    instructions_layer_name: str = INSTRUCTIONS_LAYER_NAME,
+) -> None:
+    """Write a base(+Instructions) layered PSD at *psd_path* -- an independent
+    stand-in for "what Photoshop saved".
+
+    Built directly with psd-tools' own construction API
+    (``PSDImage.new(mode="RGB")`` -> ``create_pixel_layer``, the same one
+    :mod:`cpsb.compose_psd` verified empirically and
+    ``cpsb.annotate._write_instructions_psd`` itself uses) rather than by
+    calling that node function, so these tests check the READ side
+    (``cpsb.annotate._read_ps_saved_psd`` and friends) against an
+    independently-built fixture, not against the node's own write path.
+
+    Args:
+        psd_path: Destination path.
+        base_image: The bottom layer's pixels (any PIL mode; converted to
+            RGB).
+        instructions_image: If given, an RGBA image written as a second,
+            top-level layer named *instructions_layer_name*. Omitted
+            entirely (no second layer at all) when ``None`` -- the
+            "layer deleted" scenario.
+        instructions_layer_name: The name to give that second layer --
+            defaults to the real contract name, but a test can pass a
+            different one to build the "layer renamed" scenario.
+    """
+    psd_path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = base_image.size
+    psd = PSDImage.new(mode="RGB", size=(width, height), depth=8)
+    psd.create_pixel_layer(base_image.convert("RGB"), name="Base", top=0, left=0, opacity=255)
+    if instructions_image is not None:
+        psd.create_pixel_layer(
+            instructions_image.convert("RGBA"),
+            name=instructions_layer_name,
+            top=0,
+            left=0,
+            opacity=255,
+        )
+    psd.save(psd_path)
+
+
 @pytest.fixture
 def manager(context: CpsbContext) -> HandoffManager:
     return HandoffManager(context)
@@ -80,7 +145,7 @@ def configured(context: CpsbContext, manager: HandoffManager):
 
     Fine for anything that never actually opens Photoshop: pass-through mode
     (which never looks up a handoff at all), or PS mode against a handoff
-    that already has an edit (``_resolve_ps_mode_diff_mask`` only reaches the
+    that already has an edit (``_resolve_ps_mode_edit`` only reaches the
     open/block path when there is no consumable edit yet).
     """
     nodes_module.configure(context, manager, cast("object", None), cast("object", None))
@@ -113,7 +178,19 @@ def node(context: CpsbContext, manager: HandoffManager, launches):
 def make_handoff_with_edit(
     manager: HandoffManager, node_id: str, source: Image.Image, edit: Image.Image
 ) -> str:
-    """A ``bridge_node`` handoff for *source*, already carrying one *edit*."""
+    """A ``bridge_node`` handoff for *source*, already carrying one ingested *edit*.
+
+    Deliberately does NOT write a ``source.psd`` (mirrors ``manager.create``'s
+    own docstring: "Does not write source.psd"). Only usable by tests that
+    never call ``execute()``'s PS-mode consume path -- which now re-opens
+    ``source.psd`` with psd-tools (``cpsb.annotate._read_ps_saved_psd``) and
+    would fail against a handoff with no such file. Safe for ``IS_CHANGED``
+    tests (:class:`TestIsChanged`), which only ever consult
+    ``manager.latest_edit_hash`` (the ingested edit PNG's hash), never
+    ``source.psd`` itself -- and for pass-through-mode tests, which never
+    look up a handoff at all. See :func:`make_handoff_with_layered_edit` for
+    the ``execute()``-safe equivalent.
+    """
     meta = manager.create(
         origin_node_id=node_id,
         origin_kind="bridge_node",
@@ -122,6 +199,40 @@ def make_handoff_with_edit(
         original_image=source,
     )
     manager.ingest_edit(meta.handoff_id, edit, "plugin")
+    return meta.handoff_id
+
+
+def make_handoff_with_layered_edit(
+    manager: HandoffManager,
+    node_id: str,
+    source: Image.Image,
+    saved_base: Image.Image,
+    instructions_image: Image.Image | None,
+    instructions_layer_name: str = INSTRUCTIONS_LAYER_NAME,
+) -> str:
+    """A ``bridge_node`` handoff for *source* with a SAVED layered ``source.psd``
+    already on disk, plus one edit recorded so the consume-without-reopening
+    path is taken.
+
+    The node under test reads ``source.psd`` directly
+    (``cpsb.annotate._read_ps_saved_psd``), not the ingested edit PNG -- so
+    this is the layered-PSD analogue of :func:`make_handoff_with_edit`:
+    ``manager.ingest_edit`` still needs to fire (that's what makes
+    ``active.edits`` non-empty, the signal the consume-without-reopening
+    branch checks for), but the pixel content it's given is never looked at
+    by the node -- only what :func:`make_layered_psd` writes to
+    ``source.psd`` is.
+    """
+    meta = manager.create(
+        origin_node_id=node_id,
+        origin_kind="bridge_node",
+        workflow_name="",
+        source=SourceRef(filename=f"annotate_{node_id}.png", subfolder="", type="temp"),
+        original_image=source,
+    )
+    psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+    make_layered_psd(psd_path, saved_base, instructions_image, instructions_layer_name)
+    manager.ingest_edit(meta.handoff_id, saved_base, "plugin")
     return meta.handoff_id
 
 
@@ -197,9 +308,9 @@ class TestInstructionPassthrough:
     def test_exact_string_returned_ps_mode(self, node, manager):
         """PS mode with a pre-existing edit: the consume path, no blocking."""
         source = Image.new("RGB", (24, 16), RED)
-        edit = source.copy()
-        edit.putpixel((1, 1), (0, 255, 0))
-        make_handoff_with_edit(manager, "61", source, edit)
+        instructions = Image.new("RGBA", (24, 16), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).rectangle((1, 1, 3, 3), fill=(255, 255, 255, 255))
+        make_handoff_with_layered_edit(manager, "61", source, source, instructions)
 
         result = node.execute(
             image=tensor_from_image(source),
@@ -213,224 +324,270 @@ class TestInstructionPassthrough:
         assert result[2] == "fix the sky"
 
 
-class TestRawDiffMask:
-    def test_detects_pixels_above_threshold(self):
-        source = Image.new("RGB", (10, 10), (0, 0, 0))
-        edit = Image.new("RGB", (10, 10), (0, 0, 0))
-        edit.putpixel((3, 4), (50, 50, 50))
-        raw = annotate_module._raw_diff_mask(source, edit)
-        assert raw[4, 3]
-        assert raw.sum() == 1
-
-    def test_below_threshold_is_ignored(self):
-        source = Image.new("RGB", (10, 10), (100, 100, 100))
-        edit = Image.new("RGB", (10, 10), (100, 100, 100))
-        edit.putpixel((2, 2), (105, 100, 100))  # diff = 5 < threshold
-        raw = annotate_module._raw_diff_mask(source, edit)
-        assert not raw.any()
-
-    def test_diff_exactly_at_threshold_is_ignored(self):
-        source = Image.new("RGB", (5, 5), (0, 0, 0))
-        edit = source.copy()
-        edit.putpixel((1, 1), (annotate_module._DIFF_THRESHOLD,) * 3)
-        raw = annotate_module._raw_diff_mask(source, edit)
-        assert not raw.any()  # strictly greater-than: exactly-at doesn't count
-
-    def test_diff_one_above_threshold_is_detected(self):
-        source = Image.new("RGB", (5, 5), (0, 0, 0))
-        edit = source.copy()
-        edit.putpixel((1, 1), (annotate_module._DIFF_THRESHOLD + 1,) * 3)
-        raw = annotate_module._raw_diff_mask(source, edit)
-        assert raw[1, 1]
-
-    def test_size_mismatch_returns_none(self):
-        source = Image.new("RGB", (10, 10), (0, 0, 0))
-        edit = Image.new("RGB", (12, 10), (0, 0, 0))
-        assert annotate_module._raw_diff_mask(source, edit) is None
-
-
-class TestCloseAndFillMask:
-    """A hollow square ring so the scipy-vs-fallback distinction is exact
-    and deterministic (no PIL anti-aliasing/ellipse-rendering ambiguity).
+class TestWriteLayeredHandoff:
+    """product-owner spec, 2026-07-17: opening PS mode with no active handoff
+    writes the handoff PSD LAYERED -- the input image as a base pixel layer
+    plus a fully-transparent top-level layer named exactly "Instructions" --
+    instead of the old flat, single-layer write.
     """
 
-    @staticmethod
-    def _hollow_ring(size: int = 20) -> np.ndarray:
-        raw = np.zeros((size, size), dtype=bool)
-        raw[5:15, 5] = True  # left edge
-        raw[5:15, 14] = True  # right edge
-        raw[5, 5:15] = True  # top edge
-        raw[14, 5:15] = True  # bottom edge
-        return raw
+    def test_source_psd_has_base_plus_blank_instructions_layer(self, node, manager, launches):
+        node_id = "120"
+        width, height = 12, 10
+        tensor = make_tensor(RED, size=(width, height))
 
-    def test_scipy_fills_interior_of_closed_ring(self):
-        assert annotate_module._import_scipy_ndimage() is not None  # sanity: real scipy
-        raw = self._hollow_ring()
-        result = annotate_module._close_and_fill_mask(raw)
-        assert result[5, 5]  # boundary still set
-        assert result[10, 10]  # interior filled
+        with raises_interrupt():
+            node.execute(
+                image=tensor,
+                instruction="",
+                annotate_mode=AnnotateMode.PS_MODE,
+                box_composite=False,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                mask=None,
+            )
 
-    def test_close_and_fill_dispatches_to_fallback_when_scipy_missing(self, monkeypatch):
-        monkeypatch.setattr(annotate_module, "_import_scipy_ndimage", lambda: None)
-        raw = self._hollow_ring()
-        result = annotate_module._close_and_fill_mask(raw)
-        assert result[5, 5]  # boundary still set (dilated, at least as large)
-        assert not result[10, 10]  # no fill_holes equivalent: interior stays empty
+        active = manager.find_active_for_node(node_id)
+        psd_path = manager.handoff_dir(active.handoff_id) / "source.psd"
+        assert psd_path.exists()
 
-    def test_dilate_only_fallback_directly(self):
-        raw = self._hollow_ring()
-        result = annotate_module._dilate_only_fallback(raw)
-        assert result[5, 5]
-        assert not result[10, 10]
+        psd = PSDImage.open(psd_path)
+        top_level = list(psd)
+        assert len(top_level) == 2  # exactly the base layer + Instructions
+        names = [layer.name for layer in top_level]
+        assert names.count(INSTRUCTIONS_LAYER_NAME) == 1
+        assert top_level[-1].name == INSTRUCTIONS_LAYER_NAME  # topmost: last-inserted
 
-    def test_all_zero_raw_mask_returned_unchanged(self):
-        raw = np.zeros((10, 10), dtype=bool)
-        result = annotate_module._close_and_fill_mask(raw)
-        assert not result.any()
+        instructions_layer = next(
+            layer for layer in psd if layer.name == INSTRUCTIONS_LAYER_NAME
+        )
+        composite = instructions_layer.composite(viewport=psd.viewbox)
+        assert composite is not None
+        alpha = np.array(composite.convert("RGBA").split()[-1])
+        assert not alpha.any()  # fully transparent everywhere
+
+        base_layer = next(layer for layer in psd if layer.name != INSTRUCTIONS_LAYER_NAME)
+        base_composite = base_layer.composite(viewport=psd.viewbox).convert("RGB")
+        assert base_composite.size == (width, height)
+        assert base_composite.getpixel((0, 0)) == RED
+
+    def test_launched_psd_path_matches_the_written_source_psd(self, node, manager, launches):
+        """The exact path handed to ``launch_photoshop`` is the layered file
+        just asserted above -- not some other intermediate path.
+        """
+        node_id = "121"
+        tensor = make_tensor(RED)
+        with raises_interrupt():
+            node.execute(
+                image=tensor,
+                instruction="",
+                annotate_mode=AnnotateMode.PS_MODE,
+                box_composite=False,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                mask=None,
+            )
+        active = manager.find_active_for_node(node_id)
+        expected = manager.handoff_dir(active.handoff_id) / "source.psd"
+        assert launches == [str(expected)]
 
 
-class TestDiffMaskCorrectnessEndToEnd:
-    """The real diff -> close -> fill pipeline through ``execute()`` itself,
-    on a synthetic "circled it" gesture: a hollow outline, not a filled
-    blob, so ``binary_fill_holes`` has real interior to fill.
+class TestReadFoundInstructionsLayer:
+    """product-owner spec: a saved PSD with a top-level "Instructions" layer
+    yields MASK = that layer's own opacity and IMAGE = the composite of
+    every OTHER layer -- so a base-layer edit bakes into the image output,
+    while paint on the Instructions layer never does.
     """
 
     @pytest.fixture(autouse=True)
     def _require_torch(self):
         pytest.importorskip("torch")
 
-    @staticmethod
-    def _ring_source_and_edit(size: tuple[int, int] = (40, 40)) -> tuple[Image.Image, Image.Image]:
-        width, height = size
-        source = Image.new("RGB", (width, height), (0, 0, 0))
-        edit = source.copy()
-        ImageDraw.Draw(edit).ellipse((8, 8, 31, 31), outline=(255, 255, 255), width=3)
-        return source, edit
+    def test_painted_instructions_layer_mask_matches_painted_region(self, node, manager):
+        node_id = "130"
+        width, height = 24, 16
+        source = Image.new("RGB", (width, height), RED)
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).rectangle((5, 3, 10, 8), fill=(255, 255, 255, 255))
+        make_handoff_with_layered_edit(manager, node_id, source, source, instructions)
 
-    def test_scipy_path_fills_the_ring_interior(self, node, manager):
-        source, edit = self._ring_source_and_edit()
-        make_handoff_with_edit(manager, "70", source, edit)
-
-        tensor = tensor_from_image(source)
-        _, mask_out, _, _ = node.execute(
-            image=tensor,
+        image_out, mask_out, _, _ = node.execute(
+            image=tensor_from_image(source),
             instruction="",
             annotate_mode=AnnotateMode.PS_MODE,
             box_composite=False,
             timeout_seconds=60,
-            unique_id="70",
+            unique_id=node_id,
             mask=None,
         )
 
         mask_np = mask_out[0].numpy()
-        assert mask_np[8, 19] > 0  # the ring's own boundary
-        assert mask_np[19, 19] > 0  # dead center: filled by binary_fill_holes
+        assert mask_np[3:9, 5:11].min() > 0.9  # painted region: opaque
+        assert mask_np[0, 0] == 0  # untouched region: fully zero
+        assert mask_np[15, 23] == 0  # opposite corner: fully zero
 
-    def test_fallback_path_dilates_but_does_not_fill_interior(self, node, manager, monkeypatch):
-        monkeypatch.setattr(annotate_module, "_import_scipy_ndimage", lambda: None)
-        source, edit = self._ring_source_and_edit()
-        make_handoff_with_edit(manager, "71", source, edit)
+        # The base layer was never touched -- image output is the source,
+        # unaffected by the Instructions layer's own paint.
+        image_np = image_tensor_to_uint8_array(image_out)
+        assert np.array_equal(image_np, np.array(source))
 
-        tensor = tensor_from_image(source)
-        _, mask_out, _, _ = node.execute(
-            image=tensor,
+    def test_edited_base_layer_bakes_into_image_output(self, node, manager):
+        """A base layer the user actually painted on (not just the
+        Instructions layer) bakes that edit into the IMAGE output --
+        "any edits the user made to the base image BAKE INTO the image
+        output" (product-owner spec).
+        """
+        node_id = "132"
+        width, height = 20, 14
+        source = Image.new("RGB", (width, height), RED)
+        saved_base = source.copy()
+        ImageDraw.Draw(saved_base).rectangle((2, 2, 6, 6), fill=BLUE)
+        # Instructions layer present but left blank -- isolates the "base
+        # edit bakes in" behavior from any mask painting.
+        blank_instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        make_handoff_with_layered_edit(manager, node_id, source, saved_base, blank_instructions)
+
+        image_out, mask_out, _, _ = node.execute(
+            image=tensor_from_image(source),
             instruction="",
             annotate_mode=AnnotateMode.PS_MODE,
             box_composite=False,
             timeout_seconds=60,
-            unique_id="71",
+            unique_id=node_id,
             mask=None,
         )
 
-        mask_np = mask_out[0].numpy()
-        assert mask_np[8, 19] > 0  # boundary still (dilated-)marked
-        assert mask_np[19, 19] == 0  # dead center: no fill_holes equivalent, stays empty
+        image_np = image_tensor_to_uint8_array(image_out)
+        assert np.array_equal(image_np, np.array(saved_base))  # edit baked in
+        assert tuple(image_np[4, 4]) == BLUE  # inside the edited patch
+        assert tuple(image_np[0, 0]) == RED  # outside it: untouched
 
-
-class TestMaskPrecedence:
-    """PROTOCOL.md §6d: diff mask (1) > mask socket (2) > zeros (3)."""
-
-    @pytest.fixture(autouse=True)
-    def _require_torch(self):
-        pytest.importorskip("torch")
-
-    def test_zeros_when_pass_through_and_no_mask_socket(self, node):
         import torch
 
-        tensor = make_tensor((10, 20, 30))
-        _, mask_out, _, _ = node.execute(
-            image=tensor,
+        assert torch.count_nonzero(mask_out).item() == 0  # Instructions left blank
+
+    def test_box_composite_draws_box_from_layer_derived_mask(self, node, manager):
+        node_id = "131"
+        width, height = 60, 50
+        source = Image.new("RGB", (width, height), (0, 0, 0))
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        # A wide margin around the painted region so the box's 4px stroke
+        # leaves genuine untouched interior to check (unlike a thin mask,
+        # where the stroke could eat the whole region).
+        ImageDraw.Draw(instructions).rectangle((10, 10, 50, 40), fill=(255, 255, 255, 255))
+        make_handoff_with_layered_edit(manager, node_id, source, source, instructions)
+
+        _, _, _, annotated_out = node.execute(
+            image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
-            box_composite=False,
+            annotate_mode=AnnotateMode.PS_MODE,
+            box_composite=True,
             timeout_seconds=60,
-            unique_id="80",
+            unique_id=node_id,
             mask=None,
         )
-        assert mask_out.shape == (1, 16, 24)
+
+        annotated_np = image_tensor_to_uint8_array(annotated_out)
+        assert tuple(annotated_np[10, 10]) == RED  # top-left border pixel of the box
+        assert tuple(annotated_np[25, 30]) == (0, 0, 0)  # deep interior: untouched (unfilled box)
+
+
+class TestReadMissingInstructionsLayer:
+    """product-owner spec: no top-level "Instructions" layer (renamed or
+    deleted) falls back to treating the saved file as a plain edited image.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_no_instructions_layer_yields_full_composite_and_zero_mask(self, node, manager):
+        node_id = "140"
+        width, height = 20, 14
+        source = Image.new("RGB", (width, height), RED)
+        saved = Image.new("RGB", (width, height), GREEN)
+        make_handoff_with_layered_edit(manager, node_id, source, saved, instructions_image=None)
+
+        image_out, mask_out, _, _ = node.execute(
+            image=tensor_from_image(source),
+            instruction="",
+            annotate_mode=AnnotateMode.PS_MODE,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id=node_id,
+            mask=None,
+        )
+
+        image_np = image_tensor_to_uint8_array(image_out)
+        assert np.array_equal(image_np, np.array(saved))  # full composite, no layer excluded
+
+        import torch
+
         assert torch.count_nonzero(mask_out).item() == 0
 
-    def test_socket_mask_used_when_pass_through(self, node):
+    def test_no_instructions_layer_falls_back_to_mask_socket(self, node, manager):
         import torch
 
-        tensor = make_tensor(RED)
-        socket_mask = torch.zeros((1, 16, 24))
-        socket_mask[0, 3, 5] = 0.75
+        node_id = "143"
+        width, height = 20, 14
+        source = Image.new("RGB", (width, height), RED)
+        make_handoff_with_layered_edit(
+            manager, node_id, source, source, instructions_image=None
+        )
+
+        socket_mask = torch.zeros((1, height, width))
+        socket_mask[0, 5, 5] = 0.75
+
         _, mask_out, _, _ = node.execute(
-            image=tensor,
+            image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            annotate_mode=AnnotateMode.PS_MODE,
             box_composite=False,
             timeout_seconds=60,
-            unique_id="81",
+            unique_id=node_id,
             mask=socket_mask,
         )
         assert torch.allclose(mask_out, socket_mask)
 
-    def test_diff_mask_wins_over_socket_mask_in_ps_mode(self, node, manager):
-        node_id = "82"
-        source = Image.new("RGB", (24, 16), (0, 0, 0))
-        edit = source.copy()
-        edit.putpixel((5, 5), (255, 255, 255))
-        make_handoff_with_edit(manager, node_id, source, edit)
+    def test_renamed_instructions_layer_bakes_its_own_paint_into_full_composite(
+        self, node, manager
+    ):
+        """A layer that WOULD have been "Instructions" but got renamed is no
+        longer excluded from anything -- it's just another layer in the
+        full composite, paint and all (PROTOCOL.md §6d: "if that layer is
+        renamed or deleted then the image is just treated like an image").
+        """
+        node_id = "144"
+        width, height = 16, 12
+        source = Image.new("RGB", (width, height), RED)
+        renamed_layer_image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(renamed_layer_image).rectangle((2, 2, 5, 5), fill=(0, 0, 255, 255))
+        make_handoff_with_layered_edit(
+            manager,
+            node_id,
+            source,
+            source,
+            renamed_layer_image,
+            instructions_layer_name="Notes",
+        )
 
-        import torch
-
-        socket_mask = torch.zeros((1, 16, 24))
-        socket_mask[0, 10, 10] = 1.0  # a DIFFERENT location than the diff mask
-
-        _, mask_out, _, _ = node.execute(
+        image_out, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
             annotate_mode=AnnotateMode.PS_MODE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
-            mask=socket_mask,
-        )
-        assert mask_out[0, 5, 5] > 0  # the diff-mask pixel
-        assert mask_out[0, 10, 10] == 0  # the socket-only pixel is NOT used
-
-    def test_ps_mode_diff_ignored_when_annotate_mode_is_pass_through(self, node, manager):
-        """A leftover handoff+edit must not leak into pass-through mode."""
-        import torch
-
-        node_id = "83"
-        source = Image.new("RGB", (24, 16), (0, 0, 0))
-        edit = source.copy()
-        edit.putpixel((5, 5), (255, 255, 255))
-        make_handoff_with_edit(manager, node_id, source, edit)
-
-        _, mask_out, _, _ = node.execute(
-            image=tensor_from_image(source),
-            instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
-            box_composite=False,
-            timeout_seconds=60,
-            unique_id=node_id,
             mask=None,
         )
-        assert torch.count_nonzero(mask_out).item() == 0  # zeros tier: diff never consulted
+
+        image_np = image_tensor_to_uint8_array(image_out)
+        assert tuple(image_np[3, 3]) == BLUE  # the renamed layer's own paint, baked in
+        assert tuple(image_np[0, 0]) == RED  # untouched elsewhere
+
+        import torch
+
+        assert torch.count_nonzero(mask_out).item() == 0
 
 
 class TestBboxOfNonzero:
@@ -489,6 +646,93 @@ class TestBuildAnnotated:
         assert tuple(result_arr[15, 20]) == (0, 0, 0)  # deep interior: untouched (no fill)
 
 
+class TestMaskPrecedence:
+    """PROTOCOL.md §6d: PS mode's Instructions-layer mask > mask socket > zeros."""
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_zeros_when_pass_through_and_no_mask_socket(self, node):
+        import torch
+
+        tensor = make_tensor((10, 20, 30))
+        _, mask_out, _, _ = node.execute(
+            image=tensor,
+            instruction="",
+            annotate_mode=AnnotateMode.PASS_THROUGH,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id="80",
+            mask=None,
+        )
+        assert mask_out.shape == (1, 16, 24)
+        assert torch.count_nonzero(mask_out).item() == 0
+
+    def test_socket_mask_used_when_pass_through(self, node):
+        import torch
+
+        tensor = make_tensor(RED)
+        socket_mask = torch.zeros((1, 16, 24))
+        socket_mask[0, 3, 5] = 0.75
+        _, mask_out, _, _ = node.execute(
+            image=tensor,
+            instruction="",
+            annotate_mode=AnnotateMode.PASS_THROUGH,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id="81",
+            mask=socket_mask,
+        )
+        assert torch.allclose(mask_out, socket_mask)
+
+    def test_layer_mask_wins_over_socket_mask_in_ps_mode(self, node, manager):
+        node_id = "82"
+        width, height = 24, 16
+        source = Image.new("RGB", (width, height), (0, 0, 0))
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).point((5, 5), fill=(255, 255, 255, 255))
+        make_handoff_with_layered_edit(manager, node_id, source, source, instructions)
+
+        import torch
+
+        socket_mask = torch.zeros((1, height, width))
+        socket_mask[0, 10, 10] = 1.0  # a DIFFERENT location than the layer mask
+
+        _, mask_out, _, _ = node.execute(
+            image=tensor_from_image(source),
+            instruction="",
+            annotate_mode=AnnotateMode.PS_MODE,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id=node_id,
+            mask=socket_mask,
+        )
+        assert mask_out[0, 5, 5] > 0  # the layer-mask pixel
+        assert mask_out[0, 10, 10] == 0  # the socket-only pixel is NOT used
+
+    def test_ps_mode_ignored_when_annotate_mode_is_pass_through(self, node, manager):
+        """A leftover handoff+edit must not leak into pass-through mode."""
+        import torch
+
+        node_id = "83"
+        source = Image.new("RGB", (24, 16), (0, 0, 0))
+        edit = source.copy()
+        edit.putpixel((5, 5), (255, 255, 255))
+        make_handoff_with_edit(manager, node_id, source, edit)
+
+        _, mask_out, _, _ = node.execute(
+            image=tensor_from_image(source),
+            instruction="",
+            annotate_mode=AnnotateMode.PASS_THROUGH,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id=node_id,
+            mask=None,
+        )
+        assert torch.count_nonzero(mask_out).item() == 0  # zeros tier: handoff never consulted
+
+
 class TestPsModeBlocking:
     """PROTOCOL.md §6d (2026-07-17 update): PS mode with no consumable edit
     BLOCKS ``execute()`` -- open Photoshop, then wait -- instead of the
@@ -496,9 +740,10 @@ class TestPsModeBlocking:
     ``TestWaitForFirstSaveMode``/``TestExecute`` shapes.
     """
 
-    def test_blocks_until_edit_then_returns_diff_mask(self, node, manager, monkeypatch):
+    def test_blocks_until_edit_then_returns_instructions_mask(self, node, manager, monkeypatch):
         node_id = "110"
-        tensor = make_tensor(RED)
+        width, height = 24, 16
+        tensor = make_tensor(RED, size=(width, height))
 
         def _save_shortly_after_open(psd_path, override=""):
             # Ingest from a delayed background thread: the launch call
@@ -506,18 +751,21 @@ class TestPsModeBlocking:
             # lands, exactly as real Photoshop usage sequences (a human
             # editing and saving takes far longer than the launch call
             # itself) -- see test_nodes.py's identical pattern/comment.
-            def _do_ingest():
+            def _do_save():
                 active = manager.find_active_for_node(node_id)
-                edit = Image.new("RGB", (24, 16), RED)
-                edit.putpixel((5, 5), (0, 255, 0))
-                manager.ingest_edit(active.handoff_id, edit, "plugin")
+                saved_psd_path = manager.handoff_dir(active.handoff_id) / "source.psd"
+                base = Image.new("RGB", (width, height), RED)
+                instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                ImageDraw.Draw(instructions).point((5, 5), fill=(255, 255, 255, 255))
+                make_layered_psd(saved_psd_path, base, instructions)
+                manager.ingest_edit(active.handoff_id, base, "plugin")
 
-            threading.Timer(0.3, _do_ingest).start()
+            threading.Timer(0.3, _do_save).start()
             return LaunchResult(ok=True)
 
         monkeypatch.setattr(routes_module, "launch_photoshop", _save_shortly_after_open)
 
-        image_out, mask_out, instruction_out, _ = node.execute(
+        _, mask_out, instruction_out, _ = node.execute(
             image=tensor,
             instruction="mark the sky",
             annotate_mode=AnnotateMode.PS_MODE,
@@ -526,9 +774,8 @@ class TestPsModeBlocking:
             unique_id=node_id,
             mask=None,
         )
-        assert image_out is tensor  # IMAGE output: always the original passthrough
         assert instruction_out == "mark the sky"
-        assert mask_out[0, 5, 5] > 0  # the diff-mask pixel the background save introduced
+        assert mask_out[0, 5, 5] > 0  # the Instructions-layer pixel the background save painted
 
         active = manager.find_active_for_node(node_id)
         assert active is not None
@@ -742,10 +989,11 @@ class TestPsModeBlocking:
 class TestConsumePath:
     def test_consumes_existing_edit_without_reopening(self, node, manager, launches):
         node_id = "94"
-        source = Image.new("RGB", (24, 16), RED)
-        edit = source.copy()
-        edit.putpixel((2, 2), (0, 255, 0))
-        make_handoff_with_edit(manager, node_id, source, edit)
+        width, height = 24, 16
+        source = Image.new("RGB", (width, height), RED)
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).point((2, 2), fill=(255, 255, 255, 255))
+        make_handoff_with_layered_edit(manager, node_id, source, source, instructions)
 
         tensor = tensor_from_image(source)
         result = node.execute(
@@ -758,7 +1006,6 @@ class TestConsumePath:
             mask=None,
         )
         assert len(launches) == 0  # never opened: consumed the existing edit instead
-        assert result[0] is tensor  # IMAGE output stays the original, not the edit
         assert result[2] == "check this"
         assert result[1][0, 2, 2] > 0
 

@@ -5,11 +5,10 @@ Pairs a typed instruction with a region mask so a downstream model gets both
 without the user having to lay text out on the image by hand (the design
 brief this node exists to satisfy, ``research/research-annotate-node.md``
 §0). Two ways to produce the MASK: plug one in from any ComfyUI-only mask
-source (MaskEditor, a segmentation node, ...), or let the user mark up the
-image in Photoshop itself and derive the mask from the PIXEL DIFFERENCE
-between what was sent and what came back -- ANY tool/color works, since nothing
-here inspects layers or channels, only the final flattened pixels (PROTOCOL.md
-§4 removed channel-based extraction entirely; this node never relied on it).
+source (MaskEditor, a segmentation node, ...), or let the user mark up an
+auto-created **"Instructions" layer** in Photoshop and derive the mask from
+that layer's own painted pixels (product-owner spec, 2026-07-17 --
+superseding an earlier whole-image pixel-diff design, see below).
 
 Reuses :mod:`cpsb.nodes`' shared plumbing rather than duplicating it: tensor
 <-> PIL conversion (:func:`cpsb.nodes._tensor_to_pil` /
@@ -23,6 +22,32 @@ than re-implemented, so this node's Tier 1/Tier 2 behavior (and its bounded,
 non-hanging Tier 2 send) is identical to the bridge node's own by
 construction, not by a second copy that could drift.
 
+**The "Instructions" layer redesign (product-owner spec, 2026-07-17).** PS
+mode used to hand Photoshop a FLAT, layer-less PSD (:func:`cpsb.psd_io.write_psd`)
+and derive the MASK by diffing the whole flattened image against whatever
+came back -- workable with any tool/color, but unable to tell "the user
+painted a mask" apart from "the user edited the picture itself", and unable
+to preserve either signal independently. This node now instead writes the
+handoff PSD LAYERED (:func:`_write_instructions_psd`): the input image as a
+bottom pixel layer, plus a fully-transparent, top-level layer named exactly
+:data:`INSTRUCTIONS_LAYER_NAME` on top, ready for the user to draw on. On
+save, :func:`_read_ps_saved_psd` reopens that same saved ``source.psd`` with
+psd-tools and looks for that layer BY NAME: if it is still there, its own
+painted pixels (opaque vs. transparent) become the MASK directly, and the
+IMAGE output becomes the composite of every OTHER layer -- so any edit the
+user made to the base picture BAKES INTO the image output, while only the
+Instructions layer is treated specially. If the user renamed or deleted that
+layer, this falls back to treating the saved file as a plain edited image
+(full composite, MASK from the ordinary mask-socket/zeros precedence) --
+never a crash, just a degraded-but-valid result. The construction API used
+to build the layered write -- ``PSDImage.new(mode="RGB")`` ->
+``create_pixel_layer`` -- is the SAME one :mod:`cpsb.compose_psd` already
+verified empirically against the installed psd-tools 1.17.4 (that module's
+own docstring); :func:`_write_instructions_psd` and :func:`_layer_alpha_mask`
+document the additional psd-tools claims specific to reading an alpha-
+carrying layer back out of an RGB-mode document, verified the same way by
+this module's own test suite.
+
 PS mode BLOCKS the workflow until the user saves (PROTOCOL.md §6d, product-
 owner update 2026-07-17): when there is no consumable edit yet, this node
 writes/reuses a handoff, opens Photoshop through the shared seam above, and
@@ -31,23 +56,18 @@ same blocking primitive :meth:`cpsb.nodes.PhotoshopBridge.execute`'s "Wait
 for first save" mode uses -- until the first save lands, the user cancels, or
 *timeout_seconds* elapses. Cancel/timeout raise ComfyUI's own
 ``InterruptProcessingException`` via :func:`cpsb.nodes._raise_interrupt`,
-reused rather than reimplemented for the identical reason. This replaces an
-earlier, non-blocking "fire-and-forget open, mask stays zeros until the next
-manual queue" behavior -- a field report that the toggle "didn't open
-Photoshop" turned out to be indistinguishable, from the user's seat, from
-"opened invisibly and nothing else happened"; blocking makes success and
-failure both visible in the run itself instead.
+reused rather than reimplemented for the identical reason.
 
-Like :mod:`cpsb.nodes`, this module never imports ``torch``/``numpy``/
-``scipy`` at module level: :func:`cpsb.nodes._tensor_to_pil` already proves
-plain ``numpy`` arrays (no torch) are enough for every pixel operation this
-node needs, so importing ``numpy`` locally, inside each function that touches
+Like :mod:`cpsb.nodes`, this module never imports ``torch``/``numpy`` at
+module level: :func:`cpsb.nodes._tensor_to_pil` already proves plain
+``numpy`` arrays (no torch) are enough for every pixel operation this node
+needs, so importing ``numpy`` locally, inside each function that touches
 array data, keeps this module importable in a plain test environment too.
-``scipy`` gets the same treatment for an additional reason: it is not this
-package's own dependency at all (``requirements.txt`` doesn't list it) but
-IS guaranteed present at runtime because ComfyUI itself depends on it --
-the identical reasoning :mod:`cpsb.nodes`' own docstring already documents
-for torch/numpy, applied to a second, ComfyUI-provided-not-declared package.
+``psd-tools``, by contrast, IS imported at module level here, exactly like
+:mod:`cpsb.psd_io` and :mod:`cpsb.compose_psd` already do -- it is this
+package's own declared dependency (``requirements.txt``), not a
+ComfyUI-provided-but-undeclared one, so there is no test-environment
+importability reason to defer it.
 """
 
 from __future__ import annotations
@@ -58,32 +78,28 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from PIL import Image, ImageDraw
+from psd_tools import PSDImage
 
 from . import nodes
 from .handoff import HandoffManager, HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
-from .psd_io import write_psd
 
 if TYPE_CHECKING:
     from .nodes import _NodeState
 
 logger = logging.getLogger("cpsb")
 
-#: Per-channel abs-difference threshold (0-255 scale) above which a pixel
-#: counts as "edited" for the Photoshop diff mask (PROTOCOL.md §6d: "a small
-#: threshold"). ~4% of full-scale: large enough to ignore the lossless-but-
-#: not-bit-identical round trip a pixel takes through this package's own PSD
-#: write (``psd_io.write_psd``, psd-tools RLE encoding) and Photoshop's own
-#: re-save, small enough to still catch a faint/thin pencil mark. Chosen as a
-#: sane constant, not derived -- documented here rather than tuned per image.
-_DIFF_THRESHOLD = 10
+#: Exact top-level layer name this node looks for on read, and writes on
+#: open (product-owner spec, 2026-07-17). Part of the protocol contract --
+#: not just a display label -- so it lives here as a named constant rather
+#: than inlined at each use site.
+INSTRUCTIONS_LAYER_NAME = "Instructions"
 
-#: Iterations for both the scipy morphological close and the degraded PIL
-#: dilate-only fallback (see :func:`_close_and_fill_mask`). Two passes closes
-#: small gaps in a hand-drawn outline (PROTOCOL.md §6d's whole reason for
-#: closing at all: "the user may mark with ANY tool/color", including a thin
-#: outline stroke that a single-pass close would still leave holed) without
-#: letting the mask balloon far past the user's actual marks.
-_MORPH_ITERATIONS = 2
+#: Name for the bottom (base-image) layer written alongside
+#: :data:`INSTRUCTIONS_LAYER_NAME`. Unlike that name, this one is NOT part of
+#: the read-side contract (the base layer is identified by "not being the
+#: Instructions layer", never by its own name) -- purely cosmetic, so the
+#: layer has a sensible label in Photoshop's own layer panel.
+_BASE_LAYER_NAME = "Image"
 
 #: 4px pure red, no fill (PROTOCOL.md §6d) -- the box-annotation convention
 #: Kontext/Qwen-Image-Edit are documented to respond to
@@ -106,152 +122,193 @@ class AnnotateMode:
     PS_MODE = "Open in Photoshop (mask from edits)"
 
 
-def _import_scipy_ndimage() -> Any | None:
-    """``scipy.ndimage``, or ``None`` if scipy is not importable.
+def _write_instructions_psd(psd_path: Path, pil_image: Image.Image) -> None:
+    """Write *pil_image* as a LAYERED handoff PSD (product-owner spec, 2026-07-17).
 
-    Guarded the same way this package treats torch/numpy (see this module's
-    own docstring): scipy is a core ComfyUI dependency, not this package's,
-    so it is never declared in ``requirements.txt`` and never imported at
-    module level. Tests force the degraded fallback path (see
-    :func:`_dilate_only_fallback`) by monkeypatching this function directly
-    rather than manipulating ``sys.modules``.
-    """
-    try:
-        from scipy import ndimage
-    except ImportError:
-        return None
-    return ndimage
+    Two top-level pixel layers, bottom to top: *pil_image* itself (named
+    :data:`_BASE_LAYER_NAME`), then a fully-transparent layer named exactly
+    :data:`INSTRUCTIONS_LAYER_NAME`, sized to the same canvas -- so Photoshop
+    opens with an empty layer already selected and ready to draw on. Uses the
+    SAME ``PSDImage.new(mode="RGB")`` -> ``create_pixel_layer`` construction
+    API :mod:`cpsb.compose_psd` already verified empirically against the
+    installed psd-tools 1.17.4 (that module's own docstring), not
+    ``PSDImage.frompil`` (:mod:`cpsb.psd_io`'s old flat write -- always
+    layer-less, exactly what this node no longer wants).
 
-
-def _raw_diff_mask(source_image: Image.Image, edit_image: Image.Image) -> Any | None:
-    """Boolean ``(H, W)`` array where *edit_image* differs from *source_image*.
-
-    A pixel counts as "edited" when the max abs difference across its RGB
-    channels exceeds :data:`_DIFF_THRESHOLD` -- comparing on RGB (not the
-    raw mode) so an edit saved with or without an alpha channel diffs
-    consistently either way.
+    One additional psd-tools claim, specific to this write and verified the
+    same empirical way (build a real PSD, reopen it, inspect it -- see this
+    module's own test suite): because the document mode is ``"RGB"`` (no
+    transparency band of its own), ``create_pixel_layer`` given a fully
+    transparent RGBA source stores that transparency as a real Photoshop
+    LAYER MASK (``layer.mask``, all-zero) rather than as alpha inside the
+    pixel data channels themselves -- :func:`_layer_alpha_mask` is written to
+    read it back correctly (via ``layer.composite()``, which applies the
+    mask) rather than inspecting ``layer.topil()``'s own channel data, which
+    reads back fully opaque regardless of the mask.
 
     Args:
-        source_image: The image handed to Photoshop.
-        edit_image: The ingested edit read back from disk.
+        psd_path: Destination ``source.psd`` path. Parent directories are
+            created if needed.
+        pil_image: The node's input image, decoded. Always ``"RGB"`` in
+            practice (:func:`cpsb.nodes._tensor_to_pil` never produces
+            anything else), but converted defensively here too.
+    """
+    psd_path.parent.mkdir(parents=True, exist_ok=True)
+    width, height = pil_image.size
+    psd = PSDImage.new(mode="RGB", size=(width, height), depth=8)
+    psd.create_pixel_layer(
+        pil_image.convert("RGB"), name=_BASE_LAYER_NAME, top=0, left=0, opacity=255
+    )
+    blank_instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    psd.create_pixel_layer(
+        blank_instructions, name=INSTRUCTIONS_LAYER_NAME, top=0, left=0, opacity=255
+    )
+    psd.save(psd_path)
+
+
+def _find_top_level_layer(psd: PSDImage, name: str) -> Any | None:
+    """The first TOP-LEVEL (direct-child) layer of *psd* named exactly *name*, or ``None``.
+
+    Deliberately iterates *psd* itself, never ``psd.descendants()``:
+    :class:`~psd_tools.api.psd_image.PSDImage` is itself a psd-tools
+    ``GroupMixin`` (verified against the installed 1.17.4 -- ``for layer in
+    psd`` yields only its immediate children, exactly like iterating a
+    ``Group``), so this only ever matches a genuinely TOP-LEVEL layer, never
+    one nested inside some group the user happened to create while marking
+    up the image -- matching the product-owner spec's own wording, "a
+    top-level layer named exactly Instructions".
+
+    Args:
+        psd: The already-open document.
+        name: The exact layer name to match (case-sensitive, no trimming).
 
     Returns:
-        A numpy bool array, or ``None`` if the two images differ in pixel
-        size (e.g. the user resized the canvas in Photoshop) -- no
-        pixel-aligned diff is possible then, and callers fall back to the
-        next MASK precedence tier (PROTOCOL.md §6d).
+        The matching layer object, or ``None`` if no top-level layer has
+        that exact name.
+    """
+    for layer in psd:
+        if layer.name == name:
+            return layer
+    return None
+
+
+def _layer_alpha_mask(psd: PSDImage, layer: Any) -> Any:
+    """*layer*'s own opacity as an ``(H, W)`` float32 0..1 array, full-canvas-sized.
+
+    Uses ``layer.composite(viewport=psd.viewbox)`` rather than
+    ``layer.topil()``, for two independent reasons, both verified
+    empirically against the installed psd-tools 1.17.4 (this module's own
+    test suite builds and reopens real PSDs to check both):
+
+    1. As :func:`_write_instructions_psd` documents, an RGB-mode document's
+       pixel layer stores alpha as a LAYER MASK, not as a transparency band
+       inside its own pixel data -- ``layer.topil()`` reads back fully
+       opaque regardless of what the user painted; only
+       ``layer.composite()`` (which applies the mask) reflects it.
+    2. Photoshop commonly trims a saved layer's own pixel bounds down to
+       just its non-transparent region -- a mostly-empty "Instructions"
+       layer is exactly this case. Passing ``viewport=psd.viewbox``
+       (the document's own full canvas box) forces the composited result
+       back onto the FULL canvas at the correct offset, instead of
+       returning an image cropped to wherever the user happened to paint.
+
+    Args:
+        psd: The already-open document (consulted for its canvas
+            size/viewbox).
+        layer: The layer to read (any composable layer -- pixel layer or
+            group).
+
+    Returns:
+        A ``(H, W)`` float32 array, values in ``[0.0, 1.0]``. All-zero if
+        the layer has no pixels at all within the viewport (nothing was
+        ever drawn, or ``composite()`` finds nothing to render).
     """
     import numpy as np
 
-    source_rgb = source_image.convert("RGB")
-    edit_rgb = edit_image.convert("RGB")
-    if source_rgb.size != edit_rgb.size:
-        return None
-    source_arr = np.asarray(source_rgb, dtype=np.int16)
-    edit_arr = np.asarray(edit_rgb, dtype=np.int16)
-    diff = np.abs(source_arr - edit_arr).max(axis=-1)
-    return diff > _DIFF_THRESHOLD
+    width, height = psd.size
+    composite = layer.composite(viewport=psd.viewbox)
+    if composite is None:
+        return np.zeros((height, width), dtype=np.float32)
+    alpha = np.array(composite.convert("RGBA").split()[-1]).astype(np.float32) / 255.0
+    return alpha
 
 
-def _dilate_only_fallback(raw_mask: Any) -> Any:
-    """Degraded no-scipy fallback for :func:`_close_and_fill_mask`.
+def _composite_excluding_layer(psd: PSDImage, excluded_layer: Any) -> Image.Image:
+    """RGB composite of every layer in *psd* EXCEPT *excluded_layer* itself.
 
-    PIL has no hole-filling primitive, so this only dilates (``MaxFilter``,
-    the "grow the white region" half of a true morphological close) -- it
-    closes small gaps in a stroke the same way the scipy path's
-    ``binary_closing`` does, but a genuinely hollow outline (a closed ring
-    with an untouched interior) stays hollow: there is no
-    ``binary_fill_holes`` equivalent here. Degraded, not broken: a mask that
-    is a thin ring instead of a filled blob is still usably positioned for a
-    "roughly mark this area" feature, just less complete than the scipy path.
-
-    Args:
-        raw_mask: Boolean ``(H, W)`` array (see :func:`_raw_diff_mask`).
-
-    Returns:
-        A boolean ``(H, W)`` array, dilated by :data:`_MORPH_ITERATIONS`
-        3x3 passes.
-    """
-    import numpy as np
-    from PIL import ImageFilter
-
-    mask_image = Image.fromarray((raw_mask.astype("uint8") * 255), mode="L")
-    for _ in range(_MORPH_ITERATIONS):
-        mask_image = mask_image.filter(ImageFilter.MaxFilter(3))
-    return np.asarray(mask_image) > 127
-
-
-def _close_and_fill_mask(raw_mask: Any) -> Any:
-    """Morphologically close then hole-fill *raw_mask* (PROTOCOL.md §6d).
-
-    Turns a hand-drawn OUTLINE (a ring of edited pixels, not a filled region
-    -- the natural result of "circling" something with a brush or lasso
-    stroke) into a filled region, so the mask actually covers the area the
-    user meant to mark rather than just its boundary. Idempotent on an
-    already-filled scribble: closing/filling a solid blob with no interior
-    holes is a safe no-op, so one code path handles both drawing styles
-    (``research/research-annotate-node.md`` §1.4).
-
-    Prefers ``scipy.ndimage`` (``binary_closing`` + ``binary_fill_holes``,
-    guarded via :func:`_import_scipy_ndimage`); falls back to
-    :func:`_dilate_only_fallback` -- dilate-only, no true closing, no hole
-    fill -- when scipy is not importable, documented there as degraded.
+    Filters by object IDENTITY (``candidate is not excluded_layer``), not by
+    name: a differently-nested layer that happens to share the Instructions
+    layer's name (inside some group the user created) is never accidentally
+    excluded too -- only the exact layer object the caller found is.
+    ``layer_filter`` is psd-tools' own documented hook for exactly this
+    (:meth:`~psd_tools.api.psd_image.PSDImage.composite`'s ``layer_filter``
+    parameter, called during compositing for every layer, nested or not);
+    the default filter it replaces is ``PixelLayer.is_visible``, so ordinary
+    visibility handling is preserved for every OTHER layer -- this only adds
+    one further exclusion on top of it.
 
     Args:
-        raw_mask: Boolean ``(H, W)`` array (see :func:`_raw_diff_mask`).
+        psd: The already-open document.
+        excluded_layer: The layer to omit from the composite (the found
+            Instructions layer).
 
     Returns:
-        A boolean ``(H, W)`` array. An all-zero input is returned unchanged
-        (nothing to close or fill).
+        An ``"RGB"`` PIL image, sized to the document's canvas -- any edit
+        made to another layer (e.g. the base image itself) is included,
+        exactly the "bake edits in" behavior the product-owner spec calls
+        for.
     """
-    import numpy as np
-
-    if not raw_mask.any():
-        return raw_mask
-
-    ndimage = _import_scipy_ndimage()
-    if ndimage is None:
-        return _dilate_only_fallback(raw_mask)
-
-    # Full 3x3 (8-connectivity) structure so diagonal gaps in a stroke close
-    # too, not just orthogonal ones.
-    structure = np.ones((3, 3), dtype=bool)
-    closed = ndimage.binary_closing(raw_mask, structure=structure, iterations=_MORPH_ITERATIONS)
-    return ndimage.binary_fill_holes(closed)
+    composite = psd.composite(
+        layer_filter=lambda candidate: candidate.is_visible() and candidate is not excluded_layer
+    )
+    return composite.convert("RGB")
 
 
-def _compute_diff_mask(
-    manager: HandoffManager, handoff_id: str, source_image: Image.Image
-) -> Any | None:
-    """The closed-and-filled Photoshop diff mask for *handoff_id*, as float32 0/1.
+def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None]:
+    """Resolve ``(image, mask)`` from a saved layered handoff PSD (product-owner spec, 2026-07-17).
 
     Args:
-        manager: The handoff manager.
-        handoff_id: An active handoff already confirmed to have an edit.
-        source_image: The image originally handed to Photoshop for this
-            handoff.
+        psd_path: The handoff's ``source.psd`` -- the exact file Photoshop
+            opened and, in Tier 1 / local Tier 2, the user's Cmd/Ctrl+S
+            overwrote in place.
 
     Returns:
-        A ``(H, W)`` float32 numpy array (values exactly 0.0 or 1.0), or
-        ``None`` if there is no edit file on disk (a filesystem race --
-        cheap to guard) or its size doesn't match *source_image* -- both
-        cases mean "no diff mask available," and the caller falls back to
-        the next MASK precedence tier (PROTOCOL.md §6d).
+        ``(image, mask)``:
+
+        * A top-level layer named exactly :data:`INSTRUCTIONS_LAYER_NAME`
+          IS found: *image* is the RGB composite of every OTHER layer
+          (:func:`_composite_excluding_layer`) -- any edit the user made to
+          the base layer bakes straight into this output; only the
+          Instructions layer itself is treated specially. *mask* is that
+          layer's own opacity (:func:`_layer_alpha_mask`), a ``(H, W)``
+          float32 array, never ``None`` in this branch.
+        * NOT found (the user renamed or deleted it): *image* is the FULL
+          composite of the whole document (every visible layer, psd-tools'
+          own default filter); *mask* is ``None`` -- signalling the caller
+          to fall back through the ordinary mask-input-socket/zeros
+          precedence tiers, exactly as if this were a plain edited image
+          with no Instructions layer involved at all (PROTOCOL.md §6d,
+          "if that layer is renamed or deleted then the image is just
+          treated like an image").
+
+    Note:
+        In REMOTE Tier 2, the connected plugin saves to its own sandbox and
+        uploads a flat PNG (:mod:`cpsb.routes`' upload handler) -- it never
+        overwrites THIS server-side ``source.psd`` with a layered file, so
+        re-opening it here after such an edit finds the ORIGINAL,
+        just-written (still-blank) Instructions layer. That degrades
+        gracefully through the FOUND branch above (mask ends up all-zero,
+        image ends up unchanged) rather than crashing or surfacing the
+        remote edit -- an accepted limitation until layered upload lands
+        for Tier 2 remote, not a bug in this function.
     """
-    edit_path = manager.edit_image_path(handoff_id)
-    if edit_path is None or not edit_path.exists():
-        return None
-    with Image.open(edit_path) as edit_file:
-        edit_file.load()
-        raw = _raw_diff_mask(source_image, edit_file)
-    if raw is None:
-        logger.warning(
-            "cpsb annotate: handoff %s: edit size differs from source, "
-            "skipping the diff mask",
-            handoff_id,
-        )
-        return None
-    return _close_and_fill_mask(raw).astype("float32")
+    psd = PSDImage.open(psd_path)
+    instructions_layer = _find_top_level_layer(psd, INSTRUCTIONS_LAYER_NAME)
+    if instructions_layer is None:
+        return psd.composite().convert("RGB"), None
+    image = _composite_excluding_layer(psd, instructions_layer)
+    mask = _layer_alpha_mask(psd, instructions_layer)
+    return image, mask
 
 
 def _mask_tensor_to_array(mask_tensor: Any) -> Any:
@@ -306,7 +363,10 @@ def _create_handoff(
     ``source`` is a descriptive placeholder -- PROTOCOL.md §6). Opening
     Photoshop is a separate step (:func:`_open_and_block_for_edit`) so the
     "reuse an existing handoff" and "create a fresh one" branches in
-    :func:`_resolve_ps_mode_diff_mask` can share one open/block call site.
+    :func:`_resolve_ps_mode_edit` can share one open/block call site. Writes
+    the handoff's ``source.psd`` LAYERED (:func:`_write_instructions_psd`,
+    product-owner spec 2026-07-17), not the old flat
+    :func:`cpsb.psd_io.write_psd`.
 
     Args:
         state: The configured backend state (``nodes._require_state()``).
@@ -326,7 +386,7 @@ def _create_handoff(
         source_hash=source_hash,
     )
     psd_path = state.manager.handoff_dir(meta.handoff_id) / "source.psd"
-    write_psd(psd_path, pil_image)
+    _write_instructions_psd(psd_path, pil_image)
     state.manager.note_source_written(meta.handoff_id)
     return meta
 
@@ -360,8 +420,8 @@ def _open_and_block_for_edit(
 
     Returns:
         Nothing. Returning normally means the wait outcome was
-        :data:`~cpsb.handoff.WaitOutcome.EDITED` -- the caller may now derive
-        the diff mask.
+        :data:`~cpsb.handoff.WaitOutcome.EDITED` -- the caller may now
+        re-open *psd_path* (Photoshop's own save) to resolve the image/mask.
 
     Raises:
         Whatever :func:`cpsb.nodes._raise_interrupt` raises (ComfyUI's own
@@ -410,14 +470,14 @@ def _open_and_block_for_edit(
         nodes._raise_interrupt()
 
 
-def _resolve_ps_mode_diff_mask(
+def _resolve_ps_mode_edit(
     state: _NodeState,
     node_id: str,
     pil_image: Image.Image,
     source_hash: str,
     timeout_seconds: float,
-) -> Any | None:
-    """The PS-mode MASK precedence tier (PROTOCOL.md §6d, tier 1) -- BLOCKS.
+) -> tuple[Image.Image, Any | None]:
+    """The PS-mode ``(image, mask)`` resolution (PROTOCOL.md §6d) -- BLOCKS.
 
     Node-reuse semantics mirror :meth:`cpsb.nodes.PhotoshopBridge.execute`
     exactly: an active handoff whose recorded ``source_hash`` no longer
@@ -425,18 +485,20 @@ def _resolve_ps_mode_diff_mask(
     anything else happens (a legacy handoff with no recorded ``source_hash``
     is treated as matching, same documented choice as the bridge node). Once
     that's settled, two cases remain: (a) the (possibly just-refreshed)
-    active handoff already has an edit -- consume it, deriving the diff mask,
-    WITHOUT reopening Photoshop (the existing consume behavior, unchanged);
-    (b) no consumable edit exists yet (no active handoff, or one exists but
-    hasn't been saved into) -- write a fresh handoff or reuse the existing
-    one, open Photoshop through the shared tier-selecting seam, and BLOCK
-    this call (:func:`_open_and_block_for_edit`) until the user saves,
-    cancels, or *timeout_seconds* elapses. This is the same "always (re)open,
-    then wait" shape as the bridge node's "Wait for first save" mode -- there
-    is no non-blocking mode left to preserve here (PROTOCOL.md §6d, product-
-    owner update 2026-07-17): a manual re-queue after a prior timeout reuses
-    and reopens the SAME handoff (layers intact), exactly like the bridge
-    node's own documented re-queue-after-timeout behavior.
+    active handoff already has an edit -- consume it by re-opening its
+    ``source.psd`` with psd-tools (:func:`_read_ps_saved_psd`), WITHOUT
+    reopening Photoshop (the existing consume behavior, unchanged); (b) no
+    consumable edit exists yet (no active handoff, or one exists but hasn't
+    been saved into) -- write a fresh handoff or reuse the existing one
+    (:func:`_create_handoff` / :func:`_write_instructions_psd`), open
+    Photoshop through the shared tier-selecting seam, and BLOCK this call
+    (:func:`_open_and_block_for_edit`) until the user saves, cancels, or
+    *timeout_seconds* elapses. This is the same "always (re)open, then wait"
+    shape as the bridge node's "Wait for first save" mode -- there is no
+    non-blocking mode left to preserve here (PROTOCOL.md §6d, product-owner
+    update 2026-07-17): a manual re-queue after a prior timeout reuses and
+    reopens the SAME handoff (layers intact), exactly like the bridge node's
+    own documented re-queue-after-timeout behavior.
 
     Args:
         state: The configured backend state.
@@ -446,13 +508,16 @@ def _resolve_ps_mode_diff_mask(
         timeout_seconds: Bound on the blocking wait, case (b) only.
 
     Returns:
-        A ``(H, W)`` float32 0/1 numpy array, or ``None`` only when
-        :func:`_compute_diff_mask` itself finds no usable diff (a same-size
-        mismatch, or a vanished edit file -- both a filesystem-level race,
-        cheap to guard) -- the caller falls back to the next MASK precedence
-        tier. Case (b) never returns without either a mask or raising: a
+        ``(image, mask)`` -- per :func:`_read_ps_saved_psd`'s own contract:
+        *image* is the composite excluding the Instructions layer when found,
+        else the full document composite; *mask* is that layer's own opacity,
+        or ``None`` when no Instructions layer was found (the caller falls
+        back to the ordinary mask-socket/zeros precedence tiers for the
+        MASK output only -- the IMAGE output stays the full composite either
+        way). Case (b) never returns without either a result or raising: a
         normal return from :func:`_open_and_block_for_edit` means the wait
-        outcome was EDITED, so an edit is on disk to derive a mask from.
+        outcome was EDITED, so *psd_path* is confirmed to hold Photoshop's
+        own save.
 
     Raises:
         See :func:`_open_and_block_for_edit` -- propagates unchanged.
@@ -476,7 +541,8 @@ def _resolve_ps_mode_diff_mask(
             node_id,
             active.handoff_id,
         )
-        return _compute_diff_mask(manager, active.handoff_id, pil_image)
+        psd_path = manager.handoff_dir(active.handoff_id) / "source.psd"
+        return _read_ps_saved_psd(psd_path)
 
     if active is None:
         logger.info("cpsb annotate: node %s: no active handoff, creating", node_id)
@@ -491,9 +557,9 @@ def _resolve_ps_mode_diff_mask(
     psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
 
     _open_and_block_for_edit(state, node_id, meta, psd_path, timeout_seconds)
-    # A normal return above means WaitOutcome.EDITED -- there is now an edit
-    # on disk to derive the diff mask from.
-    return _compute_diff_mask(manager, meta.handoff_id, pil_image)
+    # A normal return above means WaitOutcome.EDITED -- Photoshop's own save
+    # now sits at psd_path, ready to be re-opened with psd-tools.
+    return _read_ps_saved_psd(psd_path)
 
 
 def _fold_edit_hash_for_is_changed(
@@ -513,46 +579,51 @@ def _fold_edit_hash_for_is_changed(
 class PhotoshopAnnotate:
     """Pairs a typed instruction with a region MASK for a downstream model (PROTOCOL.md §6d).
 
-    Outputs ``(IMAGE, MASK, STRING, IMAGE)``: the first ``IMAGE`` is always
-    the unchanged input (this node never modifies the pixels it was given,
-    only derives a mask and, optionally, a SEPARATE annotated copy); the
-    ``STRING`` is *instruction* verbatim, never rendered onto any pixels
-    (the whole point -- "not having to lay out text on an image",
-    ``research/research-annotate-node.md`` §0); the second ``IMAGE``
-    (*annotated*) is a copy with a red box drawn at the resolved mask's
-    bounding box when *box_composite* is ``True`` (the Kontext/Qwen-Image-Edit
-    box-annotation convention), else the same unchanged input again.
+    Outputs ``(IMAGE, MASK, STRING, IMAGE)``. The ``STRING`` is *instruction*
+    verbatim, never rendered onto any pixels (the whole point -- "not having
+    to lay out text on an image", ``research/research-annotate-node.md``
+    §0). The second ``IMAGE`` (*annotated*) is a copy of the resolved image
+    with a red box drawn at the resolved mask's bounding box when
+    *box_composite* is ``True`` (the Kontext/Qwen-Image-Edit box-annotation
+    convention), else the resolved image unchanged.
 
-    MASK resolution precedence (PROTOCOL.md §6d), first match wins:
+    The first ``IMAGE`` output and the MASK are resolved together
+    (product-owner spec, 2026-07-17 -- the "Instructions" layer redesign):
 
-    1. **Photoshop diff mask** -- only when *annotate_mode* is
-       :data:`AnnotateMode.PS_MODE` and this node's active handoff (matched
-       by ``source_hash``) has at least one edit: the pixel difference
-       between what was sent and what came back, closed and hole-filled
-       (:func:`_compute_diff_mask`). Works with ANY Photoshop tool/color --
-       nothing here inspects layers or channels.
-    2. **The `mask` input socket** -- whatever a ComfyUI-only source (a
-       MaskEditor, a segmentation node, ...) already provided.
-    3. **All-zero**, sized to *image*.
+    * **Pass-through mode** (:data:`AnnotateMode.PASS_THROUGH`, the default):
+      never even looks up a handoff. IMAGE is the unchanged input; MASK is
+      the ``mask`` input socket if connected, else all-zero.
+    * **PS mode** (:data:`AnnotateMode.PS_MODE`), once a save is consumable
+      (see below): this node re-opens the saved handoff PSD with psd-tools
+      and looks for a top-level layer named exactly
+      :data:`INSTRUCTIONS_LAYER_NAME` (:func:`_read_ps_saved_psd`):
 
-    Pass-through mode (:data:`AnnotateMode.PASS_THROUGH`, the default) never
-    even looks up a handoff -- tier 1 is entirely gated on PS mode, so this
-    mode never touches Photoshop at all, exactly as PROTOCOL.md §6d
-    specifies.
+      - **Found**: MASK = that layer's own painted pixels (its opacity,
+        normalized 0..1); IMAGE = the composite of every OTHER layer --
+        so any edit the user made to the base picture itself BAKES INTO
+        the image output, while only the Instructions layer is treated
+        specially.
+      - **Not found** (renamed or deleted by the user): IMAGE = the FULL
+        composite of the whole saved document, treated as a plain edited
+        image; MASK falls back to the ordinary tiers -- the ``mask`` input
+        socket if connected, else all-zero.
 
     PS mode BLOCKS (PROTOCOL.md §6d, product-owner update 2026-07-17): with
-    no matching edit yet, it writes (or reuses) a ``bridge_node`` handoff,
-    opens Photoshop through the same tier-selecting seam the bridge node
-    uses, and then blocks ``execute()`` -- identical to
+    no matching edit yet, it writes (or reuses) a ``bridge_node`` handoff
+    whose ``source.psd`` is a LAYERED PSD (input image + a blank
+    "Instructions" layer, :func:`_write_instructions_psd`), opens Photoshop
+    through the same tier-selecting seam the bridge node uses, and then
+    blocks ``execute()`` -- identical to
     :meth:`cpsb.nodes.PhotoshopBridge.execute`'s "Wait for first save" mode
     -- until the user marks up and saves the image, cancels, or
     *timeout_seconds* elapses (see :func:`_open_and_block_for_edit`). A save
-    resumes this same call with the freshly derived diff mask; cancel/
-    timeout raise ComfyUI's own ``InterruptProcessingException``, stopping
-    the workflow rather than silently returning zeros. There is no re-run
-    mode and so no auto-queue (PROTOCOL.md §5/§6d) -- once this node returns
-    with a real diff mask, the user is done; a re-queue only reopens
-    Photoshop if they explicitly want another pass.
+    resumes this same call, which then re-reads the saved ``source.psd`` per
+    the precedence above; cancel/timeout raise ComfyUI's own
+    ``InterruptProcessingException``, stopping the workflow rather than
+    silently returning zeros. There is no re-run mode and so no auto-queue
+    (PROTOCOL.md §5/§6d) -- once this node returns with a real result, the
+    user is done; a re-queue only reopens Photoshop if they explicitly want
+    another pass.
     """
 
     CATEGORY = "image/photoshop"
@@ -641,7 +712,7 @@ class PhotoshopAnnotate:
         """``(IMAGE, MASK, STRING, IMAGE)`` per the class docstring's precedence rules.
 
         In PS mode with no consumable edit yet, this call BLOCKS (see the
-        class docstring, :func:`_resolve_ps_mode_diff_mask`,
+        class docstring, :func:`_resolve_ps_mode_edit`,
         :func:`_open_and_block_for_edit`) until the user saves in Photoshop,
         cancels, or *timeout_seconds* elapses -- the latter two raise
         ComfyUI's own ``InterruptProcessingException`` rather than returning.
@@ -659,8 +730,11 @@ class PhotoshopAnnotate:
             mask: The optional ``MASK`` input socket.
 
         Returns:
-            ``(image, mask, instruction, annotated)`` -- *image* is always
-            the same tensor object passed in.
+            ``(image, mask, instruction, annotated)``. In Pass-through mode,
+            *image* is the exact same tensor object passed in. In PS mode,
+            *image* is derived from the saved handoff PSD (see the class
+            docstring) -- it is the same object as the input only by
+            coincidence, never guaranteed.
         """
         state = nodes._require_state()
         node_id = str(unique_id)
@@ -671,40 +745,51 @@ class PhotoshopAnnotate:
         pil_image = nodes._tensor_to_pil(image)
         source_hash = compute_source_hash(pil_image)
 
-        diff_mask_array = None
         if annotate_mode == AnnotateMode.PS_MODE:
-            diff_mask_array = _resolve_ps_mode_diff_mask(
+            result_image, ps_mask_array = _resolve_ps_mode_edit(
                 state, node_id, pil_image, source_hash, timeout_seconds
             )
+            image_tensor = nodes._pil_to_tensor(result_image)
+        else:
+            result_image = pil_image
+            ps_mask_array = None
+            image_tensor = image  # same tensor object: pass-through never re-encodes
 
-        mask_array = self._resolve_mask_array(diff_mask_array, mask, pil_image)
+        mask_array = self._resolve_mask_array(ps_mask_array, mask, result_image)
         mask_tensor = _array_to_mask_tensor(mask_array)
-        annotated = self._build_annotated(image, mask_array, bool(box_composite))
+        annotated = self._build_annotated(image_tensor, mask_array, bool(box_composite))
 
-        return image, mask_tensor, instruction, annotated
+        return image_tensor, mask_tensor, instruction, annotated
 
     @staticmethod
-    def _resolve_mask_array(diff_mask_array: Any | None, mask_socket: Any, pil_image: Image.Image):
-        """MASK precedence tiers 2-3 (PROTOCOL.md §6d) -- tier 1 is resolved by the caller.
+    def _resolve_mask_array(
+        ps_mask_array: Any | None, mask_socket: Any, image_for_sizing: Image.Image
+    ):
+        """MASK fallback tiers (PROTOCOL.md §6d) -- the PS-mode layer read is resolved
+        by the caller.
 
         Args:
-            diff_mask_array: Tier 1's result, or ``None`` if unavailable/not
-                applicable.
+            ps_mask_array: The Instructions layer's own opacity
+                (:func:`_read_ps_saved_psd`), or ``None`` when unavailable
+                (pass-through mode, or PS mode with no Instructions layer
+                found).
             mask_socket: The node's optional ``mask`` input tensor, or
                 ``None`` if unconnected.
-            pil_image: The current input image, decoded (for zero-mask
-                sizing only).
+            image_for_sizing: The resolved image for this execution (for
+                zero-mask sizing only) -- PS mode's own resolved image, which
+                may differ in size from the original input if the user
+                resized the canvas in Photoshop.
 
         Returns:
             A ``(H, W)`` float32 numpy array.
         """
-        if diff_mask_array is not None:
-            return diff_mask_array
+        if ps_mask_array is not None:
+            return ps_mask_array
         if mask_socket is not None:
             return _mask_tensor_to_array(mask_socket)
         import numpy as np
 
-        width, height = pil_image.size
+        width, height = image_for_sizing.size
         return np.zeros((height, width), dtype=np.float32)
 
     @staticmethod
@@ -718,8 +803,8 @@ class PhotoshopAnnotate:
         rectangle, unfilled, at the mask's bounding box on a fresh RGB copy.
 
         Args:
-            image_tensor: The node's own input tensor (returned as-is when
-                no box is drawn).
+            image_tensor: The node's own resolved image tensor (returned
+                as-is when no box is drawn).
             mask_array: The final, precedence-resolved ``(H, W)`` mask.
             box_composite: The ``box_composite`` widget value.
 

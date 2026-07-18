@@ -21,7 +21,7 @@ Right-clicking an image and choosing **Open in Photoshop** is the core action, a
 - **Edit in Photoshop** — a node that opens its input in Photoshop and, in the default "Wait for first save" mode, *blocks* the workflow until you save, then continues with your edit. Also offers "Re-run on every save" and "Open only" modes, a timeout, and a cancel.
 - **Load PSD** — start a workflow from a `.psd`/`.psb` in ComfyUI's input folder, with an on-node **preview** (rendered server-side, no Photoshop needed) and an optional "edit the original in place" mode. Outputs IMAGE + MASK.
 - **Compose Layers to PSD** — stack multiple images into one layered, grouped PSD, then (by default) open it in Photoshop and block until you save. Outputs the flattened composite plus the written PSD's path.
-- **Annotate for Edit** — hand an image to Photoshop for markup, block until you save, and get back a diff MASK of what you drew (plus a text instruction) — handy for inpainting / edit models.
+- **Annotate for Edit** — hand an image to Photoshop; it opens with an auto-created transparent **"Instructions"** layer. Draw on that layer to mark a region (any color), optionally edit the base image too, and save. You get back the image (with your base edits baked in), a **MASK** from your marks, and your instruction — handy for inpainting / edit models. Rename or delete the Instructions layer and it's just treated as a plain edited image.
 
 A **"Photoshop Edits" sidebar gallery** tracks every round trip for the workflow: re-open an edit, add it as a node, reveal the file, or remove an entry from the list. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
 
