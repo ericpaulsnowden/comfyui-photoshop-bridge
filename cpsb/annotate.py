@@ -540,7 +540,9 @@ def _resolve_ps_mode_edit(
         or ``None`` when no Instructions layer was found (the caller falls
         back to the ordinary mask-socket/zeros precedence tiers for the
         MASK output only -- the IMAGE output stays the full composite either
-        way); *combined* is the full composite WITH the painted strokes. Case (b) never returns without either a result or raising: a
+        way); *combined* is the full composite WITH the painted strokes.
+
+        Case (b) never returns without either a result or raising: a
         normal return from :func:`_open_and_block_for_edit` means the wait
         outcome was EDITED, so *psd_path* is confirmed to hold Photoshop's
         own save.
