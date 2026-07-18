@@ -72,6 +72,12 @@ MAX_IMAGE_INPUTS = 20
 DEFAULT_FILENAME_PREFIX = "compose"
 DEFAULT_GROUP_NAME = "ComfyUI Layers"
 
+#: Base name for the pixel layers; each layer is ``"<layer_name> <index>"`` with
+#: index counting 1..N bottom-to-top. Replaces the removed ``filename_prefix``
+#: widget (which only named an intermediate file the user never saw — Photoshop
+#: opens a managed ``source.psd`` copy, not that file).
+DEFAULT_LAYER_NAME = "Layer"
+
 #: The Compose-node-specific third ``mode`` string (PROTOCOL.md §6c). The
 #: other two options reuse :class:`cpsb.nodes.BridgeMode`'s constants verbatim
 #: (``WAIT_FIRST_SAVE`` / ``RERUN_EVERY_SAVE``), but this one is deliberately
@@ -236,7 +242,11 @@ def _sanitize_filename_prefix(raw: str) -> str:
 
 
 def _compute_inputs_hash(
-    pil_images: list[Image.Image], filename_prefix: str, group_name: str, mode: str
+    pil_images: list[Image.Image],
+    filename_prefix: str,
+    group_name: str,
+    mode: str,
+    layer_name: str = DEFAULT_LAYER_NAME,
 ) -> str:
     """A deterministic sha256 identity for "these inputs, these params".
 
@@ -294,6 +304,10 @@ def _compute_inputs_hash(
     hasher.update(group_name.encode("utf-8"))
     hasher.update(b"\x00")
     hasher.update(mode.encode("utf-8"))
+    hasher.update(b"\x00")
+    # layer_name is folded so renaming the layers forces a re-run (the written
+    # PSD's layer names change even though the composite pixels don't).
+    hasher.update(layer_name.encode("utf-8"))
     return hasher.hexdigest()
 
 
@@ -378,7 +392,7 @@ def _centered_offset(item_size: int, canvas_size: int) -> int:
 
 
 def _build_group_psd(
-    pil_images: list[Image.Image], group_name: str
+    pil_images: list[Image.Image], group_name: str, layer_name: str = DEFAULT_LAYER_NAME
 ) -> tuple[PSDImage, int, int, list[tuple[Image.Image, int, int]]]:
     """Build the in-memory grouped PSD document (PROTOCOL.md §6c).
 
@@ -422,7 +436,7 @@ def _build_group_psd(
         left = _centered_offset(layer_image.width, canvas_width)
         top = _centered_offset(layer_image.height, canvas_height)
         layer = psd.create_pixel_layer(
-            layer_image, name=f"Layer {index}", top=top, left=left, opacity=_LAYER_OPACITY
+            layer_image, name=f"{layer_name} {index}", top=top, left=left, opacity=_LAYER_OPACITY
         )
         layers.append(layer)
         placements.append((layer_image, left, top))
@@ -602,8 +616,8 @@ class PhotoshopComposePSD:
         optional = {f"image_{i}": ("IMAGE",) for i in range(1, MAX_IMAGE_INPUTS + 1)}
         return {
             "required": {
-                "filename_prefix": ("STRING", {"default": DEFAULT_FILENAME_PREFIX}),
                 "group_name": ("STRING", {"default": DEFAULT_GROUP_NAME}),
+                "layer_name": ("STRING", {"default": DEFAULT_LAYER_NAME}),
                 "mode": (
                     [
                         nodes.BridgeMode.WAIT_FIRST_SAVE,
@@ -625,12 +639,13 @@ class PhotoshopComposePSD:
     @classmethod
     def IS_CHANGED(
         cls,
-        filename_prefix: str,
         group_name: str,
         mode: str,
         timeout_seconds: int,
         unique_id: str,
         max_layers: int = DEFAULT_MAX_LAYERS,
+        layer_name: str = DEFAULT_LAYER_NAME,
+        filename_prefix: str = DEFAULT_FILENAME_PREFIX,
         **kwargs: Any,
     ) -> str:
         """:func:`_compute_inputs_hash`, folded with the latest-edit hash when consumable.
@@ -658,7 +673,7 @@ class PhotoshopComposePSD:
         """
         pil_images, _ = _collect_layer_images(kwargs, max_layers)
         prefix = _sanitize_filename_prefix(filename_prefix)
-        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode)
+        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode, layer_name)
 
         state = nodes._state_if_configured()
         if state is None:
@@ -672,12 +687,13 @@ class PhotoshopComposePSD:
 
     def execute(
         self,
-        filename_prefix: str,
         group_name: str,
         mode: str,
         timeout_seconds: int,
         unique_id: str,
         max_layers: int = DEFAULT_MAX_LAYERS,
+        layer_name: str = DEFAULT_LAYER_NAME,
+        filename_prefix: str = DEFAULT_FILENAME_PREFIX,
         **kwargs: Any,
     ) -> tuple[Any, Any, str]:
         """Compose (or consume) and return ``(IMAGE, MASK, STRING)`` (PROTOCOL.md §6c).
@@ -753,7 +769,7 @@ class PhotoshopComposePSD:
             )
 
         prefix = _sanitize_filename_prefix(filename_prefix)
-        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode)
+        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode, layer_name)
 
         active = _find_matching_active_handoff(manager, node_id, inputs_hash)
         if active is not None:
@@ -774,7 +790,9 @@ class PhotoshopComposePSD:
             group_name,
             mode,
         )
-        psd, canvas_width, canvas_height, placements = _build_group_psd(pil_images, group_name)
+        psd, canvas_width, canvas_height, placements = _build_group_psd(
+            pil_images, group_name, layer_name
+        )
         output_path = _allocate_output_path(state.context.input_dir, prefix)
         psd.save(output_path)
         logger.info("cpsb compose_psd: node %s: wrote %s", node_id, output_path)

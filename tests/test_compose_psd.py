@@ -170,11 +170,9 @@ class TestContractShape:
 
     def test_input_types_shape(self):
         spec = ComposePSD.INPUT_TYPES()
-        assert spec["required"]["filename_prefix"] == (
-            "STRING",
-            {"default": "compose"},
-        )
+        assert "filename_prefix" not in spec["required"]  # removed widget
         assert spec["required"]["group_name"] == ("STRING", {"default": "ComfyUI Layers"})
+        assert spec["required"]["layer_name"] == ("STRING", {"default": "Layer"})
         assert spec["hidden"] == {"unique_id": "UNIQUE_ID"}
 
     def test_mode_combo_is_the_three_protocol_strings(self):
@@ -282,6 +280,16 @@ class TestBuildGroupPsd:
         assert group.name == "My Group"
         assert len(group) == 3
         assert [layer.name for layer in group] == ["Layer 1", "Layer 2", "Layer 3"]
+
+    def test_custom_layer_name_increments(self, tmp_path):
+        """The `layer_name` widget names layers `<name> 1..N` (replaces the
+        removed `filename_prefix`)."""
+        images = [Image.new("RGB", (4, 4), RED), Image.new("RGB", (4, 4), GREEN)]
+        psd, _, _, _ = compose_module._build_group_psd(images, "G", "Frame")
+        out = tmp_path / "named.psd"
+        psd.save(out)
+        group = PSDImage.open(out)[0]
+        assert [layer.name for layer in group] == ["Frame 1", "Frame 2"]
 
     def test_odd_size_centering_reopens_at_expected_bbox(self, tmp_path):
         images = [Image.new("RGB", (7, 9), RED), Image.new("RGB", (4, 4), BLUE)]

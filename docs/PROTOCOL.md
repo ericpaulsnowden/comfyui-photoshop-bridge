@@ -437,11 +437,15 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   carries a ComfyUI IMAGE, which may be a multi-image BATCH (e.g. a VAE Decode emitting
   several images) — every image in every batch becomes its own layer (frames expanded in
   batch order within a socket, sockets in `image_1..image_N` order).
-- Widgets: `filename_prefix` (STRING, default "compose"), `group_name` (STRING, default
-  "ComfyUI Layers"), `mode` (COMBO — the SAME three strings as the Edit in Photoshop
-  node's BridgeMode: "Wait for first save" (default) | "Re-run on every save" |
-  "Don't open (composite only)"). (Replaces the earlier `edit_after` BOOLEAN — pre-release
-  breaking change.) `timeout_seconds` (INT, default 1800) applies to "Wait for first save".
+- Widgets: `group_name` (STRING, default "ComfyUI Layers" — the group/folder the layers
+  land in), `layer_name` (STRING, default "Layer" — each layer is named `<layer_name> N`,
+  N counting 1..N bottom-to-top), `mode` (COMBO — the SAME three strings as the Edit in
+  Photoshop node's BridgeMode: "Wait for first save" (default) | "Re-run on every save" |
+  "Don't open (composite only)"). (`mode` replaces the earlier `edit_after` BOOLEAN;
+  `layer_name` replaces the removed `filename_prefix` — both pre-release breaking changes.
+  `filename_prefix` was dropped because it only named an intermediate file the user never
+  sees: Photoshop opens the managed `source.psd` copy, not that file.) `timeout_seconds`
+  (INT, default 1800) applies to "Wait for first save".
   `max_layers` (INT, default 64, min 1, max 512) caps the total images turned into layers
   across all sockets, oldest-first; a larger batch is truncated (first N kept) with a
   logged warning — no silent drop.
