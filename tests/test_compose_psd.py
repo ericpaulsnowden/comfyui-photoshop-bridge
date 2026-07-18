@@ -730,6 +730,12 @@ class TestIsChanged:
         pil_images = [nodes_module._tensor_to_pil(tensor)]
         prefix = compose_module._sanitize_filename_prefix("compose")
         inputs_hash = compose_module._compute_inputs_hash(pil_images, prefix, "Group", WAIT)
+        # The handoff's OWN source_hash is the mode/prefix-FREE identity hash
+        # (the defect-3 fix: a bridge_node handoff's source_hash must never
+        # bake `mode` in, or a mere mode flip would strand it) -- NOT the
+        # mode-sensitive inputs_hash above, which is IS_CHANGED's own return
+        # value only.
+        identity_hash = compose_module._compute_identity_hash(pil_images, "Group")
 
         before = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
@@ -747,7 +753,7 @@ class TestIsChanged:
             workflow_name="",
             source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGBA", (4, 4), (0, 0, 0, 0)),
-            source_hash=inputs_hash,
+            source_hash=identity_hash,
         )
         manager.ingest_edit(meta.handoff_id, Image.new("RGB", (4, 4), (5, 5, 5)), "plugin")
 
@@ -1059,7 +1065,12 @@ class TestExecuteConsumePath:
         pil_images = [nodes_module._tensor_to_pil(tensor)]
         # WAIT mode (the blocking one) -- proving the consume check runs BEFORE
         # any open/block: an already-saved edit is served without touching PS.
-        inputs_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", WAIT)
+        # The handoff's own source_hash is the mode/prefix-FREE identity hash
+        # (see _compute_identity_hash's docstring) -- NOT the mode-sensitive
+        # _compute_inputs_hash value, which would make execute()'s reuse
+        # check treat this handoff as stale (source_hash mismatch) and
+        # supersede it instead of consuming its edit.
+        identity_hash = compose_module._compute_identity_hash(pil_images, "Group")
 
         meta = manager.create(
             origin_node_id="1",
@@ -1067,7 +1078,7 @@ class TestExecuteConsumePath:
             workflow_name="",
             source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
             original_image=Image.new("RGBA", (8, 8), (0, 0, 0, 0)),
-            source_hash=inputs_hash,
+            source_hash=identity_hash,
         )
         manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (200, 150, 100)), "plugin")
 
@@ -1182,6 +1193,40 @@ class TestModeRerunEverySave:
         handoff_psd = manager.handoff_dir(active.handoff_id) / "source.psd"
         assert launches[0] == str(handoff_psd)
 
+    def test_rerun_while_already_open_does_not_relaunch_photoshop(
+        self, context, manager, configured_with_app, launches
+    ):
+        """Reusing an already-open handoff in a NON-BLOCKING mode must not
+        reopen Photoshop -- same rule as cpsb/nodes.py:434-452.
+
+        "Re-run on every save" re-executes on EVERY save, so relaunching on
+        reuse would yank focus back to Photoshop (and re-issue an OS open on
+        Tier 1) on every single one. That is the user-reported "fires off a
+        bunch of quick commands" disruption, and it is distinct from the
+        duplicate-handoff bug: even with reuse working correctly, an
+        unconditional reopen here would still be wrong.
+        """
+        node = ComposePSD()
+        tensor = make_tensor(RED, size=(8, 8))
+        kwargs = dict(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=tensor,
+        )
+
+        node.execute(**kwargs)
+        first = manager.find_active_for_node("1")
+        assert len(launches) == 1  # the genuinely new handoff opened once
+
+        # Re-run with IDENTICAL inputs, exactly as a save-triggered re-queue
+        # does. Same handoff, and crucially no second launch.
+        node.execute(**kwargs)
+        assert manager.find_active_for_node("1").handoff_id == first.handoff_id
+        assert len(launches) == 1, "reused an open handoff but relaunched Photoshop anyway"
+
     def test_handoff_is_a_managed_copy_not_edit_in_place(
         self, context, manager, configured_with_app, launches
     ):
@@ -1204,7 +1249,20 @@ class TestModeRerunEverySave:
         assert handoff_psd.read_bytes() == (context.input_dir / filename_out).read_bytes()
         assert active.handoff_id in manager._own_source_writes
 
-    def test_source_hash_folds_mode_for_consume(self, context, manager, configured_with_app):
+    def test_source_hash_is_mode_free_identity(self, context, manager, configured_with_app):
+        """A ``bridge_node`` handoff's ``source_hash`` is the mode/prefix-FREE
+        identity hash, NOT :func:`compose_module._compute_inputs_hash`'s
+        mode-sensitive value.
+
+        This test used to assert the OPPOSITE (``source_hash ==
+        _compute_inputs_hash(..., RERUN)``) -- that was the confirmed bug:
+        folding ``mode`` into the recorded ``source_hash`` meant a later
+        mode flip (e.g. to "Wait for first save") changed the identity a
+        reused handoff is matched against, so the already-open handoff could
+        never be recognized again and a second one (and a second live
+        Photoshop document) got created underneath it. See
+        ``_compute_identity_hash``'s docstring in ``cpsb/compose_psd.py``.
+        """
         tensor = make_tensor(RED, size=(8, 8))
         node = ComposePSD()
         node.execute(
@@ -1217,7 +1275,7 @@ class TestModeRerunEverySave:
         )
         active = manager.find_active_for_node("1")
         pil_images = [nodes_module._tensor_to_pil(tensor)]
-        expected_hash = compose_module._compute_inputs_hash(pil_images, "compose", "Group", RERUN)
+        expected_hash = compose_module._compute_identity_hash(pil_images, "Group")
         assert active.source_hash == expected_hash
 
     def test_open_failure_is_logged_and_marked_error_not_a_crash(
@@ -1425,3 +1483,242 @@ class TestModeWaitFirstSave:
             )
         elapsed = time.monotonic() - start
         assert elapsed < 5  # unblocked by cancellation, not the 30s timeout
+
+
+class TestHandoffIdentityReuseAndSupersede:
+    """Regression coverage for the confirmed "spins forever" / "slew of new
+    documents" bug: HANDOFF IDENTITY. The waiter must poll the SAME
+    handoff_id ingest_edit writes to -- across a plain re-queue while
+    unsaved (defect 1: execute() had no reuse path at all, only
+    ``_find_matching_active_handoff``, whose predicate requires non-empty
+    ``edits`` and so never recognized an open-but-unsaved handoff as
+    anything but "no handoff") and across a bare ``mode`` widget flip
+    (defect 3: the OLD code folded ``mode`` into the very value recorded as
+    ``source_hash``, so a mode flip alone changed a handoff's identity and
+    it could never be matched again). Mirrors
+    ``tests/test_annotate.py::TestPsModeBlocking``'s
+    ``test_requeue_after_timeout_reuses_and_reopens_same_handoff`` /
+    ``test_stale_handoff_from_changed_input_is_superseded_and_reopened``
+    shapes.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_requeue_while_unsaved_reuses_same_handoff_not_a_second_one(
+        self, context, manager, configured_with_app, launches
+    ):
+        """THE actual spin bug: re-queueing "Wait for first save" while the
+        previously-opened handoff is still unsaved must reuse it (and
+        reopen it), never mint a second handoff/document.
+        """
+        node_id = "500"
+        tensor = make_tensor(RED, size=(8, 8))
+        node = ComposePSD()
+
+        # First queue: nobody saves before the short timeout -- the user's
+        # first (uninterrupted) attempt. The handoff stays "editing".
+        with raises_interrupt():
+            node.execute(
+                group_name="Group",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                image_1=tensor,
+            )
+        first_active = manager.find_active_for_node(node_id)
+        assert first_active is not None
+        assert first_active.status == "editing"
+        assert len(launches) == 1
+
+        # Re-queue: same inputs, same mode, STILL unsaved -- exactly the
+        # user's "it just spins" report.
+        with raises_interrupt():
+            node.execute(
+                group_name="Group",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                image_1=tensor,
+            )
+        second_active = manager.find_active_for_node(node_id)
+        assert second_active is not None
+        assert second_active.handoff_id == first_active.handoff_id  # reused, not a fresh one
+        assert len(launches) == 2  # reopened the SAME handoff's source.psd
+
+        # No second handoff was ever created for this node.
+        matching = [h for h in manager.list_all(limit=50) if h.origin_node_id == node_id]
+        assert len(matching) == 1
+
+    def test_mode_flip_alone_does_not_strand_or_duplicate_the_handoff(
+        self, context, manager, configured_with_app, launches
+    ):
+        """Flipping ONLY the `mode` widget, with identical images, must not
+        strand the open handoff nor mint a second one (the OLD code folded
+        `mode` into the handoff's own source_hash, so a mode flip changed
+        its identity and it could never be matched again).
+        """
+        node_id = "501"
+        tensor = make_tensor(RED, size=(8, 8))
+        node = ComposePSD()
+
+        # Open via "Re-run on every save" (non-blocking) -- creates the handoff.
+        node.execute(
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=tensor,
+        )
+        first_active = manager.find_active_for_node(node_id)
+        assert first_active is not None
+        assert len(launches) == 1
+
+        # Flip ONLY mode -- to "Wait for first save" -- with the SAME image.
+        # Nobody saves, so this blocks until the short timeout.
+        with raises_interrupt():
+            node.execute(
+                group_name="Group",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                image_1=tensor,
+            )
+        second_active = manager.find_active_for_node(node_id)
+        assert second_active is not None
+        assert second_active.handoff_id == first_active.handoff_id  # same handoff, mode-flip-proof
+        assert len(launches) == 2  # reopened (mode == WAIT_FIRST_SAVE always reopens)
+
+        matching = [h for h in manager.list_all(limit=50) if h.origin_node_id == node_id]
+        assert len(matching) == 1  # never stranded/duplicated across the mode flip
+
+    def test_changed_images_still_supersede_and_create_a_new_handoff(
+        self, context, manager, configured_with_app, launches
+    ):
+        """The behavior that MUST be preserved: genuinely different inputs
+        retire the old handoff and open a real new one (unlike a mere mode
+        flip, this really is "a different desired output").
+        """
+        node_id = "502"
+        node = ComposePSD()
+        node.execute(
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        old_active = manager.find_active_for_node(node_id)
+        assert old_active is not None
+
+        node.execute(
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=make_tensor(GREEN, size=(8, 8)),  # genuinely different pixels
+        )
+        assert manager.get(old_active.handoff_id).status == "superseded"
+        new_active = manager.find_active_for_node(node_id)
+        assert new_active is not None
+        assert new_active.handoff_id != old_active.handoff_id
+        assert len(launches) == 2  # both the old and the new handoff got opened
+
+    def test_dont_open_mode_supersedes_an_active_handoff(
+        self, context, manager, configured_with_app, launches
+    ):
+        """Switching to "Don't open (composite only)" must retire a still-open
+        handoff for this node -- otherwise it strands a live Photoshop
+        document nobody will ever consume (item D of the fix).
+        """
+        node_id = "503"
+        tensor = make_tensor(RED, size=(8, 8))
+        node = ComposePSD()
+        node.execute(
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=tensor,
+        )
+        active = manager.find_active_for_node(node_id)
+        assert active is not None
+
+        image_out, _mask_out, _filename_out = node.execute(
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=tensor,
+        )
+        assert manager.get(active.handoff_id).status == "superseded"
+        assert manager.find_active_for_node(node_id) is None
+        array = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == RED  # still returns the flat composite
+
+    def test_ingest_into_reused_handoff_unblocks_the_waiting_node(
+        self, context, manager, configured_with_app, monkeypatch
+    ):
+        """End-to-end-ish reproduction of the exact user report: open (wait),
+        then simulate the Photoshop plugin's upload route ingesting a save
+        into the handoff the node is ACTUALLY waiting on -- the wait must
+        return the edited pixels, not time out.
+
+        Before the fix, a re-queue while unsaved minted a brand-new second
+        handoff and waited on THAT one, while the plugin/user's save always
+        lands on the file physically open in Photoshop -- the ORIGINAL
+        handoff's ``source.psd``, unchanged since the first call. Ingesting
+        into ``first_active.handoff_id`` below models exactly that: it only
+        unblocks the second call if that original handoff is the one being
+        reused/waited on.
+        """
+        node_id = "504"
+        tensor = make_tensor(RED, size=(8, 8))
+        node = ComposePSD()
+
+        monkeypatch.setattr(
+            routes_module, "launch_photoshop", lambda p, override="": LaunchResult(ok=True)
+        )
+        with raises_interrupt():
+            node.execute(
+                group_name="Group",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                image_1=tensor,
+            )
+        first_active = manager.find_active_for_node(node_id)
+        assert first_active is not None
+        assert first_active.status == "editing"
+
+        edit_color = (11, 22, 33)
+
+        def _save_partway_through(psd_path, override=""):
+            def _do_ingest():
+                manager.ingest_edit(
+                    first_active.handoff_id,
+                    Image.new("RGB", (8, 8), edit_color),
+                    "plugin",
+                )
+
+            threading.Timer(0.3, _do_ingest).start()
+            return LaunchResult(ok=True)
+
+        monkeypatch.setattr(routes_module, "launch_photoshop", _save_partway_through)
+
+        # Re-queue: the user still hasn't saved when this second call starts.
+        image_out, _mask_out, filename_out = node.execute(
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=10,
+            unique_id=node_id,
+            image_1=tensor,
+        )
+        array = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == edit_color  # the save's pixels, NOT a timeout
+
+        second_active = manager.find_active_for_node(node_id)
+        assert second_active is not None
+        assert second_active.handoff_id == first_active.handoff_id  # same handoff throughout
+        assert filename_out == first_active.source.filename

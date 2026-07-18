@@ -650,7 +650,19 @@ class HandoffManager:
                 logger.warning("ingest_edit: unknown handoff %s", handoff_id)
                 return None
             if meta.status not in ACTIVE_STATUSES:
-                logger.info("ingest_edit: ignoring edit for %s handoff %s", meta.status, handoff_id)
+                # WARNING, not info: this is exactly the shape of the
+                # "handoff identity" class of bug (a save lands on a handoff
+                # that is superseded/inactive because the waiter is polling a
+                # DIFFERENT handoff for the same node) -- surfacing it at
+                # this level is what makes that class of bug self-diagnosing
+                # from the ComfyUI console instead of silently spinning.
+                logger.warning(
+                    "ingest_edit: ignoring edit for superseded/inactive handoff %s "
+                    "(node=%s, status=%s)",
+                    handoff_id,
+                    meta.origin_node_id,
+                    meta.status,
+                )
                 return None
 
             edit = self._append_edit_locked(meta, image, fidelity)

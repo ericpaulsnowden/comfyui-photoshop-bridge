@@ -241,6 +241,51 @@ def _sanitize_filename_prefix(raw: str) -> str:
     return name or DEFAULT_FILENAME_PREFIX
 
 
+def _compute_identity_hash(
+    pil_images: list[Image.Image],
+    group_name: str,
+    layer_name: str = DEFAULT_LAYER_NAME,
+) -> str:
+    """The handoff's source IDENTITY -- deliberately mode/prefix-FREE.
+
+    This is what a ``bridge_node`` handoff's ``source_hash`` is now recorded
+    as (:meth:`PhotoshopComposePSD._create_bridge_handoff`) and what
+    :meth:`PhotoshopComposePSD.execute`'s reuse/supersede check compares
+    against, matching :func:`cpsb.handoff.compute_source_hash`'s own
+    pixels-only contract (the same one :class:`cpsb.nodes.PhotoshopBridge`
+    and :mod:`cpsb.annotate` key their own supersede-on-changed-input checks
+    on). It intentionally does NOT include ``mode`` or ``filename_prefix`` --
+    :func:`_compute_inputs_hash` used to fold ``mode`` into the very value
+    recorded as ``source_hash``, which meant merely flipping the ``mode``
+    widget (e.g. "Re-run on every save" -> "Wait for first save") with
+    otherwise-identical pixels changed the handoff's identity: the already-
+    open handoff could never match again, so a second handoff -- and a
+    second live Photoshop document -- got created and the first was left
+    dangling (the confirmed "spins forever" / "slew of new documents" bug).
+    Hashing only the pixels + the structural params that actually change the
+    written PSD's own content (``group_name``, ``layer_name``) keeps a mode
+    flip, or a filename-prefix edit, from stranding an in-progress edit.
+
+    Args:
+        pil_images: The connected inputs, already decoded to PIL, in
+            ``image_1..image_N`` order.
+        group_name: The ``group_name`` widget value (changes the written
+            PSD's group name, so it is part of the document's identity).
+        layer_name: The ``layer_name`` widget value (changes every layer's
+            name for the same reason).
+
+    Returns:
+        A 64-char lowercase hex sha256 digest.
+    """
+    hasher = hashlib.sha256()
+    for image in pil_images:
+        hasher.update(compute_source_hash(image).encode("ascii"))
+    hasher.update(group_name.encode("utf-8"))
+    hasher.update(b"\x00")
+    hasher.update(layer_name.encode("utf-8"))
+    return hasher.hexdigest()
+
+
 def _compute_inputs_hash(
     pil_images: list[Image.Image],
     filename_prefix: str,
@@ -248,40 +293,28 @@ def _compute_inputs_hash(
     mode: str,
     layer_name: str = DEFAULT_LAYER_NAME,
 ) -> str:
-    """A deterministic sha256 identity for "these inputs, these params".
+    """A deterministic sha256 identity for "these inputs, these params, this mode".
 
-    Shared by :meth:`PhotoshopComposePSD.IS_CHANGED` and
-    :meth:`PhotoshopComposePSD.execute` -- both need the IDENTICAL value so
-    that a handoff created inside ``execute()`` (its ``source_hash``, see
-    :meth:`PhotoshopComposePSD._open_after_compose`) can later be recognized
-    as "still matching the current inputs" by a subsequent call to either
-    method (PROTOCOL.md §6c: "execute() returns the latest edit ... when the
-    active handoff's source_hash matches the current inputs' hash").
+    Used ONLY by :meth:`PhotoshopComposePSD.IS_CHANGED` as the base value
+    that forces ComfyUI to re-execute this node when ANYTHING relevant
+    changes -- pixels, ``filename_prefix``, ``group_name``, ``layer_name``,
+    or ``mode`` (switching ``mode`` genuinely changes what ``execute()``
+    does even for pixel-identical inputs, so it must still be folded in
+    HERE). This is deliberately a DIFFERENT value from
+    :func:`_compute_identity_hash` -- see that function's docstring for why
+    a handoff's recorded ``source_hash`` must NOT include ``mode``/
+    ``filename_prefix`` while this ``IS_CHANGED`` value still needs to.
 
-    Deliberately hashes the ORDERED CONCATENATION of each image's own
-    :func:`~cpsb.handoff.compute_source_hash` (a "hash of hashes"), per
-    research-multilayer-compose.md §6's recommendation for a multi-input
-    ``source_hash``: any addition, removal, reorder, or pixel change of an
-    input changes the combined result, matching what a single-image node's
-    plain ``compute_source_hash`` comparison already guarantees (PROTOCOL.md
-    §1/§6). ``filename_prefix``/``group_name``/``mode`` are folded in too,
-    since a change to any of them should also force re-execution (a different
-    filename or group label is a different desired output, and switching
-    ``mode`` changes what execute() does even for pixel-identical inputs).
-    Folding ``mode`` in also keeps a handoff created under one mode from ever
-    being consumed by a run under a different mode: the recorded
-    ``source_hash`` bakes the mode in, so a stale handoff from a
-    since-switched-away-from mode simply fails the ``source_hash`` match in
-    :func:`_find_matching_active_handoff` rather than needing a separate guard.
+    Built on top of :func:`_compute_identity_hash` (same pixel/group/layer
+    hashing) rather than duplicating it, with ``filename_prefix`` and
+    ``mode`` folded in afterward.
 
     Note this is NOT literally "sha256 of the PSD bytes that would be
     written" -- computing that would require re-serializing a full PSD on
     every ``IS_CHANGED`` call (expensive, and psd-tools' write path is not
     guaranteed byte-for-byte deterministic run to run) just to test
-    equality. Hashing the inputs directly is cheap, deterministic by
-    construction, and is what actually makes the "does this handoff still
-    match" check in :meth:`PhotoshopComposePSD.execute` work without
-    rewriting a file merely to compare it.
+    equality. Hashing the inputs directly is cheap and deterministic by
+    construction.
 
     Args:
         pil_images: The connected inputs, already decoded to PIL, in
@@ -296,32 +329,28 @@ def _compute_inputs_hash(
     Returns:
         A 64-char lowercase hex sha256 digest.
     """
+    identity_hash = _compute_identity_hash(pil_images, group_name, layer_name)
     hasher = hashlib.sha256()
-    for image in pil_images:
-        hasher.update(compute_source_hash(image).encode("ascii"))
+    hasher.update(identity_hash.encode("ascii"))
+    hasher.update(b"\x00")
     hasher.update(filename_prefix.encode("utf-8"))
     hasher.update(b"\x00")
-    hasher.update(group_name.encode("utf-8"))
-    hasher.update(b"\x00")
     hasher.update(mode.encode("utf-8"))
-    hasher.update(b"\x00")
-    # layer_name is folded so renaming the layers forces a re-run (the written
-    # PSD's layer names change even though the composite pixels don't).
-    hasher.update(layer_name.encode("utf-8"))
     return hasher.hexdigest()
 
 
 def _find_matching_active_handoff(
-    manager: HandoffManager, node_id: str, inputs_hash: str
+    manager: HandoffManager, node_id: str, identity_hash: str
 ) -> HandoffMeta | None:
     """The active ``bridge_node`` handoff for *node_id*, iff it has a consumable edit.
 
     Mirrors :meth:`cpsb.nodes.PhotoshopBridge.execute`'s consume predicate
     (same shape, deliberately re-implemented rather than imported --
     ``cpsb/nodes.py`` is owned elsewhere and keeps its check inline; a small
-    parallel helper here couples nothing to that module's internals). Shared
-    by :meth:`PhotoshopComposePSD.IS_CHANGED` and
-    :meth:`PhotoshopComposePSD.execute`.
+    parallel helper here couples nothing to that module's internals). Used by
+    :meth:`PhotoshopComposePSD.IS_CHANGED` (:meth:`PhotoshopComposePSD.execute`
+    has its own inline reuse/supersede logic, since unlike this read-only
+    helper it must be able to mutate state via ``manager.supersede``).
 
     The ``origin_kind == "bridge_node"`` filter matches what this node's own
     open paths now write (:meth:`PhotoshopComposePSD._create_bridge_handoff`,
@@ -333,21 +362,24 @@ def _find_matching_active_handoff(
     Args:
         manager: The handoff manager.
         node_id: This node instance's ``unique_id``, stringified.
-        inputs_hash: :func:`_compute_inputs_hash` of the CURRENT inputs/params.
+        identity_hash: :func:`_compute_identity_hash` of the CURRENT inputs --
+            deliberately mode/prefix-FREE (see that function's docstring),
+            since a handoff's recorded ``source_hash`` is now identity-only
+            too.
 
     Returns:
         The matching handoff, or ``None`` when there is no active handoff for
         this node, it isn't ``origin_kind == "bridge_node"`` (defensive --
         e.g. a leftover handoff of another kind for the same node id), its
-        recorded ``source_hash`` doesn't equal *inputs_hash* (different
-        inputs/params/mode), or it has no edits yet -- each meaning "write a
+        recorded ``source_hash`` doesn't equal *identity_hash* (the actual
+        inputs changed), or it has no edits yet -- each meaning "write a
         fresh compose instead".
     """
     active = manager.find_active_for_node(node_id)
     if (
         active is not None
         and active.origin_kind == "bridge_node"
-        and active.source_hash == inputs_hash
+        and active.source_hash == identity_hash
         and active.edits
     ):
         return active
@@ -576,16 +608,28 @@ class PhotoshopComposePSD:
     plumbing this build does not own); the blocking round trip works
     end-to-end all the same.
 
-    Consume semantics mirror :meth:`cpsb.nodes.PhotoshopBridge.execute`,
-    keyed off :func:`_compute_inputs_hash` instead of a single file's raw
-    bytes (PROTOCOL.md §6c): while an ACTIVE ``bridge_node`` handoff for this
-    node has a ``source_hash`` matching the CURRENT inputs' combined hash and
-    at least one edit, :meth:`execute` returns that edit's pixels (flattened)
-    instead of composing fresh -- so re-queuing after a Photoshop save
-    delivers the user's manual compositing/masking work, the same "consume
-    the edit" pattern PROTOCOL.md §6/§6b establish. This consume check runs
-    first for EVERY mode, so an already-saved edit is served without
-    re-opening Photoshop regardless of which mode is selected.
+    Consume/reuse/supersede semantics mirror
+    :meth:`cpsb.nodes.PhotoshopBridge.execute` and :mod:`cpsb.annotate`,
+    keyed off :func:`_compute_identity_hash` -- a mode/prefix-FREE hash of
+    the combined inputs (PROTOCOL.md §6c) -- instead of a single file's raw
+    bytes: while an ACTIVE ``bridge_node`` handoff for this node has a
+    ``source_hash`` matching the CURRENT inputs' identity, :meth:`execute`
+    either (a) returns its latest edit's pixels (flattened) instead of
+    composing fresh, when one has arrived -- so re-queuing after a Photoshop
+    save delivers the user's manual compositing/masking work, the same
+    "consume the edit" pattern PROTOCOL.md §6/§6b establish -- or (b), when
+    no edit has arrived yet, REUSES that same handoff (reopening its
+    ``source.psd``) rather than minting a second one, so a re-queue against a
+    handoff that is open in Photoshop but not yet saved never orphans it with
+    a duplicate. Only when the identity no longer matches (the actual
+    connected images, ``group_name``, or ``layer_name`` changed) is the old
+    handoff superseded and a genuinely new one created. The consume check
+    runs first for EVERY mode, so an already-saved edit is served without
+    re-opening Photoshop regardless of which mode is selected; the reuse
+    check likewise applies regardless of mode, so switching *only* the
+    ``mode`` widget (with unchanged inputs) can never strand an open
+    handoff/document (see :func:`_compute_identity_hash`'s docstring for the
+    bug this fixes).
     """
 
     CATEGORY = "image/photoshop"
@@ -678,7 +722,13 @@ class PhotoshopComposePSD:
         state = nodes._state_if_configured()
         if state is None:
             return inputs_hash
-        active = _find_matching_active_handoff(state.manager, str(unique_id), inputs_hash)
+        # Matching uses the mode/prefix-FREE identity hash -- a handoff's
+        # source_hash is recorded as _compute_identity_hash's value now (see
+        # that function's docstring), not the mode-sensitive inputs_hash
+        # above (which stays mode-sensitive here only so a mode/prefix change
+        # alone still forces THIS node to re-execute).
+        identity_hash = _compute_identity_hash(pil_images, group_name, layer_name)
+        active = _find_matching_active_handoff(state.manager, str(unique_id), identity_hash)
         if active is not None:
             edit_hash = state.manager.latest_edit_hash(active.handoff_id)
             if edit_hash is not None:
@@ -769,10 +819,43 @@ class PhotoshopComposePSD:
             )
 
         prefix = _sanitize_filename_prefix(filename_prefix)
-        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode, layer_name)
+        # Mode/prefix-FREE identity (see _compute_identity_hash's docstring):
+        # this is what a bridge_node handoff's source_hash is now recorded
+        # as, and what reuse/supersede below is keyed on -- deliberately NOT
+        # the mode-sensitive _compute_inputs_hash (that value is IS_CHANGED's
+        # job only). Folding mode in here was the confirmed bug: a mere mode
+        # flip changed the recorded identity, so the already-open handoff
+        # could never match again, stranding it as a live, unreachable
+        # Photoshop document while a second one got created underneath it.
+        identity_hash = _compute_identity_hash(pil_images, group_name, layer_name)
 
-        active = _find_matching_active_handoff(manager, node_id, inputs_hash)
-        if active is not None:
+        # -- reuse / supersede (mirrors cpsb.nodes.PhotoshopBridge.execute,
+        # cpsb/nodes.py:402-432, and cpsb.annotate's analogous block,
+        # cpsb/annotate.py:539-549) -----------------------------------------
+        active = manager.find_active_for_node(node_id)
+        if active is not None and active.origin_kind != "bridge_node":
+            # Defensive: a leftover handoff of another kind for the same node
+            # id is not one this node ever created or can consume.
+            active = None
+        if (
+            active is not None
+            and active.source_hash is not None
+            and active.source_hash != identity_hash
+        ):
+            # The connected inputs (or group_name/layer_name) genuinely
+            # changed since this handoff was opened: any edits it holds
+            # belong to the OLD identity and must not be served for the new
+            # one. Retire it and start fresh -- this is the one case a new
+            # handoff (and new Photoshop document) is actually warranted.
+            logger.info(
+                "cpsb compose_psd: node %s: inputs changed, superseding handoff %s",
+                node_id,
+                active.handoff_id,
+            )
+            manager.supersede(active.handoff_id)
+            active = None
+
+        if active is not None and active.edits:
             consumed = _consume_active_edit(manager, active.handoff_id)
             if consumed is not None:
                 logger.info(
@@ -782,6 +865,8 @@ class PhotoshopComposePSD:
                 )
                 image_tensor, mask_tensor = consumed
                 return image_tensor, mask_tensor, active.source.filename
+            # Filesystem race: the edit file vanished. `active` stays set so
+            # the open paths below REUSE it rather than minting a new one.
 
         logger.info(
             "cpsb compose_psd: node %s: composing %d layer(s) into group %r (mode=%r)",
@@ -801,7 +886,19 @@ class PhotoshopComposePSD:
         image_tensor, mask_tensor = nodes._tensors_from_image(flattened)
 
         if mode == MODE_DONT_OPEN:
-            # Old always-flat behavior: no Photoshop, no handoff.
+            # Old always-flat behavior: no Photoshop, no handoff. If a
+            # handoff was still open for this node (e.g. the user switched
+            # from an open-Photoshop mode to this one without saving first),
+            # retire it -- nobody will ever consume it otherwise, and it
+            # would strand a live Photoshop document.
+            if active is not None:
+                logger.info(
+                    "cpsb compose_psd: node %s: mode=%r, superseding handoff %s (won't be opened)",
+                    node_id,
+                    mode,
+                    active.handoff_id,
+                )
+                manager.supersede(active.handoff_id)
             return image_tensor, mask_tensor, output_path.name
 
         if mode == nodes.BridgeMode.WAIT_FIRST_SAVE:
@@ -809,10 +906,10 @@ class PhotoshopComposePSD:
             # Deliberately NOT wrapped in try/except: an open failure or a
             # cancel/timeout must propagate as InterruptProcessingException
             # (the bridge/annotate contract), never be swallowed here.
-            image_tensor, mask_tensor = self._open_and_wait_for_edit(
-                state, node_id, output_path, inputs_hash, flattened, timeout_seconds
+            image_tensor, mask_tensor, result_name = self._open_and_wait_for_edit(
+                state, node_id, output_path, identity_hash, flattened, timeout_seconds, active
             )
-            return image_tensor, mask_tensor, output_path.name
+            return image_tensor, mask_tensor, result_name
 
         # mode == BridgeMode.RERUN_EVERY_SAVE: open non-blocking, pass the flat
         # composite through. PROTOCOL.md §6c: "Failure to open = log + cpsb.status
@@ -820,22 +917,25 @@ class PhotoshopComposePSD:
         # already valid and must still be returned. _open_in_photoshop already
         # catches and marks its own ordinary failure modes; this try/except is a
         # last-resort guard against a genuinely unexpected one.
+        result_name = output_path.name
         try:
-            self._open_passthrough(state, node_id, output_path, inputs_hash, flattened)
+            result_name = self._open_passthrough(
+                state, node_id, output_path, identity_hash, flattened, active
+            )
         except Exception:
             logger.exception(
                 "cpsb compose_psd: node %s: opening Photoshop after compose failed",
                 node_id,
             )
 
-        return image_tensor, mask_tensor, output_path.name
+        return image_tensor, mask_tensor, result_name
 
     @staticmethod
     def _create_bridge_handoff(
         state: nodes._NodeState,
         node_id: str,
         psd_path: Path,
-        inputs_hash: str,
+        identity_hash: str,
         composite_image: Image.Image,
     ) -> HandoffMeta:
         """Create the ``bridge_node`` handoff whose ``source.psd`` is *psd_path* copied.
@@ -870,17 +970,21 @@ class PhotoshopComposePSD:
         pointing the handoff directly at *psd_path* is the natural follow-up
         once that ``edit_in_place`` plumbing lands.
 
-        ``source_hash`` is set to *inputs_hash* (the SAME value the consume
-        check recomputes from the current inputs) rather than a hash of
-        *psd_path*'s bytes -- see :func:`_compute_inputs_hash`'s docstring for
-        why a PSD-bytes hash cannot support the cheap per-call equality test
-        the consume path needs.
+        ``source_hash`` is set to *identity_hash* (the SAME mode/prefix-FREE
+        value :func:`_compute_identity_hash` recomputes from the current
+        inputs, and what the reuse/supersede check in :meth:`execute`
+        compares against) rather than a hash of *psd_path*'s bytes -- see
+        :func:`_compute_identity_hash`'s docstring for why a PSD-bytes hash
+        cannot support the cheap per-call equality test the consume path
+        needs, and why this must be the mode-FREE identity rather than the
+        mode-sensitive :func:`_compute_inputs_hash` value (folding mode in
+        here was the confirmed "spins forever" / "slew of documents" bug).
 
         Args:
             state: The shared backend state.
             node_id: This node instance's id (the handoff's ``origin_node_id``).
             psd_path: The just-written compose output (already on disk).
-            inputs_hash: :func:`_compute_inputs_hash` of the inputs that
+            identity_hash: :func:`_compute_identity_hash` of the inputs that
                 produced *psd_path* -- recorded as the handoff's
                 ``source_hash``.
             composite_image: The flattened composite (for the handoff's
@@ -899,7 +1003,7 @@ class PhotoshopComposePSD:
             workflow_name="",
             source=SourceRef(filename=psd_path.name, subfolder="", type="input"),
             original_image=composite_image,
-            source_hash=inputs_hash,
+            source_hash=identity_hash,
         )
         handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
         handoff_psd_path.parent.mkdir(parents=True, exist_ok=True)
@@ -912,36 +1016,55 @@ class PhotoshopComposePSD:
         state: nodes._NodeState,
         node_id: str,
         psd_path: Path,
-        inputs_hash: str,
+        identity_hash: str,
         composite_image: Image.Image,
         timeout_seconds: int,
-    ) -> tuple[Any, Any]:
+        existing: HandoffMeta | None = None,
+    ) -> tuple[Any, Any, str]:
         """"Wait for first save": open Photoshop and BLOCK until saved (PROTOCOL.md §6c).
 
         Identical in shape to :meth:`cpsb.nodes.PhotoshopBridge.execute`'s
         "Wait for first save" tail and :func:`cpsb.annotate._open_and_block_for_edit`:
-        create the handoff (:meth:`_create_bridge_handoff`), open via the
-        shared tier-selecting seam
-        (:meth:`cpsb.nodes.PhotoshopBridge._open_in_photoshop`, reused rather
-        than reimplemented -- it already logs tier selection and the launch
-        result), then poll :meth:`cpsb.handoff.HandoffManager.wait_for_edit`
-        on this (worker) thread until the first save. Every step is also
-        logged under ``cpsb compose_psd:`` so a "didn't open Photoshop" report
-        is diagnosable from this node's own log trail.
+        create (or REUSE, see *existing*) the handoff, open via the shared
+        tier-selecting seam (:meth:`cpsb.nodes.PhotoshopBridge._open_in_photoshop`,
+        reused rather than reimplemented -- it already logs tier selection and
+        the launch result), then poll
+        :meth:`cpsb.handoff.HandoffManager.wait_for_edit` on this (worker)
+        thread until the first save. Every step is also logged under ``cpsb
+        compose_psd:`` so a "didn't open Photoshop" report is diagnosable
+        from this node's own log trail.
 
         Args:
             state: The shared backend state.
             node_id: This node instance's id.
             psd_path: The just-written compose output.
-            inputs_hash: Recorded as the handoff's ``source_hash``.
-            composite_image: The flattened composite (thumbnail, and the
-                fallback returned if the edit file races away after the wait).
+            identity_hash: :func:`_compute_identity_hash` of the current
+                inputs -- recorded as a freshly-created handoff's
+                ``source_hash``. Unused when *existing* is provided (its own
+                ``source_hash`` already matched, or the caller wouldn't have
+                passed it).
+            composite_image: The flattened composite (thumbnail for a fresh
+                handoff, and the fallback returned if the edit file races
+                away after the wait).
             timeout_seconds: Bound on the blocking wait.
+            existing: An already-open, still-unsaved ``bridge_node`` handoff
+                for this SAME node whose identity already matches (PROTOCOL.md
+                §6c reuse semantics, mirroring
+                :meth:`cpsb.nodes.PhotoshopBridge.execute` and
+                :func:`cpsb.annotate._resolve_ps_mode`). When given, this
+                REUSES it -- reopening the SAME ``source.psd`` the user may
+                already be working in -- instead of minting a brand-new
+                handoff (and a second, orphaned Photoshop document). ``None``
+                (the default) creates a fresh one via
+                :meth:`_create_bridge_handoff`, as before.
 
         Returns:
-            ``(IMAGE, MASK)`` tensors of the SAVED edit (flattened) -- a
-            normal return means the wait outcome was
-            :data:`~cpsb.handoff.WaitOutcome.EDITED`.
+            ``(IMAGE, MASK, filename)`` -- the tensors are the SAVED edit's
+            pixels (flattened); a normal return means the wait outcome was
+            :data:`~cpsb.handoff.WaitOutcome.EDITED`. *filename* is the
+            handoff's own ``source.filename`` -- the ORIGINAL generated PSD
+            on reuse, matching what the consume path already reports, not
+            necessarily *psd_path*'s name.
 
         Raises:
             Whatever :func:`cpsb.nodes._raise_interrupt` raises (ComfyUI's own
@@ -950,9 +1073,16 @@ class PhotoshopComposePSD:
             ``CANCELLED``/``TIMEOUT``.
         """
         manager = state.manager
-        meta = PhotoshopComposePSD._create_bridge_handoff(
-            state, node_id, psd_path, inputs_hash, composite_image
-        )
+        if existing is None:
+            meta = PhotoshopComposePSD._create_bridge_handoff(
+                state, node_id, psd_path, identity_hash, composite_image
+            )
+            result_name = psd_path.name
+        else:
+            # Reuse: do NOT rewrite source.psd -- the user's in-progress
+            # layers live in it. Same rule as cpsb/annotate.py:550-557.
+            meta = existing
+            result_name = existing.source.filename
         handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
 
         logger.info(
@@ -999,23 +1129,26 @@ class PhotoshopComposePSD:
         # A normal return above means WaitOutcome.EDITED -- an edit is on disk.
         consumed = _consume_active_edit(manager, meta.handoff_id)
         if consumed is not None:
-            return consumed
+            image_tensor, mask_tensor = consumed
+            return image_tensor, mask_tensor, result_name
         # Filesystem race: the edit file vanished between ingest and read.
         # Fall back to the flat composite so the outputs stay valid.
-        return nodes._tensors_from_image(composite_image)
+        image_tensor, mask_tensor = nodes._tensors_from_image(composite_image)
+        return image_tensor, mask_tensor, result_name
 
     @staticmethod
     def _open_passthrough(
         state: nodes._NodeState,
         node_id: str,
         psd_path: Path,
-        inputs_hash: str,
+        identity_hash: str,
         composite_image: Image.Image,
-    ) -> None:
+        existing: HandoffMeta | None = None,
+    ) -> str:
         """"Re-run on every save": open Photoshop non-blocking (PROTOCOL.md §6c).
 
-        Creates the ``bridge_node`` handoff (:meth:`_create_bridge_handoff`)
-        and opens it through the shared tier-selecting seam, returning as soon
+        Creates (or REUSES, see *existing*) the ``bridge_node`` handoff and
+        opens it through the shared tier-selecting seam, returning as soon
         as the OS launch (Tier 1) or the plugin ``open_handoff`` send (Tier 2)
         completes -- it never waits for a save. The caller returns the flat
         composite; each later save is auto-queued by the frontend (PROTOCOL.md
@@ -1030,14 +1163,48 @@ class PhotoshopComposePSD:
             state: The shared backend state.
             node_id: This node instance's id.
             psd_path: The just-written compose output.
-            inputs_hash: Recorded as the handoff's ``source_hash``.
+            identity_hash: :func:`_compute_identity_hash` of the current
+                inputs -- recorded as a freshly-created handoff's
+                ``source_hash``. Unused when *existing* is provided.
             composite_image: The flattened composite (for the thumbnail).
+            existing: An already-open ``bridge_node`` handoff for this node
+                whose identity already matches -- reuse it (same rationale as
+                :meth:`_open_and_wait_for_edit`) instead of creating a new
+                one. ``None`` (the default) creates a fresh handoff.
+
+        Returns:
+            The filename to report as this call's STRING output: the
+            handoff's own ``source.filename`` (the ORIGINAL generated PSD on
+            reuse, *psd_path*'s name for a fresh handoff).
         """
         manager = state.manager
-        meta = PhotoshopComposePSD._create_bridge_handoff(
-            state, node_id, psd_path, inputs_hash, composite_image
-        )
+        if existing is None:
+            meta = PhotoshopComposePSD._create_bridge_handoff(
+                state, node_id, psd_path, identity_hash, composite_image
+            )
+            result_name = psd_path.name
+        else:
+            # Reuse: do NOT rewrite source.psd -- the user's in-progress
+            # layers live in it. Same rule as cpsb/annotate.py:550-557.
+            meta = existing
+            result_name = existing.source.filename
         handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+
+        if existing is not None:
+            # Reusing an already-open handoff in a NON-BLOCKING mode: do not
+            # relaunch Photoshop. This is the same rule (and the same reason)
+            # as cpsb/nodes.py:434-452 -- "Re-run on every save" re-executes on
+            # every single save, so relaunching here would yank focus back to
+            # Photoshop (and, on Tier 1, re-issue an OS open) on each one,
+            # which is precisely the "fires off a bunch of quick commands"
+            # disruption this node was reported for. The document is already
+            # open in front of the user; there is nothing to open.
+            logger.info(
+                "cpsb compose_psd: node %s handoff %s: handoff already open, not reopening",
+                node_id,
+                meta.handoff_id,
+            )
+            return result_name
 
         attempt = nodes.PhotoshopBridge._open_in_photoshop(state, meta, handoff_psd_path)
         if attempt.ok:
@@ -1054,3 +1221,4 @@ class PhotoshopComposePSD:
                 meta.handoff_id,
                 attempt.error,
             )
+        return result_name

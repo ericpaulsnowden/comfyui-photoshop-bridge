@@ -532,6 +532,28 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   latest-edit hash when an active matching handoff exists; execute() returns the latest
   edit (flattened) when the active handoff's `source_hash` matches the current inputs'
   hash — the §6/§6b consume pattern.
+- **Handoff identity is mode-FREE** (fixed v0.5.18 — this node previously had neither
+  reuse nor supersede, which is what made "Wait for first save" hang forever and spawned
+  a document per run). Two distinct hashes now:
+  - `_compute_identity_hash` (images + `group_name` + `layer_name`) is what a handoff's
+    `source_hash` records and what reuse/supersede is keyed on. Deliberately excludes
+    `mode` and `filename_prefix`, matching `compute_source_hash`'s pixels-only contract.
+    Folding `mode` in was the bug: flipping the widget with identical pixels changed the
+    recorded identity, so the already-open handoff could never match again — it was
+    stranded as a live but unreachable Photoshop document while a second one was created
+    underneath it. The user then saved document A while execute() waited on document B,
+    and blocked until timeout.
+  - `_compute_inputs_hash` (identity + `filename_prefix` + `mode`) stays mode-sensitive
+    and is `IS_CHANGED`'s job ONLY.
+- Reuse/supersede now mirrors §6's bridge node exactly: an active `bridge_node` handoff
+  for this node is REUSED (its `source.psd` is never rewritten — the user's in-progress
+  layers live in it); it is superseded only when the identity hash genuinely differs, and
+  also when switching to "Don't open (composite only)". A reused handoff in a NON-BLOCKING
+  mode does NOT relaunch Photoshop (same rule as §6): "Re-run on every save" re-executes on
+  every save, so reopening would steal focus and re-issue a Tier-1 OS open each time.
+- `ingest_edit` logs an edit arriving for an inactive/superseded handoff at WARNING (was
+  INFO), naming the handoff id, node id and status — this class of bug is otherwise
+  invisible from the ComfyUI console.
 
 ### 6d. Annotate for Edit node
 
