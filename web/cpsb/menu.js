@@ -102,6 +102,7 @@
 
 import { app } from '../../../scripts/app.js'
 import * as api from './api.js'
+import * as compose from './compose.js'
 import * as loadpsd from './loadpsd.js'
 import * as open from './open.js'
 import * as state from './state.js'
@@ -189,13 +190,21 @@ export function deriveOriginKind(node) {
  * common case (PROTOCOL.md §6b: its hand-rolled widget bypasses the stock
  * image-preview pipeline entirely — see loadpsd.js's header) — its file
  * lives on the `psd` COMBO widget's value instead, always `type: "input"`.
- * Every other node type keeps the original `node.imgs`-based lookup.
+ * A Compose node (`PhotoshopComposePSD`) likewise never populates
+ * `node.imgs` (it returns plain `IMAGE`/`MASK`/`STRING` tensors, not a
+ * SaveImage-style UI preview) — its file is whatever `compose.js`'s
+ * `cpsb.compose_written` handler last recorded on the node (build brief item
+ * 4: reopening a "Don't open" run's output). Checked BEFORE the `node.imgs`
+ * fallback so a stale/absent `node.imgs` on a Compose node never masks a
+ * genuinely known written file. Every other node type keeps the original
+ * `node.imgs`-based lookup.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @param {number} imageIndex
  * @returns {import('./api.js').CpsbImageRef | null}
  */
 function resolveImageRef(node, imageIndex) {
   if (loadpsd.isLoadPsdNode(node)) return loadpsd.getPsdFileRef(node)
+  if (compose.isComposePsdNode(node)) return compose.getWrittenFileRef(node)
   return api.parseImageRef(node.imgs?.[imageIndex]?.src)
 }
 
@@ -234,7 +243,9 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
       summary: 'Could not open in Photoshop',
       detail: loadpsd.isLoadPsdNode(node)
         ? 'Upload a PSD/PSB file to this node first.'
-        : 'This image has no resolvable file reference.'
+        : compose.isComposePsdNode(node)
+          ? 'Run this node at least once first.'
+          : 'This image has no resolvable file reference.'
     })
     return
   }
@@ -347,14 +358,26 @@ async function openAllInPhotoshop(node) {
  * populates `node.imgs` (see loadpsd.js's header — it deliberately doesn't
  * hook into the stock image-preview pipeline), so without this exception a
  * freshly-added Load PSD node would never offer "Open in Photoshop" at all.
- * `count` below naturally falls back to 0 for such a node, so the "Open all
- * N" batch item — a concept that doesn't apply to a single-file COMBO —
- * simply never appears for it, no extra branching needed there.
+ * It is likewise allowlist-extended for a `PhotoshopComposePSD` node that has
+ * RECORDED a written filename (`compose.hasWrittenFile`, populated by the
+ * `cpsb.compose_written` event `compose.js` subscribes to) — build brief
+ * item 4: a Compose node run in `MODE_DONT_OPEN` ("Don't open (composite
+ * only)") never opens Photoshop and never populates `node.imgs` either, so
+ * without this it would have no way to re-open the file it already wrote.
+ * `count` below naturally falls back to 0 for both allowlisted cases, so the
+ * "Open all N" batch item — a concept that doesn't apply to either a
+ * single-file COMBO or a single composed PSD — simply never appears for
+ * them, no extra branching needed there. The re-open itself goes through the
+ * exact same `mode: 'new'` → `open.openInteractive` → `POST /cpsb/open` path
+ * as every other node's right-click "Open in Photoshop" ({@link
+ * openInPhotoshop}/{@link resolveImageRef}), so it inherits the same
+ * client-locality confirm and Tier 1/Tier 2 handling for free.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @returns {import('../../../scripts/app.js').IContextMenuValue[]}
  */
 export function getNodeMenuItems(node) {
-  if (!node.imgs?.length && !loadpsd.isLoadPsdNode(node)) return []
+  const hasComposeWrittenFile = compose.isComposePsdNode(node) && compose.hasWrittenFile(node)
+  if (!node.imgs?.length && !loadpsd.isLoadPsdNode(node) && !hasComposeWrittenFile) return []
 
   const activeHandoff = state.getActiveHandoffForNode(String(node.id))
   const tierInfo = state.getTierInfo()

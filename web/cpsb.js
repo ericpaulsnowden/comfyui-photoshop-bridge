@@ -135,26 +135,30 @@ app.registerExtension({
 
   /**
    * Fires once per node instance. Installs the chained `onDrawForeground`
-   * badge hook (badges.js) and, for Load PSD nodes only, the hand-rolled
-   * upload button + drag-and-drop (loadpsd.js — PROTOCOL.md §6b: the stock
+   * badge hook (badges.js); for Load PSD nodes only, the hand-rolled upload
+   * button + drag-and-drop (loadpsd.js — PROTOCOL.md §6b: the stock
    * IMAGEUPLOAD widget can't accept `.psd`/`.psb`; see loadpsd.js's header
-   * for why).
+   * for why); and, for Compose nodes only, the auto-growing `image_N` inputs
+   * plus the "Written: ..." display's `localStorage` restore (compose.js).
    */
   nodeCreated(node) {
     safely('badges.installBadgeHook', () => badges.installBadgeHook(node))
     safely('loadpsd.attachUploadWidget', () => loadpsd.attachUploadWidget(node))
     safely('compose.attachAutoGrowInputs', () => compose.attachAutoGrowInputs(node))
+    safely('compose.attachWrittenDisplay', () => compose.attachWrittenDisplay(node))
   },
 
   /**
    * Fires once, after ComfyUI has finished starting up. Wires the
    * `cpsb.updated` paste-back handler, the node-badge event subscriptions,
-   * the sidebar gallery tab, and seeds the client-side handoff cache from
+   * the `cpsb.compose_written` "Written: ..." handler (compose.js), the
+   * sidebar gallery tab, and seeds the client-side handoff cache from
    * `GET /cpsb/status`.
    */
   async setup() {
     safely('pasteback.init', () => pasteback.init())
     safely('badges.init', () => badges.init())
+    safely('compose.init', () => compose.init())
     safely('gallery.registerGalleryTab', () => gallery.registerGalleryTab())
     safely('state.initState', () => state.initState())
     // Piggybacks on the same (idempotent — see state.js) initState() call

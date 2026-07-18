@@ -565,6 +565,34 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   latest-edit hash when an active matching handoff exists; execute() returns the latest
   edit (flattened) when the active handoff's `source_hash` matches the current inputs'
   hash — the §6/§6b consume pattern.
+- **Finding the written file** (v0.5.22). "Don't open (composite only)" writes a real PSD
+  but deliberately creates NO handoff — and every discoverability surface in this pack
+  (gallery cards, badges, reveal/re-open, the right-click menu) is handoff-driven, so the
+  file existed with nothing pointing at it ("how do I later find and open the file?").
+  - A new informational event `cpsb.compose_written` (`COMPOSE_WRITTEN_EVENT`) is emitted
+    right after the PSD is written, for ALL three modes, carrying the node id and the
+    written filename. It is emitted via `context.send_event` ONLY — the same non-handoff
+    transport `routes._emit_tier2` uses — and never touches `HandoffManager`, so "Don't
+    open" keeps its zero-Photoshop-entanglement contract literally (asserted by test: no
+    active handoff, no `meta.json`). It is NOT emitted on the consume path or the
+    duplicate-append skip, since no write happens there.
+  - The frontend shows `Written: <filename> (on ComfyUI machine)` on the node, click to
+    copy. Deliberately the input-relative FILENAME, not an absolute path, and with NO
+    reveal-in-OS affordance: in remote mode the file is on the ComfyUI machine and
+    revealing it in the browser machine's Finder is meaningless.
+  - The right-click "Open in Photoshop" gate (previously `node.imgs?.length`) now also
+    accepts a Compose node with a recorded written filename, routed through the SAME
+    `/cpsb/open` `mode:"new"` path everything else uses — so it inherits the client-locality
+    confirm and Tier-1/Tier-2 handling for free.
+  - Persistence: the filename is mirrored into `localStorage` (keyed by workflow name +
+    node id) and restored on `nodeCreated`. It survives a reload of the same
+    browser/profile/workflow; it does NOT survive a different browser/profile, cleared or
+    blocked storage, or opening the exported workflow JSON fresh. There is no server-side
+    record to re-sync from — by design, since "Don't open" creates none.
+  - Already-shipped alternative, no new machinery: Compose writes into ComfyUI's input
+    folder, and `PhotoshopLoadPSD`'s `psd` combo lists `input/*.psd` — so pointing a Load
+    PSD node at the composed file works today. (Exception: an `existing_psd_path` override
+    can point outside `input/`, where it won't appear in that combo.)
 - **Append into an existing document** (v0.5.20). Widgets, all appended at the END of
   `required` (ComfyUI matches saved widget values BY POSITION, so anywhere else silently
   shifts every existing workflow's values): `append_to_existing` (BOOLEAN, default False),

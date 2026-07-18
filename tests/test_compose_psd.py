@@ -1053,6 +1053,237 @@ class TestExecuteCompose:
         assert manager.find_active_for_node("1") is None  # never handed off
 
 
+class TestComposeWrittenEvent:
+    """``cpsb.compose_written`` (product owner gap: "for 'don't open' how do
+    I later find and open the file?"): a NEW, minimal, non-handoff event
+    fired immediately after every REAL PSD write, for all three ``mode``
+    values alike, carrying enough for the frontend to show "Written:
+    <filename>" -- and, critically, never creating a handoff/meta.json/
+    thumbnail, so "Don't open"'s zero-Photoshop-entanglement contract holds.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_event_payload_shape(self, context, manager, configured, events):
+        node = ComposePSD()
+        node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="42",
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        written_events = events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)
+        assert len(written_events) == 1
+        assert written_events[0] == {
+            "node_id": "42",
+            "filename": "compose_00001.psd",
+            "subfolder": "",
+            "type": "input",
+        }
+
+    def test_dont_open_emits_the_event_but_creates_no_handoff_or_meta_json(
+        self, context, manager, configured, events
+    ):
+        """The event fires alongside (not instead of) the pre-existing "no
+        handoff" guarantee (see ``TestExecuteCompose.
+        test_dont_open_never_opens_or_hands_off``) -- this is the regression
+        test for the build's own CRITICAL CONSTRAINT: adding the event must
+        not create a handoff, a thumbnail, or a ``meta.json``.
+        """
+        node = ComposePSD()
+        _image_out, _mask_out, filename_out = node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        assert len(events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)) == 1
+        assert manager.find_active_for_node("1") is None  # no handoff
+        assert manager.list_all(limit=50) == []  # not even a terminal/superseded one
+        # No meta.json anywhere under the managed folder -- Path.glob on a
+        # not-yet-created directory yields nothing rather than raising, so
+        # this holds whether or not cpsb_input_dir exists at all.
+        assert list(context.cpsb_input_dir.glob("*/meta.json")) == []
+        assert filename_out == "compose_00001.psd"
+
+    def test_rerun_every_save_emits_the_event(
+        self, context, manager, configured_with_app, launches, events
+    ):
+        node = ComposePSD()
+        node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id="2",
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        written_events = events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)
+        assert len(written_events) == 1
+        assert written_events[0]["filename"] == "compose_00001.psd"
+        assert written_events[0]["node_id"] == "2"
+        # The event is unconditional and unrelated to the handoff this mode
+        # ALSO creates -- both exist side by side, not one instead of the
+        # other.
+        assert manager.find_active_for_node("2") is not None
+
+    def test_wait_first_save_emits_the_event(
+        self, context, manager, configured_with_app, monkeypatch, events
+    ):
+        node_id = "3"
+
+        def _save_shortly_after_open(psd_path, override=""):
+            def _do_ingest():
+                active = manager.find_active_for_node(node_id)
+                edit = Image.new("RGB", (8, 8), (1, 2, 3))
+                manager.ingest_edit(active.handoff_id, edit, "plugin")
+
+            threading.Timer(0.2, _do_ingest).start()
+            return LaunchResult(ok=True)
+
+        monkeypatch.setattr(routes_module, "launch_photoshop", _save_shortly_after_open)
+
+        node = ComposePSD()
+        node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=10,
+            unique_id=node_id,
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        written_events = events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)
+        # Fired once, for the ORIGINAL compose write -- before the blocking
+        # wait even starts, not per-edit.
+        assert len(written_events) == 1
+        assert written_events[0]["filename"] == "compose_00001.psd"
+        assert written_events[0]["node_id"] == node_id
+
+    def test_append_into_existing_target_emits_event_with_target_filename(
+        self, context, manager, configured, events
+    ):
+        target = context.input_dir / "review.psd"
+        prior_images = [Image.new("RGB", (10, 10), RED)]
+        psd, _, _, _ = compose_module._build_group_psd(prior_images, "Review 1")
+        psd.save(target)
+
+        node = ComposePSD()
+        node.execute(
+            group_name="Review",
+            layer_name="Layer",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="4",
+            append_to_existing=True,
+            existing_psd_path=str(target),
+            image_1=make_tensor(GREEN, size=(10, 10)),
+        )
+        written_events = events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)
+        assert len(written_events) == 1
+        assert written_events[0]["filename"] == "review.psd"
+        assert written_events[0]["subfolder"] == ""
+        assert written_events[0]["type"] == "input"
+
+    def test_append_creating_missing_target_emits_event(self, context, manager, configured, events):
+        target = context.input_dir / "not_yet_created.psd"
+        node = ComposePSD()
+        node.execute(
+            group_name="Review",
+            layer_name="Layer",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="5",
+            append_to_existing=True,
+            existing_psd_path=str(target),
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        written_events = events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)
+        assert len(written_events) == 1
+        assert written_events[0]["filename"] == "not_yet_created.psd"
+
+    def test_requeue_while_unsaved_does_not_emit_a_second_event(
+        self, context, manager, configured_with_app, launches, events
+    ):
+        """The duplicate-append guard (``TestAppendDuplicateGuard``) skips the
+        real write on a re-queue against an already-open, still-unsaved
+        handoff -- so this event, which only ever fires alongside a REAL
+        write, must not double-fire either.
+        """
+        target = context.input_dir / "review.psd"
+        node = ComposePSD()
+        tensor = make_tensor(RED, size=(8, 8))
+        node_id = "6"
+
+        with raises_interrupt():
+            node.execute(
+                group_name="Review",
+                layer_name="Layer",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                append_to_existing=True,
+                existing_psd_path=str(target),
+                image_1=tensor,
+            )
+        assert len(events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)) == 1
+
+        with raises_interrupt():
+            node.execute(
+                group_name="Review",
+                layer_name="Layer",
+                mode=WAIT,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                append_to_existing=True,
+                existing_psd_path=str(target),
+                image_1=tensor,
+            )
+        # Still just one -- the second call reused the pending handoff and
+        # skipped the re-append (TestAppendDuplicateGuard), so no second
+        # write means no second event.
+        assert len(events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)) == 1
+
+    def test_consume_path_does_not_emit_a_new_event(self, context, manager, configured, events):
+        """Serving an already-arrived edit (the consume path, run FIRST for
+        every mode) never recomposes or rewrites the PSD -- so it must not
+        emit this event either, exactly like it must not touch
+        ``_build_group_psd`` (see ``TestExecuteConsumePath.
+        test_consumes_latest_edit_instead_of_recomposing``, whose
+        monkeypatch guard this test mirrors).
+        """
+        tensor = make_tensor(RED, size=(8, 8))
+        pil_images = [nodes_module._tensor_to_pil(tensor)]
+        identity_hash = compose_module._compute_identity_hash(pil_images, "Group")
+
+        meta = manager.create(
+            origin_node_id="7",
+            origin_kind="bridge_node",
+            workflow_name="",
+            source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
+            original_image=Image.new("RGBA", (8, 8), (0, 0, 0, 0)),
+            source_hash=identity_hash,
+        )
+        manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (200, 150, 100)), "plugin")
+        events.events.clear()  # only care about what execute() itself emits below
+
+        node = ComposePSD()
+        node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=1800,
+            unique_id="7",
+            image_1=tensor,
+        )
+        assert events.of_type(compose_module.COMPOSE_WRITTEN_EVENT) == []
+
+
 class TestExecuteConsumePath:
     """The consume path fires FIRST for every mode: an active ``bridge_node``
     handoff whose source_hash matches the current inputs and that carries an

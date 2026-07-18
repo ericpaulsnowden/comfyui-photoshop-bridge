@@ -217,6 +217,26 @@ export function warn(...args) {
  */
 
 /**
+ * @typedef {Object} CpsbComposeWrittenEvent
+ * Payload of the `cpsb.compose_written` websocket message. NOT part of
+ * `docs/PROTOCOL.md`'s handoff lifecycle -- this event carries no
+ * `handoff_id`/`origin_kind` and implies no handoff at all. Emitted by
+ * `PhotoshopComposePSD` (`cpsb/compose_psd.py`) immediately after it writes
+ * a PSD to disk, for all three `mode` values alike, so the frontend can show
+ * "Written: <filename>" on the node even in `MODE_DONT_OPEN` ("Don't open
+ * (composite only)"), which never opens Photoshop and never creates a
+ * handoff -- the only reason this event exists (closing the reported gap:
+ * "for 'don't open' how do I later find and open the file?").
+ * @property {string} node_id - The compose node's own id (matches
+ * `String(node.id)`, NOT an `origin_node_id` of any handoff).
+ * @property {string} filename
+ * @property {string} subfolder - Always `""` -- see
+ * `cpsb.compose_psd._emit_compose_written`'s docstring for the one accepted
+ * exception (an `existing_psd_path` override pointing outside `input/`).
+ * @property {CpsbFileType} type - Always `"input"`.
+ */
+
+/**
  * Error thrown by every helper in this module for a non-2xx response.
  * Callers that need to branch on the exact status (e.g. the 409
  * existing-handoff response from `/cpsb/open`) should catch this type and
@@ -553,4 +573,20 @@ export function onTier2Changed(callback) {
   const handler = (event) => callback(event.detail)
   api.addEventListener('cpsb.tier2', handler)
   return () => api.removeEventListener('cpsb.tier2', handler)
+}
+
+/**
+ * Subscribes to the `cpsb.compose_written` websocket event (a
+ * `PhotoshopComposePSD` node just wrote a PSD to disk -- see
+ * {@link CpsbComposeWrittenEvent}'s own doc comment for why this exists
+ * outside the handoff lifecycle every other `on*` helper here concerns
+ * itself with).
+ * @param {(detail: CpsbComposeWrittenEvent) => void} callback
+ * @returns {() => void} Unsubscribe function.
+ */
+export function onComposeWritten(callback) {
+  /** @param {CustomEvent<CpsbComposeWrittenEvent>} event */
+  const handler = (event) => callback(event.detail)
+  api.addEventListener('cpsb.compose_written', handler)
+  return () => api.removeEventListener('cpsb.compose_written', handler)
 }

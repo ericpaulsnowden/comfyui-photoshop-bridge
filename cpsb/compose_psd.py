@@ -996,6 +996,70 @@ def _atomic_save(psd: PSDImage, target_path: Path) -> None:
         raise
 
 
+#: Websocket event name for :func:`_emit_compose_written` (product owner gap:
+#: "for 'don't open' how do I later find and open the file?"). A NEW, minimal
+#: event, deliberately distinct from ``cpsb.updated``/``cpsb.status``
+#: (:mod:`cpsb.handoff`) -- see that function's docstring for why.
+COMPOSE_WRITTEN_EVENT = "cpsb.compose_written"
+
+
+def _emit_compose_written(context: CpsbContext, node_id: str, output_path: Path) -> None:
+    """Notify the frontend that *output_path* was just written to disk.
+
+    Closes the product owner's reported gap verbatim: "And for 'don't open'
+    how do I later find and open the file?" -- :data:`MODE_DONT_OPEN` builds
+    and writes a real, complete PSD but (by design) never opens Photoshop and
+    never creates a handoff, so none of this pack's handoff-driven
+    discoverability surface (gallery cards, badges, reveal/re-open buttons,
+    the right-click node menu's active-handoff submenu) ever learns the file
+    exists. This event is the fix: called unconditionally after every REAL
+    write this node performs, for all three ``mode`` values alike (including
+    :data:`MODE_DONT_OPEN`), so the frontend (``web/cpsb/compose.js``) can
+    show "Written: <filename>" on the node regardless of which mode was
+    selected -- knowing what a run wrote is useful even when Photoshop DID
+    open, not just when it didn't.
+
+    **Why this cannot regress the "Don't open" contract of zero Photoshop
+    entanglement**: this function calls :meth:`CpsbContext.send_event`
+    DIRECTLY -- the exact same direct-context call
+    :func:`cpsb.routes._emit_tier2` already makes for its own non-handoff
+    event -- and nothing else. It never touches
+    :class:`~cpsb.handoff.HandoffManager` (no ``manager.create``, no
+    ``manager.note_source_written``, no status transition of any kind), so
+    it cannot create a handoff, cannot write a ``meta.json``, and cannot
+    produce a thumbnail (``orig_thumb.png``) -- the three things a handoff
+    would otherwise imply. ``send_event`` itself
+    (:attr:`cpsb.context.CpsbContext.send_event`) is a thin, side-effect-free
+    wrapper over ``PromptServer.send_sync`` (a websocket broadcast to
+    already-connected browser tabs); it touches no disk and blocks on
+    nothing. Skipping this call entirely (e.g. if a caller is never reached)
+    leaves every other behavior of this node completely unchanged -- it is
+    purely informational, exactly like :func:`cpsb.routes._emit_tier2`.
+
+    Args:
+        context: The active backend context (``state.context``), whose
+            ``send_event`` reaches every connected frontend.
+        node_id: This node instance's id (the same stringified
+            ``unique_id`` every other event/log line in this module keys
+            on).
+        output_path: The just-written file's full path. Only its bare name
+            is sent, with ``subfolder=""``/``type="input"`` alongside it --
+            the exact same convention (and the exact same accepted
+            limitation for an out-of-``input/`` ``existing_psd_path``
+            override) already documented on this class's own STRING output;
+            see :class:`PhotoshopComposePSD`'s docstring "Outputs" section.
+    """
+    context.send_event(
+        COMPOSE_WRITTEN_EVENT,
+        {
+            "node_id": node_id,
+            "filename": output_path.name,
+            "subfolder": "",
+            "type": "input",
+        },
+    )
+
+
 class PhotoshopComposePSD:
     """Composes N images into one grouped, multi-layer PSD (PROTOCOL.md §6c).
 
@@ -1501,6 +1565,7 @@ class PhotoshopComposePSD:
                 )
                 _atomic_save(psd, target_path)
                 logger.info("cpsb compose_psd: node %s: wrote %s", node_id, target_path)
+                _emit_compose_written(state.context, node_id, target_path)
             else:
                 # Missing target: first-run convenience, not an error (build
                 # brief item 3) -- create it fresh via the same build path
@@ -1521,6 +1586,7 @@ class PhotoshopComposePSD:
                 )
                 _atomic_save(psd, target_path)
                 logger.info("cpsb compose_psd: node %s: wrote %s", node_id, target_path)
+                _emit_compose_written(state.context, node_id, target_path)
             output_path = target_path
         else:
             logger.info(
@@ -1536,6 +1602,7 @@ class PhotoshopComposePSD:
             output_path = _allocate_output_path(state.context.input_dir, prefix)
             psd.save(output_path)
             logger.info("cpsb compose_psd: node %s: wrote %s", node_id, output_path)
+            _emit_compose_written(state.context, node_id, output_path)
 
         flattened = _flatten_placements(placements, canvas_width, canvas_height)
         image_tensor, mask_tensor = nodes._tensors_from_image(flattened)

@@ -1,12 +1,32 @@
 /**
- * @file Auto-growing `image_N` inputs for the "Compose Layers to PSD" node
- * (`PhotoshopComposePSD`, PROTOCOL.md §6c): "connecting one reveals the next
- * empty socket." The backend (`cpsb/compose_psd.py`, out of scope for this
- * file) declares a static, generous range of OPTIONAL `image_1..image_20`
- * sockets (`MAX_IMAGE_INPUTS` there) so the node accepts any number >= 1;
- * this module is purely a display concern layered on top — hiding every
- * disconnected socket except one, and revealing the next as the user
- * connects — so a freshly-added node doesn't show 20 empty sockets at once.
+ * @file Two independent per-node display concerns for the "Compose Layers to
+ * PSD" node (`PhotoshopComposePSD`, PROTOCOL.md §6c), both owned here because
+ * this is where the rest of this package already does compose-node-specific
+ * widget/socket manipulation:
+ *
+ * 1. Auto-growing `image_N` inputs: "connecting one reveals the next empty
+ *    socket." The backend (`cpsb/compose_psd.py`, out of scope for this
+ *    file) declares a static, generous range of OPTIONAL `image_1..image_20`
+ *    sockets (`MAX_IMAGE_INPUTS` there) so the node accepts any number >= 1;
+ *    this module is purely a display concern layered on top — hiding every
+ *    disconnected socket except one, and revealing the next as the user
+ *    connects — so a freshly-added node doesn't show 20 empty sockets at once.
+ * 2. "Written: &lt;filename&gt;" display (product owner gap, verbatim: "And
+ *    for 'don't open' how do I later find and open the file?"): the backend
+ *    now emits a `cpsb.compose_written` event (`cpsb/compose_psd.py`
+ *    `_emit_compose_written`) immediately after every real PSD write, for
+ *    all three `mode` values alike — including `MODE_DONT_OPEN`, which never
+ *    opens Photoshop and never creates a handoff, so none of this pack's
+ *    handoff-driven discoverability surface (gallery, badges, node-menu
+ *    active-handoff submenu) ever learns the file exists. This module's
+ *    {@link init} subscribes to that event and shows the written filename as
+ *    a clickable, copy-to-clipboard button widget on the originating node;
+ *    {@link getWrittenFileRef}/{@link hasWrittenFile} let `menu.js` also
+ *    offer "Open in Photoshop" for a Compose node with no `node.imgs` at all
+ *    (build brief item 4).
+ *
+ * See this file's "Written-file display" section below for the full design
+ * (including what does and does not survive a browser reload).
  *
  * FORK NOTICE (PROTOCOL.md §6c: "FORK the rgthree MIT pattern, with
  * attribution"): the "keep exactly one trailing empty slot, prune the
@@ -93,6 +113,10 @@
  */
 
 import { app } from '../../../scripts/app.js'
+import * as api from './api.js'
+import * as pasteback from './pasteback.js'
+import * as state from './state.js'
+import * as ui from './ui.js'
 
 /**
  * Class id for the Compose Layers to PSD node (PROTOCOL.md §6c). Must match
@@ -228,6 +252,319 @@ function scheduleStabilize(node) {
     node.__cpsbComposeStabilizeTimer = null
     stabilizeImageInputs(node)
   }, STABILIZE_DEBOUNCE_MS)
+}
+
+// -----------------------------------------------------------------------
+// "Written: <filename>" display (this file's header, section 2; product
+// owner gap: "for 'don't open' how do I later find and open the file?").
+//
+// Persistence honesty, up front: the backend deliberately creates NO
+// handoff and NO meta.json for this event (`cpsb/compose_psd.py`
+// `_emit_compose_written`'s own docstring — that is the whole point of
+// keeping `MODE_DONT_OPEN` free of Photoshop entanglement), so there is no
+// server-side record to re-fetch after a reload the way badges.js/state.js
+// re-sync handoff status from `GET /cpsb/status`. What this module actually
+// does:
+//   - The event payload is held ONLY in memory on the node instance
+//     (`node.__cpsbLastWritten`) for as long as this browser tab's JS
+//     context lives — reliable while the tab stays open, gone the instant
+//     it doesn't (a real page unload, not just losing focus).
+//   - As a best-effort survival path across an ACTUAL browser reload of the
+//     SAME tab (`REASONABLY PRACTICAL`, not guaranteed): every write is also
+//     mirrored into `window.localStorage`, keyed by this browser + the
+//     current workflow name + this node's id (see {@link writtenStorageKey}
+//     — the same per-node-id scoping concern `state.js`'s own
+//     `workflowMatches` already documents for handoff lookups, since a bare
+//     numeric node id is only unique WITHIN one workflow). `nodeCreated`
+//     restores from this on every node (re)construction — which covers a
+//     plain browser refresh of the same workflow, since ComfyUI's own
+//     workflow autosave/restore recreates the same nodes with the same ids.
+//     It does NOT survive: a different browser/profile, a cleared
+//     localStorage, private/incognito storage partitioning, or opening the
+//     saved `.json` workflow file fresh in a different session — all of
+//     which are expected, not bugs, given the deliberate no-server-record
+//     constraint above.
+//   - `localStorage` access is feature-detected exactly like `open.js`'s own
+//     `REMOTE_OPEN_ALLOWED_KEY` convention (try/catch around every access,
+//     one-time `[cpsb]` warning via {@link warnLocalStorageUnavailable} if
+//     it throws) — a broken/disabled localStorage degrades silently to
+//     "in-memory only for this tab," never a crash.
+// -----------------------------------------------------------------------
+
+/** `localStorage` key prefix for {@link writtenStorageKey}. */
+const WRITTEN_STORAGE_PREFIX = 'cpsb.composeWritten:'
+
+/** Widget name for the clickable "Written: ..." button (this section). */
+const WRITTEN_WIDGET_NAME = 'cpsb_written'
+
+/** Guards {@link warnLocalStorageUnavailable} so it fires at most once per session. */
+let writtenLocalStorageWarned = false
+
+/**
+ * @param {unknown} error
+ */
+function warnLocalStorageUnavailable(error) {
+  if (writtenLocalStorageWarned) return
+  writtenLocalStorageWarned = true
+  api.warn(
+    'localStorage is unavailable; a Compose node’s "Written: ..." display ' +
+      'will not survive a browser reload this session',
+    error
+  )
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {string} Scoped by workflow name (best-effort — see
+ * {@link state.getWorkflowName}) so the same numeric node id in a DIFFERENT
+ * workflow never shows this node's stale written-filename (mirrors
+ * `state.js`'s own `workflowMatches` scoping rationale for handoff lookups).
+ */
+function writtenStorageKey(node) {
+  return `${WRITTEN_STORAGE_PREFIX}${state.getWorkflowName() || ''}::${node.id}`
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {{filename: string, subfolder: string, type: import('./api.js').CpsbFileType} | null}
+ */
+function loadPersistedWritten(node) {
+  try {
+    const raw = window.localStorage.getItem(writtenStorageKey(node))
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed.filename === 'string' && parsed.filename) {
+      return {
+        filename: parsed.filename,
+        subfolder: typeof parsed.subfolder === 'string' ? parsed.subfolder : '',
+        type: parsed.type || 'input'
+      }
+    }
+    return null
+  } catch (error) {
+    warnLocalStorageUnavailable(error)
+    return null
+  }
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {{filename: string, subfolder: string, type: import('./api.js').CpsbFileType}} ref
+ */
+function persistWritten(node, ref) {
+  try {
+    window.localStorage.setItem(writtenStorageKey(node), JSON.stringify(ref))
+  } catch (error) {
+    warnLocalStorageUnavailable(error)
+  }
+}
+
+/**
+ * @param {{filename: string}} ref
+ * @returns {string} The button widget's visible label. Deliberately names
+ * the file, not a path: PROTOCOL.md's two-machine setup (ComfyUI and
+ * Photoshop/browser can be on different machines) makes a full server-side
+ * absolute path confusing to a remote user, and a "Reveal in Finder"-style
+ * affordance would be meaningless there — so this shows the same
+ * input/-relative filename the node's own STRING output already returns,
+ * with an explicit "(on ComfyUI machine)" marker so a remote user is never
+ * left assuming it is a local, browser-side path. No reveal-in-OS affordance
+ * is offered anywhere near this widget, deliberately.
+ */
+function writtenLabel({ filename }) {
+  return `Written: ${filename} (on ComfyUI machine)`
+}
+
+/**
+ * Copies *text* to the clipboard, preferring the modern async
+ * `navigator.clipboard` API and falling back to the long-standing
+ * `document.execCommand('copy')` trick (via a detached, invisible
+ * `<textarea>`) for older/insecure-context frontends where
+ * `navigator.clipboard` is unavailable — the same kind of graceful-degrade
+ * every other browser-API touchpoint in this package already does (compare
+ * `ui.js`'s toast/dialog fallbacks).
+ * @param {string} text
+ * @returns {Promise<boolean>} Whether the copy is believed to have succeeded.
+ */
+async function copyToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch (error) {
+      api.warn('navigator.clipboard.writeText failed, trying the execCommand fallback', error)
+    }
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.opacity = '0'
+    document.body.appendChild(textarea)
+    textarea.select()
+    const ok = document.execCommand('copy')
+    textarea.remove()
+    return ok
+  } catch (error) {
+    api.warn('clipboard fallback copy failed', error)
+    return false
+  }
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
+ */
+function getWrittenWidget(node) {
+  return node.widgets?.find((w) => w.name === WRITTEN_WIDGET_NAME)
+}
+
+/**
+ * Creates (once) or updates the clickable "Written: <filename>" button
+ * widget on *node* and records *ref* on the node instance for
+ * {@link getWrittenFileRef}/menu.js's re-open gate. A `button`-type widget
+ * with `serialize: false` — the same convention `loadpsd.js`'s own upload
+ * button already uses — so this widget itself is never written into
+ * `widgets_values`: it carries no INPUT_TYPES-declared meaning the backend
+ * would need to read back, and keeping it out of the saved graph JSON avoids
+ * any risk of ever colliding, positionally, with a future backend-declared
+ * widget (`cpsb/compose_psd.py`'s own "append new widgets at the very END of
+ * required" rule exists for exactly this class of concern). Session
+ * persistence instead goes through `localStorage` (see this section's
+ * header) — a deliberately separate mechanism from graph serialization.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {{filename: string, subfolder: string, type: import('./api.js').CpsbFileType}} ref
+ */
+function setWrittenDisplay(node, ref) {
+  node.__cpsbLastWritten = ref
+  let widget = getWrittenWidget(node)
+  if (!widget) {
+    widget = node.addWidget(
+      'button',
+      WRITTEN_WIDGET_NAME,
+      WRITTEN_WIDGET_NAME,
+      async () => {
+        const current = node.__cpsbLastWritten
+        if (!current) return
+        const ok = await copyToClipboard(current.filename)
+        ui.showToast({
+          severity: ok ? 'success' : 'error',
+          summary: ok ? 'Filename copied' : 'Could not copy filename',
+          detail: current.filename
+        })
+      },
+      { serialize: false, canvasOnly: true }
+    )
+  }
+  widget.label = writtenLabel(ref)
+  // Opportunistic — not every widget-rendering path shows a tooltip, but
+  // when it does, this reiterates the same "(on ComfyUI machine)" clarity
+  // the label already carries (build brief item 3: "tooltip OR label").
+  widget.tooltip = `${ref.filename} — on the ComfyUI machine's input folder. Click to copy the filename.`
+  node.graph?.setDirtyCanvas(true, false)
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {import('./api.js').CpsbImageRef | null} This node's most
+ * recently written file, from THIS session (in-memory) or restored from
+ * `localStorage` at `nodeCreated` time — whichever is freshest, since
+ * {@link setWrittenDisplay} always updates both. `null` before any write has
+ * ever been observed for this node instance (a fresh node, or one that has
+ * only ever run in a way that hasn't reached a write yet). Used by
+ * `menu.js`'s {@link hasWrittenFile}-gated re-open item (build brief item 4).
+ */
+export function getWrittenFileRef(node) {
+  const ref = node.__cpsbLastWritten
+  if (!ref || typeof ref.filename !== 'string' || !ref.filename) return null
+  return { filename: ref.filename, subfolder: ref.subfolder || '', type: ref.type || 'input' }
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {boolean} Whether {@link getWrittenFileRef} would return non-null.
+ */
+export function hasWrittenFile(node) {
+  return getWrittenFileRef(node) !== null
+}
+
+/**
+ * Deferred, `configuringGraph`-safe restore of a persisted "Written: ..."
+ * display for *node* — the exact same defer-until-configured idiom
+ * {@link scheduleStabilize}/{@link stabilizeImageInputs} already establish in
+ * this file (see this file's header for why: a workflow restore's node id is
+ * not reliably final until `app.configuringGraph` drops back to `false`, so
+ * reading `localStorage` any earlier risks looking up the wrong key).
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function scheduleRestoreWrittenDisplay(node) {
+  if (node.__cpsbWrittenRestoreTimer) return
+  node.__cpsbWrittenRestoreTimer = setTimeout(() => {
+    node.__cpsbWrittenRestoreTimer = null
+    if (!node.graph) return // removed from the graph since being scheduled
+    if (app.configuringGraph) {
+      scheduleRestoreWrittenDisplay(node)
+      return
+    }
+    const persisted = loadPersistedWritten(node)
+    if (persisted) setWrittenDisplay(node, persisted)
+  }, STABILIZE_DEBOUNCE_MS)
+}
+
+/**
+ * Installs the "Written: <filename>" display on one `PhotoshopComposePSD`
+ * node instance. Call from `nodeCreated`. Idempotent per node instance (the
+ * same convention every other `attach*`/`installBadgeHook` in this package
+ * already uses) and a no-op for any other node type.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+export function attachWrittenDisplay(node) {
+  if (!isComposePsdNode(node)) return
+  if (node.__cpsbWrittenDisplayAttached) return
+  node.__cpsbWrittenDisplayAttached = true
+
+  const originalOnRemoved = node.onRemoved
+  node.onRemoved = function () {
+    if (node.__cpsbWrittenRestoreTimer) {
+      clearTimeout(node.__cpsbWrittenRestoreTimer)
+      node.__cpsbWrittenRestoreTimer = null
+    }
+    return originalOnRemoved?.call(this)
+  }
+
+  scheduleRestoreWrittenDisplay(node)
+}
+
+/**
+ * Handles one `cpsb.compose_written` event (see {@link api.CpsbComposeWrittenEvent}):
+ * finds the originating node and updates its "Written: ..." display, if it
+ * still exists and is still a Compose node (both are simple no-ops
+ * otherwise — unlike an edit arriving from Photoshop, PLAN.md/PROTOCOL.md
+ * define no "node deleted while this was in flight" toast for this purely
+ * informational event; there is nothing the user was waiting on).
+ * @param {import('./api.js').CpsbComposeWrittenEvent} payload
+ */
+function handleComposeWritten(payload) {
+  const node = pasteback.getNodeByIdFlexible(payload.node_id)
+  if (!node || !isComposePsdNode(node)) return
+  const ref = {
+    filename: payload.filename,
+    subfolder: payload.subfolder || '',
+    type: payload.type || 'input'
+  }
+  persistWritten(node, ref)
+  setWrittenDisplay(node, ref)
+}
+
+/**
+ * Subscribes to `cpsb.compose_written`. Call once from `cpsb.js`'s `setup()`
+ * (mirrors `pasteback.init()`'s single-global-listener shape — one
+ * subscription for the whole session, looking up the target node fresh on
+ * every event, rather than a per-node listener).
+ */
+export function init() {
+  api.onComposeWritten(handleComposeWritten)
 }
 
 /**
