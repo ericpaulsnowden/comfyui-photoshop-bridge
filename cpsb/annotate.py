@@ -135,16 +135,22 @@ def _write_instructions_psd(psd_path: Path, pil_image: Image.Image) -> None:
     ``PSDImage.frompil`` (:mod:`cpsb.psd_io`'s old flat write -- always
     layer-less, exactly what this node no longer wants).
 
-    One additional psd-tools claim, specific to this write and verified the
-    same empirical way (build a real PSD, reopen it, inspect it -- see this
-    module's own test suite): because the document mode is ``"RGB"`` (no
-    transparency band of its own), ``create_pixel_layer`` given a fully
-    transparent RGBA source stores that transparency as a real Photoshop
-    LAYER MASK (``layer.mask``, all-zero) rather than as alpha inside the
-    pixel data channels themselves -- :func:`_layer_alpha_mask` is written to
-    read it back correctly (via ``layer.composite()``, which applies the
-    mask) rather than inspecting ``layer.topil()``'s own channel data, which
-    reads back fully opaque regardless of the mask.
+    One psd-tools trap, specific to the transparent layer and the reason this
+    function does not simply call ``create_pixel_layer`` twice: psd-tools
+    decides where a layer's alpha goes purely from the PARENT document's
+    ``pil_mode`` at ``create_pixel_layer`` time. For an ``"RGB"`` document it
+    converts the RGBA source down to RGB -- compositing a fully transparent
+    source onto BLACK -- and re-attaches the discarded alpha as an all-zero
+    USER_LAYER_MASK (``psd_tools/api/layers.py``, ``PixelLayer.frompil``).
+    Photoshop then opens a black layer behind a black mask that hides every
+    brush stroke, so painting on it appears to do nothing at all. Temporarily
+    advertising a transparency band (channels 3 -> 4) makes ``pil_mode``
+    report ``"RGBA"`` for the duration of that ONE call, so the alpha is
+    written where Photoshop expects an ordinary empty layer to carry it: the
+    layer's own TRANSPARENCY_MASK (channel -1), with no layer mask at all.
+    The count is restored before :meth:`~psd_tools.api.psd_image.PSDImage.save`
+    so the FILE stays a plain 3-channel RGB document and never gains a stray
+    "Alpha 1" channel in Photoshop's Channels panel.
 
     Args:
         psd_path: Destination ``source.psd`` path. Parent directories are
@@ -160,9 +166,14 @@ def _write_instructions_psd(psd_path: Path, pil_image: Image.Image) -> None:
         pil_image.convert("RGB"), name=_BASE_LAYER_NAME, top=0, left=0, opacity=255
     )
     blank_instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    psd.create_pixel_layer(
-        blank_instructions, name=INSTRUCTIONS_LAYER_NAME, top=0, left=0, opacity=255
-    )
+    header = psd._record.header
+    header.channels += 1
+    try:
+        psd.create_pixel_layer(
+            blank_instructions, name=INSTRUCTIONS_LAYER_NAME, top=0, left=0, opacity=255
+        )
+    finally:
+        header.channels -= 1
     psd.save(psd_path)
 
 
@@ -200,11 +211,14 @@ def _layer_alpha_mask(psd: PSDImage, layer: Any) -> Any:
     empirically against the installed psd-tools 1.17.4 (this module's own
     test suite builds and reopens real PSDs to check both):
 
-    1. As :func:`_write_instructions_psd` documents, an RGB-mode document's
-       pixel layer stores alpha as a LAYER MASK, not as a transparency band
-       inside its own pixel data -- ``layer.topil()`` reads back fully
-       opaque regardless of what the user painted; only
-       ``layer.composite()`` (which applies the mask) reflects it.
+    1. ``composite()`` is the only reader that handles BOTH shapes this
+       layer can arrive in. :func:`_write_instructions_psd` hands Photoshop
+       a layer whose opacity lives in its own TRANSPARENCY_MASK channel,
+       but the user is free to add a real layer mask in Photoshop (or open
+       a PSD written by an older version of this node, where the alpha WAS
+       an all-zero USER_LAYER_MASK). ``layer.topil()`` ignores a layer mask
+       entirely and reads back fully opaque; ``layer.composite()`` applies
+       both, so it reflects what the user actually sees on screen.
     2. Photoshop commonly trims a saved layer's own pixel bounds down to
        just its non-transparent region -- a mostly-empty "Instructions"
        layer is exactly this case. Passing ``viewport=psd.viewbox``

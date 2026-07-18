@@ -554,10 +554,23 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   to mark the region (any color) and may also edit the base image. On save the node
   reopens the saved layered `source.psd`:
   - **`Instructions` top-level layer found** → MASK = that layer's alpha (read via
-    `layer.composite(viewport=psd.viewbox)` — in an RGB-mode document psd-tools stores the
-    paint's transparency as a layer mask, so `.composite()`, not `.topil()`, reads it
-    back, and the viewport re-expands Photoshop's trimmed layer bounds to the full canvas);
+    `layer.composite(viewport=psd.viewbox)` — `.composite()` rather than `.topil()` because
+    it applies BOTH a layer's own alpha and any layer mask the user added in Photoshop, and
+    the viewport re-expands Photoshop's trimmed layer bounds to the full canvas);
     IMAGE = composite of all OTHER layers (`layer_filter` excluding it by identity).
+  - **Writing that transparent layer needs care** (fixed v0.5.16 after a user report of
+    "a black layer with a black mask; drawing on it does nothing"): psd-tools decides where
+    a layer's alpha goes from the PARENT document's `pil_mode` at `create_pixel_layer` time.
+    For an `RGB` document it converts the RGBA source down to RGB — compositing a fully
+    transparent source onto BLACK — and re-attaches the discarded alpha as an all-zero
+    USER_LAYER_MASK, which Photoshop renders as an opaque black layer behind a mask that
+    hides every brush stroke. The write therefore bumps `header.channels` 3→4 for the
+    duration of that single call (so `pil_mode` reports `RGBA` and the alpha lands in the
+    layer's own TRANSPARENCY_MASK channel `-1`, with no `-2` mask), then restores it before
+    `save()` so the file stays a plain 3-channel RGB document with no stray alpha channel.
+    Structure — not `composite()` — is what distinguishes the two shapes: `composite()`
+    applies the mask and so reports a perfectly transparent layer under EITHER, which is
+    exactly why the original test suite missed the bug.
   - **renamed/deleted** → treated as a plain image: IMAGE = full composite, MASK = None →
     falls through to the mask precedence below.
   - NB: REMOTE Tier 2 degrades to the empty-`Instructions` case (the plugin uploads a flat

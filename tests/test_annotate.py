@@ -371,6 +371,63 @@ class TestWriteLayeredHandoff:
         assert base_composite.size == (width, height)
         assert base_composite.getpixel((0, 0)) == RED
 
+    def test_instructions_layer_is_paintable_not_a_black_masked_layer(
+        self, node, manager, launches
+    ):
+        """REGRESSION (user-reported, 2026-07-18: "a black layer with a black
+        mask. So drawing on it does nothing").
+
+        psd-tools picks where a layer's alpha goes from the PARENT document's
+        ``pil_mode``: for an "RGB" document ``create_pixel_layer`` converted the
+        transparent RGBA source down to RGB -- compositing it onto BLACK -- and
+        re-attached the discarded alpha as an all-zero USER_LAYER_MASK. In
+        Photoshop that is an opaque black layer behind a mask that hides every
+        brush stroke.
+
+        Note the sibling test above cannot catch this: it measures transparency
+        through ``composite()``, which APPLIES the layer mask and so reported a
+        perfectly transparent layer the whole time the bug was shipping. Only
+        the layer's STRUCTURE distinguishes the two, so that is what this
+        asserts: opacity carried by the layer's own TRANSPARENCY_MASK channel
+        (-1), and no USER_LAYER_MASK (-2) at all.
+        """
+        node_id = "122"
+        with raises_interrupt():
+            node.execute(
+                image=make_tensor(RED),
+                instruction="",
+                annotate_mode=AnnotateMode.PS_MODE,
+                box_composite=False,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                mask=None,
+            )
+
+        active = manager.find_active_for_node(node_id)
+        psd = PSDImage.open(manager.handoff_dir(active.handoff_id) / "source.psd")
+        instructions_layer = next(
+            layer for layer in psd if layer.name == INSTRUCTIONS_LAYER_NAME
+        )
+
+        assert instructions_layer.mask is None, (
+            "Instructions layer carries a user layer mask -- Photoshop will hide "
+            "every brush stroke behind it"
+        )
+        channel_ids = {int(channel.id) for channel in instructions_layer._record.channel_info}
+        assert -2 not in channel_ids  # USER_LAYER_MASK
+        assert -1 in channel_ids  # TRANSPARENCY_MASK: the layer's own alpha
+
+        # The pixel data itself must be transparent, read WITHOUT going through
+        # composite() -- topil() ignores any mask, so this is the assertion that
+        # actually failed under the bug (it read back fully opaque black).
+        pixels = instructions_layer.topil()
+        assert pixels.mode == "RGBA"
+        assert not np.array(pixels.split()[-1]).any()
+
+        # And the file stays a plain 3-channel RGB document, so Photoshop never
+        # shows a stray "Alpha 1" in its Channels panel.
+        assert psd._record.header.channels == 3
+
     def test_launched_psd_path_matches_the_written_source_psd(self, node, manager, launches):
         """The exact path handed to ``launch_photoshop`` is the layered file
         just asserted above -- not some other intermediate path.
