@@ -1,8 +1,8 @@
 /**
- * @file Two independent per-node display concerns for the "Compose Layers to
- * PSD" node (`PhotoshopComposePSD`, PROTOCOL.md §6c), both owned here because
- * this is where the rest of this package already does compose-node-specific
- * widget/socket manipulation:
+ * @file Three independent per-node display concerns for the "Compose Layers
+ * to PSD" node (`PhotoshopComposePSD`, PROTOCOL.md §6c), all owned here
+ * because this is where the rest of this package already does
+ * compose-node-specific widget/socket manipulation:
  *
  * 1. Auto-growing `image_N` inputs: "connecting one reveals the next empty
  *    socket." The backend (`cpsb/compose_psd.py`, out of scope for this
@@ -11,7 +11,17 @@
  *    this module is purely a display concern layered on top — hiding every
  *    disconnected socket except one, and revealing the next as the user
  *    connects — so a freshly-added node doesn't show 20 empty sockets at once.
- * 2. "Written: &lt;filename&gt;" display (product owner gap, verbatim: "And
+ * 2. Append-target widgets (product owner, verbatim: "When append to
+ *    existing is false can the two existing fields below that be
+ *    disabled"): `existing_psd`/`existing_psd_path` (the `append_to_existing`
+ *    BOOLEAN's target-selection widgets, `cpsb/compose_psd.py`'s
+ *    `INPUT_TYPES`, added v0.5.20) are greyed out and click-blocked whenever
+ *    `append_to_existing` is `false`, and restored live the instant it's
+ *    toggled back to `true` — cosmetic only, the backend always reads
+ *    whatever values they hold regardless. See this file's "Append-target
+ *    widgets" section below for the `widget.disabled` mechanism and why it
+ *    was chosen over `widget.hidden`.
+ * 3. "Written: &lt;filename&gt;" display (product owner gap, verbatim: "And
  *    for 'don't open' how do I later find and open the file?"): the backend
  *    now emits a `cpsb.compose_written` event (`cpsb/compose_psd.py`
  *    `_emit_compose_written`) immediately after every real PSD write, for
@@ -20,7 +30,10 @@
  *    handoff-driven discoverability surface (gallery, badges, node-menu
  *    active-handoff submenu) ever learns the file exists. This module's
  *    {@link init} subscribes to that event and shows the written filename as
- *    a clickable, copy-to-clipboard button widget on the originating node;
+ *    a plain, non-clickable text row plus a separate "Copy Path" button
+ *    (product owner, verbatim: "Can the written message be just text and
+ *    there be a separate 'Copy Path' button. And can that button copy the
+ *    full path not just the file name") on the originating node;
  *    {@link getWrittenFileRef}/{@link hasWrittenFile} let `menu.js` also
  *    offer "Open in Photoshop" for a Compose node with no `node.imgs` at all
  *    (build brief item 4).
@@ -255,7 +268,169 @@ function scheduleStabilize(node) {
 }
 
 // -----------------------------------------------------------------------
-// "Written: <filename>" display (this file's header, section 2; product
+// Append-target widgets (this file's header, section 2; product owner,
+// verbatim: "When append to existing is false can the two existing fields
+// below that be disabled"): `existing_psd`/`existing_psd_path`
+// (`cpsb/compose_psd.py`'s `INPUT_TYPES`, added v0.5.20, the last three
+// required inputs — `append_to_existing` BOOLEAN, `existing_psd` COMBO,
+// `existing_psd_path` STRING) only matter when `append_to_existing` is
+// `true`; when it's `false` this section greys the other two out and blocks
+// clicks on them, purely cosmetic — the backend's own `execute()` still
+// receives whatever values they currently hold either way (it simply
+// ignores them when `append_to_existing` is falsy, same as before this
+// section existed).
+//
+// Mechanism decision — `widget.disabled`, NOT `widget.hidden` (+ a manual
+// node-size recompute, this file's OWN fallback pattern for `image_N`
+// SOCKETS above): verified against the CURRENT `Comfy-Org/ComfyUI_frontend`
+// source, the same established methodology this file's header already uses
+// for every other litegraph API claim here (cloned into a scratch checkout
+// rather than coded from memory):
+// - `BaseWidget` (`src/lib/litegraph/src/widgets/BaseWidget.ts` ~line
+//   101-106) has a real, current, first-class `disabled` getter/setter
+//   backed by `_state.disabled`. Every widget `cpsb/compose_psd.py`'s
+//   `INPUT_TYPES` declares (BOOLEAN/COMBO/STRING) is constructed as a real
+//   `BaseWidget` subclass instance by ComfyUI's own node-construction path
+//   (`BooleanWidget`/`ComboWidget`/`TextWidget`, `widgetMap.ts`), so setting
+//   `.disabled` on one of THIS node's own widgets needs no monkey-patching —
+//   it's the same property the class already has.
+// - `LGraphNode.drawWidgets` (`LGraphNode.ts` ~line 3956-3961: `widget.
+//   computedDisabled = widget.disabled || this.getSlotFromWidget(widget)?.
+//   link != null`) recomputes `computedDisabled` from `.disabled` on EVERY
+//   draw pass, and (~line 3990) halves `ctx.globalAlpha` for any
+//   `computedDisabled` widget — visually greyed out automatically, with no
+//   manual per-frame bookkeeping from this module: set `.disabled` once,
+//   request one redraw (`setDirtyCanvas`), done.
+// - `LGraphCanvas`'s own pointer-down handler (`LGraphCanvas.ts` ~line
+//   2877: `node.getWidgetOnPos(x, y)`, the exact call that decides which
+//   widget receives `processWidgetClick`) uses `getWidgetOnPos`'s default
+//   `includeDisabled = false` (`LGraphNode.ts` ~line 2259-2277: skips any
+//   `(widget.computedDisabled && !includeDisabled)` widget entirely) — so a
+//   disabled COMBO/STRING widget's dropdown/text-edit box never opens; the
+//   click never reaches the widget at all. This is real click-blocking, not
+//   just a visual dimming.
+// `hidden` was rejected for THIS case (unlike the `image_N` sockets above,
+// where litegraph SLOTS genuinely have no visibility flag at all, forcing
+// remove/re-add): litegraph WIDGETS already have this first-class
+// enable/disable flag that does exactly what was asked ("disabled", not
+// "gone" — the product owner's own word), so reaching for `hidden` (a
+// different visual effect — the row vanishes and the node resizes) plus a
+// manual size recompute would be solving a problem `disabled` doesn't have.
+//
+// Toggle-timing: `append_to_existing`'s widget `callback` only fires for an
+// INTERACTIVE toggle (a real pointer click, via `BaseWidget.setValue`) —
+// {@link updateAppendTargetWidgetsEnabled} is chained onto it (never
+// clobbering whatever callback, if any, ComfyUI's own construction path
+// already assigned) for the "reacts immediately" requirement. A WORKFLOW
+// LOAD instead assigns the saved value directly (`LGraphNode.configure`:
+// `widget.value = info.widgets_values[i++]`, no `callback` invoked) — so
+// {@link scheduleAppendTargetSync} exists for exactly that path, the same
+// defer-until-`app.configuringGraph`-settles idiom
+// {@link scheduleStabilize}/{@link scheduleRestoreWrittenDisplay} already
+// establish elsewhere in this file (see this file's header for the timing
+// argument itself, which applies identically here: at the `nodeCreated`
+// moment this node's OWN `configure()` hasn't run yet, so `append_to_
+// existing`'s widget still holds its just-constructed DEFAULT value, not
+// whatever a saved workflow restores moments later).
+// -----------------------------------------------------------------------
+
+const APPEND_TO_EXISTING_WIDGET_NAME = 'append_to_existing'
+const EXISTING_PSD_WIDGET_NAME = 'existing_psd'
+const EXISTING_PSD_PATH_WIDGET_NAME = 'existing_psd_path'
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {string} name
+ * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
+ */
+function findWidgetByName(node, name) {
+  return node.widgets?.find((w) => w.name === name)
+}
+
+/**
+ * Applies the node's current `append_to_existing` value to the `.disabled`
+ * flag of `existing_psd`/`existing_psd_path` (this section's header): both
+ * disabled when `append_to_existing` is falsy, both re-enabled the instant
+ * it's truthy. A no-op if `append_to_existing` itself isn't present (an
+ * impossible case for a node built from the current `INPUT_TYPES`, but
+ * cheap to guard) — leaves whichever of the other two widgets DOES exist
+ * untouched rather than assuming both always do.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function updateAppendTargetWidgetsEnabled(node) {
+  const toggle = findWidgetByName(node, APPEND_TO_EXISTING_WIDGET_NAME)
+  if (!toggle) return
+  const enabled = toggle.value === true
+  const existingPsd = findWidgetByName(node, EXISTING_PSD_WIDGET_NAME)
+  const existingPsdPath = findWidgetByName(node, EXISTING_PSD_PATH_WIDGET_NAME)
+  if (existingPsd) existingPsd.disabled = !enabled
+  if (existingPsdPath) existingPsdPath.disabled = !enabled
+  node.graph?.setDirtyCanvas(true, false)
+}
+
+/**
+ * Deferred, `configuringGraph`-safe initial sync of the append-target
+ * widgets' `.disabled` flag — see this section's header ("Toggle-timing")
+ * for why a deferred pass, separate from the live `callback` chain, is the
+ * only place a just-loaded workflow's `append_to_existing` value ever gets
+ * applied to `existing_psd`/`existing_psd_path`.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function scheduleAppendTargetSync(node) {
+  if (node.__cpsbAppendTargetSyncTimer) return
+  node.__cpsbAppendTargetSyncTimer = setTimeout(() => {
+    node.__cpsbAppendTargetSyncTimer = null
+    if (!node.graph) return // removed from the graph since being scheduled
+    if (app.configuringGraph) {
+      scheduleAppendTargetSync(node) // workflow still loading -- retry once it settles
+      return
+    }
+    updateAppendTargetWidgetsEnabled(node)
+  }, STABILIZE_DEBOUNCE_MS)
+}
+
+/**
+ * Installs the append-target enable/disable behavior on one
+ * `PhotoshopComposePSD` node instance (this section's header). Exported —
+ * matching every other `attach*` in this file being its own clean,
+ * independently-callable entry point — but ALSO invoked directly from
+ * {@link attachAutoGrowInputs} below, since THIS change's scope is
+ * `compose.js` only and `web/cpsb.js`'s own `nodeCreated` wiring (where
+ * every other `attach*` here is actually invoked) is out of bounds for it;
+ * idempotent per node instance (the guard immediately below), so a future
+ * explicit `nodeCreated` wire-up of this function directly is a safe,
+ * ordinary no-op layered on top of this. A no-op for any other node type.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+export function attachAppendTargetWidgets(node) {
+  if (!isComposePsdNode(node)) return
+  if (node.__cpsbAppendTargetAttached) return
+  node.__cpsbAppendTargetAttached = true
+
+  const toggle = findWidgetByName(node, APPEND_TO_EXISTING_WIDGET_NAME)
+  if (toggle) {
+    const originalCallback = toggle.callback
+    toggle.callback = function (value, ...rest) {
+      const result = originalCallback?.call(this, value, ...rest)
+      updateAppendTargetWidgetsEnabled(node)
+      return result
+    }
+  }
+
+  const originalOnRemoved = node.onRemoved
+  node.onRemoved = function () {
+    if (node.__cpsbAppendTargetSyncTimer) {
+      clearTimeout(node.__cpsbAppendTargetSyncTimer)
+      node.__cpsbAppendTargetSyncTimer = null
+    }
+    return originalOnRemoved?.call(this)
+  }
+
+  scheduleAppendTargetSync(node)
+}
+
+// -----------------------------------------------------------------------
+// "Written: <filename>" display (this file's header, section 3; product
 // owner gap: "for 'don't open' how do I later find and open the file?").
 //
 // Persistence honesty, up front: the backend deliberately creates NO
@@ -289,13 +464,57 @@ function scheduleStabilize(node) {
 //     one-time `[cpsb]` warning via {@link warnLocalStorageUnavailable} if
 //     it throws) — a broken/disabled localStorage degrades silently to
 //     "in-memory only for this tab," never a crash.
+//
+// Two widgets, not one (product owner, verbatim: "Can the written message be
+// just text and there be a separate 'Copy Path' button. And can that button
+// copy the full path not just the file name"):
+//   - A plain, non-clickable TEXT ROW ({@link WRITTEN_TEXT_WIDGET_NAME}) —
+//     "Written: <filename> (on ComfyUI machine)". Non-interactive widget
+//     type chosen: a `button`-type widget PERMANENTLY `.disabled = true` —
+//     the exact same `widget.disabled` mechanism this file's "Append-target
+//     widgets" section verifies against the current `Comfy-Org/
+//     ComfyUI_frontend` source in detail (see that section's header for the
+//     full citation trail: `BaseWidget`'s real `disabled` property,
+//     `LGraphNode.drawWidgets`' automatic 50%-alpha dimming, `getWidgetOnPos`
+//     excluding `computedDisabled` widgets from ever receiving a click).
+//     Reused here rather than researching a second mechanism, because it is
+//     litegraph's own answer to exactly this: "greyed out and inert, but
+//     still occupying its row" — no genuine dedicated read-only/label
+//     widget type exists in this frontend (mirrors `settings.js`'s own
+//     documented finding for the ComfyUI-settings-panel case, a different
+//     surface with the same absence).
+//   - A separate "Copy Path" BUTTON ({@link WRITTEN_COPY_PATH_WIDGET_NAME})
+//     that copies the FULL, absolute, server-side path
+//     ({@link api.CpsbComposeWrittenEvent}'s `path` field, added alongside
+//     this change) — never the bare filename the text row shows.
+//     Pre-upgrade `localStorage` records (written by an older frontend
+//     build, before `path` existed) have no path to copy: rather than
+//     silently falling back to copying the bare filename under a "Copy
+//     Path" label (which would lie about what got copied), this button is
+//     `.disabled` whenever {@link CpsbWrittenFileRef.path} is absent — see
+//     {@link setWrittenDisplay}'s own handling of that case.
 // -----------------------------------------------------------------------
+
+/**
+ * @typedef {import('./api.js').CpsbImageRef & {path: string | null}} CpsbWrittenFileRef
+ * The shape held in `node.__cpsbLastWritten`, mirrored into `localStorage`,
+ * and returned by {@link getWrittenFileRef}: {@link api.CpsbImageRef}'s three
+ * fields (all `menu.js`'s re-open request needs) plus `path` — the full,
+ * absolute, server-side location from {@link api.CpsbComposeWrittenEvent}.
+ * `path` is `null` only for a record a PRE-upgrade frontend build persisted
+ * before this field existed (see this section's header, "Two widgets, not
+ * one" — the "Copy Path" button disables itself rather than copying the
+ * bare filename under a path-labeled button in that case).
+ */
 
 /** `localStorage` key prefix for {@link writtenStorageKey}. */
 const WRITTEN_STORAGE_PREFIX = 'cpsb.composeWritten:'
 
-/** Widget name for the clickable "Written: ..." button (this section). */
-const WRITTEN_WIDGET_NAME = 'cpsb_written'
+/** Widget name for the plain, non-clickable "Written: ..." text row (this section). */
+const WRITTEN_TEXT_WIDGET_NAME = 'cpsb_written'
+
+/** Widget name for the separate "Copy Path" button (this section). */
+const WRITTEN_COPY_PATH_WIDGET_NAME = 'cpsb_written_copy_path'
 
 /** Guards {@link warnLocalStorageUnavailable} so it fires at most once per session. */
 let writtenLocalStorageWarned = false
@@ -326,7 +545,11 @@ function writtenStorageKey(node) {
 
 /**
  * @param {import('../../../scripts/app.js').LGraphNode} node
- * @returns {{filename: string, subfolder: string, type: import('./api.js').CpsbFileType} | null}
+ * @returns {CpsbWrittenFileRef | null} `path` is `null` (not just absent)
+ * for a record a pre-upgrade frontend build persisted before that field
+ * existed (this section's header) — never silently coerced to `""` or
+ * dropped, so {@link setWrittenDisplay}'s "Copy Path" disable check can
+ * distinguish "no path was ever recorded" from "recorded as empty."
  */
 function loadPersistedWritten(node) {
   try {
@@ -337,7 +560,8 @@ function loadPersistedWritten(node) {
       return {
         filename: parsed.filename,
         subfolder: typeof parsed.subfolder === 'string' ? parsed.subfolder : '',
-        type: parsed.type || 'input'
+        type: parsed.type || 'input',
+        path: typeof parsed.path === 'string' && parsed.path ? parsed.path : null
       }
     }
     return null
@@ -349,7 +573,7 @@ function loadPersistedWritten(node) {
 
 /**
  * @param {import('../../../scripts/app.js').LGraphNode} node
- * @param {{filename: string, subfolder: string, type: import('./api.js').CpsbFileType}} ref
+ * @param {CpsbWrittenFileRef} ref
  */
 function persistWritten(node, ref) {
   try {
@@ -416,69 +640,118 @@ async function copyToClipboard(text) {
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
  */
-function getWrittenWidget(node) {
-  return node.widgets?.find((w) => w.name === WRITTEN_WIDGET_NAME)
+function getWrittenTextWidget(node) {
+  return node.widgets?.find((w) => w.name === WRITTEN_TEXT_WIDGET_NAME)
 }
 
 /**
- * Creates (once) or updates the clickable "Written: <filename>" button
- * widget on *node* and records *ref* on the node instance for
- * {@link getWrittenFileRef}/menu.js's re-open gate. A `button`-type widget
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
+ */
+function getCopyPathWidget(node) {
+  return node.widgets?.find((w) => w.name === WRITTEN_COPY_PATH_WIDGET_NAME)
+}
+
+/**
+ * Creates (once) or updates the "Written: <filename>" text row plus the
+ * separate "Copy Path" button on *node*, and records *ref* on the node
+ * instance for {@link getWrittenFileRef}/menu.js's re-open gate (this
+ * section's header, "Two widgets, not one"). Both are `button`-type widgets
  * with `serialize: false` — the same convention `loadpsd.js`'s own upload
- * button already uses — so this widget itself is never written into
- * `widgets_values`: it carries no INPUT_TYPES-declared meaning the backend
- * would need to read back, and keeping it out of the saved graph JSON avoids
- * any risk of ever colliding, positionally, with a future backend-declared
- * widget (`cpsb/compose_psd.py`'s own "append new widgets at the very END of
+ * button already uses — so neither is ever written into `widgets_values`:
+ * they carry no INPUT_TYPES-declared meaning the backend would need to read
+ * back, and keeping them out of the saved graph JSON avoids any risk of
+ * ever colliding, positionally, with a future backend-declared widget
+ * (`cpsb/compose_psd.py`'s own "append new widgets at the very END of
  * required" rule exists for exactly this class of concern). Session
  * persistence instead goes through `localStorage` (see this section's
  * header) — a deliberately separate mechanism from graph serialization.
  * @param {import('../../../scripts/app.js').LGraphNode} node
- * @param {{filename: string, subfolder: string, type: import('./api.js').CpsbFileType}} ref
+ * @param {CpsbWrittenFileRef} ref
  */
 function setWrittenDisplay(node, ref) {
   node.__cpsbLastWritten = ref
-  let widget = getWrittenWidget(node)
-  if (!widget) {
-    widget = node.addWidget(
+
+  let textWidget = getWrittenTextWidget(node)
+  if (!textWidget) {
+    textWidget = node.addWidget(
       'button',
-      WRITTEN_WIDGET_NAME,
-      WRITTEN_WIDGET_NAME,
+      WRITTEN_TEXT_WIDGET_NAME,
+      WRITTEN_TEXT_WIDGET_NAME,
+      () => {}, // never invoked -- permanently `.disabled` below blocks every click
+      { serialize: false, canvasOnly: true }
+    )
+    // Permanently non-interactive (this section's header, "Two widgets, not
+    // one"): set once, at creation, and never toggled back -- unlike the
+    // Copy Path button below, this row's disabled-ness isn't conditional on
+    // anything.
+    textWidget.disabled = true
+  }
+  textWidget.label = writtenLabel(ref)
+  // Opportunistic — not every widget-rendering path shows a tooltip, but
+  // when it does, this reiterates the same "(on ComfyUI machine)" clarity
+  // the label already carries (build brief item 3: "tooltip OR label"). No
+  // "click to copy" wording here anymore -- this row isn't clickable.
+  textWidget.tooltip = `${ref.filename} — on the ComfyUI machine's input folder.`
+
+  let copyPathWidget = getCopyPathWidget(node)
+  if (!copyPathWidget) {
+    copyPathWidget = node.addWidget(
+      'button',
+      WRITTEN_COPY_PATH_WIDGET_NAME,
+      WRITTEN_COPY_PATH_WIDGET_NAME,
       async () => {
         const current = node.__cpsbLastWritten
-        if (!current) return
-        const ok = await copyToClipboard(current.filename)
+        if (!current?.path) return // disabled below whenever this is true -- defensive only
+        const ok = await copyToClipboard(current.path)
         ui.showToast({
           severity: ok ? 'success' : 'error',
-          summary: ok ? 'Filename copied' : 'Could not copy filename',
-          detail: current.filename
+          summary: ok ? 'Path copied' : 'Could not copy path',
+          detail: current.path
         })
       },
       { serialize: false, canvasOnly: true }
     )
   }
-  widget.label = writtenLabel(ref)
-  // Opportunistic — not every widget-rendering path shows a tooltip, but
-  // when it does, this reiterates the same "(on ComfyUI machine)" clarity
-  // the label already carries (build brief item 3: "tooltip OR label").
-  widget.tooltip = `${ref.filename} — on the ComfyUI machine's input folder. Click to copy the filename.`
+  copyPathWidget.label = 'Copy Path'
+  // Pre-upgrade-localStorage-record handling (this section's header): a
+  // `ref.path` of `null` means no full path was ever recorded for this
+  // write (an older frontend build persisted it before `path` existed) --
+  // disable rather than fall back to copying the bare filename under a
+  // "Copy Path" label, which would silently copy something other than what
+  // the button claims to.
+  const hasPath = typeof ref.path === 'string' && ref.path.length > 0
+  copyPathWidget.disabled = !hasPath
+  copyPathWidget.tooltip = hasPath
+    ? `${ref.path} — click to copy the full path.`
+    : 'No full path was recorded for this write (from a build before ' +
+      '"Copy Path" existed) -- run this node again to record one.'
+
   node.graph?.setDirtyCanvas(true, false)
 }
 
 /**
  * @param {import('../../../scripts/app.js').LGraphNode} node
- * @returns {import('./api.js').CpsbImageRef | null} This node's most
- * recently written file, from THIS session (in-memory) or restored from
- * `localStorage` at `nodeCreated` time — whichever is freshest, since
- * {@link setWrittenDisplay} always updates both. `null` before any write has
- * ever been observed for this node instance (a fresh node, or one that has
- * only ever run in a way that hasn't reached a write yet). Used by
- * `menu.js`'s {@link hasWrittenFile}-gated re-open item (build brief item 4).
+ * @returns {CpsbWrittenFileRef | null} This node's most recently written
+ * file, from THIS session (in-memory) or restored from `localStorage` at
+ * `nodeCreated` time — whichever is freshest, since {@link setWrittenDisplay}
+ * always updates both. `null` before any write has ever been observed for
+ * this node instance (a fresh node, or one that has only ever run in a way
+ * that hasn't reached a write yet). Used by `menu.js`'s
+ * {@link hasWrittenFile}-gated re-open item (build brief item 4) — that
+ * caller only ever reads the pre-existing `filename`/`subfolder`/`type`
+ * fields, so adding `path` here is additive and doesn't change what it
+ * already relies on.
  */
 export function getWrittenFileRef(node) {
   const ref = node.__cpsbLastWritten
   if (!ref || typeof ref.filename !== 'string' || !ref.filename) return null
-  return { filename: ref.filename, subfolder: ref.subfolder || '', type: ref.type || 'input' }
+  return {
+    filename: ref.filename,
+    subfolder: ref.subfolder || '',
+    type: ref.type || 'input',
+    path: typeof ref.path === 'string' && ref.path ? ref.path : null
+  }
 }
 
 /**
@@ -551,7 +824,8 @@ function handleComposeWritten(payload) {
   const ref = {
     filename: payload.filename,
     subfolder: payload.subfolder || '',
-    type: payload.type || 'input'
+    type: payload.type || 'input',
+    path: typeof payload.path === 'string' && payload.path ? payload.path : null
   }
   persistWritten(node, ref)
   setWrittenDisplay(node, ref)
@@ -572,11 +846,15 @@ export function init() {
  * `PhotoshopComposePSD` node instance (PROTOCOL.md §6c). Call from
  * `nodeCreated`. Idempotent per node instance (the same convention
  * `badges.installBadgeHook`/`loadpsd.attachUploadWidget` already use) and a
- * no-op for any other node type.
+ * no-op for any other node type. ALSO installs
+ * {@link attachAppendTargetWidgets} — see that function's own doc comment
+ * for why it's invoked from here rather than from `web/cpsb.js`'s
+ * `nodeCreated` directly.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 export function attachAutoGrowInputs(node) {
   if (!isComposePsdNode(node)) return
+  attachAppendTargetWidgets(node)
   if (node.__cpsbComposeInputsAttached) return
   node.__cpsbComposeInputsAttached = true
 

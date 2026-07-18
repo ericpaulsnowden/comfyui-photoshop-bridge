@@ -1042,18 +1042,33 @@ def _emit_compose_written(context: CpsbContext, node_id: str, output_path: Path)
         node_id: This node instance's id (the same stringified
             ``unique_id`` every other event/log line in this module keys
             on).
-        output_path: The just-written file's full path. Only its bare name
-            is sent, with ``subfolder=""``/``type="input"`` alongside it --
-            the exact same convention (and the exact same accepted
-            limitation for an out-of-``input/`` ``existing_psd_path``
+        output_path: The just-written file's full path. Its bare name is
+            sent as ``filename``, with ``subfolder=""``/``type="input"``
+            alongside it -- the exact same convention (and the exact same
+            accepted limitation for an out-of-``input/`` ``existing_psd_path``
             override) already documented on this class's own STRING output;
             see :class:`PhotoshopComposePSD`'s docstring "Outputs" section.
+            The FULL path is ALSO sent, as ``path``, resolved via
+            :meth:`Path.resolve` here (not assumed of the caller) so it is
+            always absolute -- including for an ``existing_psd_path``
+            power-user override the user typed as a relative string
+            (:func:`_resolve_append_target` returns that override verbatim,
+            unresolved; see its own docstring). This is purely additive and
+            purely informational, exactly like the rest of this event: it is
+            never read back by any identity/cache-key/handoff logic in this
+            module or :mod:`cpsb.handoff`, existing only so the frontend's
+            "Copy Path" button (``web/cpsb/compose.js``) has the real,
+            absolute, server-side location to copy -- the pre-existing
+            ``filename`` field alone is not enough for that (it is
+            deliberately bare, per the STRING-output convention referenced
+            above).
     """
     context.send_event(
         COMPOSE_WRITTEN_EVENT,
         {
             "node_id": node_id,
             "filename": output_path.name,
+            "path": str(output_path.resolve()),
             "subfolder": "",
             "type": "input",
         },

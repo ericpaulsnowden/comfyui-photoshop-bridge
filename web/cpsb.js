@@ -145,6 +145,7 @@ app.registerExtension({
     safely('badges.installBadgeHook', () => badges.installBadgeHook(node))
     safely('loadpsd.attachUploadWidget', () => loadpsd.attachUploadWidget(node))
     safely('compose.attachAutoGrowInputs', () => compose.attachAutoGrowInputs(node))
+    safely('compose.attachAppendTargetWidgets', () => compose.attachAppendTargetWidgets(node))
     safely('compose.attachWrittenDisplay', () => compose.attachWrittenDisplay(node))
   },
 

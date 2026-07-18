@@ -93,6 +93,23 @@ def raises_interrupt():
     return pytest.raises(RuntimeError, match=r"comfy\.model_management")
 
 
+def _assert_written_path(payload: dict, context: CpsbContext) -> None:
+    """Shared assertions for the ``path`` field ``_emit_compose_written`` adds
+    to a ``cpsb.compose_written`` event payload alongside the pre-existing
+    ``filename`` (PROTOCOL-adjacent build brief: "Copy Path" needs the full,
+    absolute, server-side location, not just the bare filename): *path* is
+    absolute, sits directly inside this test's fixture ``context.input_dir``
+    (every compose write lands there or at an ``existing_psd_path`` override
+    that these tests always also point inside ``input_dir``, never in a
+    subfolder -- matching the payload's own always-``""`` ``subfolder``), and
+    ends with the same bare name the payload's ``filename`` field carries.
+    """
+    path = Path(payload["path"])
+    assert path.is_absolute()
+    assert path.parent == context.input_dir.resolve()
+    assert payload["path"].endswith(payload["filename"])
+
+
 @pytest.fixture
 def manager(context: CpsbContext) -> HandoffManager:
     return HandoffManager(context)
@@ -1078,12 +1095,12 @@ class TestComposeWrittenEvent:
         )
         written_events = events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)
         assert len(written_events) == 1
-        assert written_events[0] == {
-            "node_id": "42",
-            "filename": "compose_00001.psd",
-            "subfolder": "",
-            "type": "input",
-        }
+        payload = written_events[0]
+        assert payload["node_id"] == "42"
+        assert payload["filename"] == "compose_00001.psd"
+        assert payload["subfolder"] == ""
+        assert payload["type"] == "input"
+        _assert_written_path(payload, context)
 
     def test_dont_open_emits_the_event_but_creates_no_handoff_or_meta_json(
         self, context, manager, configured, events
@@ -1189,6 +1206,7 @@ class TestComposeWrittenEvent:
         assert written_events[0]["filename"] == "review.psd"
         assert written_events[0]["subfolder"] == ""
         assert written_events[0]["type"] == "input"
+        _assert_written_path(written_events[0], context)
 
     def test_append_creating_missing_target_emits_event(self, context, manager, configured, events):
         target = context.input_dir / "not_yet_created.psd"
@@ -1206,6 +1224,7 @@ class TestComposeWrittenEvent:
         written_events = events.of_type(compose_module.COMPOSE_WRITTEN_EVENT)
         assert len(written_events) == 1
         assert written_events[0]["filename"] == "not_yet_created.psd"
+        _assert_written_path(written_events[0], context)
 
     def test_requeue_while_unsaved_does_not_emit_a_second_event(
         self, context, manager, configured_with_app, launches, events

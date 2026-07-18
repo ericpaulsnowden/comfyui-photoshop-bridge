@@ -576,10 +576,17 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     open" keeps its zero-Photoshop-entanglement contract literally (asserted by test: no
     active handoff, no `meta.json`). It is NOT emitted on the consume path or the
     duplicate-append skip, since no write happens there.
-  - The frontend shows `Written: <filename> (on ComfyUI machine)` on the node, click to
-    copy. Deliberately the input-relative FILENAME, not an absolute path, and with NO
-    reveal-in-OS affordance: in remote mode the file is on the ComfyUI machine and
-    revealing it in the browser machine's Finder is meaningless.
+  - The frontend shows a plain (disabled, non-clickable) text row `Written: <filename>
+    (on ComfyUI machine)` plus a separate **Copy Path** button (v0.5.24; originally one
+    click-to-copy button). The event payload carries `path` — the absolute, resolved
+    server-side path — and Copy Path copies THAT, not the filename. The locality label
+    stays: the path means the ComfyUI machine's filesystem. Still NO reveal-in-OS
+    affordance (meaningless in remote mode). A localStorage record persisted before the
+    `path` field existed disables the button (tooltip suggests a re-run) rather than
+    silently copying the bare filename. The append-target widgets (`existing_psd`,
+    `existing_psd_path`) are greyed out and click-blocked via `widget.disabled` while
+    `append_to_existing` is false (cosmetic only — the backend contract is unchanged;
+    mechanism verified against ComfyUI_frontend's BaseWidget/`computedDisabled` draw path).
   - The right-click "Open in Photoshop" gate (previously `node.imgs?.length`) now also
     accepts a Compose node with a recorded written filename, routed through the SAME
     `/cpsb/open` `mode:"new"` path everything else uses — so it inherits the client-locality

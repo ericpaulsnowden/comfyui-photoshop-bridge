@@ -229,7 +229,15 @@ export function warn(...args) {
  * "for 'don't open' how do I later find and open the file?").
  * @property {string} node_id - The compose node's own id (matches
  * `String(node.id)`, NOT an `origin_node_id` of any handoff).
- * @property {string} filename
+ * @property {string} filename - Bare filename (input-dir-relative
+ * convention), suitable for `viewUrl`-style addressing but NOT a
+ * server-side absolute path -- see {@link path} for that.
+ * @property {string} path - The just-written file's FULL, absolute,
+ * server-side path (`Path.resolve()`d by
+ * `cpsb.compose_psd._emit_compose_written`), added so the frontend's "Copy
+ * Path" button (`web/cpsb/compose.js`) can copy something a remote
+ * (different-machine) user could actually use to find the file on the
+ * ComfyUI machine, unlike the deliberately-bare {@link filename}.
  * @property {string} subfolder - Always `""` -- see
  * `cpsb.compose_psd._emit_compose_written`'s docstring for the one accepted
  * exception (an `existing_psd_path` override pointing outside `input/`).
