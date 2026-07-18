@@ -50,13 +50,18 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 from psd_tools import PSDImage
+from psd_tools.constants import ColorMode
 
-from . import nodes
+from . import nodes, routes
+from .context import CpsbContext
 from .handoff import HandoffManager, HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
 
 logger = logging.getLogger("cpsb")
@@ -93,6 +98,15 @@ MODE_DONT_OPEN = "Don't open (composite only)"
 #: overlap between layers is purely a function of stacking order and each
 #: image's own bounding box, not blending).
 _LAYER_OPACITY = 255
+
+#: Extensions the ``existing_psd`` combo lists / ``existing_psd_path``
+#: accepts for the "append to existing document" feature. Identical to
+#: :data:`cpsb.load_psd.PSD_EXTENSIONS`, deliberately duplicated by hand
+#: rather than imported -- ``cpsb/load_psd.py`` is owned by another change
+#: in flight, and this is the same short, stable, two-entry-tuple
+#: hand-mirroring convention that module's own docstring already
+#: establishes for ``cpsb.routes._PSD_NATIVE_EXTENSIONS``.
+_PSD_EXTENSIONS: tuple[str, ...] = (".psd", ".psb")
 
 
 def _collect_connected_images(kwargs: dict[str, Any]) -> list[Any]:
@@ -245,6 +259,8 @@ def _compute_identity_hash(
     pil_images: list[Image.Image],
     group_name: str,
     layer_name: str = DEFAULT_LAYER_NAME,
+    append_to_existing: bool = False,
+    append_target: str = "",
 ) -> str:
     """The handoff's source IDENTITY -- deliberately mode/prefix-FREE.
 
@@ -263,8 +279,19 @@ def _compute_identity_hash(
     second live Photoshop document -- got created and the first was left
     dangling (the confirmed "spins forever" / "slew of new documents" bug).
     Hashing only the pixels + the structural params that actually change the
-    written PSD's own content (``group_name``, ``layer_name``) keeps a mode
-    flip, or a filename-prefix edit, from stranding an in-progress edit.
+    written PSD's own content (``group_name``, ``layer_name``,
+    ``append_to_existing``/``append_target``) keeps a mode flip, or a
+    filename-prefix edit, from stranding an in-progress edit.
+
+    ``append_to_existing``/``append_target`` ARE part of this identity
+    (unlike ``mode``/``filename_prefix``): appending is on or off, and (when
+    on) which document it writes into, both genuinely change what this run
+    WOULD produce on disk -- toggling either must supersede any handoff
+    whose recorded identity predates the change, exactly like a genuinely
+    different connected image would, rather than being silently ignored by
+    the reuse check the way a mere mode flip is. See
+    :meth:`PhotoshopComposePSD.execute`'s "duplicate-append" docstring
+    section for the full reasoning this feeds.
 
     Args:
         pil_images: The connected inputs, already decoded to PIL, in
@@ -273,6 +300,11 @@ def _compute_identity_hash(
             PSD's group name, so it is part of the document's identity).
         layer_name: The ``layer_name`` widget value (changes every layer's
             name for the same reason).
+        append_to_existing: The ``append_to_existing`` widget value.
+        append_target: :func:`_append_target_key` of the current
+            ``existing_psd``/``existing_psd_path`` widget values -- empty
+            when *append_to_existing* is ``False`` (the target is
+            irrelevant then, so it must not perturb the identity).
 
     Returns:
         A 64-char lowercase hex sha256 digest.
@@ -283,6 +315,10 @@ def _compute_identity_hash(
     hasher.update(group_name.encode("utf-8"))
     hasher.update(b"\x00")
     hasher.update(layer_name.encode("utf-8"))
+    hasher.update(b"\x00")
+    hasher.update(b"\x01" if append_to_existing else b"\x00")
+    hasher.update(b"\x00")
+    hasher.update(append_target.encode("utf-8"))
     return hasher.hexdigest()
 
 
@@ -292,21 +328,24 @@ def _compute_inputs_hash(
     group_name: str,
     mode: str,
     layer_name: str = DEFAULT_LAYER_NAME,
+    append_to_existing: bool = False,
+    append_target: str = "",
 ) -> str:
     """A deterministic sha256 identity for "these inputs, these params, this mode".
 
     Used ONLY by :meth:`PhotoshopComposePSD.IS_CHANGED` as the base value
     that forces ComfyUI to re-execute this node when ANYTHING relevant
     changes -- pixels, ``filename_prefix``, ``group_name``, ``layer_name``,
-    or ``mode`` (switching ``mode`` genuinely changes what ``execute()``
-    does even for pixel-identical inputs, so it must still be folded in
-    HERE). This is deliberately a DIFFERENT value from
-    :func:`_compute_identity_hash` -- see that function's docstring for why
-    a handoff's recorded ``source_hash`` must NOT include ``mode``/
-    ``filename_prefix`` while this ``IS_CHANGED`` value still needs to.
+    ``mode``, ``append_to_existing``, or the append target
+    (switching any of these genuinely changes what ``execute()`` does even
+    for pixel-identical inputs, so each must be folded in HERE). This is
+    deliberately a DIFFERENT value from :func:`_compute_identity_hash` --
+    see that function's docstring for why a handoff's recorded
+    ``source_hash`` must NOT include ``mode``/``filename_prefix`` while this
+    ``IS_CHANGED`` value still needs to.
 
-    Built on top of :func:`_compute_identity_hash` (same pixel/group/layer
-    hashing) rather than duplicating it, with ``filename_prefix`` and
+    Built on top of :func:`_compute_identity_hash` (same pixel/group/layer/
+    append hashing) rather than duplicating it, with ``filename_prefix`` and
     ``mode`` folded in afterward.
 
     Note this is NOT literally "sha256 of the PSD bytes that would be
@@ -325,11 +364,16 @@ def _compute_inputs_hash(
         mode: The ``mode`` widget value (one of :data:`MODE_DONT_OPEN`,
             :attr:`cpsb.nodes.BridgeMode.WAIT_FIRST_SAVE`, or
             :attr:`cpsb.nodes.BridgeMode.RERUN_EVERY_SAVE`).
+        append_to_existing: The ``append_to_existing`` widget value.
+        append_target: :func:`_append_target_key` of the current
+            ``existing_psd``/``existing_psd_path`` widget values.
 
     Returns:
         A 64-char lowercase hex sha256 digest.
     """
-    identity_hash = _compute_identity_hash(pil_images, group_name, layer_name)
+    identity_hash = _compute_identity_hash(
+        pil_images, group_name, layer_name, append_to_existing, append_target
+    )
     hasher = hashlib.sha256()
     hasher.update(identity_hash.encode("ascii"))
     hasher.update(b"\x00")
@@ -423,6 +467,86 @@ def _centered_offset(item_size: int, canvas_size: int) -> int:
     return (canvas_size - item_size) // 2
 
 
+def _compute_placements(
+    pil_images: list[Image.Image], canvas_width: int, canvas_height: int
+) -> list[tuple[Image.Image, int, int]]:
+    """``(layer_image, left, top)`` per image, centered against a canvas.
+
+    The pure layout math (alpha-preserving mode handling + centering),
+    independent of psd-tools/any ``PSDImage`` -- shared by
+    :func:`_create_layers_in_psd` (which ALSO creates the real pixel
+    layers) and :meth:`PhotoshopComposePSD.execute`'s duplicate-append
+    guard (which needs this run's own flatten for the IMAGE/MASK outputs
+    but must NOT write anything to disk -- see the class docstring's
+    "duplicate-append avoidance" section).
+
+    Args:
+        pil_images: Decoded inputs, in ``image_1..image_N`` order.
+        canvas_width: Canvas width to center against.
+        canvas_height: Canvas height to center against.
+
+    Returns:
+        ``(layer_image, left, top)`` per image, in the same order --
+        *layer_image* keeps RGB/RGBA as-is (alpha preserved) and converts
+        anything else (the old unconditional ``.convert("RGB")`` dropped
+        every alpha).
+    """
+    placements: list[tuple[Image.Image, int, int]] = []
+    for image in pil_images:
+        layer_image = image if image.mode in ("RGB", "RGBA") else image.convert("RGB")
+        left = _centered_offset(layer_image.width, canvas_width)
+        top = _centered_offset(layer_image.height, canvas_height)
+        placements.append((layer_image, left, top))
+    return placements
+
+
+def _create_layers_in_psd(
+    psd: PSDImage,
+    pil_images: list[Image.Image],
+    layer_name: str,
+    canvas_width: int,
+    canvas_height: int,
+) -> tuple[list[Any], list[tuple[Image.Image, int, int]]]:
+    """Create one pixel layer per *pil_images* entry directly on *psd*,
+    centered against ``(canvas_width, canvas_height)`` (:func:`_compute_placements`).
+
+    Factored out of :func:`_build_group_psd` so the identical per-layer
+    creation logic (alpha-preserving mode handling, centering, naming,
+    opacity) is shared with :func:`_append_run_into_psd` (the "append to
+    existing document" feature) rather than duplicated -- the two differ
+    only in WHERE ``canvas_width``/``canvas_height`` come from (a fresh
+    document sized to the inputs themselves, vs. an existing target's own
+    fixed, un-resizable canvas), not in how a layer gets placed once a
+    canvas is chosen.
+
+    Args:
+        psd: The (already-created or already-opened) document to add layers
+            to. Not saved by this function.
+        pil_images: Decoded inputs, in ``image_1..image_N`` order.
+        layer_name: Base name; layers are named ``"<layer_name> <index>"``,
+            1-indexed.
+        canvas_width: Canvas width to center against.
+        canvas_height: Canvas height to center against.
+
+    Returns:
+        ``(layers, placements)`` -- *layers* bottom-to-top, ready for
+        ``psd.create_group``; *placements* is ``(layer_image, left, top)``
+        per layer, reused by :func:`_flatten_placements` so the IMAGE/MASK
+        outputs are derived from the exact same positions just written to
+        disk rather than by re-reading the file back. Each *layer_image*
+        keeps its own mode (``"RGBA"`` when the source carried alpha) so the
+        flatten sees the transparency the PSD layers were written with.
+    """
+    placements = _compute_placements(pil_images, canvas_width, canvas_height)
+    layers = []
+    for index, (layer_image, left, top) in enumerate(placements, start=1):
+        layer = psd.create_pixel_layer(
+            layer_image, name=f"{layer_name} {index}", top=top, left=left, opacity=_LAYER_OPACITY
+        )
+        layers.append(layer)
+    return layers, placements
+
+
 def _build_group_psd(
     pil_images: list[Image.Image], group_name: str, layer_name: str = DEFAULT_LAYER_NAME
 ) -> tuple[PSDImage, int, int, list[tuple[Image.Image, int, int]]]:
@@ -457,24 +581,55 @@ def _build_group_psd(
     # yields a transparent layer, verified empirically against psd-tools 1.17.4),
     # so this is NOT a place alpha would be flattened away.
     psd = PSDImage.new(mode="RGB", size=(canvas_width, canvas_height), depth=8)
-
-    layers = []
-    placements: list[tuple[Image.Image, int, int]] = []
-    for index, image in enumerate(pil_images, start=1):
-        # Preserve alpha: keep RGB/RGBA untouched so an RGBA source becomes a
-        # layer WITH transparency; only convert truly-odd modes (P, CMYK, ...)
-        # to RGB. The old unconditional ``.convert("RGB")`` dropped every alpha.
-        layer_image = image if image.mode in ("RGB", "RGBA") else image.convert("RGB")
-        left = _centered_offset(layer_image.width, canvas_width)
-        top = _centered_offset(layer_image.height, canvas_height)
-        layer = psd.create_pixel_layer(
-            layer_image, name=f"{layer_name} {index}", top=top, left=left, opacity=_LAYER_OPACITY
-        )
-        layers.append(layer)
-        placements.append((layer_image, left, top))
-
+    layers, placements = _create_layers_in_psd(
+        psd, pil_images, layer_name, canvas_width, canvas_height
+    )
     psd.create_group(layer_list=layers, name=group_name)
     return psd, canvas_width, canvas_height, placements
+
+
+def _append_run_into_psd(
+    psd: PSDImage, pil_images: list[Image.Image], run_group_name: str, layer_name: str
+) -> tuple[list[tuple[Image.Image, int, int]], int, int]:
+    """Add *pil_images* as a NEW top-level group onto *psd* -- the "append to
+    existing document" feature's own write step (build brief items 1/6).
+    Mutates *psd* in place; does NOT save (see :func:`_atomic_save` for why
+    saving is a separate, deliberately atomic step).
+
+    Verified empirically (this feature's own pre-build spike): a group
+    added via ``psd.create_group(...)`` on an already-populated, REOPENED
+    ``PSDImage`` lands AFTER every pre-existing top-level child in
+    iteration order -- which is ABOVE them in the stack, exactly matching
+    this module's own "later index stacks on top" convention
+    (:func:`_build_group_psd`) -- and every pre-existing top-level group,
+    its own layers, names, and bboxes are left completely untouched.
+
+    Canvas is *psd*'s OWN existing ``(width, height)`` -- CONSTRAINT 1:
+    psd-tools has no canvas-resize API, so appended layers are centered
+    against the EXISTING canvas and simply clipped if they don't fit,
+    never grow the document (callers warn when this clips --
+    :func:`_log_canvas_mismatch_if_needed`).
+
+    Args:
+        psd: The already-opened (or freshly-created) target document.
+        pil_images: This run's decoded inputs, in ``image_1..image_N`` order.
+        run_group_name: This run's own group name (already run-numbered by
+            :func:`_next_run_group_name`).
+        layer_name: Base layer name for this run's own layers.
+
+    Returns:
+        ``(placements, canvas_width, canvas_height)`` -- *placements* covers
+        ONLY this run's just-added layers (never any pre-existing document
+        content), matching :func:`_build_group_psd`'s own return contract so
+        :func:`_flatten_placements` can be reused unchanged; the canvas
+        dims are *psd*'s existing, unchanged size.
+    """
+    canvas_width, canvas_height = psd.width, psd.height
+    layers, placements = _create_layers_in_psd(
+        psd, pil_images, layer_name, canvas_width, canvas_height
+    )
+    psd.create_group(layer_list=layers, name=run_group_name)
+    return placements, canvas_width, canvas_height
 
 
 def _flatten_placements(
@@ -553,6 +708,294 @@ def _allocate_output_path(input_dir: Path, filename_prefix: str) -> Path:
         index += 1
 
 
+# -----------------------------------------------------------------------
+# "Append to existing document" (product owner brief verbatim: "a switch
+# for existing document... writes into an existing psd as new layers... for
+# generating multiple runs of images and storing the results into a single
+# psd for review vs a slew of separate files"). Three new widgets on
+# PhotoshopComposePSD.INPUT_TYPES (appended at the END of "required", so a
+# saved workflow's existing widget VALUES -- matched by ComfyUI purely by
+# POSITION -- are never silently reassigned to the wrong widget):
+# `append_to_existing` (BOOLEAN, default False), `existing_psd` (a COMBO of
+# .psd/.psb files already in ComfyUI's input dir, mirroring
+# cpsb.load_psd.PhotoshopLoadPSD's own combo -- the ONLY file-picker
+# mechanism available to a server-side ComfyUI node, and the one mechanism
+# that still works when ComfyUI and Photoshop are on different machines, as
+# in this project's own two-machine setup), and `existing_psd_path` (a
+# STRING power-user override, used VERBATIM -- never resolved against the
+# input dir -- whenever it is non-empty).
+# -----------------------------------------------------------------------
+
+
+def _list_psd_files(input_dir: Path) -> list[str]:
+    """Sorted ``.psd``/``.psb`` filenames directly under *input_dir*.
+
+    A byte-for-byte port of :func:`cpsb.load_psd._list_psd_files` (that
+    module is owned by another change in flight -- this copies its logic
+    rather than importing it, per this feature's own build brief). Flat,
+    non-recursive, matching ``LoadImage.INPUT_TYPES``'s own directory
+    listing (see ``cpsb.load_psd``'s module docstring for the verified
+    upstream reference). Empty if *input_dir* doesn't exist yet -- never
+    raises, so :meth:`PhotoshopComposePSD.INPUT_TYPES` stays introspectable
+    without a live backend, the same tolerance
+    :meth:`cpsb.load_psd.PhotoshopLoadPSD.INPUT_TYPES` already has.
+    """
+    if not input_dir.is_dir():
+        return []
+    return sorted(
+        entry.name
+        for entry in input_dir.iterdir()
+        if entry.is_file() and entry.suffix.lower() in _PSD_EXTENSIONS
+    )
+
+
+def _append_target_key(existing_psd: str, existing_psd_path: str) -> str:
+    """A cheap, non-validating identity string for the append target.
+
+    Used ONLY as a cache-key ingredient
+    (:meth:`PhotoshopComposePSD.IS_CHANGED` and
+    :meth:`PhotoshopComposePSD.execute`'s own ``identity_hash`` -- the two
+    MUST agree, or a handoff recorded under one value would never be found
+    by the other's lookup) -- never for actual path resolution, which is
+    :func:`_resolve_append_target`'s job and can raise on an invalid
+    selection. This must never raise: ``IS_CHANGED`` runs on every graph
+    submission, including with a currently-invalid
+    ``existing_psd``/``existing_psd_path`` combination the user hasn't
+    fixed yet.
+
+    ``existing_psd_path`` wins when non-empty, mirroring
+    :func:`_resolve_append_target`'s own precedence, so the cache key and
+    the real resolution agree about WHICH input is "the target" even
+    though only the real resolution actually validates it.
+    """
+    override = (existing_psd_path or "").strip()
+    return override if override else (existing_psd or "").strip()
+
+
+def _resolve_append_target(
+    context: CpsbContext, existing_psd: str, existing_psd_path: str
+) -> Path:
+    """Resolve the real append-target path for ``append_to_existing`` mode.
+
+    Mirrors :func:`cpsb.load_psd._resolve_psd_path`'s shape (validate
+    suffix, resolve input-dir-relative, reject path traversal) but ADDS the
+    ``existing_psd_path`` power-user override this feature's own brief
+    calls for: a non-empty ``existing_psd_path`` is used VERBATIM
+    (interpreted as a plain filesystem path, not resolved relative to the
+    input directory, and not traversal-checked -- it is an explicit
+    path the user typed, the same trust boundary every other STRING widget
+    in this package already sits behind), taking priority over the
+    ``existing_psd`` combo when non-empty.
+
+    Args:
+        context: The active backend context.
+        existing_psd: The ``existing_psd`` COMBO's selected filename (bare,
+            input-dir-relative, as listed by :func:`_list_psd_files`).
+        existing_psd_path: The ``existing_psd_path`` STRING widget's raw
+            value.
+
+    Returns:
+        The resolved path. This may point at a file that does NOT exist
+        yet -- callers create it fresh in that case (build brief item 3,
+        "point at a file that isn't there yet must be a first-run
+        convenience, not an error"); this function's own job ends at "a
+        safe, well-formed path", not "a path that exists".
+
+    Raises:
+        ValueError: *existing_psd_path* is non-empty but not a ``.psd``/
+            ``.psb`` path; or *existing_psd* is empty (nothing selected and
+            no override given); or *existing_psd* is not a ``.psd``/``.psb``
+            filename; or *existing_psd* would resolve outside
+            *context.input_dir* (only reachable via a crafted raw-API
+            value -- a COMBO selection made through the real frontend
+            widget is always one of :func:`_list_psd_files`'s own outputs).
+    """
+    override = (existing_psd_path or "").strip()
+    if override:
+        candidate = Path(override)
+        if candidate.suffix.lower() not in _PSD_EXTENSIONS:
+            raise ValueError(
+                f"existing_psd_path must be a .psd/.psb file, got: {existing_psd_path!r}"
+            )
+        return candidate
+
+    combo_value = (existing_psd or "").strip()
+    if not combo_value:
+        raise ValueError(
+            "append_to_existing is enabled but no existing_psd file is selected "
+            "and existing_psd_path is empty -- pick a file from existing_psd, or "
+            "type a path into existing_psd_path"
+        )
+    if Path(combo_value).suffix.lower() not in _PSD_EXTENSIONS:
+        raise ValueError(f"existing_psd must be a .psd/.psb file, got: {combo_value!r}")
+    resolved = routes._resolve_source_path(context, combo_value, "", "input")
+    if resolved is None:
+        raise ValueError(f"existing_psd escapes the input directory: {combo_value!r}")
+    return resolved
+
+
+def _next_run_group_name(psd: PSDImage | None, group_name: str) -> str:
+    """*group_name*, suffixed with the next run number (build brief item 6:
+    "run-over-run grouping" -- each execution's layers get their own group
+    so an accumulated review document stays navigable).
+
+    ``"<group_name> 1"`` for the first run ever written into a target
+    (including a brand-new one, ``psd=None``), ``"<group_name> 2"`` for the
+    second, etc. -- one past the highest existing top-level GROUP in *psd*
+    already named ``"<group_name> <N>"``.
+
+    Deliberately matches ONLY the numbered form, not a bare ``group_name``
+    with no trailing number: this scheme only ever WRITES numbered names
+    itself, so a bare match must be something else (a user's own manually
+    named group, or a document predating this feature) and is left alone
+    rather than being treated as "run 0" and colliding with a future
+    "run 1".
+
+    Args:
+        psd: The already-opened target document to scan, or ``None`` when
+            the target doesn't exist yet (nothing to scan -- always run 1).
+        group_name: The ``group_name`` widget's current value.
+
+    Returns:
+        The run-numbered group name for THIS execution's own new group.
+    """
+    pattern = re.compile(rf"^{re.escape(group_name)} (\d+)$")
+    highest = 0
+    if psd is not None:
+        for child in psd:
+            if child.kind != "group":
+                continue
+            match = pattern.match(child.name)
+            if match:
+                highest = max(highest, int(match.group(1)))
+    return f"{group_name} {highest + 1}"
+
+
+def _ensure_rgb_target(psd: PSDImage, target_path: Path) -> None:
+    """Refuse to append into a non-RGB document (build brief guard 5).
+
+    Empirically confirmed (this feature's own pre-build spike, not just
+    docs): appending an RGB pixel layer into a non-RGB (e.g. CMYK/
+    Grayscale) ``PSDImage`` does NOT raise on its own -- it silently
+    converts/desaturates (an RGB (255, 0, 0) layer became a Grayscale L=76
+    layer in that spike). Left unguarded, a user appending a colorful
+    generation into an accidentally-CMYK/Grayscale review document would
+    get silently wrong colors with no error at all -- so this checks
+    *psd*'s own recorded :class:`~psd_tools.constants.ColorMode` up front
+    and raises a clear, mode-naming error instead.
+
+    Raises:
+        ValueError: *psd*'s ``color_mode`` is not
+            :attr:`~psd_tools.constants.ColorMode.RGB`, naming the actual
+            mode and *target_path*.
+    """
+    if psd.color_mode != ColorMode.RGB:
+        raise ValueError(
+            f"Cannot append to {target_path}: its color mode is "
+            f"{psd.color_mode.name}, not RGB. Convert it to RGB in Photoshop "
+            "first (Image > Mode > RGB Color), or point append_to_existing "
+            "at a different/new target."
+        )
+
+
+def _peek_target_canvas(target_path: Path, pil_images: list[Image.Image]) -> tuple[int, int]:
+    """The canvas this run's layers will actually be placed against.
+
+    An EXISTING target's own ``(width, height)`` if *target_path* is a file
+    (a read-only open -- never mutates or saves it); otherwise the same
+    max-across-inputs canvas :func:`_build_group_psd` would compute for a
+    brand-new document, since a missing target is created fresh (build
+    brief item 3) with that same sizing.
+    """
+    if target_path.is_file():
+        existing = PSDImage.open(target_path)
+        return existing.width, existing.height
+    return (
+        max(image.width for image in pil_images),
+        max(image.height for image in pil_images),
+    )
+
+
+def _log_canvas_mismatch_if_needed(
+    node_id: str,
+    target_path: Path,
+    existing_width: int,
+    existing_height: int,
+    pil_images: list[Image.Image],
+) -> None:
+    """Warn (build brief guard 5) when this run's own layers won't fully fit
+    *target_path*'s EXISTING canvas.
+
+    CONSTRAINT 1: psd-tools has no canvas-resize API (a literal TODO
+    comment in its own ``psd_image.py``, confirmed empirically) --
+    appending an image LARGER than the existing canvas does not error and
+    does not lose data, it is simply clipped visually to the existing
+    canvas. That is silent and easy to miss, so this logs a WARNING naming
+    both sizes whenever any connected image's own width/height exceeds the
+    target's, so the clipping is at least diagnosable from this node's log
+    trail.
+    """
+    max_width = max(image.width for image in pil_images)
+    max_height = max(image.height for image in pil_images)
+    if max_width > existing_width or max_height > existing_height:
+        logger.warning(
+            "cpsb compose_psd: node %s: appending into %s (canvas %dx%d) with new "
+            "layer(s) up to %dx%d -- psd-tools cannot resize an existing PSD's "
+            "canvas, so content outside %dx%d will be clipped",
+            node_id,
+            target_path,
+            existing_width,
+            existing_height,
+            max_width,
+            max_height,
+            existing_width,
+            existing_height,
+        )
+
+
+def _atomic_save(psd: PSDImage, target_path: Path) -> None:
+    """Save *psd* to *target_path* WITHOUT ever truncating a pre-existing file.
+
+    CONSTRAINT 3 (the single most dangerous part of this feature):
+    :meth:`~psd_tools.api.psd_image.PSDImage.save` opens its destination
+    ``"wb"`` IMMEDIATELY, truncating any existing file at that path before
+    writing a single byte of the new content. If serialization then raised
+    partway through (a genuinely possible failure -- a corrupt embedded
+    resource, an out-of-memory composite, ...), the user's previously-good
+    PSD would be left truncated and unopenable, with no way back.
+
+    This instead writes to a fresh, uniquely-named temp file in the SAME
+    directory as *target_path* (:func:`tempfile.mkstemp`, guaranteeing the
+    same filesystem so the final step is a true atomic rename rather than a
+    cross-filesystem copy), and only ``os.replace()``s it onto *target_path*
+    once :meth:`PSDImage.save` has fully returned. Any exception during the
+    save leaves *target_path* byte-for-byte untouched, and the temp file is
+    removed rather than left behind.
+
+    Args:
+        psd: The (already-mutated, unsaved) document to write.
+        target_path: The final destination -- pre-existing or not.
+
+    Raises:
+        Whatever :meth:`PSDImage.save` itself raises -- propagated after
+        the temp file is cleaned up, never swallowed (this node's other
+        error paths -- the non-RGB guard, the missing-input check -- are
+        likewise real exceptions, not silently-logged best-efforts).
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(target_path.parent), prefix=f".{target_path.name}.", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        psd.save(tmp_path)
+        os.replace(tmp_path, target_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 class PhotoshopComposePSD:
     """Composes N images into one grouped, multi-layer PSD (PROTOCOL.md §6c).
 
@@ -576,7 +1019,12 @@ class PhotoshopComposePSD:
     package uses; STRING is the written PSD's filename, relative to
     ``input/`` (``subfolder=""``) -- usable directly by
     :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s ``psd`` combo or ComfyUI's
-    own ``/view``.
+    own ``/view``. EXCEPTION: in ``append_to_existing`` mode with an
+    ``existing_psd_path`` override that points OUTSIDE ``input/`` (a
+    power-user escape hatch, used verbatim -- see below), STRING is still
+    just that target's bare filename, which is no longer guaranteed unique
+    or resolvable via ``input/``-relative tooling; this is an accepted
+    limitation of that override, not a bug.
 
     The ``mode`` COMBO (PROTOCOL.md §6c) mirrors the "Edit in Photoshop"
     bridge node's three behaviors exactly, applied to the just-written
@@ -630,6 +1078,68 @@ class PhotoshopComposePSD:
     ``mode`` widget (with unchanged inputs) can never strand an open
     handoff/document (see :func:`_compute_identity_hash`'s docstring for the
     bug this fixes).
+
+    **Append to an existing document** (``append_to_existing``, product
+    owner request: "generating multiple runs of images and storing the
+    results into a single psd for review vs a slew of separate files"):
+    when the ``append_to_existing`` BOOLEAN is ``True``, this run's layers
+    are written into an EXISTING ``.psd``/``.psb`` -- selected via the
+    ``existing_psd`` COMBO (files already in ComfyUI's input directory,
+    mirroring :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s own combo -- the
+    only file-picker mechanism available to a server-side ComfyUI node, and
+    the only one that still works when ComfyUI and Photoshop run on
+    different machines) or the ``existing_psd_path`` STRING power-user
+    override (used VERBATIM whenever non-empty, taking priority over the
+    combo) -- as a NEW top-level group, instead of a brand-new auto-numbered
+    file. A target that doesn't exist yet is created fresh (a first-run
+    convenience, not an error). Each run's group is named
+    ``"<group_name> <N>"``, *N* one past the highest existing same-prefixed
+    run group already in the target (:func:`_next_run_group_name`) -- so
+    successive runs accumulate as distinguishable, separately-named groups
+    rather than merging or colliding. Appending into a non-RGB (CMYK/
+    Grayscale/...) target is refused with a clear mode-naming error rather
+    than silently desaturating the new layers (psd-tools does the latter on
+    its own -- :func:`_ensure_rgb_target`); a target whose canvas doesn't
+    match the new layers' own size is still WRITTEN (psd-tools cannot
+    resize a canvas), but a WARNING names both sizes
+    (:func:`_log_canvas_mismatch_if_needed`) so the resulting clipping is
+    diagnosable. The write itself is ATOMIC (:func:`_atomic_save`): it never
+    truncates the pre-existing target in place, so a failure anywhere in
+    the append/serialize path leaves the user's previously-good document
+    byte-for-byte untouched.
+
+    Appending is otherwise ORTHOGONAL to the ``mode``/handoff machinery
+    above: ``append_to_existing`` only changes WHERE/HOW this run's own
+    layers get written to disk (a fixed, persistent target instead of a
+    fresh auto-numbered file); the IMAGE/MASK outputs remain this run's OWN
+    flattened composite (never the whole accumulated document), and the
+    ``mode`` dispatch, handoff creation, and Photoshop-open behavior run
+    completely unchanged against whatever ``output_path`` the append step
+    resolved to -- opening Photoshop opens a MANAGED COPY of the target
+    file exactly as it does for the non-append auto-numbered file, so
+    "Wait for first save"/"Re-run on every save" let the user review/edit
+    the real, growing, multi-run document, which is the whole point of this
+    feature.
+
+    **Duplicate-append avoidance** (the subtle caching interaction): both
+    ``append_to_existing`` and the resolved append target are folded into
+    :func:`_compute_identity_hash` (so toggling the flag or switching
+    targets, even with pixel-identical images, is treated as a genuinely
+    new identity -- supersedes any stale handoff and performs a real new
+    append) and into :func:`_compute_inputs_hash` (so :meth:`IS_CHANGED`
+    forces ComfyUI to re-execute when either changes). Within a single
+    identity, however, :meth:`execute` performs the REAL append (a
+    persisted, run-numbered group written to disk) at most once per
+    distinct identity per node: if an ACTIVE handoff for this node already
+    matches the current identity (the reuse case above -- e.g. a re-queue
+    while "Wait for first save" is still unsaved), the append step is
+    SKIPPED entirely -- this run's own IMAGE/MASK outputs are still computed
+    (from the SAME centering math, against the target's already-current
+    canvas), but nothing more is written to the target, so re-queuing an
+    unedited, still-pending run can never duplicate its group. Only a
+    genuinely new identity (different pixels, ``group_name``,
+    ``layer_name``, ``append_to_existing``, or target) ever performs
+    another real append.
     """
 
     CATEGORY = "image/photoshop"
@@ -656,8 +1166,25 @@ class PhotoshopComposePSD:
         to "connected, plus one trailing empty socket"; the backend's own
         declared range here only needs to be generous enough to never run
         out.
+
+        The final three ``required`` entries are the "append to existing
+        document" feature (the class docstring's own section): the
+        ``append_to_existing`` BOOLEAN (default ``False``, so every existing
+        saved workflow keeps its old auto-numbered-file behavior unchanged),
+        the ``existing_psd`` COMBO (:func:`_list_psd_files` over ComfyUI's
+        input directory -- tolerates an unconfigured backend by listing
+        nothing, exactly like :meth:`cpsb.load_psd.PhotoshopLoadPSD.
+        INPUT_TYPES`'s own combo), and the ``existing_psd_path`` STRING
+        power-user override (default ``""``). These are appended at the
+        very END of ``required`` deliberately: ComfyUI matches a saved
+        workflow's widget VALUES to widgets purely by POSITION, so inserting
+        anywhere else would silently reassign every existing saved
+        workflow's ``mode``/``timeout_seconds``/``max_layers`` values onto
+        the wrong widgets.
         """
         optional = {f"image_{i}": ("IMAGE",) for i in range(1, MAX_IMAGE_INPUTS + 1)}
+        state = nodes._state_if_configured()
+        existing_psd_files = _list_psd_files(state.context.input_dir) if state is not None else []
         return {
             "required": {
                 "group_name": ("STRING", {"default": DEFAULT_GROUP_NAME}),
@@ -675,6 +1202,13 @@ class PhotoshopComposePSD:
                     "INT",
                     {"default": DEFAULT_MAX_LAYERS, "min": 1, "max": 512},
                 ),
+                # -- "append to existing document" (class docstring) --
+                # appended LAST: widget order is positional, so anything
+                # else here would corrupt every saved workflow's existing
+                # widget values.
+                "append_to_existing": ("BOOLEAN", {"default": False}),
+                "existing_psd": (existing_psd_files,),
+                "existing_psd_path": ("STRING", {"default": ""}),
             },
             "optional": optional,
             "hidden": {"unique_id": "UNIQUE_ID"},
@@ -690,6 +1224,9 @@ class PhotoshopComposePSD:
         max_layers: int = DEFAULT_MAX_LAYERS,
         layer_name: str = DEFAULT_LAYER_NAME,
         filename_prefix: str = DEFAULT_FILENAME_PREFIX,
+        append_to_existing: bool = False,
+        existing_psd: str = "",
+        existing_psd_path: str = "",
         **kwargs: Any,
     ) -> str:
         """:func:`_compute_inputs_hash`, folded with the latest-edit hash when consumable.
@@ -713,11 +1250,22 @@ class PhotoshopComposePSD:
         never what a completed run produces, so hashing it would force
         needless re-execution on a mere timeout tweak. *mode*, by contrast,
         IS folded (through :func:`_compute_inputs_hash`) because switching it
-        genuinely changes the output.
+        genuinely changes the output. *append_to_existing*/*existing_psd*/
+        *existing_psd_path* are likewise folded in (via
+        :func:`_append_target_key`, the cheap non-validating form -- this
+        method must never raise on a currently-invalid selection): toggling
+        the flag or switching targets must re-execute this node even with
+        pixel-identical upstream images (the class docstring's "append to an
+        existing document" section).
         """
         pil_images, _ = _collect_layer_images(kwargs, max_layers)
         prefix = _sanitize_filename_prefix(filename_prefix)
-        inputs_hash = _compute_inputs_hash(pil_images, prefix, group_name, mode, layer_name)
+        append_target = (
+            _append_target_key(existing_psd, existing_psd_path) if append_to_existing else ""
+        )
+        inputs_hash = _compute_inputs_hash(
+            pil_images, prefix, group_name, mode, layer_name, append_to_existing, append_target
+        )
 
         state = nodes._state_if_configured()
         if state is None:
@@ -727,7 +1275,9 @@ class PhotoshopComposePSD:
         # that function's docstring), not the mode-sensitive inputs_hash
         # above (which stays mode-sensitive here only so a mode/prefix change
         # alone still forces THIS node to re-execute).
-        identity_hash = _compute_identity_hash(pil_images, group_name, layer_name)
+        identity_hash = _compute_identity_hash(
+            pil_images, group_name, layer_name, append_to_existing, append_target
+        )
         active = _find_matching_active_handoff(state.manager, str(unique_id), identity_hash)
         if active is not None:
             edit_hash = state.manager.latest_edit_hash(active.handoff_id)
@@ -744,6 +1294,9 @@ class PhotoshopComposePSD:
         max_layers: int = DEFAULT_MAX_LAYERS,
         layer_name: str = DEFAULT_LAYER_NAME,
         filename_prefix: str = DEFAULT_FILENAME_PREFIX,
+        append_to_existing: bool = False,
+        existing_psd: str = "",
+        existing_psd_path: str = "",
         **kwargs: Any,
     ) -> tuple[Any, Any, str]:
         """Compose (or consume) and return ``(IMAGE, MASK, STRING)`` (PROTOCOL.md §6c).
@@ -751,8 +1304,11 @@ class PhotoshopComposePSD:
         Serves a consumable active edit first (the class docstring's "Consume
         semantics" paragraph -- this runs for EVERY mode, so an already-saved
         edit is returned without re-opening Photoshop). Otherwise composes
-        the connected inputs fresh, writes the LAYERED PSD, and dispatches on
-        *mode*:
+        the connected inputs fresh, writes the LAYERED PSD -- either a fresh
+        auto-numbered file (``append_to_existing=False``, unchanged from
+        before) or into an existing/new target document
+        (``append_to_existing=True``, the class docstring's "append to an
+        existing document" section) -- and dispatches on *mode*:
 
         * :attr:`~cpsb.nodes.BridgeMode.WAIT_FIRST_SAVE`: open Photoshop and
           BLOCK (:meth:`_open_and_wait_for_edit`) until the first save, then
@@ -768,12 +1324,17 @@ class PhotoshopComposePSD:
         The STRING output is always the written PSD's filename, unchanged from
         the old build -- including on the "Wait for first save" path, whose
         IMAGE/MASK come from the saved edit but whose STRING still names the
-        file that was composed and handed off.
+        file that was composed and handed off. In ``append_to_existing`` mode
+        this is the TARGET's own filename (:func:`_resolve_append_target`),
+        not a freshly auto-numbered one.
 
         Args:
             filename_prefix: Base name for the written file (sanitized via
-                :func:`_sanitize_filename_prefix` before use).
-            group_name: Name of the single group every layer is placed in.
+                :func:`_sanitize_filename_prefix` before use). Unused when
+                *append_to_existing* is ``True``.
+            group_name: Name of the group every layer is placed in (in
+                ``append_to_existing`` mode, run-numbered first via
+                :func:`_next_run_group_name`).
             mode: One of the three ``mode`` COMBO strings (see the class
                 docstring).
             timeout_seconds: Bound on the "Wait for first save" blocking wait;
@@ -785,6 +1346,13 @@ class PhotoshopComposePSD:
                 logged when it truncates.
             unique_id: This node instance's id (ComfyUI's hidden
                 ``UNIQUE_ID`` input), used to key its handoff lookup.
+            append_to_existing: When ``True``, this run's layers are written
+                into the resolved ``existing_psd``/``existing_psd_path``
+                target instead of a new auto-numbered file (class docstring).
+            existing_psd: The ``existing_psd`` COMBO's current selection.
+            existing_psd_path: The ``existing_psd_path`` power-user override;
+                used verbatim, taking priority over *existing_psd*, whenever
+                non-empty.
             **kwargs: The connected ``image_N`` tensors (each possibly a
                 multi-image batch), whichever subset ComfyUI passed.
 
@@ -793,7 +1361,12 @@ class PhotoshopComposePSD:
 
         Raises:
             ValueError: No ``image_N`` input is connected -- there is
-                nothing to compose.
+                nothing to compose. Also raised (``append_to_existing=True``
+                only) when neither *existing_psd* nor *existing_psd_path*
+                resolves to a usable ``.psd``/``.psb`` path
+                (:func:`_resolve_append_target`), or the resolved target
+                already exists but is not an RGB document
+                (:func:`_ensure_rgb_target`).
             comfy.model_management.InterruptProcessingException: "Wait for
                 first save" mode, when the open attempt fails or the wait ends
                 in cancel/timeout (via :func:`cpsb.nodes._raise_interrupt`) --
@@ -819,6 +1392,15 @@ class PhotoshopComposePSD:
             )
 
         prefix = _sanitize_filename_prefix(filename_prefix)
+        # Append target key for the cache-key-consistent identity hash below
+        # (see _append_target_key's docstring: IS_CHANGED computes this same
+        # value from the same two widgets, so a handoff recorded here is
+        # always findable from there). Empty when append_to_existing is
+        # False -- the target is irrelevant then, and must not perturb the
+        # identity of a plain (non-append) run.
+        append_target = (
+            _append_target_key(existing_psd, existing_psd_path) if append_to_existing else ""
+        )
         # Mode/prefix-FREE identity (see _compute_identity_hash's docstring):
         # this is what a bridge_node handoff's source_hash is now recorded
         # as, and what reuse/supersede below is keyed on -- deliberately NOT
@@ -827,7 +1409,11 @@ class PhotoshopComposePSD:
         # flip changed the recorded identity, so the already-open handoff
         # could never match again, stranding it as a live, unreachable
         # Photoshop document while a second one got created underneath it.
-        identity_hash = _compute_identity_hash(pil_images, group_name, layer_name)
+        # append_to_existing/append_target ARE folded in here, unlike mode --
+        # see _compute_identity_hash's own docstring for why.
+        identity_hash = _compute_identity_hash(
+            pil_images, group_name, layer_name, append_to_existing, append_target
+        )
 
         # -- reuse / supersede (mirrors cpsb.nodes.PhotoshopBridge.execute,
         # cpsb/nodes.py:402-432, and cpsb.annotate's analogous block,
@@ -842,11 +1428,11 @@ class PhotoshopComposePSD:
             and active.source_hash is not None
             and active.source_hash != identity_hash
         ):
-            # The connected inputs (or group_name/layer_name) genuinely
-            # changed since this handoff was opened: any edits it holds
-            # belong to the OLD identity and must not be served for the new
-            # one. Retire it and start fresh -- this is the one case a new
-            # handoff (and new Photoshop document) is actually warranted.
+            # The connected inputs (or group_name/layer_name/append settings)
+            # genuinely changed since this handoff was opened: any edits it
+            # holds belong to the OLD identity and must not be served for the
+            # new one. Retire it and start fresh -- this is the one case a
+            # new handoff (and new Photoshop document) is actually warranted.
             logger.info(
                 "cpsb compose_psd: node %s: inputs changed, superseding handoff %s",
                 node_id,
@@ -868,19 +1454,88 @@ class PhotoshopComposePSD:
             # Filesystem race: the edit file vanished. `active` stays set so
             # the open paths below REUSE it rather than minting a new one.
 
-        logger.info(
-            "cpsb compose_psd: node %s: composing %d layer(s) into group %r (mode=%r)",
-            node_id,
-            len(pil_images),
-            group_name,
-            mode,
-        )
-        psd, canvas_width, canvas_height, placements = _build_group_psd(
-            pil_images, group_name, layer_name
-        )
-        output_path = _allocate_output_path(state.context.input_dir, prefix)
-        psd.save(output_path)
-        logger.info("cpsb compose_psd: node %s: wrote %s", node_id, output_path)
+        if append_to_existing:
+            # -- "append to existing document" (class docstring) ----------
+            target_path = _resolve_append_target(state.context, existing_psd, existing_psd_path)
+            if active is not None:
+                # DUPLICATE-APPEND GUARD (class docstring's "duplicate-append
+                # avoidance" section): `active` here means an already-open,
+                # not-yet-edited handoff for THIS node already matches the
+                # CURRENT identity (pixels/group_name/layer_name/append
+                # settings all unchanged) -- e.g. a re-queue of "Wait for
+                # first save" before anyone has saved yet. That prior call
+                # already performed the real append into `target_path`; doing
+                # it again here would append a SECOND, redundant group of the
+                # exact same content. So: do NOT touch the target file at
+                # all. This run's own IMAGE/MASK outputs are still computed,
+                # from the SAME centering math against the target's current
+                # (already-updated) canvas, purely so the node's outputs stay
+                # correct -- but nothing more is written to disk.
+                logger.info(
+                    "cpsb compose_psd: node %s: append_to_existing reusing pending "
+                    "handoff %s for unchanged identity -- skipping re-append into %s",
+                    node_id,
+                    active.handoff_id,
+                    target_path,
+                )
+                canvas_width, canvas_height = _peek_target_canvas(target_path, pil_images)
+                placements = _compute_placements(pil_images, canvas_width, canvas_height)
+            elif target_path.is_file():
+                psd = PSDImage.open(target_path)
+                _ensure_rgb_target(psd, target_path)
+                _log_canvas_mismatch_if_needed(
+                    node_id, target_path, psd.width, psd.height, pil_images
+                )
+                run_group_name = _next_run_group_name(psd, group_name)
+                logger.info(
+                    "cpsb compose_psd: node %s: appending %d layer(s) into %s as group %r "
+                    "(mode=%r)",
+                    node_id,
+                    len(pil_images),
+                    target_path,
+                    run_group_name,
+                    mode,
+                )
+                placements, canvas_width, canvas_height = _append_run_into_psd(
+                    psd, pil_images, run_group_name, layer_name
+                )
+                _atomic_save(psd, target_path)
+                logger.info("cpsb compose_psd: node %s: wrote %s", node_id, target_path)
+            else:
+                # Missing target: first-run convenience, not an error (build
+                # brief item 3) -- create it fresh via the same build path
+                # _build_group_psd already uses for a brand-new auto-numbered
+                # file, just written to the resolved target path instead.
+                run_group_name = _next_run_group_name(None, group_name)
+                logger.info(
+                    "cpsb compose_psd: node %s: existing_psd target %s does not exist yet, "
+                    "creating it fresh with %d layer(s) as group %r (mode=%r)",
+                    node_id,
+                    target_path,
+                    len(pil_images),
+                    run_group_name,
+                    mode,
+                )
+                psd, canvas_width, canvas_height, placements = _build_group_psd(
+                    pil_images, run_group_name, layer_name
+                )
+                _atomic_save(psd, target_path)
+                logger.info("cpsb compose_psd: node %s: wrote %s", node_id, target_path)
+            output_path = target_path
+        else:
+            logger.info(
+                "cpsb compose_psd: node %s: composing %d layer(s) into group %r (mode=%r)",
+                node_id,
+                len(pil_images),
+                group_name,
+                mode,
+            )
+            psd, canvas_width, canvas_height, placements = _build_group_psd(
+                pil_images, group_name, layer_name
+            )
+            output_path = _allocate_output_path(state.context.input_dir, prefix)
+            psd.save(output_path)
+            logger.info("cpsb compose_psd: node %s: wrote %s", node_id, output_path)
 
         flattened = _flatten_placements(placements, canvas_width, canvas_height)
         image_tensor, mask_tensor = nodes._tensors_from_image(flattened)

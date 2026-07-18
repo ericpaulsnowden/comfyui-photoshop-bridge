@@ -532,6 +532,39 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   latest-edit hash when an active matching handoff exists; execute() returns the latest
   edit (flattened) when the active handoff's `source_hash` matches the current inputs'
   hash — the §6/§6b consume pattern.
+- **Append into an existing document** (v0.5.20). Widgets, all appended at the END of
+  `required` (ComfyUI matches saved widget values BY POSITION, so anywhere else silently
+  shifts every existing workflow's values): `append_to_existing` (BOOLEAN, default False),
+  `existing_psd` (COMBO over `.psd`/`.psb` in the input dir), `existing_psd_path` (STRING
+  override, used verbatim when non-empty). Purpose: accumulate many runs into ONE
+  reviewable document instead of a slew of separate files.
+  - There is no OS file picker available to a ComfyUI node — nodes execute SERVER-SIDE.
+    The input-dir COMBO is the idiomatic mechanism (what `PhotoshopLoadPSD` and core
+    `LoadImage` already do) and the only one that works when ComfyUI and Photoshop are on
+    different machines. `existing_psd_path` is a path on the **ComfyUI** machine.
+  - Target resolution mirrors `load_psd.py`'s `_resolve_psd_path`, rejecting traversal
+    identically. A target that does not exist yet is CREATED fresh (first-run convenience,
+    not an error).
+  - **Atomic write** (`_atomic_save`): `PSDImage.save()` opens its destination `"wb"`
+    immediately, truncating the existing file before writing a byte — a mid-save failure
+    would leave the user's accumulated document unopenable. Writes to a `mkstemp` temp
+    file in the SAME directory (guaranteeing one filesystem, so the final step is a true
+    atomic rename) and `os.replace()`s only after `save()` fully returns; on any exception
+    the temp file is removed and the target is byte-for-byte untouched.
+  - Guards: a non-RGB target is REFUSED naming its actual mode (psd-tools would silently
+    desaturate/convert instead of erroring); a canvas-size mismatch WARNS naming both
+    sizes and proceeds (psd-tools has no canvas-resize API, so a larger image is clipped).
+  - Run grouping: each append lands in `"<group_name> <N>"`, N = 1 + the highest existing
+    same-prefixed numbered group in the target, so runs stay navigable.
+  - **Duplicate-append avoidance**: `append_to_existing` and the resolved target are folded
+    into BOTH hashes (identity → switching targets supersedes a stale handoff; inputs →
+    IS_CHANGED forces re-execution). Within one identity the real append happens AT MOST
+    ONCE: if an active handoff for the node already matches the current identity (e.g. a
+    re-queue of "Wait for first save" before any save), the append is SKIPPED — outputs are
+    still computed from the same centering math, but nothing further is written.
+  - Appending changes only WHERE this run's layers are written. IMAGE/MASK outputs stay
+    this run's own flattened composite, never the whole accumulated document, and `mode`
+    dispatch is unchanged.
 - **Handoff identity is mode-FREE** (fixed v0.5.18 — this node previously had neither
   reuse nor supersede, which is what made "Wait for first save" hang forever and spawned
   a document per run). Two distinct hashes now:
