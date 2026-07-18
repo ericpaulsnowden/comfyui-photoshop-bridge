@@ -183,6 +183,25 @@ function workflowMatches(candidateName) {
  * ids are only unique within one workflow, so without this, node "17" in
  * workflow B would cross-match an active handoff belonging to node "17" in
  * workflow A.
+ *
+ * Deliberately does NOT check whether the returned handoff's own recorded
+ * `source` still corresponds to whatever `nodeId`'s node currently displays
+ * — a match here is "active, for this node id, in a compatible workflow",
+ * nothing about image identity. That is enough for node ids that are never
+ * reused (the common case), but an empty workflow name is a wildcard on
+ * BOTH sides ({@link workflowMatches}), and node ids are plain small
+ * integers assigned per-workflow — so a handoff from an EARLIER session, or
+ * from a DIFFERENT unsaved workflow, can still satisfy every check here
+ * while belonging to a completely different image than the one the node
+ * currently shows. This function is intentionally kept dependency-free of
+ * node-shape concerns (no `node.imgs`/widget access, no `loadpsd.js`/
+ * `compose.js` imports — importing the latter here would in fact create a
+ * cycle, since `compose.js` already imports this module), so the
+ * source-identity gate lives in the one current caller instead: see
+ * `menu.js`'s `activeHandoffMatchesNode`, applied immediately after this
+ * function's result before it's allowed to switch the context menu to the
+ * "Edit Original / Start Fresh" submenu. Add the same gate at any future
+ * call site that offers to re-open "the same" file based on this lookup.
  * @param {string} nodeId
  * @returns {import('./api.js').CpsbHandoffMeta | undefined}
  */

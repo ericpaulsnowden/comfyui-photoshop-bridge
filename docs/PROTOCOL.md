@@ -770,6 +770,23 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
   (no active handoff), or "Edit Original in Photoshop" + "Start Fresh in Photoshop"
   (active handoff exists — tracked client-side from `cpsb.status` events + initial
   `/cpsb/status` fetch).
+- **Source-identity gate on the submenu** (v0.5.23 — user report: unexpected nodes showed
+  Edit Original/Start Fresh, and clicking it "opened a different psd"). The client-side
+  lookup matches by node id + workflow name only, and the workflow check wildcards when
+  EITHER name is empty (unsaved workflow) — so a stale-but-ACTIVE handoff from an earlier
+  session or another workflow could latch onto whatever node now holds that id, and
+  `mode:"original"` reopens the STALE handoff's stored PSD unconditionally. menu.js now
+  additionally requires the handoff's recorded `source` to match the node's CURRENT
+  content before offering the submenu: `load_psd` → source.filename equals the node's psd
+  combo selection; `load_image`/`terminal_output` → the source triple matches ANY of
+  `node.imgs` (batches are real); `bridge_node` → no gate (its source.psd is
+  generated/managed — node identity is the correct key and staleness is handled by
+  server-side supersede); unknown origin_kind or missing source → fail OPEN, so a
+  version-skewed server never silently kills the menu. On rejection the node gets the
+  plain "Open in Photoshop", which opens a NEW handoff for what the node actually shows.
+  In-flight edits are unaffected: pasteback keys strictly by handoff_id, never by this
+  menu decision. Residual known gap: a stale bridge_node handoff cross-matching via the
+  empty-workflow-name wildcard is still offered (no pixel identity is knowable client-side).
 - Batch nodes (`node.imgs.length > 1`): open the **currently displayed** image
   (`node.imageIndex ?? 0`); an "Open all N in Photoshop" item appears for N ≤ 8.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),

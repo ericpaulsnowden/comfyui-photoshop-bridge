@@ -209,6 +209,109 @@ function resolveImageRef(node, imageIndex) {
 }
 
 /**
+ * Every currently-displayed image on *node*, parsed to
+ * `{filename, subfolder, type}` — unlike {@link resolveImageRef} (which
+ * addresses exactly one `node.imgs` slot by index, for building an actual
+ * open request), this is used by {@link activeHandoffMatchesNode} to check
+ * a candidate source against ALL of a batch node's slots at once: batches
+ * are real, and the slot that matches a given handoff's source is not
+ * necessarily index 0.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {import('./api.js').CpsbImageRef[]}
+ */
+function getAllCurrentImageRefs(node) {
+  if (!Array.isArray(node.imgs)) return []
+  const refs = []
+  for (let i = 0; i < node.imgs.length; i++) {
+    const ref = api.parseImageRef(node.imgs[i]?.src)
+    if (ref) refs.push(ref)
+  }
+  return refs
+}
+
+/**
+ * @param {import('./api.js').CpsbImageRef | null | undefined} a
+ * @param {import('./api.js').CpsbImageRef | null | undefined} b
+ * @returns {boolean}
+ */
+function sameSourceRef(a, b) {
+  return (
+    !!a &&
+    !!b &&
+    a.filename === b.filename &&
+    (a.subfolder || '') === (b.subfolder || '') &&
+    (a.type || '') === (b.type || '')
+  )
+}
+
+/**
+ * The source-identity gate for the Edit-Original/Start-Fresh submenu (field
+ * report, verbatim: "Images I didn't expect on my mac had both edit
+ * original and start fresh in the menu. And if you click edit original on
+ * an image that doesn't have an original it will open a different psd and
+ * show a different preview"). `state.getActiveHandoffForNode` only matches
+ * on `origin_node_id` + workflow + status (see its own doc comment) — NOTHING
+ * there checks that the handoff's SOURCE FILE is still what the node
+ * currently shows. Node ids get reused across sessions/workflows (and an
+ * empty workflow name is a wildcard on BOTH sides — unsaved workflows), so a
+ * handoff that is genuinely still server-side "active" (a round trip from an
+ * earlier session, or one belonging to an entirely different unsaved
+ * workflow) can latch onto whatever node now happens to reuse that id. This
+ * is the check that keeps such a handoff from ever reaching the menu as if
+ * it were this node's own — see {@link getNodeMenuItems} for where it's
+ * applied and what "rejected" falls back to.
+ *
+ * Origin-kind-specific because each kind's "identity" lives in a different
+ * place:
+ * - `load_psd`: the node has no `node.imgs` at all (loadpsd.js's header —
+ *   its hand-rolled widget bypasses the stock image-preview pipeline
+ *   entirely), so identity is the `psd` COMBO's CURRENT selection
+ *   ({@link loadpsd.getPsdFileRef}) vs. the handoff's recorded `source`.
+ * - `load_image` / `terminal_output`: identity is whichever image(s) the
+ *   node currently displays — checked against EVERY slot in `node.imgs` via
+ *   {@link getAllCurrentImageRefs}, not just index 0 (batches are real).
+ * - `bridge_node` (PhotoshopBridge / Compose / Annotate — PROTOCOL.md §6c):
+ *   deliberately NO gate, always matches. These handoffs are created by the
+ *   node's own backend execution, never by a menu click ({@link
+ *   deriveOriginKind} never itself produces `bridge_node`), a Compose node
+ *   in particular never populates `node.imgs` at all (compose.js's header),
+ *   and staleness for this kind is already handled server-side
+ *   (`cpsb/routes.py`'s `_resolve_source`/source_hash-based auto-supersede
+ *   on `mode:"new"`, and `HandoffManager.find_active_for_node`'s own
+ *   workflow-scoped node-id lookup) — node identity IS the correct key for
+ *   this kind. Gating on `node.imgs` here would incorrectly hide the
+ *   submenu for every Compose/Annotate/Bridge node with a real edit in
+ *   flight (build brief item 4: `MODE_DONT_OPEN` re-open relies on exactly
+ *   this "no node.imgs, still a real file" state).
+ * - Unknown/missing `origin_kind`, or a handoff with no recorded `source` at
+ *   all: fails OPEN (treated as still matching). A server newer or older
+ *   than this frontend build must never silently make the submenu vanish —
+ *   the worst case on a false positive here is the pre-existing staleness
+ *   bug this function exists to fix, not a new failure mode; the server's
+ *   own 409 chooser (`open.js`) remains the authoritative backstop
+ *   regardless of what the menu guesses.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ * @returns {boolean}
+ */
+function activeHandoffMatchesNode(node, meta) {
+  if (!meta.origin_kind || !meta.source) return true // fail open — see doc comment above
+  switch (meta.origin_kind) {
+    case 'load_psd': {
+      const current = loadpsd.getPsdFileRef(node)
+      return !!current && current.filename === meta.source.filename
+    }
+    case 'load_image':
+    case 'terminal_output':
+      return getAllCurrentImageRefs(node).some((ref) => sameSourceRef(ref, meta.source))
+    case 'bridge_node':
+      return true
+    default:
+      return true // unknown future origin_kind — fail open, see doc comment above
+  }
+}
+
+/**
  * Opens a single image on a node via the shared `open.js` flow — the 409
  * Edit Original / Start Fresh chooser, the PROTOCOL.md §2/§7 428
  * remote-open confirm, and server-message error toasts all live there
@@ -379,7 +482,17 @@ export function getNodeMenuItems(node) {
   const hasComposeWrittenFile = compose.isComposePsdNode(node) && compose.hasWrittenFile(node)
   if (!node.imgs?.length && !loadpsd.isLoadPsdNode(node) && !hasComposeWrittenFile) return []
 
-  const activeHandoff = state.getActiveHandoffForNode(String(node.id))
+  // state.getActiveHandoffForNode only matches on node id + workflow +
+  // status (see its own doc comment) -- activeHandoffMatchesNode is the
+  // additional source-identity gate that keeps a handoff belonging to a
+  // DIFFERENT image (stale session, or a different unsaved workflow) from
+  // ever being offered as "this node's" Edit Original / Start Fresh. A
+  // rejected match is treated exactly like "no active handoff" below.
+  const candidateHandoff = state.getActiveHandoffForNode(String(node.id))
+  const activeHandoff =
+    candidateHandoff && activeHandoffMatchesNode(node, candidateHandoff)
+      ? candidateHandoff
+      : undefined
   const tierInfo = state.getTierInfo()
   const unavailable = !tierInfo.tier1Effective && !tierInfo.tier2Connected
   const suffix = unavailable ? ' (unavailable)' : ''
