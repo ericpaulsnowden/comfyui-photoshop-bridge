@@ -450,9 +450,16 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   frame is the BOTTOM layer, later frames/indices stack on top; all layers inside ONE
   group named `group_name`. Written via psd-tools
   (`PSDImage.new` → `create_pixel_layer` → `create_group`) to
-  `input/<filename_prefix>_%05d.psd` (unique per execution). Outputs:
-  (IMAGE flattened composite, MASK = 1-alpha of composite else zeros, STRING = the
-  written psd filename, input-relative — usable by Load PSD / addressable by /view).
+  `input/<filename_prefix>_%05d.psd` (unique per execution).
+- Channels: the PIL mode is matched to each frame's channel count, never forced —
+  1ch→L→RGB, 3ch→RGB (the normal-VAE path), 4ch→**RGBA with alpha PRESERVED** (a
+  4-channel IMAGE from a layer-decomposition model like Qwen Image Layered Control
+  becomes a PSD layer carrying real per-pixel transparency; forcing it to RGB previously
+  byte-misaligned it into tiled/noise garbage). The flatten is alpha-aware ("over"
+  compositing) so a fully-opaque input reproduces the old opaque overwrite exactly.
+  Outputs: (IMAGE flattened composite, MASK = the composite's accumulated alpha —
+  transparent→1, covered→0 — else zeros, STRING = the written psd filename,
+  input-relative — usable by Load PSD / addressable by /view).
 - Mode semantics MIRROR the Edit in Photoshop node (§6) exactly, applied to the
   freshly-written LAYERED PSD (so the user composites/adjusts LAYERS in Photoshop, then
   the node outputs the SAVED result, flattened): "Wait for first save" BLOCKS execute()

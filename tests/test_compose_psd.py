@@ -64,6 +64,20 @@ def make_batch(colors, size: tuple[int, int] = (24, 16)) -> np.ndarray:
     return np.concatenate([make_tensor(c, size) for c in colors], axis=0)
 
 
+def make_rgba(
+    color: tuple[int, int, int], alpha: int = 255, size: tuple[int, int] = (24, 16)
+) -> np.ndarray:
+    """A 1xHxWx4 ComfyUI-layout float32 RGBA tensor of a solid color + *alpha*.
+
+    Models a 4-channel IMAGE socket, e.g. a layer-decomposition model like "Qwen
+    Image Layered Control" emitting transparent decomposed layers. *size* =
+    (width, height).
+    """
+    r, g, b = color
+    img = Image.new("RGBA", size, (r, g, b, alpha))
+    return np.asarray(img, dtype=np.float32)[None, ...] / 255.0
+
+
 def raises_interrupt():
     """The interrupt this test environment surfaces as (no real ComfyUI installed).
 
@@ -309,6 +323,29 @@ class TestBuildGroupPsd:
         _, canvas_w, canvas_h, _ = compose_module._build_group_psd(images, "G")
         assert (canvas_w, canvas_h) == (20, 20)
 
+    def test_rgba_layer_reopens_with_transparency(self, tmp_path):
+        """PROTOCOL.md §6c use case: a transparent decomposed layer written into
+        the PSD reopens (fresh ``PSDImage.open``) still carrying per-pixel
+        transparency -- some alpha < 255 -- not flattened to opaque.
+        """
+        opaque = Image.new("RGB", (8, 8), RED)  # bottom, fully opaque
+        top = Image.new("RGBA", (8, 8), (0, 255, 0, 0))  # start fully transparent
+        for x in range(4):  # left half half-opaque, right half fully transparent
+            for y in range(8):
+                top.putpixel((x, y), (0, 255, 0, 128))
+
+        psd, _w, _h, placements = compose_module._build_group_psd([opaque, top], "G")
+        # The RGBA source is kept RGBA (alpha not dropped before the write).
+        assert placements[1][0].mode == "RGBA"
+
+        out = tmp_path / "rgba.psd"
+        psd.save(out)
+        group = PSDImage.open(out)[0]
+        top_layer = group[1]  # Layer 2 == the RGBA top
+        alphas = np.asarray(top_layer.composite().convert("RGBA"))[..., 3]
+        assert alphas.min() < 255  # transparency survived the round trip
+        assert alphas.max() > 0  # ... and it is not uniformly transparent either
+
 
 class TestFlattenPlacements:
     def test_covers_union_of_layer_bboxes_only(self):
@@ -335,6 +372,44 @@ class TestFlattenPlacements:
         placements = [(Image.new("RGB", (5, 5), GREEN), 0, 0)]
         result = compose_module._flatten_placements(placements, 5, 5)
         assert all(result.getpixel((x, y))[3] == 255 for x in range(5) for y in range(5))
+
+    def test_semi_transparent_top_blends_with_layer_below(self):
+        """Alpha-aware "over" compositing: a half-opaque top layer BLENDS with the
+        opaque layer beneath it rather than fully replacing it.
+        """
+        placements = [
+            (Image.new("RGBA", (4, 4), (255, 0, 0, 255)), 0, 0),  # opaque red (bottom)
+            (Image.new("RGBA", (4, 4), (0, 0, 255, 128)), 0, 0),  # ~half blue (top)
+        ]
+        result = compose_module._flatten_placements(placements, 4, 4)
+        r, g, b, a = result.getpixel((0, 0))
+        assert a == 255  # bottom is opaque -> composite fully opaque
+        # A plain overwrite would give pure blue (255, 0). Blended: both nonzero.
+        assert 0 < r < 255
+        assert 0 < b < 255
+        assert g == 0
+
+    def test_fully_transparent_top_reveals_layer_below(self):
+        """A fully-transparent upper layer lets the layer below show through
+        (an opaque overwrite would have hidden it).
+        """
+        placements = [
+            (Image.new("RGBA", (4, 4), (255, 0, 0, 255)), 0, 0),  # opaque red
+            (Image.new("RGBA", (4, 4), (0, 0, 255, 0)), 0, 0),  # fully transparent blue
+        ]
+        result = compose_module._flatten_placements(placements, 4, 4)
+        assert result.getpixel((0, 0)) == (255, 0, 0, 255)  # red beneath shows through
+
+    def test_rgb_layer_still_overwrites_bbox_opaquely(self):
+        """3-channel (all-opaque) path is unchanged: a later RGB layer overwrites
+        the earlier one exactly, alpha 255 across its bbox.
+        """
+        placements = [
+            (Image.new("RGB", (4, 4), RED), 0, 0),
+            (Image.new("RGB", (4, 4), BLUE), 0, 0),
+        ]
+        result = compose_module._flatten_placements(placements, 4, 4)
+        assert result.getpixel((0, 0)) == (0, 0, 255, 255)  # top RGB layer wins, opaque
 
 
 class TestAllocateOutputPath:
@@ -462,6 +537,93 @@ class TestCollectLayerImages:
         pils, total = compose_module._collect_layer_images({}, max_layers=64)
         assert pils == []
         assert total == 0
+
+
+class TestChannelAwareConversion:
+    """The channel count -- not a forced ``"RGB"`` mode -- drives the PIL mode, so
+    a 4-channel (RGBA) IMAGE tensor (e.g. "Qwen Image Layered Control") expands
+    un-garbled AND keeps its alpha, while the normal 3-channel path is unchanged.
+    """
+
+    def test_four_channel_batch_expands_ungarbled_full_array(self):
+        """The confirmed bug: forcing mode="RGB" on a 4-byte-per-pixel buffer
+        byte-misaligned every pixel past (0, 0) into noise. A per-pixel-distinct
+        RGBA frame must now round-trip on the FULL array (not just the corner).
+        """
+        rng = np.random.default_rng(1234)
+        frame = rng.integers(0, 256, size=(5, 7, 4), dtype=np.uint8)  # (H, W, RGBA)
+        tensor = frame[None, ...].astype(np.float32) / 255.0
+
+        pil = compose_module._tensor_frames_to_pils(tensor)[0]
+        assert pil.mode == "RGBA"
+        arr = np.asarray(pil)
+        assert arr.shape == (5, 7, 4)
+        # Whole-array match, not just (0, 0): proves un-garbling.
+        assert np.array_equal(arr[..., :3], frame[..., :3])
+        # Alpha preserved end to end.
+        assert np.array_equal(arr[..., 3], frame[..., 3])
+
+    def test_solid_rgba_batch_keeps_alpha(self):
+        pils = compose_module._tensor_frames_to_pils(make_rgba(RED, alpha=64, size=(6, 6)))
+        assert pils[0].mode == "RGBA"
+        assert pils[0].getpixel((0, 0)) == (255, 0, 0, 64)
+
+    def test_three_channel_path_unchanged(self):
+        """The normal-VAE (3-channel) path stays RGB with the same pixels."""
+        pils = compose_module._tensor_frames_to_pils(make_batch([RED, GREEN]))
+        assert all(p.mode == "RGB" for p in pils)
+        assert [p.getpixel((0, 0)) for p in pils] == [RED, GREEN]
+
+    def test_single_channel_becomes_rgb(self):
+        arr = np.zeros((1, 3, 5, 1), dtype=np.float32)
+        arr[0, 1, 2, 0] = 1.0  # white at (x=2, y=1)
+        pils = compose_module._tensor_frames_to_pils(arr)
+        assert pils[0].mode == "RGB"
+        assert pils[0].getpixel((2, 1)) == (255, 255, 255)
+
+    def test_two_channel_treated_as_grayscale_rgb(self):
+        arr = np.zeros((1, 2, 2, 2), dtype=np.float32)
+        arr[0, 0, 0, 0] = 1.0  # first band drives luminance; second band ignored
+        pils = compose_module._tensor_frames_to_pils(arr)
+        assert pils[0].mode == "RGB"
+        assert pils[0].getpixel((0, 0)) == (255, 255, 255)
+
+    def test_frame_without_channel_dim_is_grayscale(self):
+        arr = np.zeros((1, 2, 2), dtype=np.float32)  # (N, H, W): each frame is 2-D
+        arr[0, 0, 0] = 1.0
+        pils = compose_module._tensor_frames_to_pils(arr)
+        assert pils[0].mode == "RGB"
+        assert pils[0].getpixel((0, 0)) == (255, 255, 255)
+
+    def test_five_channel_keeps_first_four_as_rgba(self):
+        """Extra channels beyond RGBA are dropped (first four kept); the sliced
+        view is made contiguous so ``Image.fromarray`` reads it correctly.
+        """
+        rng = np.random.default_rng(99)
+        frame = rng.integers(0, 256, size=(4, 4, 5), dtype=np.uint8)
+        tensor = frame[None, ...].astype(np.float32) / 255.0
+        pil = compose_module._tensor_frames_to_pils(tensor)[0]
+        assert pil.mode == "RGBA"
+        assert np.array_equal(np.asarray(pil), frame[..., :4])
+
+
+class TestFlattenAlphaDrivesMask:
+    """The flatten's alpha becomes the node's MASK output (via
+    ``nodes._tensors_from_image``): opaque -> MASK 0, transparent -> MASK 1.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_transparent_region_yields_mask_one_covered_yields_zero(self):
+        # One opaque 4x4 layer on an 8x8 canvas: covered corner opaque, far
+        # corner never reached (transparent).
+        placements = [(Image.new("RGBA", (4, 4), (0, 255, 0, 255)), 0, 0)]
+        result = compose_module._flatten_placements(placements, 8, 8)
+        _image, mask = nodes_module._tensors_from_image(result)
+        assert mask[0, 0, 0].item() == 0.0  # covered/opaque -> mask 0
+        assert mask[0, 7, 7].item() == 1.0  # uncovered/transparent -> mask 1
 
 
 class TestIsChanged:

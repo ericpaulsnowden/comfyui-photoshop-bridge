@@ -117,6 +117,46 @@ def _collect_connected_images(kwargs: dict[str, Any]) -> list[Any]:
 DEFAULT_MAX_LAYERS = 64
 
 
+def _array_to_pil(array: Any) -> Image.Image:
+    """A single uint8 HWC (or HW) array as a PIL image, mode matched to channels.
+
+    The channel count -- not a hardcoded ``"RGB"`` -- decides the PIL mode, so a
+    4-channel (RGBA) frame is never reinterpreted as a 3-byte-per-pixel RGB
+    buffer (that byte-misalignment tiled/shifted every pixel past (0,0) into
+    noise -- the exact symptom layer-decomposition models like "Qwen Image
+    Layered Control", which emit RGBA, produced). ALPHA IS PRESERVED: a
+    4-channel frame becomes an ``"RGBA"`` PIL so the downstream PSD layer carries
+    real per-pixel transparency (:func:`_build_group_psd`).
+
+    Args:
+        array: A uint8 numpy array, either 2-D ``(H, W)`` (grayscale) or 3-D
+            ``(H, W, C)`` with ``C`` channels.
+
+    Returns:
+        * ``ndim == 2`` or ``C == 1`` -> grayscale ``"L"`` -> ``.convert("RGB")``.
+        * ``C == 2`` -> first channel as grayscale -> ``.convert("RGB")`` (a
+          rare layout; treat band 0 as luminance, drop the odd second band).
+        * ``C == 3`` -> ``"RGB"`` (the normal-VAE path, unchanged).
+        * ``C >= 4`` -> ``"RGBA"`` from the first four channels (extras dropped).
+    """
+    import numpy as np
+
+    if array.ndim == 2:
+        return Image.fromarray(array, mode="L").convert("RGB")
+
+    channels = array.shape[-1]
+    if channels == 1:
+        return Image.fromarray(array[..., 0], mode="L").convert("RGB")
+    if channels == 2:
+        return Image.fromarray(array[..., 0], mode="L").convert("RGB")
+    if channels == 3:
+        return Image.fromarray(array, mode="RGB")
+    # 4+ channels: keep RGBA (a mismatched mode is what corrupted the buffer).
+    # ascontiguousarray because slicing off any extra channels yields a
+    # non-contiguous view Image.fromarray cannot read directly.
+    return Image.fromarray(np.ascontiguousarray(array[..., :4]), mode="RGBA")
+
+
 def _tensor_frames_to_pils(image: Any) -> list[Image.Image]:
     """Every frame of a ComfyUI ``IMAGE`` tensor (NHWC float32 [0,1]) as PIL images.
 
@@ -124,14 +164,22 @@ def _tensor_frames_to_pils(image: Any) -> list[Image.Image]:
     images on a single socket. Unlike :func:`cpsb.nodes._tensor_to_pil` (which
     keeps only the first frame), this expands the whole batch so each image
     becomes its own PSD layer (PROTOCOL.md §6c: multi-image batches -> layers).
+
+    Each frame's PIL mode is matched to its channel count by
+    :func:`_array_to_pil` rather than forced to ``"RGB"`` -- so a 4-channel
+    (RGBA) frame from a layer-decomposition model is expanded correctly (and
+    keeps its alpha) instead of being garbled by an RGB reinterpretation of a
+    4-byte-per-pixel buffer.
     """
     import numpy as np
 
     frames: list[Image.Image] = []
     for frame in image:  # iterate the leading batch dimension
         array = frame.cpu().numpy() if hasattr(frame, "cpu") else np.asarray(frame)
-        array = np.clip(array * 255.0, 0, 255).astype(np.uint8)
-        frames.append(Image.fromarray(array, mode="RGB"))
+        # Round-to-nearest (not truncate) so a channel's float value maps to the
+        # nearest 8-bit level; solid colors are unaffected (255.0/0.0 are exact).
+        array = np.clip(array * 255.0, 0, 255).round().astype(np.uint8)
+        frames.append(_array_to_pil(array))
     return frames
 
 
@@ -349,26 +397,35 @@ def _build_group_psd(
     Returns:
         ``(psd, canvas_width, canvas_height, placements)`` -- *psd* is the
         unsaved :class:`~psd_tools.api.psd_image.PSDImage`; *placements* is
-        ``(rgb_image, left, top)`` per layer, bottom-to-top, reused by
+        ``(layer_image, left, top)`` per layer, bottom-to-top, reused by
         :func:`_flatten_placements` so the IMAGE/MASK outputs are derived
         from the exact same positions just written to disk rather than by
-        re-reading the file back.
+        re-reading the file back. Each *layer_image* keeps its own mode
+        (``"RGBA"`` when the source carried alpha) so the flatten sees the
+        transparency the PSD layers were written with.
     """
     canvas_width = max(image.width for image in pil_images)
     canvas_height = max(image.height for image in pil_images)
+    # The document mode stays "RGB": an RGB-mode PSD holds RGB *layers* that each
+    # carry their own per-pixel transparency (create_pixel_layer from an RGBA PIL
+    # yields a transparent layer, verified empirically against psd-tools 1.17.4),
+    # so this is NOT a place alpha would be flattened away.
     psd = PSDImage.new(mode="RGB", size=(canvas_width, canvas_height), depth=8)
 
     layers = []
     placements: list[tuple[Image.Image, int, int]] = []
     for index, image in enumerate(pil_images, start=1):
-        rgb_image = image.convert("RGB")
-        left = _centered_offset(rgb_image.width, canvas_width)
-        top = _centered_offset(rgb_image.height, canvas_height)
+        # Preserve alpha: keep RGB/RGBA untouched so an RGBA source becomes a
+        # layer WITH transparency; only convert truly-odd modes (P, CMYK, ...)
+        # to RGB. The old unconditional ``.convert("RGB")`` dropped every alpha.
+        layer_image = image if image.mode in ("RGB", "RGBA") else image.convert("RGB")
+        left = _centered_offset(layer_image.width, canvas_width)
+        top = _centered_offset(layer_image.height, canvas_height)
         layer = psd.create_pixel_layer(
-            rgb_image, name=f"Layer {index}", top=top, left=left, opacity=_LAYER_OPACITY
+            layer_image, name=f"Layer {index}", top=top, left=left, opacity=_LAYER_OPACITY
         )
         layers.append(layer)
-        placements.append((rgb_image, left, top))
+        placements.append((layer_image, left, top))
 
     psd.create_group(layer_list=layers, name=group_name)
     return psd, canvas_width, canvas_height, placements
@@ -386,36 +443,42 @@ def _flatten_placements(
     just placed, deterministic"), with no dependency on psd-tools' own
     compositor or file I/O succeeding.
 
-    Every layer is fully opaque (no per-layer alpha exists: a ComfyUI
-    ``IMAGE`` tensor never carries one), so compositing bottom-to-top is a
-    plain, in-order overwrite of each layer's own bounding box; the
-    resulting alpha channel is 255 wherever ANY layer's bbox covered that
-    pixel, 0 elsewhere (canvas regions no input reaches -- possible when the
-    max WIDTH and max HEIGHT come from different inputs, so no single image,
-    nor necessarily their union, covers every corner). RGB under an alpha-0
-    pixel is black (the canvas's own fill color) -- never accessed by a
-    downstream consumer that respects alpha, but still a fixed, deterministic
+    Compositing is ALPHA-AWARE ("over" blending), bottom-to-top: each layer is
+    placed on a transparent full-canvas frame and
+    :func:`PIL.Image.alpha_composite`'d onto the accumulator, so a semi-
+    transparent upper layer blends with what is below it rather than fully
+    replacing it, and a fully-transparent layer region shows the layers beneath.
+    A fully-opaque layer (an ``"RGB"`` source, the normal-VAE case) still
+    overwrites its bbox exactly as before -- ``alpha_composite`` of an
+    all-255-alpha layer is a plain overwrite -- so that path is unchanged.
+
+    The resulting alpha channel is the composite's own accumulated coverage:
+    255 wherever an opaque layer landed, partial where only semi-transparent
+    pixels landed, 0 where no layer reached (possible when the max WIDTH and max
+    HEIGHT come from different inputs, so no single image, nor necessarily their
+    union, covers every corner). RGB under an alpha-0 pixel is black -- never
+    accessed by a consumer that respects alpha, but a fixed, deterministic
     value rather than undefined.
 
     Args:
-        placements: ``(rgb_image, left, top)`` bottom-to-top, from
-            :func:`_build_group_psd`.
+        placements: ``(layer_image, left, top)`` bottom-to-top, from
+            :func:`_build_group_psd` (``layer_image`` may be ``"RGBA"``).
         canvas_width: Document width.
         canvas_height: Document height.
 
     Returns:
         An ``"RGBA"`` image, ready for
         :func:`cpsb.nodes._tensors_from_image` (its ``"A" in mode`` check is
-        exactly what turns this alpha channel into the MASK output).
+        exactly what turns this alpha channel into the MASK output -- a fully-
+        transparent region yields MASK 1 there, an opaque region MASK 0).
     """
-    canvas = Image.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
-    coverage = Image.new("L", (canvas_width, canvas_height), 0)
+    canvas = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
     for image, left, top in placements:
-        canvas.paste(image, (left, top))
-        coverage.paste(255, (left, top, left + image.width, top + image.height))
-    result = canvas.convert("RGBA")
-    result.putalpha(coverage)
-    return result
+        layer = image if image.mode == "RGBA" else image.convert("RGBA")
+        positioned = Image.new("RGBA", (canvas_width, canvas_height), (0, 0, 0, 0))
+        positioned.paste(layer, (left, top))
+        canvas = Image.alpha_composite(canvas, positioned)
+    return canvas
 
 
 def _allocate_output_path(input_dir: Path, filename_prefix: str) -> Path:
