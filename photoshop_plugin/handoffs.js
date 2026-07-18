@@ -209,10 +209,50 @@ function findByPath(path) {
 }
 
 /**
- * @returns {CpsbHandoffRecord[]} All currently tracked handoffs.
+ * Drops any tracked handoff whose Photoshop document has been CLOSED since we
+ * opened it (the "clear when no longer active" behavior). A record with no
+ * `documentId` yet (mid-open) is left alone so an in-flight open isn't pruned.
+ * Silent — no `notifyChanged()` — so it's safe to call from inside a render
+ * (which `getActiveHandoffs` is); the manual clear path notifies explicitly.
+ * @returns {number} How many were pruned.
+ */
+function pruneClosedHandoffs() {
+  let removed = 0
+  for (const record of Array.from(byHandoffId.values())) {
+    if (record.documentId != null && findOpenDocument(record) == null) {
+      byHandoffId.delete(record.handoffId)
+      if (record.path) byPath.delete(record.path)
+      byDocumentId.delete(record.documentId)
+      removed += 1
+    }
+  }
+  return removed
+}
+
+/**
+ * @returns {CpsbHandoffRecord[]} Currently tracked handoffs, closed-document
+ * ones pruned first so the panel never accretes stale rows for documents the
+ * user already closed.
  */
 function getActiveHandoffs() {
+  pruneClosedHandoffs()
   return Array.from(byHandoffId.values())
+}
+
+/**
+ * Forgets ALL tracked handoffs (the panel's manual "Clear" button). Local
+ * only — the ComfyUI server's own handoff records are untouched (they age out
+ * via its cleanup window); this just stops the plugin from tracking/listing
+ * them. A subsequent save on a since-forgotten document simply won't
+ * auto-deliver (re-open from ComfyUI to track it again).
+ * @returns {void}
+ */
+function clearAllHandoffs() {
+  byHandoffId.clear()
+  byPath.clear()
+  byDocumentId.clear()
+  logInfo('cleared all tracked handoffs (panel Clear)')
+  notifyChanged()
 }
 
 /**
@@ -278,5 +318,6 @@ module.exports = {
   findByDocumentId,
   findByPath,
   getActiveHandoffs,
+  clearAllHandoffs,
   deliverEdit
 }

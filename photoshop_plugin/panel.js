@@ -16,7 +16,7 @@
  */
 
 const { connection } = require('./connection.js')
-const { getActiveHandoffs, registryEvents, deliverEdit } = require('./handoffs.js')
+const { getActiveHandoffs, registryEvents, deliverEdit, clearAllHandoffs } = require('./handoffs.js')
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
 
 // Same version source the `hello` handshake message uses (connection.js):
@@ -75,6 +75,10 @@ function initPanel() {
   // it over once connection state is known (adds the server version).
   const versionEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-version'))
   const handoffList = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-list'))
+  const handoffClear = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-clear'))
+  const handoffActions = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-handoff-actions')
+  )
   const logEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-log'))
   // The whole Advanced body (version, URL, log) collapses together.
   const advancedBody = /** @type {HTMLElement} */ (
@@ -247,6 +251,10 @@ function initPanel() {
   function renderHandoffs() {
     const records = getActiveHandoffs()
     handoffList.innerHTML = ''
+    // Only offer "Clear list" when there's something to clear.
+    handoffActions.className = records.length
+      ? 'cpsb-conn-actions'
+      : 'cpsb-conn-actions cpsb-collapsed'
     if (records.length === 0) {
       const empty = document.createElement('div')
       empty.className = 'cpsb-empty'
@@ -313,6 +321,10 @@ function initPanel() {
   })
 
   connection.addEventListener('statechange', renderConnection)
+  handoffClear.addEventListener('click', () => {
+    clearAllHandoffs()
+  })
+
   registryEvents.addEventListener('change', renderHandoffs)
   onLogLine(appendLogLine)
 

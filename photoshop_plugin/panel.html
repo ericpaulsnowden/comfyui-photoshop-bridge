@@ -296,6 +296,14 @@
       <div id="cpsb-handoff-list">
         <div class="cpsb-empty">No documents from ComfyUI are currently open.</div>
       </div>
+      <!-- Manual clear: closed-document handoffs already auto-prune on render
+           (handoffs.js getActiveHandoffs), but this lets the user wipe the
+           whole list at once (e.g. after a "Re-run on every save" burst left a
+           slew of tracked docs). Local-only; the server's records age out on
+           their own. Shown only when there's something to clear (panel.js). -->
+      <div id="cpsb-handoff-actions" class="cpsb-conn-actions cpsb-collapsed">
+        <sp-button id="cpsb-handoff-clear" quiet>Clear list</sp-button>
+      </div>
 
       <div class="cpsb-rule"></div>
 
