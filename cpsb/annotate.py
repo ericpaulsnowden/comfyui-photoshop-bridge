@@ -278,8 +278,10 @@ def _composite_excluding_layer(psd: PSDImage, excluded_layer: Any) -> Image.Imag
     return composite.convert("RGB")
 
 
-def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None]:
-    """Resolve ``(image, mask)`` from a saved layered handoff PSD (product-owner spec, 2026-07-17).
+def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None, Image.Image]:
+    """Resolve ``(image, mask, combined)`` from a saved layered handoff PSD.
+
+    (product-owner spec, 2026-07-17; *combined* added 2026-07-18.)
 
     Args:
         psd_path: The handoff's ``source.psd`` -- the exact file Photoshop
@@ -287,7 +289,7 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None]:
             overwrote in place.
 
     Returns:
-        ``(image, mask)``:
+        ``(image, mask, combined)``:
 
         * A top-level layer named exactly :data:`INSTRUCTIONS_LAYER_NAME`
           IS found: *image* is the RGB composite of every OTHER layer
@@ -295,7 +297,12 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None]:
           the base layer bakes straight into this output; only the
           Instructions layer itself is treated specially. *mask* is that
           layer's own opacity (:func:`_layer_alpha_mask`), a ``(H, W)``
-          float32 array, never ``None`` in this branch.
+          float32 array, never ``None`` in this branch. *combined* is the
+          FULL composite -- the base image WITH the user's real painted
+          strokes on top, in their real colors -- which is what
+          visual-prompt edit models (the "edit what I circled" convention)
+          consume, as opposed to the clean *image* + *mask* pair an
+          inpainting model wants.
         * NOT found (the user renamed or deleted it): *image* is the FULL
           composite of the whole document (every visible layer, psd-tools'
           own default filter); *mask* is ``None`` -- signalling the caller
@@ -303,7 +310,9 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None]:
           precedence tiers, exactly as if this were a plain edited image
           with no Instructions layer involved at all (PROTOCOL.md §6d,
           "if that layer is renamed or deleted then the image is just
-          treated like an image").
+          treated like an image"). *combined* is that same full composite:
+          with nothing designated as annotation, there is nothing separate
+          left to combine, so the two views legitimately coincide.
 
     Note:
         In REMOTE Tier 2, the connected plugin saves to its own sandbox and
@@ -319,10 +328,12 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None]:
     psd = PSDImage.open(psd_path)
     instructions_layer = _find_top_level_layer(psd, INSTRUCTIONS_LAYER_NAME)
     if instructions_layer is None:
-        return psd.composite().convert("RGB"), None
+        full = psd.composite().convert("RGB")
+        return full, None, full
     image = _composite_excluding_layer(psd, instructions_layer)
     mask = _layer_alpha_mask(psd, instructions_layer)
-    return image, mask
+    combined = psd.composite().convert("RGB")
+    return image, mask, combined
 
 
 def _mask_tensor_to_array(mask_tensor: Any) -> Any:
@@ -490,8 +501,8 @@ def _resolve_ps_mode_edit(
     pil_image: Image.Image,
     source_hash: str,
     timeout_seconds: float,
-) -> tuple[Image.Image, Any | None]:
-    """The PS-mode ``(image, mask)`` resolution (PROTOCOL.md §6d) -- BLOCKS.
+) -> tuple[Image.Image, Any | None, Image.Image]:
+    """The PS-mode ``(image, mask, combined)`` resolution (PROTOCOL.md §6d) -- BLOCKS.
 
     Node-reuse semantics mirror :meth:`cpsb.nodes.PhotoshopBridge.execute`
     exactly: an active handoff whose recorded ``source_hash`` no longer
@@ -522,13 +533,14 @@ def _resolve_ps_mode_edit(
         timeout_seconds: Bound on the blocking wait, case (b) only.
 
     Returns:
-        ``(image, mask)`` -- per :func:`_read_ps_saved_psd`'s own contract:
+        ``(image, mask, combined)`` -- per :func:`_read_ps_saved_psd`'s own
+        contract:
         *image* is the composite excluding the Instructions layer when found,
         else the full document composite; *mask* is that layer's own opacity,
         or ``None`` when no Instructions layer was found (the caller falls
         back to the ordinary mask-socket/zeros precedence tiers for the
         MASK output only -- the IMAGE output stays the full composite either
-        way). Case (b) never returns without either a result or raising: a
+        way); *combined* is the full composite WITH the painted strokes. Case (b) never returns without either a result or raising: a
         normal return from :func:`_open_and_block_for_edit` means the wait
         outcome was EDITED, so *psd_path* is confirmed to hold Photoshop's
         own save.
@@ -760,18 +772,24 @@ class PhotoshopAnnotate:
         source_hash = compute_source_hash(pil_image)
 
         if annotate_mode == AnnotateMode.PS_MODE:
-            result_image, ps_mask_array = _resolve_ps_mode_edit(
+            result_image, ps_mask_array, combined_image = _resolve_ps_mode_edit(
                 state, node_id, pil_image, source_hash, timeout_seconds
             )
             image_tensor = nodes._pil_to_tensor(result_image)
         else:
             result_image = pil_image
             ps_mask_array = None
+            # Pass-through (ComfyUI-only tier): there is no Photoshop document,
+            # so no painted strokes exist to combine -- `annotated` degrades to
+            # the box-or-unchanged behavior below.
+            combined_image = None
             image_tensor = image  # same tensor object: pass-through never re-encodes
 
         mask_array = self._resolve_mask_array(ps_mask_array, mask, result_image)
         mask_tensor = _array_to_mask_tensor(mask_array)
-        annotated = self._build_annotated(image_tensor, mask_array, bool(box_composite))
+        annotated = self._build_annotated(
+            image_tensor, mask_array, bool(box_composite), combined_image
+        )
 
         return image_tensor, mask_tensor, instruction, annotated
 
@@ -807,27 +825,52 @@ class PhotoshopAnnotate:
         return np.zeros((height, width), dtype=np.float32)
 
     @staticmethod
-    def _build_annotated(image_tensor: Any, mask_array: Any, box_composite: bool) -> Any:
-        """The *annotated* output (PROTOCOL.md §6d).
+    def _build_annotated(
+        image_tensor: Any,
+        mask_array: Any,
+        box_composite: bool,
+        combined_image: Image.Image | None = None,
+    ) -> Any:
+        """The *annotated* output: the image WITH the annotation on it (PROTOCOL.md §6d).
 
-        Returns *image_tensor* completely unchanged -- the exact same
-        tensor object, not a re-encoded copy -- whenever *box_composite* is
-        ``False`` or the final mask has no nonzero pixels ("mask empty ->
-        annotated = original unmodified"). Otherwise draws a 4px pure-red
-        rectangle, unfilled, at the mask's bounding box on a fresh RGB copy.
+        This is the "imaging layers and annotations combined" view, and which
+        FORM the annotation takes is what ``box_composite`` selects:
+
+        * ``box_composite=True`` -> a synthetic 4px pure-red unfilled rectangle
+          at the mask's bounding box, drawn on the CLEAN image. This is the
+          tidy box-prompt convention Kontext/Qwen-Image-Edit respond to, and
+          deliberately replaces the raw strokes rather than adding to them: a
+          rough marking blob plus a box around it is noisier for the model than
+          the box alone.
+        * ``box_composite=False`` -> *combined_image*: the base image with the
+          user's REAL painted strokes on top, in their real colors.
+
+        Before 2026-07-18 the ``False`` branch returned the image completely
+        unannotated, which made the output indistinguishable from ``image`` and
+        left no way at all to see what had actually been painted -- reported by
+        the product owner as "if image is composited what is annotated?".
+
+        *combined_image* is ``None`` in pass-through (ComfyUI-only) mode, where
+        no Photoshop document and therefore no painted strokes exist; the output
+        then falls back to the unchanged image, preserving the original
+        behavior for that tier.
 
         Args:
             image_tensor: The node's own resolved image tensor (returned
-                as-is when no box is drawn).
+                as-is when there is nothing to draw).
             mask_array: The final, precedence-resolved ``(H, W)`` mask.
             box_composite: The ``box_composite`` widget value.
+            combined_image: The full PS composite including the painted
+                strokes, or ``None`` when there is none.
 
         Returns:
-            A tensor: either *image_tensor* itself, or a freshly encoded
-            copy with the box drawn on it.
+            A tensor: *image_tensor* itself when there is nothing to show, or
+            a freshly encoded copy carrying the annotation.
         """
         if not box_composite:
-            return image_tensor
+            if combined_image is None:
+                return image_tensor
+            return nodes._pil_to_tensor(combined_image)
         bbox = _bbox_of_nonzero(mask_array)
         if bbox is None:
             return image_tensor

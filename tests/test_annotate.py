@@ -488,6 +488,37 @@ class TestReadFoundInstructionsLayer:
         image_np = image_tensor_to_uint8_array(image_out)
         assert np.array_equal(image_np, np.array(source))
 
+    def test_annotated_output_carries_the_real_painted_strokes(self, node, manager):
+        """End-to-end for the "combined" view: with box_composite off, the
+        `annotated` output is the base image WITH the strokes on it, while
+        `image` stays clean. The two outputs must genuinely differ -- that is
+        the whole point of having both.
+        """
+        node_id = "137"
+        width, height = 24, 16
+        source = Image.new("RGB", (width, height), RED)
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).rectangle((5, 3, 10, 8), fill=(0, 0, 255, 255))
+        make_handoff_with_layered_edit(manager, node_id, source, source, instructions)
+
+        image_out, _mask_out, _instruction, annotated_out = node.execute(
+            image=tensor_from_image(source),
+            instruction="",
+            annotate_mode=AnnotateMode.PS_MODE,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id=node_id,
+            mask=None,
+        )
+
+        annotated_np = image_tensor_to_uint8_array(annotated_out)
+        image_np = image_tensor_to_uint8_array(image_out)
+
+        assert tuple(annotated_np[5, 7]) == (0, 0, 255)  # the stroke is visible
+        assert tuple(annotated_np[15, 23]) == RED  # base elsewhere
+        assert tuple(image_np[5, 7]) == RED  # `image` stays clean
+        assert not np.array_equal(annotated_np, image_np)
+
     def test_edited_base_layer_bakes_into_image_output(self, node, manager):
         """A base layer the user actually painted on (not just the
         Instructions layer) bakes that edit into the IMAGE output --
@@ -689,6 +720,59 @@ class TestBuildAnnotated:
         mask = np.zeros((16, 24), dtype=np.float32)
         result = annotate_module.PhotoshopAnnotate._build_annotated(tensor, mask, True)
         assert result is tensor
+
+    def test_without_box_composite_the_real_strokes_are_shown(self):
+        """product-owner request, 2026-07-18: "ideally there would be a way to
+        see ... the imaging layers and annotations combined".
+
+        With box_composite off, `annotated` is the base image carrying the
+        user's ACTUAL painted strokes in their real colors. Before this, the
+        branch returned the image completely unannotated, which made the output
+        indistinguishable from `image` and left no way to see what was painted.
+        """
+        tensor = make_tensor(RED, size=(24, 16))
+        mask = np.zeros((16, 24), dtype=np.float32)
+        mask[4:8, 4:8] = 1.0
+        combined = Image.new("RGB", (24, 16), RED)
+        for x in range(4, 8):
+            for y in range(4, 8):
+                combined.putpixel((x, y), (0, 0, 255))  # the brush strokes
+
+        result = annotate_module.PhotoshopAnnotate._build_annotated(
+            tensor, mask, False, combined
+        )
+        assert result is not tensor
+        arr = (result[0].numpy() * 255).round().astype(np.uint8)
+        assert tuple(arr[5, 5]) == (0, 0, 255)  # the stroke, in its real color
+        assert tuple(arr[12, 20]) == RED  # untouched base elsewhere
+
+    def test_pass_through_without_a_composite_stays_unchanged(self):
+        """ComfyUI-only tier: no Photoshop document, so no strokes exist to
+        combine -- the output must stay the exact same tensor object.
+        """
+        tensor = make_tensor(RED)
+        mask = np.zeros((16, 24), dtype=np.float32)
+        mask[2:5, 2:5] = 1.0
+        result = annotate_module.PhotoshopAnnotate._build_annotated(tensor, mask, False, None)
+        assert result is tensor
+
+    def test_box_composite_wins_over_the_real_strokes(self):
+        """box_composite selects the FORM of the annotation. The tidy box
+        replaces the raw strokes rather than adding to them -- a marking blob
+        plus a box around it is noisier for a box-prompt model than the box.
+        """
+        width, height = 40, 30
+        tensor = make_tensor((0, 0, 0), size=(width, height))
+        mask = np.zeros((height, width), dtype=np.float32)
+        mask[5:25, 5:35] = 1.0
+        combined = Image.new("RGB", (width, height), (9, 9, 9))  # would be obvious
+
+        result = annotate_module.PhotoshopAnnotate._build_annotated(
+            tensor, mask, True, combined
+        )
+        arr = (result[0].numpy() * 255).round().astype(np.uint8)
+        assert tuple(arr[5, 5]) == (255, 0, 0)  # the box
+        assert tuple(arr[15, 20]) == (0, 0, 0)  # clean image, NOT the combined view
 
     def test_box_drawn_at_mask_bounding_box(self):
         width, height = 40, 30

@@ -566,9 +566,31 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 - Outputs: (IMAGE, MASK, STRING instruction, IMAGE annotated). In PS mode the IMAGE is
   the SAVED composite EXCLUDING the `Instructions` layer (so any edit the user made to
   the base image BAKES IN); pass-through mode passes the input image through unchanged.
-  `annotated` is the IMAGE unless `box_composite` is True, in which case it is a copy
-  with a red rectangle at the final mask's bounding box (the mark convention
-  Kontext/Qwen-Image-Edit document responding to). STRING is the instruction verbatim.
+  STRING is the instruction verbatim.
+- The four outputs cover the three views of an annotated edit, so nothing needs a fifth
+  socket (product-owner question, 2026-07-18: "there are three slots — should they map
+  to that?"):
+  - **everything but the annotation** → `image` (clean, base edits baked in). Feed this
+    plus `mask` to an inpainting/mask-driven model.
+  - **just the annotation** → `mask`.
+  - **image and annotation combined** → `annotated`. Feed this to a visual-prompt edit
+    model (the "edit what I circled" convention) — it needs no mask input.
+- `annotated` is the combined view, and `box_composite` selects the FORM the annotation
+  takes in it (revised v0.5.19):
+  - `True` → a 4px red unfilled rectangle at the final mask's bounding box, drawn on the
+    CLEAN image. The tidy box REPLACES the raw strokes rather than adding to them: a
+    marking blob plus a box around it is noisier for a box-prompt model than the box
+    alone. This is the mark convention Kontext/Qwen-Image-Edit document responding to,
+    and is what `examples/annotate-qwen-image-edit.json` wires into Qwen.
+  - `False` → the full PS composite: the base image with the user's REAL painted strokes
+    on top, in their real colors. Before v0.5.19 this branch returned the image
+    completely unannotated, making the output indistinguishable from `image` and leaving
+    no way to see what had been painted.
+  - Pass-through (ComfyUI-only) mode has no Photoshop document and therefore no strokes,
+    so `annotated` there stays the unchanged image — the original behavior for that tier.
+  - Stroke COLOUR is deliberately NOT yet surfaced as a separate signal (e.g. red=remove,
+    green=keep): `_layer_alpha_mask` keeps only alpha. Deferred until a real downstream
+    consumer exists; it can be added additively at the tail of the output tuple.
 - PS-mode markup uses a dedicated **`Instructions` LAYER** (product-owner redesign
   2026-07-17, replacing the old whole-image pixel diff + scipy morphology, all removed):
   on open the node writes `source.psd` LAYERED — the input image as a base layer + a
