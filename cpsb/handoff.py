@@ -35,6 +35,43 @@ HandoffStatus = Literal[
 OriginKind = Literal["load_image", "terminal_output", "bridge_node", "load_psd"]
 Fidelity = Literal["composite", "recomposite", "plugin"]
 
+#: A handoff's save-trigger policy (product-owner requirement 2026-07-18):
+#: whether an arriving edit re-queues the workflow, is merely recorded for
+#: the next manual queue, or is not even ingested at all. Governs the ONLY
+#: existing lever this project previously had for this -- the frontend-only
+#: `cpsb.autoQueue` global setting plus `PhotoshopBridge`'s own `mode` widget
+#: (neither of which a `PhotoshopLoadPSD` node, nor a plugin upload with no
+#: browser tab open, could ever be gated by) -- with a per-handoff choice
+#: that is enforced SERVER-SIDE (see `HandoffManager.should_ingest`), not
+#: just suggested to a frontend that might not even be listening.
+#:
+#: These three exact strings are also `cpsb.load_psd.OnSaveMode`'s widget
+#: COMBO values (the `on_save` input on `PhotoshopLoadPSD`) -- kept in sync
+#: BY HAND rather than imported, the same hand-sync convention this project
+#: already uses for `PSD_EXTENSIONS`/`_PSD_NATIVE_EXTENSIONS` between
+#: `cpsb.load_psd` and `cpsb.routes` ("both are short, stable, ... entries
+#: unlikely to drift, and importing one module's constant into the other
+#: would couple them for no real benefit") -- here it also sidesteps a
+#: circular import, since `cpsb.load_psd` already imports from this module.
+TriggerPolicy = Literal["Re-run workflow", "Update only (don't re-run)", "Ignore (do nothing)"]
+
+#: Default `trigger_policy` for every handoff that doesn't explicitly request
+#: a different one -- "Re-run workflow" is today's only pre-existing
+#: behavior (every `HandoffManager.create` call site written before this
+#: field existed), so this is what a missing/legacy `meta.json` key, and
+#: every `origin_kind` whose frontend never sends this field at all, falls
+#: back to.
+DEFAULT_TRIGGER_POLICY: TriggerPolicy = "Re-run workflow"
+
+#: The one policy value that suppresses ingestion entirely (see
+#: :meth:`HandoffManager.should_ingest`). Every other value -- including one
+#: this version of the package doesn't recognize, e.g. a future policy
+#: string a newer version wrote and this one is reading -- is treated as
+#: "ingest normally": an unwanted-but-ingested edit merely sits unused,
+#: while a wrongly-dropped one is unrecoverable, so ingesting is always the
+#: safe default for anything that isn't unambiguously "Ignore."
+_IGNORE_TRIGGER_POLICY: TriggerPolicy = "Ignore (do nothing)"
+
 #: Statuses under which a handoff still accepts new edits (PROTOCOL.md §2:
 #: the set `/cpsb/upload` accepts) and counts as "the active handoff" for a
 #: node (PROTOCOL.md §2 `mode:"new"` 409 check).
@@ -163,6 +200,16 @@ class HandoffMeta:
     ``edit_in_place`` defaults ``False`` and ``original_path`` defaults
     ``None`` for every other origin and for any legacy ``meta.json`` recorded
     before these fields existed -- both safe, non-destructive defaults.
+
+    ``trigger_policy`` (product-owner requirement 2026-07-18) governs whether
+    an arriving edit is ingested at all, and -- via the ``cpsb.updated``
+    event payload -- whether the frontend auto-queues a re-run. Defaults to
+    :data:`DEFAULT_TRIGGER_POLICY` for every handoff whose opener never sent
+    a ``trigger_policy`` (every origin except a ``load_psd`` open from a
+    frontend new enough to read the ``on_save`` widget) and for any legacy
+    ``meta.json`` recorded before this field existed -- both cases must
+    behave EXACTLY as this project always has, so this default is today's
+    only pre-existing behavior, never a new one.
     """
 
     handoff_id: str
@@ -178,6 +225,7 @@ class HandoffMeta:
     managed_dir: str | None = None
     edit_in_place: bool = False
     original_path: str | None = None
+    trigger_policy: TriggerPolicy = DEFAULT_TRIGGER_POLICY
     edits: list[EditRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -191,6 +239,7 @@ class HandoffMeta:
             "managed_dir": self.managed_dir,
             "edit_in_place": self.edit_in_place,
             "original_path": self.original_path,
+            "trigger_policy": self.trigger_policy,
             "created_ts": self.created_ts,
             "updated_ts": self.updated_ts,
             "status": self.status,
@@ -214,6 +263,13 @@ class HandoffMeta:
             managed_dir=data.get("managed_dir"),
             edit_in_place=data.get("edit_in_place", False),
             original_path=data.get("original_path"),
+            # A missing/falsy key -- every meta.json written before this
+            # field existed -- MUST default safely (product-owner
+            # requirement: "meta.json is read back from disk, so a missing
+            # key MUST default safely"): DEFAULT_TRIGGER_POLICY is today's
+            # only pre-existing behavior, so an upgrade never silently
+            # changes what an already-in-flight handoff does.
+            trigger_policy=data.get("trigger_policy") or DEFAULT_TRIGGER_POLICY,
             edits=[EditRecord.from_dict(edit) for edit in data.get("edits", [])],
         )
 
@@ -358,6 +414,7 @@ class HandoffManager:
         source_hash: str | None = None,
         edit_in_place: bool = False,
         original_path: str | None = None,
+        trigger_policy: TriggerPolicy = DEFAULT_TRIGGER_POLICY,
     ) -> HandoffMeta:
         """Allocate a new handoff: id, folder, ``orig_thumb.png``, ``meta.json``.
 
@@ -394,6 +451,14 @@ class HandoffManager:
             original_path: Absolute path to the user's own file. Required
                 (by the caller's own contract, not enforced here) whenever
                 *edit_in_place* is ``True``; ``None`` otherwise.
+            trigger_policy: The save-trigger policy recorded on this handoff
+                (product-owner requirement 2026-07-18, ``on_save`` on
+                :class:`~cpsb.load_psd.PhotoshopLoadPSD`) -- consulted by
+                :meth:`should_ingest` at every ingest call site and echoed
+                in the ``cpsb.updated`` event so the frontend can gate
+                auto-queue on it too. Defaults to
+                :data:`DEFAULT_TRIGGER_POLICY` (today's only pre-existing
+                behavior) for every caller that omits it.
         """
         now = time.time()
         with self._lock:
@@ -415,6 +480,7 @@ class HandoffManager:
                 managed_dir=managed_dir,
                 edit_in_place=edit_in_place,
                 original_path=original_path,
+                trigger_policy=trigger_policy,
             )
             self._handoffs[handoff_id] = meta
             self._write_meta_locked(meta)
@@ -626,6 +692,41 @@ class HandoffManager:
 
     # -- ingest (PROTOCOL.md §4) -------------------------------------------
 
+    def should_ingest(self, handoff_id: str) -> bool:
+        """Whether an arriving edit for *handoff_id* should be ingested at all.
+
+        The single shared gate for the ``trigger_policy`` save-trigger
+        policy (product-owner requirement 2026-07-18): consulted at every
+        place pixels ever reach :meth:`ingest_edit` -- the HTTP
+        ``POST /cpsb/upload`` route, the plugin websocket's chunked
+        ``upload_edit`` handler, and :class:`~cpsb.watcher.CpsbWatcher`'s
+        settled-save path -- so a "don't trigger anything" choice is
+        enforced SERVER-SIDE and uniformly across the automatic Tier 1
+        watcher AND both of the plugin's manual Send entry points, rather
+        than trusting a frontend that might not even have a browser tab
+        open (the plugin can upload with none at all).
+
+        Only :data:`_IGNORE_TRIGGER_POLICY` answers ``False`` here: every
+        other known policy, and any missing/unrecognized one, defaults to
+        ``True`` -- see :data:`_IGNORE_TRIGGER_POLICY`'s own docstring for
+        why that direction is the safe one.
+
+        Args:
+            handoff_id: The handoff an edit is about to be ingested for.
+
+        Returns:
+            ``False`` only when this handoff's recorded ``trigger_policy``
+            is exactly "Ignore (do nothing)". ``True`` for an unknown
+            *handoff_id* too -- existence/active-status is every caller's
+            own job first (this method only ever answers the policy
+            question), so a handoff this manager has never heard of is
+            never silently treated as "ignore."
+        """
+        with self._lock:
+            meta = self._handoffs.get(handoff_id)
+            policy = meta.trigger_policy if meta is not None else None
+        return policy != _IGNORE_TRIGGER_POLICY
+
     def ingest_edit(
         self, handoff_id: str, image: Image.Image, fidelity: Fidelity
     ) -> EditRecord | None:
@@ -833,6 +934,14 @@ class HandoffManager:
                 "type": "input",
                 "fidelity": edit.fidelity,
                 "sibling_output": edit.sibling_output.to_dict() if edit.sibling_output else None,
+                # Save-trigger policy (product-owner requirement 2026-07-18):
+                # this handoff's recorded trigger_policy is the ONLY way the
+                # policy reaches the client at all -- the frontend never sees
+                # meta.json directly -- so pasteback.js's maybeAutoQueue can
+                # gate a load_psd edit's auto-queue on it. "Ignore" never
+                # reaches this point in the first place (should_ingest already
+                # suppressed the ingest that would have emitted this event).
+                "trigger_policy": meta.trigger_policy,
             },
         )
 

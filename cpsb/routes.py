@@ -36,10 +36,12 @@ from PIL import Image
 from .context import CpsbContext
 from .handoff import (
     ACTIVE_STATUSES,
+    DEFAULT_TRIGGER_POLICY,
     HandoffManager,
     HandoffMeta,
     HandoffNotFoundError,
     SourceRef,
+    TriggerPolicy,
     compute_source_hash,
 )
 from .launcher import launch_photoshop, tier1_status
@@ -86,6 +88,18 @@ _WS_MAX_MSG_SIZE_BYTES = 8 * 1024 * 1024
 _VALID_SOURCE_TYPES = ("input", "output", "temp")
 _VALID_ORIGIN_KINDS = ("load_image", "terminal_output", "bridge_node", "load_psd")
 _VALID_MODES = ("new", "original", "fresh")
+
+#: Valid `trigger_policy` values for the optional `POST /cpsb/open` field
+#: (product-owner requirement 2026-07-18, PROTOCOL.md §6b `on_save`). Kept
+#: in sync BY HAND with `cpsb.load_psd.OnSaveMode`'s three widget-combo
+#: strings and `cpsb.handoff.TriggerPolicy`'s three literal values -- the
+#: same hand-sync convention this module already uses for
+#: `_PSD_NATIVE_EXTENSIONS`/`cpsb.load_psd.PSD_EXTENSIONS`.
+_VALID_TRIGGER_POLICIES: tuple[TriggerPolicy, ...] = (
+    "Re-run workflow",
+    "Update only (don't re-run)",
+    "Ignore (do nothing)",
+)
 
 #: Extensions accepted for a psd-native (`origin_kind: "load_psd"`) source
 #: (PROTOCOL.md §2/§6b), case-insensitive.
@@ -298,6 +312,16 @@ def _parse_open_body(body: Any) -> tuple[dict[str, Any], str | None]:
     # stray/misapplied flag on any other origin is simply ignored rather
     # than rejected.
     edit_in_place = bool(body.get("edit_in_place", False))
+    # Save-trigger policy (product-owner requirement 2026-07-18, PROTOCOL.md
+    # §6b `on_save`): unlike `edit_in_place`, not origin-gated below -- the
+    # ingest-time gate this governs (`HandoffManager.should_ingest`) is
+    # origin-agnostic, so there is no origin-specific safety concern to
+    # reset it for (contrast `edit_in_place`, which must never apply outside
+    # `load_psd` because only that origin has a real "original file" to
+    # point at). A caller that omits it -- every origin whose frontend
+    # doesn't yet read an `on_save`-style widget -- keeps today's exact
+    # behavior via DEFAULT_TRIGGER_POLICY.
+    trigger_policy = str(body.get("trigger_policy") or DEFAULT_TRIGGER_POLICY)
 
     if source_type not in _VALID_SOURCE_TYPES:
         return {}, f"Invalid type: {source_type!r}"
@@ -305,6 +329,8 @@ def _parse_open_body(body: Any) -> tuple[dict[str, Any], str | None]:
         return {}, f"Invalid origin_kind: {origin_kind!r}"
     if mode not in _VALID_MODES:
         return {}, f"Invalid mode: {mode!r}"
+    if trigger_policy not in _VALID_TRIGGER_POLICIES:
+        return {}, f"Invalid trigger_policy: {trigger_policy!r}"
 
     return (
         {
@@ -317,6 +343,7 @@ def _parse_open_body(body: Any) -> tuple[dict[str, Any], str | None]:
             "mode": mode,
             "client_remote_ok": client_remote_ok,
             "edit_in_place": edit_in_place,
+            "trigger_policy": trigger_policy,
         },
         None,
     )
@@ -634,6 +661,7 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         source_hash=resolved.source_hash,
         edit_in_place=edit_in_place,
         original_path=original_path,
+        trigger_policy=fields["trigger_policy"],
     )
     if edit_in_place:
         # The user's own file IS the edit target -- never copied, never
@@ -783,6 +811,22 @@ async def upload_route(request: web.Request) -> web.Response:
         return _error(404, "Unknown handoff_id")
     if meta.status not in ACTIVE_STATUSES:
         return _error(409, f"Handoff is {meta.status}, not accepting uploads")
+
+    if not manager.should_ingest(handoff_id):
+        # "Ignore (do nothing)" (product-owner requirement 2026-07-18): the
+        # uploader (plugin or a manual gallery drop) did nothing wrong, so
+        # this is a 200/`ok: true`, never an error -- only logged at INFO
+        # (naming the handoff and its policy) so a user who forgot they set
+        # Ignore can diagnose a "nothing happened" save from the console.
+        # Deliberately skips decoding `image_bytes` at all: those pixels are
+        # never going to be used.
+        logger.info(
+            "Ignoring %s-sourced upload for handoff %s (trigger_policy=%r)",
+            source,
+            handoff_id,
+            meta.trigger_policy,
+        )
+        return web.json_response({"ok": True, "ignored": True})
 
     try:
         image = Image.open(io.BytesIO(image_bytes))
@@ -1209,6 +1253,22 @@ async def _handle_upload_edit_chunk(
                 "reason": "inactive",
             }
         )
+        return
+
+    if not manager.should_ingest(handoff_id):
+        # "Ignore (do nothing)" (product-owner requirement 2026-07-18): the
+        # plugin did nothing wrong, so this is a normal `upload_ok` ack, not
+        # an `upload_error` -- only logged at INFO (naming the handoff and
+        # its policy) so a user who forgot they set Ignore can diagnose a
+        # "nothing happened" save from the console. Deliberately skips
+        # decoding `raw_bytes` at all: those pixels are never going to be
+        # used. Mirrors `upload_route`'s identical HTTP-path gate.
+        logger.info(
+            "Ignoring plugin-sourced websocket upload for handoff %s (trigger_policy=%r)",
+            handoff_id,
+            meta.trigger_policy,
+        )
+        await connection.ws.send_json({"type": "upload_ok", "handoff_id": handoff_id})
         return
 
     try:

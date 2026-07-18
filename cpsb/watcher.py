@@ -321,6 +321,24 @@ class CpsbWatcher:
             logger.debug("Ignoring settled save for inactive handoff %s", handoff_id)
             return
 
+        if not self._manager.should_ingest(handoff_id):
+            # "Ignore (do nothing)" (product-owner requirement 2026-07-18):
+            # this is the automatic Tier 1 watcher -- the exact "close the
+            # PSD without saving [into the graph]" path the product owner
+            # asked for -- so a settled save is simply never read/ingested.
+            # Logged at INFO (naming the handoff and its policy) so a user
+            # who forgot they set Ignore can diagnose "nothing happened"
+            # from the console. Deliberately skips `_read_with_retry`
+            # entirely: those pixels are never going to be used, and
+            # skipping the read also avoids needless file-lock contention
+            # with Photoshop's own save.
+            logger.info(
+                "Ignoring settled save for handoff %s (trigger_policy=%r); not ingesting",
+                handoff_id,
+                meta.trigger_policy,
+            )
+            return
+
         image, fidelity = self._read_with_retry(path)
         if image is None or fidelity is None:
             # Deliberately NOT mark_error: "error" is terminal, and a save

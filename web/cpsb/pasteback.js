@@ -268,6 +268,25 @@ export function addLoadImageNodeNear(originNode, ref) {
 const BRIDGE_MODE_RERUN = 'Re-run on every save'
 
 /**
+ * Exact `on_save` COMBO / `trigger_policy` values for a Load PSD node's
+ * per-handoff save-trigger policy (product-owner requirement 2026-07-18,
+ * PROTOCOL.md §6b) — kept in sync BY HAND with `cpsb.load_psd.OnSaveMode`
+ * (the widget's own three strings) and `cpsb.handoff.TriggerPolicy` (the
+ * persisted enum echoed verbatim in the `cpsb.updated` event payload this
+ * file already reads everything else from) — the same hand-sync convention
+ * this project already uses for small, stable string sets shared across
+ * Python/JS (e.g. `cpsb.load_psd.PSD_EXTENSIONS`/
+ * `cpsb.routes._PSD_NATIVE_EXTENSIONS`). `payload.trigger_policy` isn't
+ * (yet) declared on `CpsbUpdatedEvent` in `api.js` — out of this change's
+ * file scope — but the backend always sends a real, non-empty string here
+ * (`HandoffManager._emit_updated`), so reading it directly off the payload
+ * is safe.
+ */
+const LOAD_PSD_TRIGGER_UPDATE_ONLY = "Update only (don't re-run)"
+/** @see LOAD_PSD_TRIGGER_UPDATE_ONLY */
+const LOAD_PSD_TRIGGER_IGNORE = 'Ignore (do nothing)'
+
+/**
  * Queues the workflow when policy allows it for this origin (PROTOCOL.md §5).
  * Uses the documented `app.queuePrompt` overload (`number, batchCount = 1`);
  * `0` means "append normally", matching the long-standing extension
@@ -288,14 +307,37 @@ const BRIDGE_MODE_RERUN = 'Re-run on every save'
  * SaveImage nodes) a second time per save — confirmed in the field as "one
  * click saved multiple files." Safe by construction: blocking mode never
  * auto-queues, re-run mode never blocks.
+ *
+ * `load_psd` ADDITIONALLY never queues when this handoff's own
+ * `trigger_policy` is "Update only (don't re-run)" or "Ignore (do nothing)"
+ * (product-owner requirement 2026-07-18) — a per-node choice that, like the
+ * bridge's `mode`, can only ever turn auto-queue OFF, never force it on:
+ * the global `cpsb.autoQueue` setting is still checked FIRST and remains the
+ * master switch, so global-off still wins over a per-node "Re-run
+ * workflow", and a per-node "Update only"/"Ignore" still wins over
+ * global-on. In practice `trigger_policy === "Ignore (do nothing)"` never
+ * actually reaches this function for a `load_psd` origin at all: the
+ * backend's `HandoffManager.should_ingest` gate suppresses ingestion (and
+ * therefore the `cpsb.updated` event that calls this) entirely for that
+ * policy — checked here anyway as a second line of defense, and because
+ * `bridge_node`'s own `mode` read below has no such server-side backstop.
  * @param {import('./api.js').CpsbOriginKind} originKind
  * @param {import('../../../scripts/app.js').LGraphNode | null} node - The
  * origin node when it still exists (needed to read a bridge's mode widget;
  * a deleted bridge node simply never re-queues).
+ * @param {string} [triggerPolicy] - `payload.trigger_policy` from the
+ * triggering `cpsb.updated` event (PROTOCOL.md §6b) — only consulted for a
+ * `load_psd` origin; ignored for every other `originKind`.
  */
-function maybeAutoQueue(originKind, node) {
+function maybeAutoQueue(originKind, node, triggerPolicy) {
   if (originKind === 'load_image' || originKind === 'load_psd') {
     if (!settings.getAutoQueue()) return
+    if (
+      originKind === 'load_psd' &&
+      (triggerPolicy === LOAD_PSD_TRIGGER_UPDATE_ONLY || triggerPolicy === LOAD_PSD_TRIGGER_IGNORE)
+    ) {
+      return
+    }
   } else if (originKind === 'bridge_node') {
     const mode = node?.widgets?.find((w) => w.name === 'mode')?.value
     if (mode !== BRIDGE_MODE_RERUN) return
@@ -342,7 +384,7 @@ function handleLoadImageOrBridge(payload) {
         `"${payload.origin_kind}" — relying on cpsb.status for the badge`
     )
   }
-  maybeAutoQueue(payload.origin_kind, node)
+  maybeAutoQueue(payload.origin_kind, node, payload.trigger_policy)
 }
 
 /**
@@ -423,7 +465,7 @@ function handleLoadPsd(payload) {
     detail: 'This Load PSD node will use it on the next queue.'
   })
 
-  maybeAutoQueue(payload.origin_kind, node)
+  maybeAutoQueue(payload.origin_kind, node, payload.trigger_policy)
 }
 
 /**

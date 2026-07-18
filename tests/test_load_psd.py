@@ -93,6 +93,72 @@ class TestContractShape:
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
         assert spec["required"]["edit_original"] == ("BOOLEAN", {"default": False})
 
+    def test_on_save_declares_combo_defaulting_to_rerun(self, configured):
+        """Product-owner requirement 2026-07-18: `on_save` is a COMBO of the
+        three OnSaveMode strings, defaulting to RERUN -- today's exact
+        pre-existing behavior for every already-saved workflow.
+        """
+        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
+        assert spec["required"]["on_save"] == (
+            [
+                load_psd_module.OnSaveMode.RERUN,
+                load_psd_module.OnSaveMode.UPDATE_ONLY,
+                load_psd_module.OnSaveMode.IGNORE,
+            ],
+            {"default": load_psd_module.OnSaveMode.RERUN},
+        )
+        assert load_psd_module.OnSaveMode.RERUN == "Re-run workflow"
+
+    def test_policy_strings_are_identical_across_all_four_layers(self):
+        """DRIFT GUARD. The `on_save`/`trigger_policy` value is a bare string
+        compared for equality in four independently-maintained places:
+
+          1. cpsb/load_psd.py       OnSaveMode           (the widget's options)
+          2. cpsb/handoff.py        TriggerPolicy        (persisted + the gate)
+          3. cpsb/routes.py         _VALID_TRIGGER_POLICIES (request validation)
+          4. web/cpsb/pasteback.js  LOAD_PSD_TRIGGER_*   (the auto-queue gate)
+
+        They cannot import each other (2 would be a circular import, 4 is a
+        different language), so nothing but this test stops one from being
+        reworded in isolation. The failure mode is SILENT and nasty: a policy
+        that simply stops being honored, or an open request rejected with a 400,
+        with no type error anywhere to catch it. Assert the actual strings, and
+        read the JS as text so the frontend is covered too.
+        """
+        from cpsb import handoff as handoff_module
+        from cpsb import routes as routes_module
+
+        rerun = load_psd_module.OnSaveMode.RERUN
+        update_only = load_psd_module.OnSaveMode.UPDATE_ONLY
+        ignore = load_psd_module.OnSaveMode.IGNORE
+
+        assert rerun == handoff_module.DEFAULT_TRIGGER_POLICY
+        assert ignore == handoff_module._IGNORE_TRIGGER_POLICY
+        assert set(routes_module._VALID_TRIGGER_POLICIES) == {rerun, update_only, ignore}
+
+        pasteback = (
+            Path(__file__).resolve().parents[1] / "web" / "cpsb" / "pasteback.js"
+        ).read_text(encoding="utf-8")
+        # Only the two the frontend actually gates on; RERUN is the fall-through.
+        assert update_only in pasteback
+        assert ignore in pasteback
+
+    def test_on_save_is_the_last_required_input(self, configured):
+        """Critical for backward compatibility: ComfyUI's frontend restores
+        a saved workflow's serialized widget values BY POSITION (index into
+        `widgets_values`, zipped against `node.widgets` in INPUT_TYPES
+        declaration order), not by name. Appending `on_save` last means a
+        workflow saved before this change (whose `widgets_values` only has
+        two entries) never touches this widget's slot at all, leaving it at
+        its own default -- inserting it anywhere else would instead shift
+        every already-serialized value after that point onto the wrong
+        widget for every existing saved workflow.
+        """
+        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
+        required_names = list(spec["required"].keys())
+        assert required_names == ["psd", "edit_original", "on_save"]
+        assert required_names[-1] == "on_save"
+
 
 class TestEditOriginalParam:
     """`edit_original` is accepted by execute()/IS_CHANGED() (ComfyUI passes
@@ -164,6 +230,55 @@ class TestEditOriginalParam:
         without = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(psd="sample.psd", unique_id="1")
         with_flag = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(
             psd="sample.psd", unique_id="1", edit_original=True
+        )
+        assert without == with_flag
+
+
+class TestOnSaveParam:
+    """`on_save` (product-owner requirement 2026-07-18) is accepted by
+    execute()/IS_CHANGED() (ComfyUI passes every declared INPUT_TYPES field
+    as a real keyword argument) but never changes their output -- mirrors
+    TestEditOriginalParam's identical convention for `edit_original`: it
+    only governs whether an arriving edit is ingested/triggers a re-run at
+    all (`HandoffManager.should_ingest`, the frontend's `maybeAutoQueue`), a
+    decision already settled by the time any edit reaches this node's
+    consume path.
+    """
+
+    def test_execute_defaults_to_rerun_for_pre_existing_callers(self, context, manager, configured):
+        write_test_psd(context.input_dir / "flat.psd", color=(7, 7, 7), size=(4, 4))
+        node = load_psd_module.PhotoshopLoadPSD()
+        node.execute(psd="flat.psd", unique_id="1")  # no TypeError
+
+    def test_execute_accepts_on_save_without_changing_flatten_output(
+        self, context, manager, configured
+    ):
+        pytest.importorskip("torch")
+        psd_path = context.input_dir / "flat.psd"
+        write_test_psd(psd_path, color=(40, 80, 120), size=(12, 8))
+
+        node = load_psd_module.PhotoshopLoadPSD()
+        image_tensor, _mask = node.execute(
+            psd="flat.psd", unique_id="1", on_save=load_psd_module.OnSaveMode.IGNORE
+        )
+
+        array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(array[0, 0]) == (40, 80, 120)
+
+    def test_is_changed_defaults_to_rerun_for_pre_existing_callers(
+        self, context, manager, configured
+    ):
+        write_test_psd(context.input_dir / "sample.psd")
+        value = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(psd="sample.psd", unique_id="1")
+        assert len(value) == 64
+
+    def test_is_changed_accepts_on_save_without_changing_the_value(
+        self, context, manager, configured
+    ):
+        write_test_psd(context.input_dir / "sample.psd", color=(3, 3, 3))
+        without = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(psd="sample.psd", unique_id="1")
+        with_flag = load_psd_module.PhotoshopLoadPSD.IS_CHANGED(
+            psd="sample.psd", unique_id="1", on_save=load_psd_module.OnSaveMode.UPDATE_ONLY
         )
         assert without == with_flag
 

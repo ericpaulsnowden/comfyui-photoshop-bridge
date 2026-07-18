@@ -12,6 +12,7 @@ import asyncio
 import base64
 import hashlib
 import io
+import json
 import platform
 import threading
 import time
@@ -281,6 +282,30 @@ class TestOpen:
         assert response.status == 400
         response = await client.post("/cpsb/open", json=open_body(origin_kind="banana"))
         assert response.status == 400
+        response = await client.post("/cpsb/open", json=open_body(trigger_policy="banana"))
+        assert response.status == 400
+
+    async def test_trigger_policy_defaults_to_rerun(self, client, manager, source_image, launches):
+        """Product-owner requirement 2026-07-18: omitting `trigger_policy`
+        entirely (every existing caller of `/cpsb/open`) must keep today's
+        exact behavior.
+        """
+        response = await client.post("/cpsb/open", json=open_body())
+        handoff_id = (await response.json())["handoff_id"]
+        assert manager.get(handoff_id).trigger_policy == "Re-run workflow"
+
+    async def test_trigger_policy_persisted_when_provided(
+        self, client, manager, context, source_image, launches
+    ):
+        response = await client.post(
+            "/cpsb/open", json=open_body(trigger_policy="Ignore (do nothing)")
+        )
+        handoff_id = (await response.json())["handoff_id"]
+        assert manager.get(handoff_id).trigger_policy == "Ignore (do nothing)"
+        stored = json.loads(
+            (context.cpsb_input_dir / handoff_id / "meta.json").read_text()
+        )
+        assert stored["trigger_policy"] == "Ignore (do nothing)"
 
     async def test_existing_handoff_conflict_and_modes(
         self, client, manager, source_image, launches
@@ -938,6 +963,65 @@ class TestOpenPsdEditInPlaceWatcherIntegration:
         assert refreshed.edits == []
 
 
+class TestTriggerPolicyWatcherGate:
+    """Product-owner requirement 2026-07-18: the `trigger_policy` gate must
+    apply to the AUTOMATIC Tier 1 watcher path too, not just the HTTP/
+    websocket upload routes -- this is the exact "close the PSD without
+    saving [into the graph]" workflow the request called out, and it never
+    goes through either upload route at all.
+    """
+
+    async def test_ignore_policy_settled_save_is_not_ingested(
+        self, watcher_client, context, manager, launches
+    ):
+        (context.output_dir / SOURCE_FILENAME).write_bytes(png_bytes((1, 2, 3)))
+        response = await watcher_client.post(
+            "/cpsb/open", json=open_body(trigger_policy="Ignore (do nothing)")
+        )
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        assert manager.get(handoff_id).trigger_policy == "Ignore (do nothing)"
+        await asyncio.sleep(0.3)  # let the initial open settle before the "save"
+
+        # Simulate Photoshop overwriting the MANAGED copy in place (a plain
+        # Cmd+S), exactly like a real edit would arrive.
+        source_path = context.cpsb_input_dir / handoff_id / "source.psd"
+        write_psd(source_path, Image.new("RGB", (16, 16), (250, 0, 0)))
+
+        # Generous settle window (debounce + a margin) -- nothing should
+        # ever arrive, so this is a "still true after waiting" assertion,
+        # not a wait_until.
+        await asyncio.sleep(0.3 + 0.2 * 4)
+
+        refreshed = manager.get(handoff_id)
+        assert refreshed.status == "editing"  # never moved to "edited"
+        assert refreshed.edits == []
+
+    async def test_update_only_policy_settled_save_is_ingested(
+        self, watcher_client, context, manager, launches
+    ):
+        """Contrast case, proving the gate is policy-specific rather than
+        having broken the watcher entirely.
+        """
+        (context.output_dir / SOURCE_FILENAME).write_bytes(png_bytes((1, 2, 3)))
+        response = await watcher_client.post(
+            "/cpsb/open", json=open_body(trigger_policy="Update only (don't re-run)")
+        )
+        handoff_id = (await response.json())["handoff_id"]
+        await asyncio.sleep(0.3)
+
+        source_path = context.cpsb_input_dir / handoff_id / "source.psd"
+        write_psd(source_path, Image.new("RGB", (16, 16), (0, 250, 0)))
+
+        await wait_until(lambda: len(manager.get(handoff_id).edits) >= 1)
+
+        refreshed = manager.get(handoff_id)
+        assert refreshed.status == "edited"
+        edit_path = context.cpsb_input_dir / handoff_id / refreshed.edits[0].filename
+        with Image.open(edit_path) as edited:
+            assert edited.getpixel((0, 0))[:3] == (0, 250, 0)
+
+
 async def _connect_tier2_plugin(ws, context: CpsbContext, local_mode: bool = True) -> None:
     """Minimal hello/ready handshake to register a ready Tier 2 plugin (PROTOCOL.md §3).
 
@@ -1248,6 +1332,92 @@ class TestUpload:
         data = await response.json()
         assert data["subfolder"] == f"folder-a/{handoff_id}"
         assert (context.input_dir / "folder-a" / handoff_id / data["filename"]).is_file()
+
+
+class TestTriggerPolicyGate:
+    """Product-owner requirement 2026-07-18: a handoff's `trigger_policy`
+    ("Ignore (do nothing)" in particular) must be enforced SERVER-SIDE at
+    every ingest call site -- not just suggested to a frontend that might
+    not even have a browser tab open (the plugin can upload with none at
+    all). Covers the HTTP upload route here; the plugin websocket's
+    `upload_edit` is covered in `TestPluginWebsocketFileTransfer`, and the
+    Tier 1 watcher's settled-save path in `TestTriggerPolicyWatcherGate`
+    below.
+    """
+
+    async def open_with_policy(self, client, trigger_policy: str) -> str:
+        response = await client.post("/cpsb/open", json=open_body(trigger_policy=trigger_policy))
+        assert response.status == 200
+        return (await response.json())["handoff_id"]
+
+    async def test_ignore_policy_upload_does_not_append_an_edit(
+        self, client, manager, source_image
+    ):
+        handoff_id = await self.open_with_policy(client, "Ignore (do nothing)")
+
+        response = await client.post(
+            "/cpsb/upload", data=upload_form(handoff_id, png_bytes((200, 0, 0)))
+        )
+
+        # Success-shaped, never an error: the uploader (plugin or gallery
+        # drag-and-drop) did nothing wrong.
+        assert response.status == 200
+        data = await response.json()
+        assert data["ok"] is True
+
+        refreshed = manager.get(handoff_id)
+        assert refreshed.edits == []
+        assert refreshed.status == "editing"  # never moved to "edited"
+
+    async def test_update_only_policy_upload_appends_an_edit(self, client, manager, source_image):
+        handoff_id = await self.open_with_policy(client, "Update only (don't re-run)")
+
+        response = await client.post(
+            "/cpsb/upload", data=upload_form(handoff_id, png_bytes((0, 200, 0)))
+        )
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["ok"] is True
+        assert data["filename"] == "edit_001.png"
+
+        refreshed = manager.get(handoff_id)
+        assert len(refreshed.edits) == 1
+        assert refreshed.status == "edited"
+
+    async def test_rerun_policy_upload_appends_an_edit(self, client, manager, source_image):
+        """Explicit "Re-run workflow" behaves exactly like today's default."""
+        handoff_id = await self.open_with_policy(client, "Re-run workflow")
+
+        response = await client.post(
+            "/cpsb/upload", data=upload_form(handoff_id, png_bytes((0, 0, 200)))
+        )
+
+        assert response.status == 200
+        assert len(manager.get(handoff_id).edits) == 1
+
+    async def test_no_trigger_policy_key_at_all_upload_appends_an_edit(
+        self, client, manager, source_image
+    ):
+        """A handoff opened before this feature existed has NO
+        `trigger_policy` at all in its in-memory/on-disk state (simulating
+        an upgrade from an older version) -- it must keep ingesting exactly
+        as it always has.
+        """
+        handoff_id = await self.create_handoff_default(client)
+        meta = manager.get(handoff_id)
+        assert meta.trigger_policy == "Re-run workflow"  # the safe default
+
+        response = await client.post(
+            "/cpsb/upload", data=upload_form(handoff_id, png_bytes((1, 1, 1)))
+        )
+
+        assert response.status == 200
+        assert len(manager.get(handoff_id).edits) == 1
+
+    async def create_handoff_default(self, client) -> str:
+        response = await client.post("/cpsb/open", json=open_body())
+        return (await response.json())["handoff_id"]
 
 
 class TestFileAndThumb:
@@ -1734,6 +1904,51 @@ class TestPluginWebsocketFileTransfer:
             edit_path = context.cpsb_input_dir / handoff_id / meta.edits[0].filename
             with Image.open(edit_path) as edited:
                 assert edited.getpixel((0, 0))[:3] == (222, 33, 44)
+
+    async def test_upload_edit_ignore_policy_does_not_ingest(
+        self, client, context, manager, source_image, launches
+    ):
+        """Product-owner requirement 2026-07-18: a "Ignore (do nothing)"
+        handoff must not ingest a plugin websocket upload -- this is the
+        Tier 2 "Send back now" path the request specifically called out
+        ("The same issues occur with it auto running the workflow").
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (
+                await client.post(
+                    "/cpsb/open", json=open_body(trigger_policy="Ignore (do nothing)")
+                )
+            ).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+            # Plugin confirms the document actually opened (PROTOCOL.md §3),
+            # same as a real "Send back now" round trip would see.
+            await ws.send_json({"type": "opened", "handoff_id": handoff_id})
+            await wait_until(lambda: manager.get(handoff_id).status == "editing")
+
+            payload = png_bytes((5, 5, 5))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+
+            # A normal upload_ok ack -- the plugin did nothing wrong -- never
+            # an upload_error.
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+
+            meta = manager.get(handoff_id)
+            assert meta.edits == []
+            assert meta.status == "editing"  # never moved to "edited"
 
     async def test_upload_edit_unknown_handoff_gets_upload_error(self, client, context, launches):
         async with client.ws_connect("/cpsb/ws") as ws:

@@ -156,6 +156,24 @@ export function getEditOriginal(node) {
 }
 
 /**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {string | undefined} The node's current `on_save` widget value
+ * (PROTOCOL.md §6b "Save-trigger policy") -- what should happen when the user
+ * saves this handoff in Photoshop: re-run the workflow, ingest the edit
+ * without re-running, or ignore the save entirely.
+ *
+ * `undefined` when the node has no such widget yet (a node instance restored
+ * from a workflow saved before this option existed). menu.js omits the field
+ * from `/cpsb/open` in that case, and the SERVER applies its own default --
+ * deliberately, so the "what does an older workflow do?" answer lives in one
+ * place (`cpsb/handoff.py`'s `DEFAULT_TRIGGER_POLICY`) rather than being
+ * duplicated as a literal string here that could silently drift from it.
+ */
+export function getOnSave(node) {
+  return node.widgets?.find((w) => w.name === 'on_save')?.value
+}
+
+/**
  * @param {string | undefined} filename
  * @returns {boolean}
  */

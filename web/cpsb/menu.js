@@ -207,12 +207,21 @@ function resolveImageRef(node, imageIndex) {
  * This function only contributes what is menu-specific: deriving the
  * request body from the clicked node.
  *
- * For a Load PSD node, the body also carries `edit_in_place` — the node's
- * current `edit_original` widget value (PROTOCOL.md §6b "Edit-original
- * option", `loadpsd.getEditOriginal`) — for every mode ('new'/'original'/
- * 'fresh' all funnel through here), since the backend only ever consults it
- * for a `load_psd` open (`cpsb/routes.py`) and ignores it otherwise; every
- * other node type simply never sends the field at all.
+ * For a Load PSD node, the body also carries two node-widget-derived fields —
+ * for every mode ('new'/'original'/'fresh' all funnel through here), since the
+ * backend only ever consults them for a `load_psd` open (`cpsb/routes.py`) and
+ * ignores them otherwise; every other node type simply never sends them:
+ * - `edit_in_place` — the node's `edit_original` widget (PROTOCOL.md §6b
+ *   "Edit-original option", `loadpsd.getEditOriginal`).
+ * - `trigger_policy` — the node's `on_save` widget (PROTOCOL.md §6b
+ *   "Save-trigger policy", `loadpsd.getOnSave`), which decides whether a save
+ *   in Photoshop re-runs the workflow, only ingests, or is ignored outright.
+ *   Both are read at OPEN time and persisted onto the handoff, so changing the
+ *   widget on an ALREADY-open handoff has no effect until the next open —
+ *   the same contract `edit_in_place` has always had. The field is OMITTED
+ *   entirely when the widget is absent (a workflow saved before the option
+ *   existed) so the server applies its own default rather than this file
+ *   duplicating that string.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @param {"new" | "original" | "fresh"} mode
  * @param {number} [imageIndex]
@@ -230,6 +239,7 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
     return
   }
   const isLoadPsd = loadpsd.isLoadPsdNode(node)
+  const onSave = isLoadPsd ? loadpsd.getOnSave(node) : undefined
   await open.openInteractive({
     filename: ref.filename,
     subfolder: ref.subfolder,
@@ -238,7 +248,8 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
     origin_kind: deriveOriginKind(node),
     workflow_name: state.getWorkflowName(),
     mode,
-    ...(isLoadPsd ? { edit_in_place: loadpsd.getEditOriginal(node) } : {})
+    ...(isLoadPsd ? { edit_in_place: loadpsd.getEditOriginal(node) } : {}),
+    ...(onSave === undefined ? {} : { trigger_policy: onSave })
   })
 }
 

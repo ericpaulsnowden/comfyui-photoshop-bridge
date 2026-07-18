@@ -75,6 +75,50 @@ logger = logging.getLogger("cpsb")
 PSD_EXTENSIONS: tuple[str, ...] = (".psd", ".psb")
 
 
+class OnSaveMode:
+    """String constants for the ``on_save`` COMBO input (product-owner
+    requirement 2026-07-18): what a save/"Send back now" for this node's
+    handoff should trigger, mirroring the ``BridgeMode`` string-constant-
+    class convention ``cpsb.nodes`` uses for ``PhotoshopBridge``'s own
+    ``mode`` widget. Placed on this module (not ``cpsb.nodes``) since it
+    governs :class:`PhotoshopLoadPSD` specifically, the same "the class and
+    its own mode constants live together" pattern.
+
+    Before this existed, the ONLY lever a user had was the single GLOBAL
+    ``cpsb.autoQueue`` frontend setting (web/cpsb/settings.js) -- on or off
+    for every ``load_image``/``load_psd`` node at once -- plus, for the
+    unrelated ``PhotoshopBridge`` node only, its own per-node ``mode``. A
+    Load PSD node had no per-node override at all, and neither lever was
+    ever enforced SERVER-SIDE: a plugin upload with no ComfyUI browser tab
+    open bypassed both entirely (the reported "turn off all layers but one,
+    push it back, close the PSD without saving" workflow always re-ran the
+    graph regardless). ``on_save`` fixes both gaps: it is per-node, and the
+    choice is persisted on the handoff record (``HandoffMeta.trigger_policy``,
+    ``cpsb.handoff``) and enforced by ``HandoffManager.should_ingest`` at
+    every ingest call site (the HTTP upload route, the plugin websocket's
+    ``upload_edit``, and the Tier 1 watcher), not just suggested to a
+    frontend that might not even be listening.
+
+    These three exact strings are also ``cpsb.handoff.TriggerPolicy``'s three
+    literal values -- kept in sync BY HAND, not imported (see
+    ``cpsb.handoff.TriggerPolicy``'s own docstring for why: the same
+    ``PSD_EXTENSIONS``/``_PSD_NATIVE_EXTENSIONS`` hand-sync convention this
+    module already uses, here also avoiding a circular import since this
+    module already imports from ``cpsb.handoff``).
+    """
+
+    #: Default -- today's exact pre-existing behavior for every already-
+    #: saved workflow (see :meth:`PhotoshopLoadPSD.INPUT_TYPES`'s docstring
+    #: on why this widget is appended LAST, never inserted elsewhere).
+    RERUN = "Re-run workflow"
+    #: Ingest the edit (so the next MANUAL queue picks it up, and the
+    #: gallery/badge stay current) but never auto-queue a re-run.
+    UPDATE_ONLY = "Update only (don't re-run)"
+    #: Never ingest and never queue -- a save into this handoff is a pure
+    #: no-op as far as this package and the ComfyUI graph are concerned.
+    IGNORE = "Ignore (do nothing)"
+
+
 def _list_psd_files(input_dir: Path) -> list[str]:
     """Sorted ``.psd``/``.psb`` filenames directly under *input_dir*.
 
@@ -217,6 +261,18 @@ class PhotoshopLoadPSD:
     branch, watched by ``cpsb.watcher``). The round-trip mechanics above are
     unaffected either way: an edit always lands as an ``edit_%03d.png`` in
     the handoff's managed folder regardless of where it was read from.
+
+    On-save trigger policy (product-owner requirement 2026-07-18): the
+    ``on_save`` COMBO widget (:class:`OnSaveMode`, default
+    :data:`OnSaveMode.RERUN` -- today's exact pre-existing behavior) is,
+    like ``edit_original``, read by the frontend at open time and threaded
+    into ``/cpsb/open`` as ``trigger_policy``, persisted on the handoff
+    (``HandoffMeta.trigger_policy``) and enforced SERVER-SIDE by
+    ``HandoffManager.should_ingest`` at every ingest call site -- this
+    class's own :meth:`execute`/:meth:`IS_CHANGED` never consult it either,
+    for the identical reason ``edit_original`` doesn't: it governs whether
+    an arriving edit is ingested/triggers a re-run at all, a decision
+    already settled by the time any edit reaches this node's consume path.
     """
 
     CATEGORY = "image/photoshop"
@@ -233,6 +289,32 @@ class PhotoshopLoadPSD:
         (see :func:`cpsb.nodes._state_if_configured`'s own docstring), and
         this classmethod must tolerate that the same way ``LoadImage``'s
         own ``INPUT_TYPES`` tolerates an empty/missing input directory.
+
+        ``on_save`` (product-owner requirement 2026-07-18) is deliberately
+        the LAST ``required`` entry, never inserted earlier: ComfyUI's
+        frontend (`Comfy-Org/litegraph.js`, `LGraphNode.configure()`)
+        restores a saved workflow's serialized widget values BY POSITION,
+        not by name -- ``this.widgets.filter(w => w.serialize !== false)``
+        is zipped against the saved ``widgets_values`` array index-for-
+        index. Every widget this node declares (``psd``, ``edit_original``)
+        serializes normally (neither sets ``serialize: false``), so a
+        workflow saved before this change has exactly two entries in that
+        array; appending ``on_save`` as a third, later position means an
+        old save simply never reaches index 2 at all, leaving the widget at
+        its own default (``OnSaveMode.RERUN``, this node's exact prior
+        behavior) instead of silently adopting whatever value used to sit
+        at that slot. Inserting it between ``psd`` and ``edit_original``
+        (or before either) would instead shift `edit_original`'s already-
+        serialized value onto `on_save`'s slot for every existing saved
+        workflow -- silently changing what a saved graph does on load, the
+        exact failure this ordering avoids. (No prior widget addition in
+        this codebase has needed to preserve backward compatibility this
+        way -- every previous widget change here, e.g. `BridgeMode`
+        replacing the old `wait_for_edit` BOOLEAN and `ComposePSD`'s
+        `mode`/`layer_name` replacing `edit_after`/`filename_prefix`, was a
+        deliberate breaking change with "no migration shim" (PROTOCOL.md
+        §6/§6c) -- so this ordering rule is verified against ComfyUI's own
+        serialization mechanics, not an existing in-repo precedent.)
         """
         state = nodes._state_if_configured()
         files = _list_psd_files(state.context.input_dir) if state is not None else []
@@ -248,6 +330,14 @@ class PhotoshopLoadPSD:
                 # docstrings): it governs how a handoff gets OPENED, not
                 # what pixels this node returns once one exists.
                 "edit_original": ("BOOLEAN", {"default": False}),
+                # On-save trigger policy (product-owner requirement
+                # 2026-07-18): MUST stay the last required entry -- see this
+                # method's own docstring above for why. Default RERUN keeps
+                # every existing saved workflow's behavior byte-identical.
+                "on_save": (
+                    [OnSaveMode.RERUN, OnSaveMode.UPDATE_ONLY, OnSaveMode.IGNORE],
+                    {"default": OnSaveMode.RERUN},
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -275,7 +365,9 @@ class PhotoshopLoadPSD:
         return True
 
     @classmethod
-    def IS_CHANGED(cls, psd: str, unique_id: str, edit_original: bool = False) -> str:
+    def IS_CHANGED(
+        cls, psd: str, unique_id: str, edit_original: bool = False, on_save: str = OnSaveMode.RERUN
+    ) -> str:
         """sha256 of *psd*'s raw bytes, folding in the latest edit hash when consumable.
 
         An arriving edit must force this node (and everything downstream)
@@ -299,6 +391,17 @@ class PhotoshopLoadPSD:
         handoff by the time any edit reaches this node's consume path.
         Defaults ``False`` so every pre-existing caller (this node's own
         tests included) that predates this input keeps working unchanged.
+
+        *on_save* (:class:`OnSaveMode`, product-owner requirement
+        2026-07-18) is accepted for the identical reason and never folds in
+        either: whether an edit was even INGESTED for a "Ignore (do
+        nothing)"-policy handoff is already decided server-side
+        (``HandoffManager.should_ingest``) by the time this runs -- an
+        ignored handoff simply never accumulates an edit for
+        :func:`_find_matching_active_handoff` to find, so there is nothing
+        for this cache key to react to beyond what it already does. Defaults
+        to :data:`OnSaveMode.RERUN` so every pre-existing caller keeps
+        working unchanged.
         """
         state = nodes._require_state()
         psd_path = _resolve_psd_path(state.context, psd)
@@ -317,7 +420,13 @@ class PhotoshopLoadPSD:
                 return f"{file_hash}:{edit_hash}"
         return file_hash
 
-    def execute(self, psd: str, unique_id: str, edit_original: bool = False) -> tuple[Any, Any]:
+    def execute(
+        self,
+        psd: str,
+        unique_id: str,
+        edit_original: bool = False,
+        on_save: str = OnSaveMode.RERUN,
+    ) -> tuple[Any, Any]:
         """``(IMAGE, MASK)`` for the selected PSD (PROTOCOL.md §6b).
 
         Serves a consumable active edit first (see the class docstring's
@@ -337,6 +446,16 @@ class PhotoshopLoadPSD:
                 handoff's managed folder), so the consume path above is
                 identical either way. Defaults ``False`` so every
                 pre-existing caller keeps working unchanged.
+            on_save: The node's current ``on_save`` widget value
+                (:class:`OnSaveMode`, product-owner requirement
+                2026-07-18). Accepted for the identical parity reason as
+                *edit_original* -- but not read here either: it governs
+                whether an edit is ingested/triggers a re-run at all
+                (``HandoffManager.should_ingest``, the frontend's
+                ``maybeAutoQueue``), a decision already settled by the time
+                any edit reaches this node's consume path below. Defaults
+                to :data:`OnSaveMode.RERUN` so every pre-existing caller
+                keeps working unchanged.
 
         Returns:
             ``(IMAGE, MASK)`` tensors.

@@ -463,6 +463,39 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   edit is read from the original path. Terminal cleanup never deletes the user's file
   (only managed-folder artifacts are ever purged). This is the only path where a bridge
   handoff points at a file the user owns — guard every delete accordingly.
+- **Save-trigger policy** (v0.5.21): the node carries a COMBO widget `on_save`, appended
+  as the LAST required input (ComfyUI restores a saved workflow's widget values BY
+  POSITION — see `LGraphNode`'s `widgets_values` zip — so appending is the only placement
+  that leaves existing workflows untouched). Values, from `cpsb/load_psd.py`'s
+  `OnSaveMode`:
+  - `"Re-run workflow"` (default) — today's behavior exactly: ingest the edit and let the
+    frontend re-queue the graph.
+  - `"Update only (don't re-run)"` — ingest the edit so the NEXT manual run picks it up,
+    but never auto-queue.
+  - `"Ignore (do nothing)"` — do not ingest at all; saving in Photoshop does nothing.
+    This is what makes "open a PSD, hide all but one layer, push that layer back, close
+    without saving" workable without the graph firing on every save.
+- The policy is read from the node's widget at OPEN time, sent on `/cpsb/open` as
+  `trigger_policy` (validated there; 400 on an unknown value; omitted → server default),
+  and PERSISTED on the handoff (`HandoffMeta.trigger_policy`; a meta.json written before
+  this existed falls back to the default). Same contract as `edit_in_place`: changing the
+  widget on an ALREADY-open handoff has no effect until the next open.
+- **Enforced SERVER-SIDE**, via one shared gate `HandoffManager.should_ingest()`, consulted
+  at all three ingest call sites — `POST /cpsb/upload`, the websocket `upload_edit` chunk
+  handler, and `CpsbWatcher._ingest_settled`. The frontend cannot be the only guard: the
+  plugin uploads with no browser tab open at all, and this must equally govern the Tier-1
+  watcher save and BOTH of the plugin's manual Send paths, which all funnel through
+  `deliverEdit` → `ingest_edit`. A suppressed upload returns a SUCCESS-shaped response
+  (`{"ok": true, "ignored": true}` / `upload_ok`) and logs at INFO — the plugin did nothing
+  wrong, and a user who forgot they set Ignore needs it diagnosable from the console.
+- `maybeAutoQueue` (frontend) additionally refuses to queue for `Update only`/`Ignore`.
+  Precedence: the global `cpsb.autoQueue` setting is checked FIRST, so per-node OFF wins
+  over global ON, and global OFF still wins over per-node `Re-run workflow`.
+- The policy string is duplicated across four layers that cannot import one another
+  (`load_psd.OnSaveMode`, `handoff.TriggerPolicy`, `routes._VALID_TRIGGER_POLICIES`,
+  `pasteback.js`'s constants). `tests/test_load_psd.py`'s drift guard asserts all four
+  agree, reading the JS as text — rewording one in isolation would otherwise silently stop
+  a policy being honored, with no type error anywhere.
 - Frontend: the node type is allowlisted in `captureImageUploadType`'s detection (its
   hand-rolled widget bypasses the stock `image_upload` spec flag), and its context-menu
   origin_kind derives as `load_psd`.

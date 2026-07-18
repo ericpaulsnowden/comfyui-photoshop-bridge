@@ -12,6 +12,7 @@ from PIL import Image
 import cpsb.handoff as handoff_module
 from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
 from cpsb.handoff import (
+    DEFAULT_TRIGGER_POLICY,
     TERMINAL_STATUSES,
     HandoffManager,
     HandoffMeta,
@@ -904,3 +905,129 @@ class TestEditInPlaceDeleteSafety:
         # Any target at all is fine for a handoff that never recorded an
         # edit_in_place original_path -- nothing to protect.
         HandoffManager._reject_unsafe_delete(context.input_dir / "anything", stored)
+
+
+class TestTriggerPolicy:
+    """Product-owner requirement 2026-07-18: a per-handoff save-trigger
+    policy (``on_save`` on ``PhotoshopLoadPSD``, persisted as
+    ``HandoffMeta.trigger_policy``) that governs whether an arriving edit is
+    ingested/re-queues the workflow at all, enforced server-side via
+    ``HandoffManager.should_ingest``.
+    """
+
+    def test_default_is_rerun(self, manager):
+        """Every pre-existing caller that omits `trigger_policy` (the whole
+        rest of this test file included) must keep getting today's exact
+        behavior.
+        """
+        meta = create_handoff(manager)
+        assert meta.trigger_policy == DEFAULT_TRIGGER_POLICY == "Re-run workflow"
+
+    def test_create_records_a_custom_policy(self, manager, context):
+        meta = create_handoff(manager, trigger_policy="Ignore (do nothing)")
+        assert meta.trigger_policy == "Ignore (do nothing)"
+        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
+        assert stored["trigger_policy"] == "Ignore (do nothing)"
+
+    def test_to_dict_from_dict_round_trip(self, manager):
+        meta = create_handoff(manager, trigger_policy="Update only (don't re-run)")
+        round_tripped = HandoffMeta.from_dict(meta.to_dict())
+        assert round_tripped.trigger_policy == "Update only (don't re-run)"
+
+    def test_legacy_meta_without_trigger_policy_key_defaults_to_rerun(self):
+        """A ``meta.json`` written before this field existed (simulating an
+        upgrade from an older version) has NO ``trigger_policy`` key at
+        all -- it must load as :data:`DEFAULT_TRIGGER_POLICY`, not raise and
+        not silently adopt some other value, so an already-in-flight handoff
+        keeps behaving exactly as it always has.
+        """
+        legacy = {
+            "handoff_id": "a1b2c3d4",
+            "origin_node_id": "1",
+            "origin_kind": "load_psd",
+            "workflow_name": "wf",
+            "source": {"filename": "sample.psd", "subfolder": "", "type": "input"},
+            "created_ts": 1.0,
+            "updated_ts": 2.0,
+            "status": "editing",
+            "error": None,
+            "edits": [],
+        }
+        assert "trigger_policy" not in legacy
+        meta = HandoffMeta.from_dict(legacy)
+        assert meta.trigger_policy == DEFAULT_TRIGGER_POLICY
+        # And it round-trips explicitly rather than staying missing.
+        assert meta.to_dict()["trigger_policy"] == DEFAULT_TRIGGER_POLICY
+
+    def test_legacy_meta_with_null_trigger_policy_defaults_to_rerun(self):
+        """Defensive: a stray ``"trigger_policy": null`` (rather than an
+        absent key) must default just as safely.
+        """
+        legacy = {
+            "handoff_id": "a1b2c3d4",
+            "origin_node_id": "1",
+            "origin_kind": "load_psd",
+            "workflow_name": "wf",
+            "source": {"filename": "sample.psd", "subfolder": "", "type": "input"},
+            "created_ts": 1.0,
+            "updated_ts": 2.0,
+            "status": "editing",
+            "error": None,
+            "trigger_policy": None,
+            "edits": [],
+        }
+        meta = HandoffMeta.from_dict(legacy)
+        assert meta.trigger_policy == DEFAULT_TRIGGER_POLICY
+
+
+class TestShouldIngest:
+    """``HandoffManager.should_ingest`` -- the single shared gate consulted
+    at every ingest call site (the HTTP upload route, the plugin websocket's
+    `upload_edit`, and the Tier 1 watcher's settled-save path).
+    """
+
+    def test_rerun_policy_ingests(self, manager):
+        meta = create_handoff(manager, trigger_policy="Re-run workflow")
+        assert manager.should_ingest(meta.handoff_id) is True
+
+    def test_update_only_policy_ingests(self, manager):
+        meta = create_handoff(manager, trigger_policy="Update only (don't re-run)")
+        assert manager.should_ingest(meta.handoff_id) is True
+
+    def test_ignore_policy_does_not_ingest(self, manager):
+        meta = create_handoff(manager, trigger_policy="Ignore (do nothing)")
+        assert manager.should_ingest(meta.handoff_id) is False
+
+    def test_unknown_handoff_defaults_to_true(self, manager):
+        """Existence/active-status is every caller's own job first --
+        `should_ingest` only ever answers the policy question, so an unknown
+        handoff must never be silently treated as "ignore."
+        """
+        assert manager.should_ingest("deadbeef") is True
+
+    def test_ignore_policy_actually_suppresses_ingest_edit(self, manager):
+        """End-to-end within this module: a caller that respects
+        `should_ingest` (as every real ingest call site now does) never
+        appends an edit for an Ignore-policy handoff, while the identical
+        call for a Re-run-policy handoff does.
+        """
+        ignored = create_handoff(manager, trigger_policy="Ignore (do nothing)")
+        rerun = create_handoff(manager, trigger_policy="Re-run workflow")
+
+        for meta in (ignored, rerun):
+            if manager.should_ingest(meta.handoff_id):
+                manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "plugin")
+
+        assert manager.get(ignored.handoff_id).edits == []
+        assert manager.get(ignored.handoff_id).status == "pending"
+        assert len(manager.get(rerun.handoff_id).edits) == 1
+        assert manager.get(rerun.handoff_id).status == "edited"
+
+
+class TestTriggerPolicyInUpdatedEvent:
+    def test_cpsb_updated_carries_the_handoffs_trigger_policy(self, manager, events):
+        meta = create_handoff(manager, trigger_policy="Update only (don't re-run)")
+        manager.ingest_edit(meta.handoff_id, make_image((1, 2, 3)), "plugin")
+
+        payload = events.of_type("cpsb.updated")[0]
+        assert payload["trigger_policy"] == "Update only (don't re-run)"
