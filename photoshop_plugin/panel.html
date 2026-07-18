@@ -280,7 +280,7 @@
            (re)connects / takes over the single plugin slot. panel.js flips the
            label from connection state. -->
       <div class="cpsb-conn-actions">
-        <sp-button id="cpsb-connect-toggle">Disconnect</sp-button>
+        <sp-button id="cpsb-connect-toggle" variant="secondary">Disconnect</sp-button>
       </div>
       <!-- Calm explanation shown when standing by (superseded by another
            Photoshop, or user-disconnected) — a state, not a fault. -->
@@ -302,7 +302,7 @@
            slew of tracked docs). Local-only; the server's records age out on
            their own. Shown only when there's something to clear (panel.js). -->
       <div id="cpsb-handoff-actions" class="cpsb-conn-actions cpsb-collapsed">
-        <sp-button id="cpsb-handoff-clear" quiet>Clear list</sp-button>
+        <sp-button id="cpsb-handoff-clear" variant="secondary" quiet>Clear list</sp-button>
       </div>
 
       <div class="cpsb-rule"></div>
@@ -330,7 +330,7 @@
             class="cpsb-server-input"
             placeholder="localhost:8188"
           ></sp-textfield>
-          <sp-button id="cpsb-server-apply">Apply / Connect</sp-button>
+          <sp-button id="cpsb-server-apply" variant="secondary">Apply / Connect</sp-button>
         </div>
         <div class="cpsb-muted cpsb-conn-line">
           Point at ComfyUI on another computer, e.g. 192.168.1.50:8188 (that

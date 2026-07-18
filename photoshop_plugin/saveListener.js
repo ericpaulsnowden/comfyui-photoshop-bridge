@@ -3,7 +3,7 @@
  * saved document this plugin is tracking, runs the deliver-edit pipeline
  * (handoffs.js). Deliberately thin: identity resolution and debouncing live
  * here; the export+upload sequence itself lives in handoffs.js so this
- * listener and the "Send back now" entry points share one implementation.
+ * listener and the "Send" entry points share one implementation.
  */
 
 const { app, action } = require('photoshop')

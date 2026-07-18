@@ -62,7 +62,7 @@ Today the plugin installs as an **unpackaged developer plugin** (a packaged, one
 3. In UDT: **Add Plugin** → select `photoshop_plugin/manifest.json` from your cloned copy of this repo, then **Load**.
 4. The **ComfyUI** panel appears (Plugins menu). It auto-connects to `localhost:8188` by default; the pill shows **Connected** when it's talking to ComfyUI.
 
-Once installed, a plain Cmd/Ctrl+S sends your edit back automatically — the panel's "Send back now" button is just a manual fallback for saves that don't fire a normal save event (e.g. Export As).
+Once installed, a plain Cmd/Ctrl+S sends your edit back automatically — the panel's "Send" button (one per open document) is just a manual fallback for saves that don't fire a normal save event (e.g. Export As).
 
 Same one-time note as Tier 1: the plugin also opens a PSD (an untitled document would force a where-to-save dialog on every save), so keep Maximize PSD Compatibility on **Always**.
 

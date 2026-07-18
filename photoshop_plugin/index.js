@@ -1,6 +1,6 @@
 /**
  * @file Plugin-scope entry point (PLAN.md §5): wires up `entrypoints.setup()`
- * for the "ComfyUI" panel and the "Send back now" command, and starts the
+ * for the "ComfyUI" panel and the "Send" command, and starts the
  * persistent connection manager from `plugin.create()` — not from the
  * panel's `show()` — so the websocket connection to ComfyUI is established
  * as soon as Photoshop launches (manifest.json sets `host.data.loadEvent`
@@ -84,7 +84,7 @@ function bootstrap() {
   const { logError, describeError } = require('./log.js')
 
   /**
-   * Implements the "Send back now" Plugins-menu command: exports and uploads
+   * Implements the "Send" Plugins-menu command: exports and uploads
    * the active document's current state without waiting for a save event
    * (PLAN.md §2, §5 — the missed-save safety net, e.g. for a user who only
    * ever uses Export/Save a Copy rather than a plain Cmd/Ctrl+S).
@@ -99,7 +99,7 @@ function bootstrap() {
       doc = null
     }
     if (!doc) {
-      logError('"Send back now": no active document')
+      logError('"Send": no active document')
       return
     }
     let record = findByDocumentId(doc.id)
@@ -113,7 +113,7 @@ function bootstrap() {
       }
     }
     if (!record) {
-      logError(`"Send back now": "${doc.title}" is not a document ComfyUI opened`)
+      logError(`"Send": "${doc.title}" is not a document ComfyUI opened`)
       return
     }
     await deliverEdit(record.handoffId)
@@ -147,7 +147,7 @@ function bootstrap() {
           try {
             await sendBackNowForActiveDocument()
           } catch (error) {
-            logError(`"Send back now" command failed: ${describeError(error)}`)
+            logError(`"Send" command failed: ${describeError(error)}`)
           }
         }
       }

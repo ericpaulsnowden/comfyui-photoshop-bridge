@@ -2,7 +2,7 @@
  * @file Wires up the "ComfyUI" panel's DOM (panel.html) to live plugin
  * state: the connection pill with failure diagnostics (target URL, last
  * error, retry countdown), the active-handoffs list with per-document
- * "Send back now" buttons, and the Advanced section's log ring buffer.
+ * "Send" buttons, and the Advanced section's log ring buffer.
  * Pure UI glue — holds no state of its own beyond the DOM it renders into,
  * and every element it needs already exists in panel.html's static markup
  * (this plugin has exactly one panel, which is also the plugin's one and
@@ -147,8 +147,16 @@ function initPanel() {
 
     // The connection control toggles by intent: Connect while standing by
     // (idle, awaiting the user), Disconnect otherwise (so a stuck retry or a
-    // tug-of-war can be stopped).
-    connectToggle.textContent = standby ? 'Connect' : 'Disconnect'
+    // tug-of-war can be stopped). Loud (cta) only when Connect is the
+    // action -- this button holds the panel's single reserved CTA slot, so
+    // Disconnect (a "cancel", not the primary ask) stays secondary.
+    if (standby) {
+      connectToggle.textContent = 'Connect'
+      connectToggle.setAttribute('variant', 'cta')
+    } else {
+      connectToggle.textContent = 'Disconnect'
+      connectToggle.setAttribute('variant', 'secondary')
+    }
 
     // Status pill. Standby is idle, NOT a fault, so it shows a neutral (grey)
     // dot rather than the red disconnected dot.
@@ -233,11 +241,12 @@ function initPanel() {
     status.textContent = record.status
 
     const button = document.createElement('sp-button')
+    button.setAttribute('variant', 'secondary')
     button.setAttribute('quiet', '')
-    button.textContent = 'Send back now'
+    button.textContent = 'Send'
     button.addEventListener('click', () => {
       deliverEdit(record.handoffId).catch((error) => {
-        logError(`"Send back now" (panel) failed: ${describeError(error)}`)
+        logError(`"Send" (panel) failed: ${describeError(error)}`)
       })
     })
 

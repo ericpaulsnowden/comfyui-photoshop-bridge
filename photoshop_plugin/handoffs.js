@@ -2,7 +2,7 @@
  * @file The document <-> handoff registry (docs/PROTOCOL.md §3, §5;
  * PLAN.md §5): tracks which open Photoshop documents correspond to which
  * ComfyUI handoffs, drives the open/cancel side of the websocket protocol,
- * and is the shared entry point the save listener and both "Send back now"
+ * and is the shared entry point the save listener and both "Send"
  * actions (the plugin command and the panel's per-document button) use to
  * run the export+upload pipeline.
  *
@@ -276,7 +276,7 @@ function findOpenDocument(record) {
  * pipeline for a tracked handoff: an immediate `save_detected` notification
  * (informational — docs/PROTOCOL.md §3), then the export pipeline
  * (exporter.js) and the multipart upload (uploader.js). Shared by the save
- * listener (automatic, on a real Photoshop save) and both "Send back now"
+ * listener (automatic, on a real Photoshop save) and both "Send"
  * entry points (the plugin command and the panel's per-document button) —
  * neither of those callers needs to know this sequence exists.
  * @param {string} handoffId
