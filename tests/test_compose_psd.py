@@ -187,7 +187,10 @@ class TestImportability:
 class TestContractShape:
     def test_node_attributes(self):
         assert ComposePSD.CATEGORY == "image/photoshop"
-        assert ComposePSD.RETURN_TYPES == ("IMAGE", "MASK", "STRING")
+        # `layers` (v0.5.25) is APPENDED so saved workflows' existing links,
+        # which ComfyUI stores by output slot index, keep their meaning.
+        assert ComposePSD.RETURN_TYPES == ("IMAGE", "MASK", "STRING", "IMAGE")
+        assert ComposePSD.RETURN_NAMES == ("image", "mask", "filename", "layers")
         assert ComposePSD.FUNCTION == "execute"
 
     def test_input_types_shape(self):
@@ -905,7 +908,7 @@ class TestExecuteCompose:
 
     def test_writes_psd_and_returns_outputs(self, context, manager, configured):
         node = ComposePSD()
-        image_out, mask_out, filename_out = node.execute(
+        image_out, mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="My Layers",
             mode=DONT_OPEN,
@@ -933,7 +936,7 @@ class TestExecuteCompose:
         """A single batched IMAGE socket (e.g. a VAE Decode's multiple outputs)
         expands frame-by-frame into one PSD layer each."""
         node = ComposePSD()
-        _, _, filename_out = node.execute(
+        _, _, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Batch",
             mode=DONT_OPEN,
@@ -947,7 +950,7 @@ class TestExecuteCompose:
     def test_max_layers_caps_batch(self, context, manager, configured):
         """max_layers bounds the batch: only the first N images become layers."""
         node = ComposePSD()
-        _, _, filename_out = node.execute(
+        _, _, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Capped",
             mode=DONT_OPEN,
@@ -962,7 +965,7 @@ class TestExecuteCompose:
     def test_image_1_is_bottom_image_n_is_top(self, context, manager, configured):
         """image_1 bottom, image_2 top -- same-bbox overlap: top wins (PROTOCOL.md §6c)."""
         node = ComposePSD()
-        image_out, _mask_out, _filename = node.execute(
+        image_out, _mask_out, _filename, _layers_out = node.execute(
             filename_prefix="stack",
             group_name="G",
             mode=DONT_OPEN,
@@ -976,7 +979,7 @@ class TestExecuteCompose:
 
     def test_single_image_n1(self, context, manager, configured):
         node = ComposePSD()
-        image_out, mask_out, filename_out = node.execute(
+        image_out, mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="solo",
             group_name="G",
             mode=DONT_OPEN,
@@ -1000,7 +1003,7 @@ class TestExecuteCompose:
             f"image_{i}": make_tensor((i * 10 % 255, 0, 0), size=(10 + i, 10 + i))
             for i in range(1, 9)
         }
-        _image_out, _mask_out, filename_out = node.execute(
+        _image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="eight",
             group_name="G",
             mode=DONT_OPEN,
@@ -1016,7 +1019,7 @@ class TestExecuteCompose:
     def test_mask_reflects_uncovered_canvas_regions(self, context, manager, configured):
         """Canvas dims taken from DIFFERENT inputs: neither alone covers it all."""
         node = ComposePSD()
-        _image_out, mask_out, _filename = node.execute(
+        _image_out, mask_out, _filename, _layers_out = node.execute(
             filename_prefix="uneven",
             group_name="G",
             mode=DONT_OPEN,
@@ -1031,7 +1034,7 @@ class TestExecuteCompose:
 
     def test_filename_collision_safety_across_executions(self, context, manager, configured):
         node = ComposePSD()
-        _, _, first = node.execute(
+        _, _, first, _layers_out = node.execute(
             filename_prefix="dup",
             group_name="G",
             mode=DONT_OPEN,
@@ -1039,7 +1042,7 @@ class TestExecuteCompose:
             unique_id="1",
             image_1=make_tensor(RED),
         )
-        _, _, second = node.execute(
+        _, _, second, _layers_out = node.execute(
             filename_prefix="dup",
             group_name="G",
             mode=DONT_OPEN,
@@ -1056,7 +1059,7 @@ class TestExecuteCompose:
         behavior -- no Photoshop, no handoff.
         """
         node = ComposePSD()
-        image_out, _mask_out, filename_out = node.execute(
+        image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
@@ -1068,6 +1071,118 @@ class TestExecuteCompose:
         assert tuple(array[0, 0]) == RED  # the flat composite, not an edit
         assert filename_out == "compose_00001.psd"
         assert manager.find_active_for_node("1") is None  # never handed off
+
+
+class TestLayersOutput:
+    """The 4th output, ``layers`` (v0.5.25, product-owner request: "when I
+    connect this node to a preview node so I can see all of the layers it
+    only shows one image"): an IMAGE batch with one canvas-sized frame per
+    placed layer, so a Preview node fans out to one image per layer.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_one_frame_per_layer_at_real_positions(self, context, manager, configured):
+        node = ComposePSD()
+        # Two different-sized inputs -> canvas 24x16; the 8x8 one is centered.
+        _img, _mask, _name, layers = node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(24, 16)),
+            image_2=make_tensor(BLUE, size=(8, 8)),
+        )
+        arr = (layers.numpy() * 255.0).round().astype("uint8")
+        assert arr.shape == (2, 16, 24, 3)  # N frames, canvas HxW
+        # Frame 0: layer 1 alone, filling its own extent.
+        assert tuple(arr[0, 0, 0]) == RED
+        assert tuple(arr[0, 8, 12]) == RED
+        # Frame 1: layer 2 alone, centered ((24-8)//2=8, (16-8)//2=4),
+        # black (flattened transparency) everywhere else.
+        assert tuple(arr[1, 8, 12]) == BLUE  # inside the centered 8x8
+        assert tuple(arr[1, 0, 0]) == (0, 0, 0)  # outside it
+        assert tuple(arr[1, 15, 23]) == (0, 0, 0)
+
+    def test_batched_input_expands_to_one_frame_each(self, context, manager, configured):
+        """A batched image_1 becomes one PSD layer per frame (v0.5.9), and
+        `layers` must mirror that expansion, not the socket count."""
+        node = ComposePSD()
+        _img, _mask, _name, layers = node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_batch([RED, GREEN, BLUE], size=(8, 8)),
+        )
+        arr = (layers.numpy() * 255.0).round().astype("uint8")
+        assert arr.shape[0] == 3
+        assert tuple(arr[0, 4, 4]) == RED
+        assert tuple(arr[1, 4, 4]) == GREEN
+        assert tuple(arr[2, 4, 4]) == BLUE
+
+    def test_append_mode_frames_use_target_canvas(self, context, manager, configured, tmp_path):
+        """Appending into an existing doc places layers against ITS fixed
+        canvas -- the layers frames must be sized to match."""
+        target = context.input_dir / "accumulate.psd"
+        existing = PSDImage.new(mode="RGB", size=(40, 30), depth=8)
+        existing.create_pixel_layer(
+            Image.new("RGB", (40, 30), (9, 9, 9)), name="Base", top=0, left=0, opacity=255
+        )
+        existing.save(target)
+
+        node = ComposePSD()
+        _img, _mask, _name, layers = node.execute(
+            filename_prefix="compose",
+            group_name="Run",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+            append_to_existing=True,
+            existing_psd="accumulate.psd",
+        )
+        arr = (layers.numpy() * 255.0).round().astype("uint8")
+        assert arr.shape == (1, 30, 40, 3)  # the TARGET's canvas, not 8x8
+        assert tuple(arr[0, 15, 20]) == RED  # centered on that canvas
+
+    def test_consume_path_still_returns_layers(self, context, manager, configured):
+        """The consume path (an edit came back from Photoshop) returns the
+        edited image/mask -- and `layers` must still be this run's WRITTEN
+        layers, since identity matched, not crash or go empty. Handoff built
+        directly, mirroring test_consumes_latest_edit_instead_of_recomposing.
+        """
+        tensor = make_tensor(RED, size=(8, 8))
+        pil_images = [nodes_module._tensor_to_pil(tensor)]
+        identity_hash = compose_module._compute_identity_hash(pil_images, "Group")
+        meta = manager.create(
+            origin_node_id="1",
+            origin_kind="bridge_node",
+            workflow_name="",
+            source=SourceRef(filename="compose_00001.psd", subfolder="", type="input"),
+            original_image=Image.new("RGBA", (8, 8), (0, 0, 0, 0)),
+            source_hash=identity_hash,
+        )
+        manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), GREEN), "plugin")
+
+        node = ComposePSD()
+        image_out, _mask, _name, layers = node.execute(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=tensor,
+        )
+        image_arr = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert tuple(image_arr[4, 4]) == GREEN  # the EDIT came through
+        arr = (layers.numpy() * 255.0).round().astype("uint8")
+        assert arr.shape[0] == 1
+        assert tuple(arr[0, 4, 4]) == RED  # `layers` = what was written
 
 
 class TestComposeWrittenEvent:
@@ -1112,7 +1227,7 @@ class TestComposeWrittenEvent:
         not create a handoff, a thumbnail, or a ``meta.json``.
         """
         node = ComposePSD()
-        _image_out, _mask_out, filename_out = node.execute(
+        _image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
@@ -1343,7 +1458,7 @@ class TestExecuteConsumePath:
         monkeypatch.setattr(compose_module, "_build_group_psd", _must_not_be_called)
 
         node = ComposePSD()
-        image_out, _mask_out, filename_out = node.execute(
+        image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=WAIT,
@@ -1370,7 +1485,7 @@ class TestExecuteConsumePath:
         manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (200, 150, 100)), "plugin")
 
         node = ComposePSD()
-        image_out, _mask_out, filename_out = node.execute(
+        image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
@@ -1396,7 +1511,7 @@ class TestExecuteConsumePath:
         )  # pending: no edit ingested yet
 
         node = ComposePSD()
-        image_out, _mask_out, _filename = node.execute(
+        image_out, _mask_out, _filename, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
@@ -1422,7 +1537,7 @@ class TestModeRerunEverySave:
         self, context, manager, configured_with_app, launches
     ):
         node = ComposePSD()
-        image_out, _mask_out, filename_out = node.execute(
+        image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=RERUN,
@@ -1487,7 +1602,7 @@ class TestModeRerunEverySave:
     ):
         # v1: a MANAGED COPY of the generated LAYERED file, not edit_in_place.
         node = ComposePSD()
-        _image_out, _mask_out, filename_out = node.execute(
+        _image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=RERUN,
@@ -1543,7 +1658,7 @@ class TestModeRerunEverySave:
 
         node = ComposePSD()
         # Must not raise -- the composed outputs are still returned.
-        image_out, mask_out, filename_out = node.execute(
+        image_out, mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=RERUN,
@@ -1597,7 +1712,7 @@ class TestModeWaitFirstSave:
         monkeypatch.setattr(routes_module, "launch_photoshop", _save_shortly_after_open)
 
         node = ComposePSD()
-        image_out, _mask_out, filename_out = node.execute(
+        image_out, _mask_out, filename_out, _layers_out = node.execute(
             filename_prefix="compose",
             group_name="Group",
             mode=WAIT,
@@ -1900,7 +2015,7 @@ class TestHandoffIdentityReuseAndSupersede:
         active = manager.find_active_for_node(node_id)
         assert active is not None
 
-        image_out, _mask_out, _filename_out = node.execute(
+        image_out, _mask_out, _filename_out, _layers_out = node.execute(
             group_name="Group",
             mode=DONT_OPEN,
             timeout_seconds=1800,
@@ -1963,7 +2078,7 @@ class TestHandoffIdentityReuseAndSupersede:
         monkeypatch.setattr(routes_module, "launch_photoshop", _save_partway_through)
 
         # Re-queue: the user still hasn't saved when this second call starts.
-        image_out, _mask_out, filename_out = node.execute(
+        image_out, _mask_out, filename_out, _layers_out = node.execute(
             group_name="Group",
             mode=WAIT,
             timeout_seconds=10,
@@ -2245,7 +2360,7 @@ class TestAppendExecute:
         target = context.input_dir / "not_yet_created.psd"
         assert not target.exists()
         node = ComposePSD()
-        _, _, filename_out = node.execute(
+        _, _, filename_out, _layers_out = node.execute(
             group_name="Review",
             layer_name="Layer",
             mode=DONT_OPEN,
@@ -2391,7 +2506,7 @@ class TestAppendExecute:
         _write_target(target, [Image.new("RGB", (8, 8), RED)], "Review 1")
 
         node = ComposePSD()
-        image_out, _mask_out, _filename = node.execute(
+        image_out, _mask_out, _filename, _layers_out = node.execute(
             group_name="Review",
             layer_name="Layer",
             mode=DONT_OPEN,

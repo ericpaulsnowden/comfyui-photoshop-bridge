@@ -565,6 +565,18 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   latest-edit hash when an active matching handoff exists; execute() returns the latest
   edit (flattened) when the active handoff's `source_hash` matches the current inputs'
   hash — the §6/§6b consume pattern.
+- **Outputs** (v0.5.25): `(image, mask, filename, layers)` — `layers` is APPENDED so saved
+  workflows' links (stored by output slot index) keep their meaning. `image`/`mask` stay
+  the single flattened composite (or the consumed edit); `layers` is an IMAGE **batch**,
+  one canvas-sized frame per placed layer, frame order = layer order — wire it to a
+  Preview node to see every layer individually (user report: "connect this node to a
+  preview node ... it only shows one image", which was correct-but-unwanted behavior of
+  the flat composite). Frames share the run's real canvas (fresh-build max-of-inputs, or
+  the append target's fixed canvas), layer alpha flattened onto black. Batched `image_N`
+  inputs expand to one frame per batch frame, mirroring the one-layer-per-frame PSD rule
+  (v0.5.9). On the consume path and in "Wait for first save", `layers` remains this run's
+  WRITTEN layers (identity matched, so the inputs are what was written) — the
+  edited/saved result comes back through `image`/`mask`.
 - **Finding the written file** (v0.5.22). "Don't open (composite only)" writes a real PSD
   but deliberately creates NO handoff — and every discoverability surface in this pack
   (gallery cards, badges, reveal/re-open, the right-click menu) is handoff-driven, so the

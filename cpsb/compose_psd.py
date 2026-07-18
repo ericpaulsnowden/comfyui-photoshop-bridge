@@ -500,6 +500,49 @@ def _compute_placements(
     return placements
 
 
+def _layers_batch_tensor(
+    placements: list[tuple[Image.Image, int, int]], canvas_width: int, canvas_height: int
+) -> Any:
+    """The ``layers`` output: an IMAGE batch, one frame per placed layer.
+
+    Product-owner request 2026-07-18: "when I connect this node to a preview
+    node so I can see all of the layers it only shows one image" -- the IMAGE
+    output is (correctly) the single flattened composite, so a Preview node
+    can only ever show that one frame. This batch is the per-layer view: frame
+    *i* is layer *i* alone, placed at its real position on the shared canvas
+    (same :func:`_compute_placements` result the PSD itself was written from),
+    so a Preview/Save node fans out to one image per layer.
+
+    Every frame must share one size to be batchable, which the shared canvas
+    already guarantees. A layer's own alpha is composited onto opaque black --
+    ComfyUI's IMAGE tensors are RGB, and black is the conventional flatten
+    (matching how a transparent region reads elsewhere in this pack's flat
+    outputs).
+
+    Args:
+        placements: ``(layer_image, left, top)`` per layer, bottom-to-top --
+            the exact list the write path produced.
+        canvas_width: The run's canvas width (fresh-build max-of-inputs, or
+            the append target's own fixed canvas).
+        canvas_height: The run's canvas height.
+
+    Returns:
+        A ``(N, H, W, 3)`` float tensor, frame order = layer order
+        (``image_1`` first).
+    """
+    import torch
+
+    frames = []
+    for layer_image, left, top in placements:
+        canvas = Image.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
+        if layer_image.mode == "RGBA":
+            canvas.paste(layer_image, (left, top), layer_image)
+        else:
+            canvas.paste(layer_image, (left, top))
+        frames.append(nodes._pil_to_tensor(canvas))
+    return torch.cat(frames, dim=0)
+
+
 def _create_layers_in_psd(
     psd: PSDImage,
     pil_images: list[Image.Image],
@@ -1222,7 +1265,8 @@ class PhotoshopComposePSD:
     """
 
     CATEGORY = "image/photoshop"
-    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "IMAGE")
+    RETURN_NAMES = ("image", "mask", "filename", "layers")
     FUNCTION = "execute"
 
     @classmethod
@@ -1529,7 +1573,32 @@ class PhotoshopComposePSD:
                     active.handoff_id,
                 )
                 image_tensor, mask_tensor = consumed
-                return image_tensor, mask_tensor, active.source.filename
+                # The `layers` output stays this run's WRITTEN layers (the
+                # inputs as placed), not a decomposition of the saved edit --
+                # the consume path only ever fires on an identity match, so
+                # the inputs ARE what was written. Canvas resolution mirrors
+                # the write path (append target's fixed canvas when
+                # appending, max-of-inputs otherwise); the defensive fallback
+                # covers an append target deleted since the write, where the
+                # write path would fail loudly but consuming a
+                # already-delivered edit still should not.
+                try:
+                    if append_to_existing:
+                        consume_target = _resolve_append_target(
+                            state.context, existing_psd, existing_psd_path
+                        )
+                        canvas_width, canvas_height = _peek_target_canvas(
+                            consume_target, pil_images
+                        )
+                    else:
+                        canvas_width = max(image.width for image in pil_images)
+                        canvas_height = max(image.height for image in pil_images)
+                except Exception:
+                    canvas_width = max(image.width for image in pil_images)
+                    canvas_height = max(image.height for image in pil_images)
+                placements = _compute_placements(pil_images, canvas_width, canvas_height)
+                layers_tensor = _layers_batch_tensor(placements, canvas_width, canvas_height)
+                return image_tensor, mask_tensor, active.source.filename, layers_tensor
             # Filesystem race: the edit file vanished. `active` stays set so
             # the open paths below REUSE it rather than minting a new one.
 
@@ -1621,6 +1690,7 @@ class PhotoshopComposePSD:
 
         flattened = _flatten_placements(placements, canvas_width, canvas_height)
         image_tensor, mask_tensor = nodes._tensors_from_image(flattened)
+        layers_tensor = _layers_batch_tensor(placements, canvas_width, canvas_height)
 
         if mode == MODE_DONT_OPEN:
             # Old always-flat behavior: no Photoshop, no handoff. If a
@@ -1636,7 +1706,7 @@ class PhotoshopComposePSD:
                     active.handoff_id,
                 )
                 manager.supersede(active.handoff_id)
-            return image_tensor, mask_tensor, output_path.name
+            return image_tensor, mask_tensor, output_path.name, layers_tensor
 
         if mode == nodes.BridgeMode.WAIT_FIRST_SAVE:
             # BLOCKS until the first save; returns the SAVED edit (flattened).
@@ -1646,7 +1716,11 @@ class PhotoshopComposePSD:
             image_tensor, mask_tensor, result_name = self._open_and_wait_for_edit(
                 state, node_id, output_path, identity_hash, flattened, timeout_seconds, active
             )
-            return image_tensor, mask_tensor, result_name
+            # `layers` stays this run's WRITTEN layers even though
+            # image/mask are the saved edit: the batch documents what
+            # went INTO the document, which is the review view the
+            # output exists for.
+            return image_tensor, mask_tensor, result_name, layers_tensor
 
         # mode == BridgeMode.RERUN_EVERY_SAVE: open non-blocking, pass the flat
         # composite through. PROTOCOL.md §6c: "Failure to open = log + cpsb.status
@@ -1665,7 +1739,7 @@ class PhotoshopComposePSD:
                 node_id,
             )
 
-        return image_tensor, mask_tensor, result_name
+        return image_tensor, mask_tensor, result_name, layers_tensor
 
     @staticmethod
     def _create_bridge_handoff(
