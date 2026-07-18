@@ -223,7 +223,13 @@ Plugin → server:
   Server replies `hello_ack`. Sent once per connection, first message.
 - `{"type": "ready", "local_mode": true}` — after the plugin probes whether
   `input_cpsb_path` from `hello_ack` exists on its local filesystem. `local_mode:true`
-  → `open_handoff` uses the shared path; `false` → remote mode (fetch via `/cpsb/file/`).
+  → `open_handoff` uses the shared path and `POST /cpsb/upload` for edits; `false` →
+  REMOTE mode, where BOTH the PSD download and the edit upload move onto this same
+  websocket (`request_file` / `upload_edit` below) instead of HTTP. UXP's runtime blocks
+  cleartext `http://` to a non-localhost host but not `ws://` (and `http://localhost` is
+  separately exempt, which is why LOCAL mode's HTTP never needed this) — REMOTE mode's
+  `fetch()` calls to a remote ComfyUI simply fail, so both directions ride the control
+  websocket that is already open and already proven to work cross-machine.
 - `{"type": "opened", "handoff_id": "...", "document_id": 123}` — document open
   succeeded; server sets status `editing`.
 - `{"type": "open_failed", "handoff_id": "...", "error": "..."}` — server sets status
@@ -233,32 +239,78 @@ Plugin → server:
   the machine the user is at) — leaving the handoff in `error` with the plugin's message
   so the real failure is visible.
 - `{"type": "save_detected", "handoff_id": "..."}` — informational (UI badge); pixels
-  follow via POST `/cpsb/upload`.
+  follow via POST `/cpsb/upload` (LOCAL mode) or `upload_edit` (REMOTE mode).
+- `{"type": "request_file", "handoff_id": "..."}` — REMOTE-mode PSD download (replaces a
+  `fetch` of `GET /cpsb/file/{handoff_id}`, which UXP blocks for a non-localhost host).
+  Server replies with one or more `file_chunk`s or a `file_error`, reading the exact same
+  path and the exact same guard (`ACTIVE_STATUSES`) `GET /cpsb/file/{handoff_id}` uses.
+- `{"type": "upload_edit", "handoff_id": "...", "seq": 0, "total": 3, "data_b64": "...",
+  "fidelity": "plugin"}` — one chunk of a REMOTE-mode edit upload (replaces a `fetch`
+  POST to `/cpsb/upload`, same UXP restriction). `fidelity` is sent on every chunk for
+  simplicity (a self-contained frame, no reliance on remembering seq 0's value) but is
+  only actually read once, when the upload completes. See "File transfer chunking"
+  below for how chunks are produced/reassembled. Server replies `upload_ok` once every
+  chunk `0..total-1` has arrived and the reassembled bytes decode and ingest cleanly, or
+  `upload_error` otherwise.
 - `{"type": "pong"}`
 
 Server → plugin:
 - `{"type": "hello_ack", "server_version": "0.1.0", "input_cpsb_path": "/abs/path/to/input/cpsb"}`
 - `{"type": "open_handoff", "handoff_id": "...", "psd_path": "/abs/.../source.psd", "file_url": "/cpsb/file/<id>"}`
-  Plugin opens `psd_path` directly in local mode, else downloads `file_url` into its
-  sandbox and opens that copy. Plugin records document↔handoff mapping either way
-  (path-keyed local, documentID-keyed remote) and replies `opened`/`open_failed`.
+  Plugin opens `psd_path` directly in LOCAL mode. In REMOTE mode the plugin downloads the
+  PSD via `request_file`/`file_chunk` over this websocket (above) rather than fetching
+  `file_url` — `file_url` is still included in this message for backward compatibility
+  and manual/diagnostic use (`GET /cpsb/file/{handoff_id}` itself is unchanged and still
+  works, e.g. from a browser on the server's own LAN) but the plugin no longer calls it.
+  Plugin records document↔handoff mapping either way (path-keyed local, documentID-keyed
+  remote) and replies `opened`/`open_failed`.
+- `{"type": "file_chunk", "handoff_id": "...", "seq": 0, "total": 3, "data_b64": "..."}` —
+  one chunk of a `request_file` response. See "File transfer chunking" below.
+- `{"type": "file_error", "handoff_id": "...", "error": "..."}` — `request_file` failed:
+  unknown/inactive `handoff_id`, or the file is missing/unreadable server-side. Sent
+  instead of any `file_chunk`, never after one.
+- `{"type": "upload_ok", "handoff_id": "..."}` — a REMOTE-mode `upload_edit` was fully
+  reassembled and ingested (or was an idempotent duplicate of the latest edit — same
+  "no error" treatment `POST /cpsb/upload` gives a duplicate).
+- `{"type": "upload_error", "handoff_id": "...", "error": "...", "reason": "unknown_handoff" |
+  "inactive" | "invalid_image" | "malformed"}` — a REMOTE-mode `upload_edit` failed.
+  `reason` mirrors `POST /cpsb/upload`'s HTTP status codes so a client can decide whether
+  retrying makes sense: `unknown_handoff`/`inactive` are the 404/409 equivalents (retrying
+  identical bytes can never change the outcome); `invalid_image`/`malformed` are left
+  retryable, matching the HTTP path's own behavior of still retrying after a 400.
 - `{"type": "handoff_cancelled", "handoff_id": "..."}` — stop tracking that document.
 - `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
   the socket (plugin reconnects with backoff).
 
+**File transfer chunking (`request_file`/`file_chunk` and `upload_edit`):** both
+directions use the identical scheme. The sender base64-encodes the ENTIRE file ONCE,
+then slices that single string into fixed-size pieces (~700,000 characters, comfortably
+inside a "~512KB–1MB base64 chunk" target) sent as successive frames carrying the same
+`handoff_id`, an increasing `seq` starting at 0, and a constant `total` (chunk count).
+The receiver's job is only "concatenate every chunk's `data_b64` in `seq` order, then
+base64-decode ONCE at the end" — chunks are never independently decodable, which avoids
+any per-chunk base64 padding/alignment subtlety (padding only ever appears at the very
+end of the full encoded string). A zero-byte file still produces exactly one chunk
+(`total: 1`, `data_b64: ""`), never a degenerate empty stream. The server's plugin
+websocket is opened with a generous inbound `max_msg_size` (8 MiB) as a safety margin —
+chunking already keeps every real frame well under 1MB on its own.
+
 **Server address (plugin-side, user-configurable):** the plugin targets a single
 `host:port` base (default `localhost:8188`), from which it derives both the WebSocket
-URL (`ws://<base>/cpsb/ws`) and the HTTP origin (`http://<base>` for the `/cpsb/file/*`
-and `/cpsb/upload` routes). It is editable from the panel's Advanced section
-("ComfyUI server"); the value is persisted plugin-side under the `localStorage` key
-`cpsb.serverBase` (falling back to in-session-only if localStorage is unavailable) and
-applying a new address triggers a clean reconnect — the current socket is torn down,
-the backoff/attempt state reset, and the hello/ready handshake re-run against the new
-URL. Default localhost use is unchanged. Cross-machine use — Photoshop on one computer,
-ComfyUI on another — requires (a) the plugin manifest's `network.domains` set to the
-catch-all `"all"` (arbitrary user-entered hosts cannot be enumerated ahead of time, so
-the localhost-only allowlist is widened; a least-privilege allowlist is a possible
-follow-up for a locked-down release), and (b) the ComfyUI server reachable over the
+URL (`ws://<base>/cpsb/ws`) and the HTTP origin (`http://<base>`, used only for LOCAL
+mode's `POST /cpsb/upload` — REMOTE mode no longer makes any HTTP call at all, having
+moved both `GET /cpsb/file/*` and `POST /cpsb/upload` onto the websocket above). It is
+editable from the panel's Advanced section ("ComfyUI server"); the value is persisted
+plugin-side under the `localStorage` key `cpsb.serverBase` (falling back to
+in-session-only if localStorage is unavailable) and applying a new address triggers a
+clean reconnect — the current socket is torn down, the backoff/attempt state reset, and
+the hello/ready handshake re-run against the new URL. Default localhost use is
+unchanged. Cross-machine use — Photoshop on one computer, ComfyUI on another — requires
+(a) the plugin manifest's `network.domains` set to the catch-all `"all"` (arbitrary
+user-entered hosts cannot be enumerated ahead of time, so the localhost-only allowlist is
+widened; a least-privilege allowlist is a possible follow-up for a locked-down release)
+— needed for the `ws://` connection to an arbitrary host, which is the only network
+capability REMOTE mode now depends on — and (b) the ComfyUI server reachable over the
 network, i.e. started with `--listen`.
 
 ---

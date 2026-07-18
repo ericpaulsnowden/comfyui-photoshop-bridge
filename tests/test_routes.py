@@ -9,6 +9,7 @@ into its own namespace, so that is where the patches land).
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import platform
@@ -140,6 +141,18 @@ def upload_form(handoff_id: str, image: bytes, source: str = "plugin") -> aiohtt
     form.add_field("source", source)
     form.add_field("image", image, filename="edit.png", content_type="image/png")
     return form
+
+
+def b64_chunks(data: bytes, chunk_chars: int = 700_000) -> list[str]:
+    """Mirrors `cpsb.routes._split_b64`'s chunking scheme (PROTOCOL.md §3):
+    base64-encode the WHOLE payload once, then slice that string into
+    fixed-size pieces. A small `chunk_chars` forces a real multi-chunk
+    transfer in tests without needing a multi-hundred-KB fixture.
+    """
+    encoded = base64.b64encode(data).decode("ascii")
+    if not encoded:
+        return [""]
+    return [encoded[i : i + chunk_chars] for i in range(0, len(encoded), chunk_chars)]
 
 
 async def wait_until(predicate, timeout: float = 5.0) -> None:
@@ -1604,3 +1617,208 @@ class TestPluginWebsocket:
             await ws.send_str("not json at all")
             # Connection survives all three.
             await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+
+class TestPluginWebsocketFileTransfer:
+    """PROTOCOL.md §3 REMOTE-mode file transfer: `request_file`/`file_chunk`/
+    `file_error` (download, replacing a `fetch` of `GET /cpsb/file/<id>`) and
+    `upload_edit`/`upload_ok`/`upload_error` (upload, replacing a `fetch` POST
+    to `/cpsb/upload`) -- both riding the plugin websocket instead of HTTP,
+    since UXP blocks cleartext `http://` to a non-localhost host but not
+    `ws://`. Connects the plugin in REMOTE mode (`local_mode=False`)
+    throughout, since that's the only mode either message type is meant for.
+    """
+
+    async def test_request_file_streams_chunks_matching_the_source(
+        self, client, context, manager, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            expected = (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes()
+
+            await ws.send_json({"type": "request_file", "handoff_id": handoff_id})
+
+            chunks: dict[int, str] = {}
+            total = None
+            while total is None or len(chunks) < total:
+                msg = await ws.receive_json(timeout=5)
+                assert msg["type"] == "file_chunk"
+                assert msg["handoff_id"] == handoff_id
+                total = msg["total"]
+                chunks[msg["seq"]] = msg["data_b64"]
+
+            reassembled = base64.b64decode("".join(chunks[i] for i in range(total)))
+            assert reassembled == expected
+            assert reassembled.startswith(b"8BPS")  # PSD magic
+
+    async def test_request_file_unknown_handoff_gets_file_error(self, client, context, launches):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "request_file", "handoff_id": "deadbeef"})
+
+            msg = await ws.receive_json(timeout=5)
+            assert msg == {
+                "type": "file_error",
+                "handoff_id": "deadbeef",
+                "error": "Unknown or inactive handoff_id",
+            }
+
+    async def test_request_file_inactive_handoff_gets_file_error(
+        self, client, context, manager, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            cancel_response = await client.post(f"/cpsb/cancel/{handoff_id}")
+            assert cancel_response.status == 200
+            await ws.receive_json(timeout=5)  # handoff_cancelled notification
+
+            await ws.send_json({"type": "request_file", "handoff_id": handoff_id})
+
+            msg = await ws.receive_json(timeout=5)
+            assert msg == {
+                "type": "file_error",
+                "handoff_id": handoff_id,
+                "error": "Unknown or inactive handoff_id",
+            }
+
+    async def test_upload_edit_chunks_reassemble_and_ingest(
+        self, client, context, manager, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            payload = png_bytes((222, 33, 44))
+            # A tiny chunk_chars forces a genuine multi-frame transfer rather
+            # than one chunk holding the whole payload.
+            chunks = b64_chunks(payload, chunk_chars=16)
+            assert len(chunks) > 1
+            total = len(chunks)
+            for seq, chunk in enumerate(chunks):
+                await ws.send_json(
+                    {
+                        "type": "upload_edit",
+                        "handoff_id": handoff_id,
+                        "seq": seq,
+                        "total": total,
+                        "data_b64": chunk,
+                        "fidelity": "plugin",
+                    }
+                )
+
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+
+            meta = manager.get(handoff_id)
+            assert meta.status == "edited"
+            assert len(meta.edits) == 1
+            assert meta.edits[0].fidelity == "plugin"
+            edit_path = context.cpsb_input_dir / handoff_id / meta.edits[0].filename
+            with Image.open(edit_path) as edited:
+                assert edited.getpixel((0, 0))[:3] == (222, 33, 44)
+
+    async def test_upload_edit_unknown_handoff_gets_upload_error(self, client, context, launches):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            payload = png_bytes((1, 2, 3))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": "deadbeef",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+
+            msg = await ws.receive_json(timeout=5)
+            assert msg == {
+                "type": "upload_error",
+                "handoff_id": "deadbeef",
+                "error": "Unknown handoff_id",
+                "reason": "unknown_handoff",
+            }
+
+    async def test_upload_edit_inactive_handoff_gets_upload_error(
+        self, client, context, manager, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+            await client.post(f"/cpsb/cancel/{handoff_id}")
+            await ws.receive_json(timeout=5)  # handoff_cancelled notification
+
+            payload = png_bytes((5, 5, 5))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "upload_error"
+            assert msg["handoff_id"] == handoff_id
+            assert msg["reason"] == "inactive"
+            assert manager.get(handoff_id).status == "cancelled"
+            assert manager.get(handoff_id).edits == []
+
+    async def test_upload_edit_invalid_image_data_gets_upload_error(
+        self, client, context, manager, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            garbage = b"not a png"
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(garbage).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "upload_error"
+            assert msg["handoff_id"] == handoff_id
+            assert msg["reason"] == "invalid_image"
+            meta = manager.get(handoff_id)
+            assert meta.status != "edited"
+            assert meta.edits == []

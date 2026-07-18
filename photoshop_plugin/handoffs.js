@@ -106,9 +106,7 @@ async function openHandoff(msg) {
   const handoffId = msg.handoff_id
   try {
     const isLocal = connection.getState().localMode === true
-    const doc = isLocal
-      ? await openLocal(msg.psd_path)
-      : await openRemote(handoffId, msg.file_url)
+    const doc = isLocal ? await openLocal(msg.psd_path) : await openRemote(handoffId)
     /** @type {CpsbHandoffRecord} */
     const record = {
       handoffId,
@@ -143,23 +141,26 @@ async function openLocal(psdPath) {
 }
 
 /**
- * Remote-mode open: no shared filesystem, so the PSD bytes are fetched over
- * HTTP and written into this plugin's own sandbox folder before opening —
- * a plain Cmd/Ctrl+S then saves in place to that sandbox copy exactly as in
- * Tier 1 (PLAN.md §5).
+ * Remote-mode open: no shared filesystem, so the PSD bytes are downloaded
+ * over the plugin's websocket (`connection.requestFile`, PROTOCOL.md §3:
+ * `request_file`/`file_chunk`/`file_error`) and written into this plugin's
+ * own sandbox folder before opening — a plain Cmd/Ctrl+S then saves in
+ * place to that sandbox copy exactly as in Tier 1 (PLAN.md §5).
+ *
+ * This used to be a plain HTTP `fetch` GET of `file_url` (`/cpsb/file/<id>`)
+ * — UXP's runtime blocks cleartext `http://` to a non-localhost host (the
+ * whole reason cross-machine use needs this fix at all: the plugin's
+ * control `ws://` connection to a remote ComfyUI works fine, but an HTTP
+ * `fetch()` to that same remote host does not), so the download now rides
+ * the identical, already-open websocket instead of a second HTTP call.
  * @param {string} handoffId
- * @param {string} fileUrl - e.g. `/cpsb/file/<id>` (PROTOCOL.md §2).
  * @returns {Promise<import('photoshop').Document>}
  */
-async function openRemote(handoffId, fileUrl) {
-  const response = await fetch(`${connection.getHttpOrigin()}${fileUrl}`)
-  if (!response.ok) {
-    throw new Error(`GET ${fileUrl} failed: HTTP ${response.status}`)
-  }
-  const bytes = await response.arrayBuffer()
+async function openRemote(handoffId) {
+  const bytes = await connection.requestFile(handoffId)
   const folder = await getHandoffsSandboxFolder()
   const file = await folder.createFile(`${handoffId}.psd`, { overwrite: true })
-  await file.write(bytes, { format: formats.binary })
+  await file.write(bytes.buffer, { format: formats.binary })
   return core.executeAsModal(() => app.open(file), { commandName: 'ComfyUI: open handoff' })
 }
 

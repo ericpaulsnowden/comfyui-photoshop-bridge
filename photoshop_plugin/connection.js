@@ -68,6 +68,98 @@ const WS_READY_STATE_OPEN = 1
 const WS_CLOSE_REPLACED = 4000
 
 /**
+ * Chunk size, in base64 CHARACTERS, for both `request_file`'s `file_chunk`
+ * replies and this plugin's own `upload_edit` frames (docs/PROTOCOL.md §3,
+ * cross-machine file transfer). Matches `cpsb/routes.py`'s `_WS_CHUNK_CHARS`
+ * in spirit, not in a load-bearing way -- either side can use a different
+ * chunk size independently, since reassembly is just "concatenate every
+ * chunk's `data_b64` in `seq` order, then base64-decode once at the end."
+ */
+const WS_TRANSFER_CHUNK_CHARS = 700_000
+
+/**
+ * How long to wait for a `request_file` download to fully arrive, or an
+ * `upload_edit` to be acknowledged (`upload_ok`/`upload_error`), before
+ * giving up (docs/PROTOCOL.md §3). Generous relative to a layered PSD that
+ * can run into the tens of MB over a LAN/WAN link.
+ */
+const TRANSFER_TIMEOUT_MS = 60000
+
+/** Base64 alphabet, standard (RFC 4648 §4), used by the hand-rolled codec
+ * below -- see its own doc comment for why this isn't `btoa`/`atob`. */
+const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+/**
+ * Encodes `bytes` to a standard, padded base64 string.
+ *
+ * Hand-rolled rather than relying on `btoa` (which operates on a JS
+ * "binary string", not a byte array, and would need its own conversion loop
+ * either way) or a Node-style `Buffer` (not guaranteed present in UXP) --
+ * this plugin already hand-rolls other binary primitives it needs rather
+ * than assuming runtime APIs beyond what UXP is documented to support (see
+ * exporter.js's PNG encoder: crc32/adler32/zlibStore/pngChunk). Pairs with
+ * {@link base64Decode}.
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function base64Encode(bytes) {
+  let result = ''
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i]
+    const hasB1 = i + 1 < bytes.length
+    const hasB2 = i + 2 < bytes.length
+    const b1 = hasB1 ? bytes[i + 1] : 0
+    const b2 = hasB2 ? bytes[i + 2] : 0
+    result += BASE64_CHARS[b0 >> 2]
+    result += BASE64_CHARS[((b0 & 0x03) << 4) | (b1 >> 4)]
+    result += hasB1 ? BASE64_CHARS[((b1 & 0x0f) << 2) | (b2 >> 6)] : '='
+    result += hasB2 ? BASE64_CHARS[b2 & 0x3f] : '='
+  }
+  return result
+}
+
+/**
+ * Decodes a standard, padded base64 string back to bytes. Pairs with
+ * {@link base64Encode}; not hardened against arbitrary/malformed input
+ * (whitespace, non-alphabet characters) since every caller here only ever
+ * feeds it a string this plugin itself produced or that the server produced
+ * with the identical scheme (`cpsb/routes.py`'s `base64.b64encode`).
+ * @param {string} b64
+ * @returns {Uint8Array}
+ */
+function base64Decode(b64) {
+  const clean = b64.replace(/=+$/, '')
+  const byteLength = Math.floor((clean.length * 3) / 4)
+  const out = new Uint8Array(byteLength)
+  let pos = 0
+  for (let i = 0; i < clean.length; i += 4) {
+    const c0 = BASE64_CHARS.indexOf(clean[i])
+    const c1 = BASE64_CHARS.indexOf(clean[i + 1])
+    const c2 = i + 2 < clean.length ? BASE64_CHARS.indexOf(clean[i + 2]) : -1
+    const c3 = i + 3 < clean.length ? BASE64_CHARS.indexOf(clean[i + 3]) : -1
+    out[pos++] = (c0 << 2) | (c1 >> 4)
+    if (c2 >= 0) out[pos++] = ((c1 & 0x0f) << 4) | (c2 >> 2)
+    if (c3 >= 0) out[pos++] = ((c2 & 0x03) << 6) | c3
+  }
+  return out
+}
+
+/**
+ * Slices `data` into <= {@link WS_TRANSFER_CHUNK_CHARS}-character pieces, in
+ * order. Always returns at least one element (`['']` for empty input).
+ * @param {string} data
+ * @returns {string[]}
+ */
+function splitIntoChunks(data) {
+  if (!data) return ['']
+  const chunks = []
+  for (let i = 0; i < data.length; i += WS_TRANSFER_CHUNK_CHARS) {
+    chunks.push(data.slice(i, i + WS_TRANSFER_CHUNK_CHARS))
+  }
+  return chunks
+}
+
+/**
  * @typedef {Object} CpsbHelloMessage
  * @property {'hello'} type
  * @property {string} plugin_version
@@ -109,7 +201,59 @@ const WS_CLOSE_REPLACED = 4000
  */
 
 /**
- * @typedef {CpsbHelloAckMessage | CpsbPingMessage | CpsbOpenHandoffMessage | CpsbHandoffCancelledMessage} CpsbServerMessage
+ * @typedef {Object} CpsbRequestFileMessage
+ * @property {'request_file'} type
+ * @property {string} handoff_id
+ */
+
+/**
+ * @typedef {Object} CpsbFileChunkMessage
+ * @property {'file_chunk'} type
+ * @property {string} handoff_id
+ * @property {number} seq
+ * @property {number} total
+ * @property {string} data_b64 - One slice of the FULL file's base64 encoding
+ * (docs/PROTOCOL.md §3) -- concatenate every chunk's `data_b64` in `seq`
+ * order, THEN base64-decode once; chunks are never independently decodable.
+ */
+
+/**
+ * @typedef {Object} CpsbFileErrorMessage
+ * @property {'file_error'} type
+ * @property {string} handoff_id
+ * @property {string} error
+ */
+
+/**
+ * @typedef {Object} CpsbUploadEditMessage
+ * @property {'upload_edit'} type
+ * @property {string} handoff_id
+ * @property {number} seq
+ * @property {number} total
+ * @property {string} data_b64 - Same full-encode-then-slice scheme as
+ * {@link CpsbFileChunkMessage}, in the opposite direction.
+ * @property {'plugin'} fidelity
+ */
+
+/**
+ * @typedef {Object} CpsbUploadOkMessage
+ * @property {'upload_ok'} type
+ * @property {string} handoff_id
+ */
+
+/**
+ * @typedef {Object} CpsbUploadErrorMessage
+ * @property {'upload_error'} type
+ * @property {string} handoff_id
+ * @property {string} error
+ * @property {'unknown_handoff' | 'inactive' | 'invalid_image' | 'malformed'} [reason] -
+ * Mirrors `POST /cpsb/upload`'s HTTP status codes: `unknown_handoff`/
+ * `inactive` are the 404/409 equivalents (never worth retrying identical
+ * bytes); `invalid_image`/`malformed` are retryable.
+ */
+
+/**
+ * @typedef {CpsbHelloAckMessage | CpsbPingMessage | CpsbOpenHandoffMessage | CpsbHandoffCancelledMessage | CpsbFileChunkMessage | CpsbFileErrorMessage | CpsbUploadOkMessage | CpsbUploadErrorMessage} CpsbServerMessage
  * Every message type the server can send (docs/PROTOCOL.md §3). Messages
  * with an unrecognized `type` are ignored for forward compatibility, per
  * the contract ("Unknown types are ignored").
@@ -293,6 +437,18 @@ class ConnectionManager extends EventTarget {
      */
     this._standby = null
     this._started = false
+    /**
+     * In-flight `request_file` downloads awaiting reassembly, keyed by
+     * `handoff_id` (docs/PROTOCOL.md §3). See {@link requestFile}.
+     * @type {Map<string, {chunks: string[], received: number, total: number | null, resolve: (bytes: Uint8Array) => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>}>}
+     */
+    this._pendingDownloads = new Map()
+    /**
+     * In-flight `upload_edit` uploads awaiting an `upload_ok`/`upload_error`
+     * ack, keyed by `handoff_id`. See {@link uploadEditOverWs}.
+     * @type {Map<string, {resolve: () => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>}>}
+     */
+    this._pendingUploads = new Map()
   }
 
   /**
@@ -354,6 +510,11 @@ class ConnectionManager extends EventTarget {
    * @returns {void}
    */
   _teardownSocket() {
+    // Any in-flight requestFile()/uploadEditOverWs() call can never complete
+    // over a socket that's about to be torn down — fail it now rather than
+    // making the caller wait out its own timeout. No-op when nothing is
+    // pending (the common case).
+    this._rejectAllPending('Connection closed')
     if (!this._socket) return
     const socket = this._socket
     this._socket = null
@@ -366,6 +527,28 @@ class ConnectionManager extends EventTarget {
     } catch (_error) {
       // Already closing/closed — nothing to do.
     }
+  }
+
+  /**
+   * Fails every in-flight {@link requestFile}/{@link uploadEditOverWs} call
+   * with *reason* and clears both pending maps. Called whenever the socket
+   * is known to be gone (`_teardownSocket`) or just closed (`_onClose`) —
+   * either way, no more `file_chunk`/`upload_ok`/etc. will ever arrive for
+   * these on this connection.
+   * @param {string} reason
+   * @returns {void}
+   */
+  _rejectAllPending(reason) {
+    for (const pending of this._pendingDownloads.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error(reason))
+    }
+    this._pendingDownloads.clear()
+    for (const pending of this._pendingUploads.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error(reason))
+    }
+    this._pendingUploads.clear()
   }
 
   /**
@@ -534,9 +717,90 @@ class ConnectionManager extends EventTarget {
       this.send(/** @type {CpsbPongMessage} */ ({ type: 'pong' }))
       return
     }
+    if (msg.type === 'file_chunk') {
+      this._onFileChunk(/** @type {CpsbFileChunkMessage} */ (msg))
+      return
+    }
+    if (msg.type === 'file_error') {
+      this._onFileError(/** @type {CpsbFileErrorMessage} */ (msg))
+      return
+    }
+    if (msg.type === 'upload_ok') {
+      this._onUploadResult(/** @type {CpsbUploadOkMessage} */ (msg).handoff_id, null, undefined)
+      return
+    }
+    if (msg.type === 'upload_error') {
+      const errorMsg = /** @type {CpsbUploadErrorMessage} */ (msg)
+      this._onUploadResult(errorMsg.handoff_id, errorMsg.error || 'Upload rejected', errorMsg.reason)
+      return
+    }
     // open_handoff / handoff_cancelled / anything future and unrecognized —
     // not this module's concern. handoffs.js listens for these.
     this.dispatchEvent(new CustomEvent('message', { detail: msg }))
+  }
+
+  /**
+   * Accumulates one `file_chunk` for its `handoff_id`'s in-flight
+   * {@link requestFile} call; once every chunk (`0..total-1`) has arrived,
+   * concatenates them in `seq` order and resolves with the decoded bytes. A
+   * chunk for a `handoff_id` with no pending download (already timed out,
+   * already resolved, or simply unexpected) is ignored.
+   * @param {CpsbFileChunkMessage} msg
+   * @returns {void}
+   */
+  _onFileChunk(msg) {
+    const pending = this._pendingDownloads.get(msg.handoff_id)
+    if (!pending) return
+    if (pending.chunks[msg.seq] === undefined) pending.received += 1
+    pending.chunks[msg.seq] = msg.data_b64
+    pending.total = msg.total
+    if (pending.total === null || pending.received < pending.total) return
+    this._pendingDownloads.delete(msg.handoff_id)
+    clearTimeout(pending.timer)
+    try {
+      pending.resolve(base64Decode(pending.chunks.join('')))
+    } catch (error) {
+      pending.reject(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+
+  /**
+   * Fails the in-flight {@link requestFile} call for `msg.handoff_id`, if
+   * any (see {@link _onFileChunk} for the "if any" rationale).
+   * @param {CpsbFileErrorMessage} msg
+   * @returns {void}
+   */
+  _onFileError(msg) {
+    const pending = this._pendingDownloads.get(msg.handoff_id)
+    if (!pending) return
+    this._pendingDownloads.delete(msg.handoff_id)
+    clearTimeout(pending.timer)
+    pending.reject(new Error(msg.error || 'Server reported a file error'))
+  }
+
+  /**
+   * Resolves or rejects the in-flight {@link uploadEditOverWs} call for
+   * `handoffId` (`upload_ok` -> resolve, `upload_error` -> reject with
+   * `error.reason` set to *reason* when the server sent one, so
+   * `uploader.js` can decide whether retrying makes sense). A result for a
+   * `handoffId` with no pending upload is ignored.
+   * @param {string} handoffId
+   * @param {string | null} errorMessage - `null` for `upload_ok`.
+   * @param {string | undefined} reason
+   * @returns {void}
+   */
+  _onUploadResult(handoffId, errorMessage, reason) {
+    const pending = this._pendingUploads.get(handoffId)
+    if (!pending) return
+    this._pendingUploads.delete(handoffId)
+    clearTimeout(pending.timer)
+    if (errorMessage === null) {
+      pending.resolve()
+      return
+    }
+    const error = new Error(errorMessage)
+    if (reason) /** @type {any} */ (error).reason = reason
+    pending.reject(error)
   }
 
   /**
@@ -595,6 +859,13 @@ class ConnectionManager extends EventTarget {
     const wasConnected = this.status === 'connected'
     this._socket = null
     this.localMode = null
+    // The socket is gone either way (superseded, dropped, or refused) — no
+    // `file_chunk`/`upload_ok`/etc. is ever coming for whatever was still
+    // in flight. Note this is the natural-close path (handlers still
+    // attached); a manual disconnect/reconnect goes through
+    // `_teardownSocket`, which does the equivalent cleanup itself since
+    // handlers are stripped before close() there and this handler never runs.
+    this._rejectAllPending('Connection closed')
     // Every close-path failure is transient (server not up yet / refused /
     // dropped) — the "just wait, it's retrying" case, NOT something the user
     // must act on. Only the constructor-throw path in `_open` is blocking.
@@ -692,6 +963,80 @@ class ConnectionManager extends EventTarget {
       return
     }
     this._socket.send(JSON.stringify(message))
+  }
+
+  /**
+   * Downloads `handoffId`'s edit-target PSD over this websocket
+   * (docs/PROTOCOL.md §3: `request_file` -> one or more `file_chunk`s ->
+   * reassembled bytes, or a `file_error`). Used by `handoffs.js`'s
+   * `openRemote` in place of a plain HTTP `fetch` GET, which UXP's runtime
+   * blocks for a non-localhost host even though the identical-origin
+   * `ws://` connection this method rides on works fine.
+   *
+   * Rejects immediately (no message sent) if the socket isn't currently
+   * open, on `file_error` from the server, if the download doesn't finish
+   * within {@link TRANSFER_TIMEOUT_MS}, or if the connection closes/resets
+   * while the download is in flight (see {@link _rejectAllPending}).
+   * @param {string} handoffId
+   * @returns {Promise<Uint8Array>}
+   */
+  requestFile(handoffId) {
+    if (!this._socket || this._socket.readyState !== WS_READY_STATE_OPEN) {
+      return Promise.reject(new Error('Not connected to the ComfyUI server'))
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingDownloads.delete(handoffId)
+        reject(new Error(`request_file for ${handoffId} timed out after ${TRANSFER_TIMEOUT_MS}ms`))
+      }, TRANSFER_TIMEOUT_MS)
+      this._pendingDownloads.set(handoffId, { chunks: [], received: 0, total: null, resolve, reject, timer })
+      this.send(/** @type {CpsbRequestFileMessage} */ ({ type: 'request_file', handoff_id: handoffId }))
+    })
+  }
+
+  /**
+   * Uploads `pngBytes` for `handoffId` over this websocket, split into
+   * {@link WS_TRANSFER_CHUNK_CHARS}-character base64 `upload_edit` chunks
+   * (docs/PROTOCOL.md §3), resolving once the server acks `upload_ok`. Used
+   * by `uploader.js` in REMOTE mode in place of a plain HTTP `fetch` POST
+   * (the same UXP cleartext-to-remote-host restriction {@link requestFile}
+   * exists for).
+   *
+   * Rejects immediately (no messages sent) if the socket isn't currently
+   * open, on `upload_error` from the server (the rejected `Error` carries a
+   * `.reason` when the server sent one — see `CpsbUploadErrorMessage`), if
+   * no ack arrives within {@link TRANSFER_TIMEOUT_MS}, or if the connection
+   * closes/resets mid-upload.
+   * @param {string} handoffId
+   * @param {Uint8Array} pngBytes
+   * @returns {Promise<void>}
+   */
+  uploadEditOverWs(handoffId, pngBytes) {
+    if (!this._socket || this._socket.readyState !== WS_READY_STATE_OPEN) {
+      return Promise.reject(new Error('Not connected to the ComfyUI server'))
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingUploads.delete(handoffId)
+        reject(new Error(`upload_edit for ${handoffId} timed out after ${TRANSFER_TIMEOUT_MS}ms`))
+      }, TRANSFER_TIMEOUT_MS)
+      this._pendingUploads.set(handoffId, { resolve, reject, timer })
+
+      const chunks = splitIntoChunks(base64Encode(pngBytes))
+      const total = chunks.length
+      for (let seq = 0; seq < total; seq++) {
+        this.send(
+          /** @type {CpsbUploadEditMessage} */ ({
+            type: 'upload_edit',
+            handoff_id: handoffId,
+            seq,
+            total,
+            data_b64: chunks[seq],
+            fidelity: 'plugin'
+          })
+        )
+      }
+    })
   }
 
   /** @returns {CpsbConnectionState} */

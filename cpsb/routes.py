@@ -16,6 +16,8 @@ global, so tests can exercise these handlers against a throwaway
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import io
@@ -59,6 +61,28 @@ _SERVER_VERSION = __version__
 _PING_INTERVAL_SECONDS = 30
 _PONG_TIMEOUT_SECONDS = 15
 
+#: Chunk size, in base64 CHARACTERS, for both `file_chunk` (download) and
+#: `upload_edit` (upload) websocket frames (PROTOCOL.md §3, cross-machine
+#: file transfer). The scheme base64-encodes the ENTIRE file ONCE, then
+#: slices that single string into fixed-size pieces -- it never encodes each
+#: raw-byte slice independently -- so reassembly on either end is just
+#: "concatenate every chunk's `data_b64` in `seq` order, then base64-decode
+#: ONCE at the end." That sidesteps any per-chunk padding/alignment
+#: subtlety, since base64 padding only ever appears at the very end of the
+#: full encoded string, never mid-stream. ~700K characters (~700KB on the
+#: wire per frame) sits inside the "~512KB-1MB base64 chunks" target: large
+#: enough that a multi-hundred-MB layered PSD doesn't turn into thousands of
+#: frames, small enough to leave generous headroom under
+#: `_WS_MAX_MSG_SIZE_BYTES` below.
+_WS_CHUNK_CHARS = 700_000
+
+#: Ceiling for one INBOUND plugin websocket frame -- aiohttp's own default
+#: is 4 MiB. `_WS_CHUNK_CHARS` keeps every real `upload_edit` frame well
+#: under ~1MB on its own; this is a safety margin against a misbehaving or
+#: future client sending an oversized chunk, not a value chunking is tuned
+#: to fit exactly.
+_WS_MAX_MSG_SIZE_BYTES = 8 * 1024 * 1024
+
 _VALID_SOURCE_TYPES = ("input", "output", "temp")
 _VALID_ORIGIN_KINDS = ("load_image", "terminal_output", "bridge_node", "load_psd")
 _VALID_MODES = ("new", "original", "fresh")
@@ -91,6 +115,14 @@ class PluginConnection:
     local_mode: bool | None = None
     ready: bool = False
     last_pong: float = field(default_factory=time.monotonic)
+    #: In-progress `upload_edit` reassembly buffers (PROTOCOL.md §3), keyed
+    #: by `handoff_id` -- the ordered list of `data_b64` chunk strings
+    #: received so far for that handoff's in-flight upload. A brand-new
+    #: connection (a fresh `PluginConnection`, one per websocket) always
+    #: starts with an empty dict, so a reconnect mid-upload never resumes a
+    #: half-finished buffer from a previous socket -- the plugin simply
+    #: restarts that upload's chunks from seq 0 over the new connection.
+    pending_uploads: dict[str, list[str]] = field(default_factory=dict)
 
 
 class _PluginSlot:
@@ -1025,6 +1057,199 @@ def _emit_tier2(context: CpsbContext, *, connected: bool, ps_version: str | None
     context.send_event("cpsb.tier2", {"connected": connected, "ps_version": ps_version})
 
 
+def _split_b64(data_b64: str, chunk_size: int = _WS_CHUNK_CHARS) -> list[str]:
+    """Slice *data_b64* into <= *chunk_size*-character pieces, in order.
+
+    Always returns at least one element (``[""]`` for an empty input) so a
+    zero-length file still produces exactly one `file_chunk`/`upload_edit`
+    frame with `total: 1` rather than a degenerate empty stream.
+    """
+    if not data_b64:
+        return [""]
+    return [data_b64[i : i + chunk_size] for i in range(0, len(data_b64), chunk_size)]
+
+
+async def _send_requested_file(
+    connection: PluginConnection, manager: HandoffManager, handoff_id: str
+) -> None:
+    """Stream *handoff_id*'s edit-target PSD to the plugin over the websocket.
+
+    The REMOTE-mode replacement for `GET /cpsb/file/{handoff_id}`
+    (`file_route`), which a REMOTE-mode plugin's `fetch()` cannot reach --
+    UXP blocks cleartext `http://` to a non-localhost host, but not `ws://`,
+    which is exactly why this transfer moves onto the plugin's already-open
+    control websocket instead of a second HTTP call (PROTOCOL.md §3). Reads
+    the same path and applies the same guard `file_route` does
+    (`_psd_path_for_handoff`, `ACTIVE_STATUSES`) so the two transports agree
+    on which bytes and which errors, even though they share no code between
+    them. Sends one `file_chunk` per `_split_b64` slice, or a single
+    `file_error` on any failure (unknown/inactive handoff, missing file,
+    unreadable file) -- never both.
+    """
+    meta = manager.get(handoff_id)
+    if meta is None or meta.status not in ACTIVE_STATUSES:
+        await connection.ws.send_json(
+            {
+                "type": "file_error",
+                "handoff_id": handoff_id,
+                "error": "Unknown or inactive handoff_id",
+            }
+        )
+        return
+    psd_path = _psd_path_for_handoff(manager, meta)
+    if not psd_path.is_file():
+        await connection.ws.send_json(
+            {"type": "file_error", "handoff_id": handoff_id, "error": "source.psd not found"}
+        )
+        return
+    try:
+        raw_bytes = psd_path.read_bytes()
+    except OSError as exc:
+        await connection.ws.send_json(
+            {"type": "file_error", "handoff_id": handoff_id, "error": f"Could not read file: {exc}"}
+        )
+        return
+
+    chunks = _split_b64(base64.b64encode(raw_bytes).decode("ascii"))
+    total = len(chunks)
+    logger.info(
+        "Streaming handoff %s (%d bytes, %d chunk(s)) to the plugin over websocket",
+        handoff_id,
+        len(raw_bytes),
+        total,
+    )
+    for seq, chunk in enumerate(chunks):
+        await connection.ws.send_json(
+            {
+                "type": "file_chunk",
+                "handoff_id": handoff_id,
+                "seq": seq,
+                "total": total,
+                "data_b64": chunk,
+            }
+        )
+
+
+async def _handle_upload_edit_chunk(
+    connection: PluginConnection, manager: HandoffManager, msg: dict[str, Any]
+) -> None:
+    """Handle one `upload_edit` chunk (PROTOCOL.md §3, REMOTE-mode upload).
+
+    Buffers `data_b64` strings on *connection* keyed by `handoff_id` (see
+    `PluginConnection.pending_uploads`) until *seq* reaches *total* - 1, then
+    base64-decodes the full concatenated string ONCE, decodes it as an
+    image, and ingests it exactly like `POST /cpsb/upload` (`upload_route`)
+    does -- both converge on the same `HandoffManager.ingest_edit`. Replies
+    `upload_ok` on success, or `upload_error` (with a `reason` mirroring
+    `upload_route`'s HTTP status codes -- `unknown_handoff`/`inactive` are
+    the 404/409 equivalents an uploader should never retry; `invalid_image`/
+    `malformed` are retryable, matching the HTTP path's own behavior of
+    still retrying on a 400) otherwise.
+    """
+    handoff_id = msg.get("handoff_id")
+    seq = msg.get("seq")
+    total = msg.get("total")
+    data_b64 = msg.get("data_b64")
+    if not handoff_id:
+        logger.warning("cpsb plugin sent upload_edit with no handoff_id, ignoring")
+        return
+    if not isinstance(seq, int) or not isinstance(total, int) or total < 1 or data_b64 is None:
+        logger.warning(
+            "cpsb plugin sent a malformed upload_edit chunk for %s, ignoring", handoff_id
+        )
+        connection.pending_uploads.pop(handoff_id, None)
+        await connection.ws.send_json(
+            {
+                "type": "upload_error",
+                "handoff_id": handoff_id,
+                "error": "Malformed upload_edit chunk",
+                "reason": "malformed",
+            }
+        )
+        return
+
+    buffer = connection.pending_uploads.setdefault(handoff_id, [])
+    buffer.append(data_b64)
+    if len(buffer) < total:
+        return  # More chunks still to come.
+
+    # Reassembly complete -- pop so a later, unrelated upload for the same
+    # handoff_id starts from a clean buffer.
+    ordered_chunks = connection.pending_uploads.pop(handoff_id)
+    try:
+        raw_bytes = base64.b64decode("".join(ordered_chunks), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        await connection.ws.send_json(
+            {
+                "type": "upload_error",
+                "handoff_id": handoff_id,
+                "error": f"Invalid base64: {exc}",
+                "reason": "malformed",
+            }
+        )
+        return
+
+    meta = manager.get(handoff_id)
+    if meta is None:
+        await connection.ws.send_json(
+            {
+                "type": "upload_error",
+                "handoff_id": handoff_id,
+                "error": "Unknown handoff_id",
+                "reason": "unknown_handoff",
+            }
+        )
+        return
+    if meta.status not in ACTIVE_STATUSES:
+        await connection.ws.send_json(
+            {
+                "type": "upload_error",
+                "handoff_id": handoff_id,
+                "error": f"Handoff is {meta.status}, not accepting uploads",
+                "reason": "inactive",
+            }
+        )
+        return
+
+    try:
+        image = Image.open(io.BytesIO(raw_bytes))
+        image.load()
+    except (OSError, ValueError) as exc:
+        await connection.ws.send_json(
+            {
+                "type": "upload_error",
+                "handoff_id": handoff_id,
+                "error": f"Invalid image data: {exc}",
+                "reason": "invalid_image",
+            }
+        )
+        return
+
+    logger.info("Ingesting plugin-sourced websocket upload for handoff %s", handoff_id)
+    # Both the HTTP and websocket upload paths deliver final, already-
+    # flattened pixels with no PSD (re)compositing on our side, so both map
+    # to fidelity "plugin" -- see upload_route's identical comment.
+    edit = manager.ingest_edit(handoff_id, image, "plugin")
+    if edit is None:
+        # Either a duplicate of the most recent edit (idempotent -- the
+        # watchdog and the plugin can both report the same save) or the
+        # handoff went inactive between the check above and here; both are
+        # safe to ack as "already delivered" rather than an error, mirroring
+        # upload_route's own idempotent handling.
+        latest = manager.get(handoff_id)
+        if latest is None or not latest.edits:
+            await connection.ws.send_json(
+                {
+                    "type": "upload_error",
+                    "handoff_id": handoff_id,
+                    "error": "Handoff is no longer active",
+                    "reason": "inactive",
+                }
+            )
+            return
+    await connection.ws.send_json({"type": "upload_ok", "handoff_id": handoff_id})
+
+
 async def _handle_plugin_message(
     context: CpsbContext,
     manager: HandoffManager,
@@ -1087,7 +1312,17 @@ async def _handle_plugin_message(
                 else:
                     await _fallback_to_tier1(context, manager, handoff_id)
     elif msg_type == "save_detected":
-        pass  # Informational only -- pixels follow via POST /cpsb/upload.
+        # Informational only -- pixels follow via POST /cpsb/upload (LOCAL
+        # mode) or a chunked `upload_edit` (REMOTE mode).
+        pass
+    elif msg_type == "request_file":
+        handoff_id = msg.get("handoff_id")
+        if not handoff_id:
+            logger.warning("cpsb plugin sent request_file with no handoff_id, ignoring")
+        else:
+            await _send_requested_file(connection, manager, handoff_id)
+    elif msg_type == "upload_edit":
+        await _handle_upload_edit_chunk(connection, manager, msg)
     elif msg_type == "pong":
         connection.last_pong = time.monotonic()
     else:
@@ -1096,7 +1331,7 @@ async def _handle_plugin_message(
 
 @routes.get("/cpsb/ws")
 async def websocket_route(request: web.Request) -> web.WebSocketResponse:
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(max_msg_size=_WS_MAX_MSG_SIZE_BYTES)
     await ws.prepare(request)
 
     context = _context(request)

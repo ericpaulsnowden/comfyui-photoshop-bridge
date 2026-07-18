@@ -72,6 +72,7 @@ To edit on one computer while ComfyUI runs on another:
 
 1. Start ComfyUI on the server machine with `--listen` (so it's reachable over the network) and note its address.
 2. In the plugin panel, open **Advanced → ComfyUI server (host:port)**, enter the server's address (e.g. `192.168.1.50:8188` or a Tailscale address), and press **Apply / Connect**.
+3. Open an image from ComfyUI — it opens in Photoshop on *your* machine, and a plain Cmd/Ctrl+S sends the edit back. The PSD download and the edit upload both ride the same WebSocket connection (chunked), so the whole round trip works over the network, not just the connection.
 
 Only **one Photoshop holds the connection at a time** (ComfyUI keeps a single plugin slot). If you have Photoshop+plugin running on two machines pointed at the same ComfyUI, the most recent one to connect wins and the other **stands by** — no fighting. Use the panel's **Connect / Disconnect** button to choose which machine is active, or to bow out.
 
