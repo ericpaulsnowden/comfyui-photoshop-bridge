@@ -511,7 +511,7 @@ class TestTier2BoundedSend:
             nodes_module.asyncio, "run_coroutine_threadsafe", _raise_runtime_error
         )
 
-        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_path = manager.psd_path(meta)
         attempt = nodes_module.PhotoshopBridge._send_tier2_open(state, meta, psd_path)
 
         assert attempt.ok is False
@@ -585,7 +585,7 @@ class TestRunningOnStateLoopGuard:
             source=SourceRef(filename="bridge_7.png", subfolder="", type="temp"),
             original_image=Image.new("RGB", (8, 8), (1, 2, 3)),
         )
-        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_path = manager.psd_path(meta)
 
         attempt = nodes_module.PhotoshopBridge._open_in_photoshop(state, meta, psd_path)
 

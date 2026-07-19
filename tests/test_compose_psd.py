@@ -1560,7 +1560,8 @@ class TestModeRerunEverySave:
 
         # The REAL Tier-1 launch seam fired exactly once, on the handoff's copy.
         assert len(launches) == 1
-        handoff_psd = manager.handoff_dir(active.handoff_id) / "source.psd"
+        handoff_psd = manager.psd_path(active)
+        assert handoff_psd.name == "compose_00001.psd"  # derived from the compose output's own name
         assert launches[0] == str(handoff_psd)
 
     def test_rerun_while_already_open_does_not_relaunch_photoshop(
@@ -1613,7 +1614,7 @@ class TestModeRerunEverySave:
         active = manager.find_active_for_node("1")
         assert active.edit_in_place is False
         assert active.original_path is None
-        handoff_psd = manager.handoff_dir(active.handoff_id) / "source.psd"
+        handoff_psd = manager.psd_path(active)
         assert handoff_psd.is_file()
         # Byte-for-byte copy of the generated file (layers preserved).
         assert handoff_psd.read_bytes() == (context.input_dir / filename_out).read_bytes()

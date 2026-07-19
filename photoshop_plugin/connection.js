@@ -190,7 +190,12 @@ function splitIntoChunks(data) {
  * @typedef {Object} CpsbOpenHandoffMessage
  * @property {'open_handoff'} type
  * @property {string} handoff_id
- * @property {string} psd_path - Absolute path to `source.psd` (local mode).
+ * @property {string} psd_path - Absolute, server-side path to the handoff's
+ * managed PSD copy (named after its origin file, not literally `source.psd`
+ * -- product-owner requirement 2026-07-18). Used directly to open in local
+ * mode; in remote mode this plugin never opens the path itself (no shared
+ * filesystem) but still basenames it to name the locally-downloaded copy
+ * the same thing (`handoffs.js`'s `openRemote`).
  * @property {string} file_url - e.g. `/cpsb/file/<id>` (remote mode).
  */
 

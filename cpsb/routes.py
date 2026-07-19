@@ -414,7 +414,7 @@ class ResolvedSource:
     ``orig_thumb.png`` (PROTOCOL.md §1) -- always present on success, for
     every origin kind. ``raw_psd_bytes`` is populated only for a psd-native
     source (``origin_kind: "load_psd"``, PROTOCOL.md §2): when set, the
-    route copies it verbatim as ``source.psd`` instead of calling
+    route copies it verbatim as the handoff's managed PSD copy instead of calling
     :func:`cpsb.psd_io.write_psd` on the decoded pixels, so the handoff
     keeps the user's actual layers rather than flattening them away.
     ``original_path`` mirrors ``raw_psd_bytes`` (populated for the same
@@ -434,8 +434,8 @@ def _placeholder_thumbnail_source() -> Image.Image:
 
     Used only when the psd-native flatten below fails (PROTOCOL.md §2:
     "if flatten fails, a neutral placeholder thumb -- never fail the open
-    for a thumbnail") -- the raw bytes that actually become ``source.psd``
-    are unaffected either way.
+    for a thumbnail") -- the raw bytes that actually become the handoff's
+    managed PSD copy are unaffected either way.
     """
     return Image.new("RGB", _PLACEHOLDER_THUMBNAIL_SIZE, _PLACEHOLDER_THUMBNAIL_COLOR)
 
@@ -451,8 +451,8 @@ def _open_psd_native_source(source_path: Path) -> tuple[bytes, Image.Image]:
     failure never fails the open itself: it falls back to a neutral
     placeholder image so ``HandoffManager.create``'s thumbnail step always
     has something to downsize, while the raw bytes -- the only thing that
-    actually becomes ``source.psd`` -- are read and returned regardless of
-    whether the flatten succeeded.
+    actually becomes the handoff's managed PSD copy -- are read and returned
+    regardless of whether the flatten succeeded.
     """
     raw_bytes = source_path.read_bytes()
     try:
@@ -526,9 +526,11 @@ def _psd_path_for_handoff(manager: HandoffManager, meta: HandoffMeta) -> Path:
     """The path Photoshop should open (and the watcher should watch) for *meta*.
 
     PROTOCOL.md §6b: an ``edit_in_place`` handoff's edit target IS the
-    user's own file (``meta.original_path``) -- it never has a managed
-    ``source.psd`` copy to fall back to. Every other handoff keeps opening
-    the managed copy exactly as before this option existed.
+    user's own file (``meta.original_path``) -- it never has a managed PSD
+    copy to fall back to. Every other handoff keeps opening the managed
+    copy (:meth:`HandoffManager.psd_path`, named per ``meta.psd_filename`` --
+    product-owner requirement 2026-07-18 -- not the literal ``source.psd``)
+    exactly as before this option existed.
     """
     if meta.edit_in_place:
         assert meta.original_path is not None, (
@@ -536,7 +538,7 @@ def _psd_path_for_handoff(manager: HandoffManager, meta: HandoffMeta) -> Path:
             "open_handoff_route's creation branch, the only place edit_in_place is set)"
         )
         return Path(meta.original_path)
-    return manager.handoff_dir(meta.handoff_id) / "source.psd"
+    return manager.psd_path(meta)
 
 
 @routes.post("/cpsb/open")
@@ -673,7 +675,7 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         if watcher is not None:
             watcher.watch_original(meta.handoff_id, psd_path)
     else:
-        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_path = manager.psd_path(meta)
         if resolved.raw_psd_bytes is not None:
             # psd-native (PROTOCOL.md §2): copy the user's own layered file
             # verbatim -- never write_psd/frompil, which would flatten it.
@@ -767,7 +769,16 @@ async def _fallback_to_tier1(
     """Tier 2 ``open_failed`` -> retry via Tier 1 if this server can (PROTOCOL.md §3)."""
     if not tier1_status().available:
         return
-    psd_path = manager.handoff_dir(handoff_id) / "source.psd"
+    meta = manager.get(handoff_id)
+    if meta is None:
+        return
+    # Mirrors this function's own pre-existing behavior: it always resolved
+    # the plain managed-copy path here, never routing through
+    # `_psd_path_for_handoff`'s `edit_in_place` branch. Preserved as-is
+    # (only the filename derivation changed) -- for an edit_in_place
+    # handoff this never had a file at this path anyway, so `is_file()`
+    # below still safely returns early.
+    psd_path = manager.psd_path(meta)
     if not psd_path.is_file():
         return
     # Same off-loop treatment as open_in_photoshop: this runs inside the
@@ -869,11 +880,11 @@ async def file_route(request: web.Request) -> web.Response:
     meta = manager.get(handoff_id)
     if meta is None or meta.status not in ACTIVE_STATUSES:
         return _error(404, "Unknown or inactive handoff_id")
-    # PROTOCOL.md §6b: an edit_in_place handoff has no source.psd copy at
+    # PROTOCOL.md §6b: an edit_in_place handoff has no managed PSD copy at
     # all -- Tier 2 remote-mode download must serve the user's own file.
     psd_path = _psd_path_for_handoff(manager, meta)
     if not psd_path.is_file():
-        return _error(404, "source.psd not found")
+        return _error(404, "PSD file not found")
     return web.Response(body=psd_path.read_bytes(), content_type="image/vnd.adobe.photoshop")
 
 
@@ -1143,7 +1154,7 @@ async def _send_requested_file(
     psd_path = _psd_path_for_handoff(manager, meta)
     if not psd_path.is_file():
         await connection.ws.send_json(
-            {"type": "file_error", "handoff_id": handoff_id, "error": "source.psd not found"}
+            {"type": "file_error", "handoff_id": handoff_id, "error": "PSD file not found"}
         )
         return
     try:

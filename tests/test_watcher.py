@@ -2,8 +2,8 @@
 
 Simulates both Photoshop save-write patterns (PLAN.md §8 spike 4): plain
 in-place rewrite and write-temp-then-rename. Both must ingest exactly once
-per save, and the watcher must ignore the ``source.psd`` this package wrote
-itself when creating the handoff.
+per save, and the watcher must ignore the managed PSD copy this package
+wrote itself when creating the handoff.
 """
 
 from __future__ import annotations
@@ -39,16 +39,26 @@ def watcher(context: CpsbContext, manager: HandoffManager):
     watcher.stop()
 
 
-def create_handoff_with_psd(manager: HandoffManager) -> tuple[HandoffMeta, Path]:
-    """Create a handoff and write its source.psd the way /cpsb/open does."""
+def create_handoff_with_psd(
+    manager: HandoffManager, filename: str = "x.png"
+) -> tuple[HandoffMeta, Path]:
+    """Create a handoff and write its managed PSD copy the way /cpsb/open does.
+
+    *filename* is the ORIGIN filename (product-owner requirement 2026-07-18:
+    the managed copy is now named after it, e.g. "Eric-Headshot.jpg" ->
+    "Eric-Headshot.psd", not the literal "source.psd") -- the returned path
+    is always resolved dynamically via ``manager.psd_path``, so every test
+    using this helper exercises the derived-name watching path regardless
+    of which filename it passes.
+    """
     meta = manager.create(
         origin_node_id="17",
         origin_kind="load_image",
         workflow_name="wf",
-        source=SourceRef(filename="x.png", subfolder="", type="output"),
+        source=SourceRef(filename=filename, subfolder="", type="output"),
         original_image=Image.new("RGB", (24, 16), (10, 20, 30)),
     )
-    psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+    psd_path = manager.psd_path(meta)
     write_psd(psd_path, Image.new("RGB", (24, 16), (10, 20, 30)))
     manager.note_source_written(meta.handoff_id)
     return meta, psd_path
@@ -56,7 +66,7 @@ def create_handoff_with_psd(manager: HandoffManager) -> tuple[HandoffMeta, Path]
 
 def create_edit_in_place_handoff(manager: HandoffManager, original_path: Path) -> HandoffMeta:
     """A `load_psd` handoff whose edit target is *original_path* itself
-    (PROTOCOL.md §6b) -- never a managed `source.psd` copy, unlike
+    (PROTOCOL.md §6b) -- never a managed PSD copy, unlike
     :func:`create_handoff_with_psd`.
     """
     return manager.create(
@@ -106,6 +116,25 @@ class TestInPlaceSave:
         assert refreshed.edits[0].fidelity == "composite"
         with Image.open(manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename) as edit:
             assert edit.getpixel((0, 0)) == (200, 0, 0)
+
+    def test_ingests_a_save_to_the_derived_filename_not_source_psd(self, watcher, manager):
+        """Product-owner requirement 2026-07-18: the managed copy is named
+        after its origin file (``Eric-Headshot.jpg`` -> ``Eric-
+        Headshot.psd``), not literally ``source.psd`` -- the watcher must
+        watch and ingest a save landing on THAT derived name.
+        """
+        meta, psd_path = create_handoff_with_psd(manager, filename="Eric-Headshot.jpg")
+        assert psd_path.name == "Eric-Headshot.psd"
+        assert not (manager.handoff_dir(meta.handoff_id) / "source.psd").exists()
+        settle_quietly(DEBOUNCE_MS / 1000 * 3)
+
+        write_psd(psd_path, Image.new("RGB", (24, 16), (5, 150, 250)))
+
+        wait_for_edit_count(manager, meta.handoff_id, 1)
+        refreshed = manager.get(meta.handoff_id)
+        assert refreshed.status == "edited"
+        with Image.open(manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename) as edit:
+            assert edit.getpixel((0, 0)) == (5, 150, 250)
 
     def test_own_initial_write_is_not_ingested(self, watcher, manager):
         meta, _ = create_handoff_with_psd(manager)
@@ -272,8 +301,8 @@ class TestEditInPlace:
         edit_path = manager.handoff_dir(meta.handoff_id) / refreshed.edits[0].filename
         with Image.open(edit_path) as edit:
             assert edit.getpixel((0, 0)) == (200, 0, 0)
-        # This handoff never has a source.psd copy in the managed folder.
-        assert not (manager.handoff_dir(meta.handoff_id) / "source.psd").exists()
+        # This handoff never has a managed PSD copy in the managed folder.
+        assert not manager.psd_path(meta).exists()
         # And the original itself is exactly what was "saved" -- untouched
         # by this package.
         with Image.open(original) as saved:

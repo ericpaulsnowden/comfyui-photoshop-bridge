@@ -2,7 +2,7 @@
   "manifestVersion": 5,
   "id": "com.cpsb.comfyui-bridge",
   "name": "ComfyUI Bridge",
-  "version": "0.5.25",
+  "version": "0.5.26",
   "main": "panel.html",
   "host": {
     "app": "PS",

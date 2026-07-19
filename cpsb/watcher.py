@@ -8,10 +8,17 @@ write-to-temp-then-rename) without needing to know in advance which one a
 given OS/Photoshop version picks: every event type watchdog can raise
 (``created``, ``modified``, ``moved``) is routed through the same handler.
 
-Only ``source.psd`` is ever acted on within that tree -- ``meta.json``,
-``orig_thumb.png``, and ``edit_*.png`` are files this package writes itself,
-and are ignored by construction (the filename check below only matches
-``source.psd``).
+Only a handoff's own managed PSD copy is ever acted on within that tree --
+``meta.json``, ``orig_thumb.png``, and ``edit_*.png`` are files this package
+writes itself, and are ignored by construction. That managed copy's
+filename is no longer a fixed literal (product-owner requirement
+2026-07-18: it is derived from the handoff's ORIGIN filename at creation
+time, ``HandoffMeta.psd_filename``, e.g. ``Eric-Headshot.psd`` rather than
+every handoff being the indistinguishable ``source.psd``), so
+:meth:`CpsbWatcher.notice` cannot match on a constant filename any more: it
+resolves the handoff id from the event path's PARENT directory name first,
+looks up that handoff's own recorded ``psd_filename``, and only treats the
+event as a managed-copy save when the event path's name matches THAT.
 
 PROTOCOL.md §6b's ``edit_in_place`` option adds a SECOND kind of watch
 target: a specific ``load_psd`` handoff's own original file, living OUTSIDE
@@ -52,8 +59,6 @@ logger = logging.getLogger("cpsb")
 #: with backoff reads (5 attempts, 150ms)" against transient OS locks).
 _READ_ATTEMPTS = 5
 _READ_RETRY_SECONDS = 0.15
-
-_WATCHED_FILENAME = "source.psd"
 
 
 class _HandoffEventHandler(FileSystemEventHandler):
@@ -122,7 +127,7 @@ class CpsbWatcher:
         Also re-establishes a watch for every ACTIVE ``edit_in_place``
         handoff already on record (PROTOCOL.md §6b) -- a server restart
         rebuilds this watcher from scratch, and those files live outside the
-        managed folder, so unlike a normal handoff's ``source.psd`` they
+        managed folder, so unlike a normal handoff's managed PSD copy they
         aren't automatically covered by the recursive watch below.
         """
         if self._observer is not None:
@@ -178,29 +183,55 @@ class CpsbWatcher:
         replaces its entry (harmless; not expected in practice, since a
         given handoff is only ever created once).
         """
-        with self._lock:
-            self._watch_original_locked(handoff_id, path)
-
-    def _watch_original_locked(self, handoff_id: str, path: Path) -> None:
+        # LOCK-ORDERING INVARIANT (deadlock observed 2026-07-19, do not
+        # regress): NEVER call ``observer.schedule``/``unschedule`` while
+        # holding ``self._lock``. On macOS, fsevents' ``schedule`` blocks
+        # coordinating with the observer's own dispatch thread -- and that
+        # dispatch thread runs :meth:`notice`, which takes ``self._lock``
+        # (via ``_schedule``/``_handoff_for_original``). Holding the lock
+        # across ``observer.schedule`` therefore deadlocks the moment a real
+        # save event is being dispatched concurrently: main thread waits on
+        # fsevents, fsevents' dispatcher waits on our lock. So: decide and
+        # record bookkeeping UNDER the lock (with a ``None`` reservation in
+        # ``_parent_watches`` keeping concurrent callers idempotent), then
+        # do the blocking observer call OUTSIDE it, then store the real
+        # watch handle -- re-checking the reservation still exists, since a
+        # concurrent unwatch/stop may have retired it meanwhile.
         resolved = path.resolve()
-        self._original_by_handoff[handoff_id] = resolved
+        with self._lock:
+            self._original_by_handoff[handoff_id] = resolved
+            try:
+                stat = resolved.stat()
+                self._original_baseline[handoff_id] = (stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                # Nothing on disk yet to baseline against -- fine, the first
+                # real event will simply never match a (missing) baseline and
+                # so will always be ingested, same as if this had succeeded.
+                self._original_baseline.pop(handoff_id, None)
+            parent = resolved.parent
+            self._parent_refcounts[parent] = self._parent_refcounts.get(parent, 0) + 1
+            need_schedule = (
+                parent not in self._parent_watches
+                and self._observer is not None
+                and self._handler is not None
+            )
+            if need_schedule:
+                self._parent_watches[parent] = None  # reservation, see above
+            observer = self._observer
+            handler = self._handler
+        if not need_schedule:
+            return
+        watch = observer.schedule(handler, str(parent), recursive=False)
+        with self._lock:
+            if parent in self._parent_watches:
+                self._parent_watches[parent] = watch
+                return
+        # The reservation vanished while we were scheduling (every ref was
+        # unwatched, or stop() cleared the table): this watch is unwanted.
         try:
-            stat = resolved.stat()
-            self._original_baseline[handoff_id] = (stat.st_size, stat.st_mtime_ns)
-        except OSError:
-            # Nothing on disk yet to baseline against -- fine, the first
-            # real event will simply never match a (missing) baseline and
-            # so will always be ingested, same as if this had succeeded.
-            self._original_baseline.pop(handoff_id, None)
-        parent = resolved.parent
-        self._parent_refcounts[parent] = self._parent_refcounts.get(parent, 0) + 1
-        if (
-            parent not in self._parent_watches
-            and self._observer is not None
-            and self._handler is not None
-        ):
-            watch = self._observer.schedule(self._handler, str(parent), recursive=False)
-            self._parent_watches[parent] = watch
+            observer.unschedule(watch)
+        except Exception:  # observer may already be stopped
+            logger.debug("unschedule of an orphaned parent watch failed", exc_info=True)
 
     def unwatch_original(self, handoff_id: str) -> None:
         """Stop watching a handoff's original file (PROTOCOL.md §6b).
@@ -218,6 +249,11 @@ class CpsbWatcher:
         restart (:meth:`start` only restores ACTIVE handoffs) or an explicit
         cancel/discard.
         """
+        # Same lock-ordering invariant as watch_original: bookkeeping under
+        # the lock, the observer call outside it. A popped ``None`` entry is
+        # a reservation whose scheduling thread is still mid-`schedule`; by
+        # popping it here we hand THAT thread the cleanup (its re-check
+        # will find the reservation gone and unschedule its own watch).
         with self._lock:
             resolved = self._original_by_handoff.pop(handoff_id, None)
             self._original_baseline.pop(handoff_id, None)
@@ -230,28 +266,64 @@ class CpsbWatcher:
                 return
             self._parent_refcounts.pop(parent, None)
             watch = self._parent_watches.pop(parent, None)
-            if watch is not None and self._observer is not None:
-                self._observer.unschedule(watch)
+            observer = self._observer
+        if watch is not None and observer is not None:
+            try:
+                observer.unschedule(watch)
+            except Exception:  # observer may already be stopped
+                logger.debug("unschedule failed for %s", parent, exc_info=True)
 
     def notice(self, path_str: str) -> None:
         """Handle one raw filesystem event path.
 
-        Two independent matches, tried in order: a managed-folder
-        ``source.psd`` (the handoff id is simply its parent folder's name,
-        PROTOCOL.md §1), or -- PROTOCOL.md §6b -- a currently-registered
-        ``edit_in_place`` handoff's own original file. Anything matching
-        neither (every other file living under a watched parent directory,
-        e.g. an unrelated upload sitting next to a psd-native source) is
-        silently ignored.
+        Two independent matches, tried in order: a managed-folder handoff's
+        own managed PSD copy, or -- PROTOCOL.md §6b -- a currently-
+        registered ``edit_in_place`` handoff's own original file. Anything
+        matching neither (every other file living under a watched parent
+        directory, e.g. an unrelated upload sitting next to a psd-native
+        source) is silently ignored.
+
+        The managed-copy match used to be a single constant filename
+        (``source.psd``); it is now PER-HANDOFF (product-owner requirement
+        2026-07-18, ``HandoffMeta.psd_filename``), so this resolves the
+        candidate handoff id from the event path's own PARENT directory
+        name first (PROTOCOL.md §1: that IS the handoff id, for anything
+        living directly under the managed folder), looks up its current
+        ``psd_filename`` via the manager, and only treats *path_str* as a
+        managed-copy save when the event path's own name matches that
+        recorded value exactly. A parent name that isn't a known handoff at
+        all (``meta.json``/``orig_thumb.png``/``edit_*.png`` events all
+        still have a real handoff for a parent, but a stray/unrelated file
+        wouldn't) simply falls through to the ``edit_in_place`` check below,
+        same as before.
+
+        A cheap, lock-free extension check runs FIRST and rejects anything
+        that isn't ``.psd``/``.psb``, before ever touching
+        ``HandoffManager``'s lock: every ``meta.json``/``orig_thumb.png``/
+        ``edit_*.png`` write this package makes itself, and any directory-
+        level event bubbling up from a non-recursive ``edit_in_place``
+        parent watch (PROTOCOL.md §6b), is exactly this common, high-volume,
+        never-relevant case -- a managed copy and an ``edit_in_place``
+        original are BOTH always ``.psd``/``.psb`` by construction
+        (:data:`cpsb.routes._PSD_NATIVE_EXTENSIONS`), so nothing real is ever
+        filtered out here. This is not just an optimization: without it,
+        EVERY raw event (however irrelevant) pays a
+        :meth:`HandoffManager.get` lock-acquire-and-deepcopy, and under
+        heavy event volume (many handoffs, or a long-running server) that
+        contention was observed to stall real event processing badly enough
+        to look like a hang in this module's own test suite.
         """
         path = Path(path_str)
-        if path.name == _WATCHED_FILENAME:
-            handoff_id = path.parent.name
+        if path.suffix.lower() not in (".psd", ".psb"):
+            return
+        handoff_id = path.parent.name
+        meta = self._manager.get(handoff_id)
+        if meta is not None and path.name == meta.psd_filename:
             self._schedule(handoff_id, path)
             return
-        handoff_id = self._handoff_for_original(path)
-        if handoff_id is not None:
-            self._schedule(handoff_id, path)
+        original_handoff_id = self._handoff_for_original(path)
+        if original_handoff_id is not None:
+            self._schedule(original_handoff_id, path)
 
     def _handoff_for_original(self, path: Path) -> str | None:
         resolved = path.resolve()
@@ -295,7 +367,7 @@ class CpsbWatcher:
             return
 
         if self._manager.is_own_source_write(handoff_id, stat.st_size, stat.st_mtime_ns):
-            logger.debug("Ignoring our own source.psd write for handoff %s", handoff_id)
+            logger.debug("Ignoring our own managed-copy write for handoff %s", handoff_id)
             return
 
         if self._matches_original_baseline(handoff_id, stat.st_size, stat.st_mtime_ns):

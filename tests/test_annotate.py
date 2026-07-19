@@ -180,16 +180,17 @@ def make_handoff_with_edit(
 ) -> str:
     """A ``bridge_node`` handoff for *source*, already carrying one ingested *edit*.
 
-    Deliberately does NOT write a ``source.psd`` (mirrors ``manager.create``'s
-    own docstring: "Does not write source.psd"). Only usable by tests that
-    never call ``execute()``'s PS-mode consume path -- which now re-opens
-    ``source.psd`` with psd-tools (``cpsb.annotate._read_ps_saved_psd``) and
-    would fail against a handoff with no such file. Safe for ``IS_CHANGED``
-    tests (:class:`TestIsChanged`), which only ever consult
-    ``manager.latest_edit_hash`` (the ingested edit PNG's hash), never
-    ``source.psd`` itself -- and for pass-through-mode tests, which never
-    look up a handoff at all. See :func:`make_handoff_with_layered_edit` for
-    the ``execute()``-safe equivalent.
+    Deliberately does NOT write a managed PSD copy (mirrors
+    ``manager.create``'s own docstring: it never writes the copy itself).
+    Only usable by tests that never call ``execute()``'s PS-mode consume
+    path -- which now re-opens the managed copy with psd-tools
+    (``cpsb.annotate._read_ps_saved_psd``) and would fail against a handoff
+    with no such file. Safe for ``IS_CHANGED`` tests (:class:`TestIsChanged`),
+    which only ever consult ``manager.latest_edit_hash`` (the ingested edit
+    PNG's hash), never the managed copy itself -- and for pass-through-mode
+    tests, which never look up a handoff at all. See
+    :func:`make_handoff_with_layered_edit` for the ``execute()``-safe
+    equivalent.
     """
     meta = manager.create(
         origin_node_id=node_id,
@@ -210,18 +211,18 @@ def make_handoff_with_layered_edit(
     instructions_image: Image.Image | None,
     instructions_layer_name: str = INSTRUCTIONS_LAYER_NAME,
 ) -> str:
-    """A ``bridge_node`` handoff for *source* with a SAVED layered ``source.psd``
-    already on disk, plus one edit recorded so the consume-without-reopening
-    path is taken.
+    """A ``bridge_node`` handoff for *source* with a SAVED layered managed PSD
+    copy already on disk, plus one edit recorded so the consume-without-
+    reopening path is taken.
 
-    The node under test reads ``source.psd`` directly
+    The node under test reads the managed PSD copy directly
     (``cpsb.annotate._read_ps_saved_psd``), not the ingested edit PNG -- so
     this is the layered-PSD analogue of :func:`make_handoff_with_edit`:
     ``manager.ingest_edit`` still needs to fire (that's what makes
     ``active.edits`` non-empty, the signal the consume-without-reopening
     branch checks for), but the pixel content it's given is never looked at
-    by the node -- only what :func:`make_layered_psd` writes to
-    ``source.psd`` is.
+    by the node -- only what :func:`make_layered_psd` writes to the managed
+    copy is.
     """
     meta = manager.create(
         origin_node_id=node_id,
@@ -230,7 +231,7 @@ def make_handoff_with_layered_edit(
         source=SourceRef(filename=f"annotate_{node_id}.png", subfolder="", type="temp"),
         original_image=source,
     )
-    psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+    psd_path = manager.psd_path(meta)
     make_layered_psd(psd_path, saved_base, instructions_image, instructions_layer_name)
     manager.ingest_edit(meta.handoff_id, saved_base, "plugin")
     return meta.handoff_id
@@ -348,7 +349,8 @@ class TestWriteLayeredHandoff:
             )
 
         active = manager.find_active_for_node(node_id)
-        psd_path = manager.handoff_dir(active.handoff_id) / "source.psd"
+        psd_path = manager.psd_path(active)
+        assert psd_path.name == f"annotate_{node_id}.psd"
         assert psd_path.exists()
 
         psd = PSDImage.open(psd_path)
@@ -404,7 +406,7 @@ class TestWriteLayeredHandoff:
             )
 
         active = manager.find_active_for_node(node_id)
-        psd = PSDImage.open(manager.handoff_dir(active.handoff_id) / "source.psd")
+        psd = PSDImage.open(manager.psd_path(active))
         instructions_layer = next(
             layer for layer in psd if layer.name == INSTRUCTIONS_LAYER_NAME
         )
@@ -445,7 +447,7 @@ class TestWriteLayeredHandoff:
                 mask=None,
             )
         active = manager.find_active_for_node(node_id)
-        expected = manager.handoff_dir(active.handoff_id) / "source.psd"
+        expected = manager.psd_path(active)
         assert launches == [str(expected)]
 
 
@@ -894,7 +896,7 @@ class TestPsModeBlocking:
             # itself) -- see test_nodes.py's identical pattern/comment.
             def _do_save():
                 active = manager.find_active_for_node(node_id)
-                saved_psd_path = manager.handoff_dir(active.handoff_id) / "source.psd"
+                saved_psd_path = manager.psd_path(active)
                 base = Image.new("RGB", (width, height), RED)
                 instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
                 ImageDraw.Draw(instructions).point((5, 5), fill=(255, 255, 255, 255))

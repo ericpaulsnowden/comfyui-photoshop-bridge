@@ -34,6 +34,12 @@ from cpsb.version import __version__ as CPSB_VERSION
 from cpsb.watcher import CpsbWatcher
 
 SOURCE_FILENAME = "ComfyUI_00042_.png"
+#: The managed PSD copy's derived name for `SOURCE_FILENAME` (product-owner
+#: requirement 2026-07-18: named after the origin file, not the literal
+#: "source.psd" every handoff used to get -- cpsb.handoff._derive_psd_filename
+#: strips the extension and appends ".psd", and every char in this stem is
+#: already allowed, so nothing is sanitized away).
+SOURCE_PSD_FILENAME = "ComfyUI_00042_.psd"
 
 
 def png_bytes(color: tuple[int, int, int], size: tuple[int, int] = (24, 16)) -> bytes:
@@ -243,14 +249,54 @@ class TestOpen:
 
         # Tier 1 launch attempted with the handoff PSD, then marked editing.
         assert len(launches.calls) == 1
-        assert launches.calls[0][0].endswith(f"{handoff_id}/source.psd")
+        assert launches.calls[0][0].endswith(f"{handoff_id}/{SOURCE_PSD_FILENAME}")
         # The blocking launch must have run off the event loop (to_thread).
         assert launches.on_event_loop == [False]
         assert manager.get(handoff_id).status == "editing"
+        assert manager.get(handoff_id).psd_filename == SOURCE_PSD_FILENAME
         folder = context.cpsb_input_dir / handoff_id
-        assert (folder / "source.psd").is_file()
+        assert (folder / SOURCE_PSD_FILENAME).is_file()
         assert (folder / "orig_thumb.png").is_file()
         assert (folder / "meta.json").is_file()
+
+    async def test_managed_filename_derives_from_the_source_and_is_launched_on(
+        self, client, manager, context, launches
+    ):
+        """Product-owner requirement 2026-07-18, end-to-end: opening a handoff
+        from "Eric-Headshot.jpg" names the managed copy "Eric-Headshot.psd"
+        (not the literal "source.psd" every handoff used to get), and
+        Photoshop is launched on THAT exact path.
+        """
+        (context.output_dir / "Eric-Headshot.jpg").write_bytes(png_bytes((10, 20, 30)))
+
+        response = await client.post("/cpsb/open", json=open_body(filename="Eric-Headshot.jpg"))
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        meta = manager.get(handoff_id)
+        assert meta.psd_filename == "Eric-Headshot.psd"
+        expected_path = context.cpsb_input_dir / handoff_id / "Eric-Headshot.psd"
+        assert manager.psd_path(meta) == expected_path
+        assert expected_path.is_file()
+        assert launches.calls[0][0] == str(expected_path)
+
+    async def test_file_route_serves_the_derived_filename(
+        self, client, manager, context, launches
+    ):
+        """GET /cpsb/file/{id} serves whatever file the derived name
+        actually resolved to -- exercised here with a non-default name so a
+        stale hardcoded "source.psd" assumption anywhere would show up as a
+        404 rather than passing by accident.
+        """
+        (context.output_dir / "Eric-Headshot.jpg").write_bytes(png_bytes((1, 2, 3)))
+        response = await client.post("/cpsb/open", json=open_body(filename="Eric-Headshot.jpg"))
+        handoff_id = (await response.json())["handoff_id"]
+
+        file_response = await client.get(f"/cpsb/file/{handoff_id}")
+
+        assert file_response.status == 200
+        expected = (context.cpsb_input_dir / handoff_id / "Eric-Headshot.psd").read_bytes()
+        assert await file_response.read() == expected
 
     async def test_launch_failure_marks_error(self, client, manager, source_image, launches):
         launches.result = LaunchResult(ok=False, error="Photoshop not found")
@@ -454,9 +500,11 @@ class TestAutoSupersedeOnChangedSource:
 
 class TestOpenPsdNative:
     """``POST /cpsb/open`` with ``origin_kind: "load_psd"`` (PROTOCOL.md §2/§6b):
-    the handoff's ``source.psd`` is a verbatim byte-for-byte copy of the
+    the handoff's managed PSD copy is a verbatim byte-for-byte copy of the
     user's own file (never a re-encoded flatten), and ``source_hash`` is the
-    sha256 of those raw bytes rather than a PNG-encoding hash.
+    sha256 of those raw bytes rather than a PNG-encoding hash. Every source
+    filename used here already ends in ``.psd`` with a clean stem, so the
+    derived ``psd_filename`` is identical to the origin's own name.
     """
 
     async def test_copies_bytes_verbatim(self, client, context, manager, launches, tmp_path):
@@ -467,9 +515,11 @@ class TestOpenPsdNative:
 
         assert response.status == 200
         handoff_id = (await response.json())["handoff_id"]
-        copied = (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes()
+        meta = manager.get(handoff_id)
+        assert meta.psd_filename == "sample.psd"  # derived from "sample.psd"'s own stem
+        copied = manager.psd_path(meta).read_bytes()
         assert copied == original
-        assert manager.get(handoff_id).source_hash == hashlib.sha256(original).hexdigest()
+        assert meta.source_hash == hashlib.sha256(original).hexdigest()
 
     async def test_preserves_real_layers_not_flattened(
         self, client, context, manager, launches, tmp_path
@@ -490,7 +540,9 @@ class TestOpenPsdNative:
 
         assert response.status == 200
         handoff_id = (await response.json())["handoff_id"]
-        copied_path = context.cpsb_input_dir / handoff_id / "source.psd"
+        meta = manager.get(handoff_id)
+        assert meta.psd_filename == "layered.psd"  # derived from "layered.psd"'s own stem
+        copied_path = manager.psd_path(meta)
         assert copied_path.read_bytes() == original
         assert len(list(PSDImage.open(copied_path))) == 1  # the "Red" layer, intact
 
@@ -538,7 +590,7 @@ class TestOpenPsdNative:
         with Image.open(thumb_path) as thumb:
             thumb.load()  # a real, decodable PNG -- not a stub/empty file
         # The raw bytes are still copied verbatim regardless of the flatten failure.
-        copied = (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes()
+        copied = manager.psd_path(manager.get(handoff_id)).read_bytes()
         assert copied == corrupt
 
     async def test_source_hash_is_raw_bytes_sha_not_png_encoding(
@@ -732,7 +784,7 @@ class TestPsdPreview:
 
 class TestOpenPsdEditInPlace:
     """PROTOCOL.md §6b "Edit-original option": ``edit_in_place: true`` on a
-    ``load_psd`` open skips the ``source.psd`` copy entirely and makes the
+    ``load_psd`` open skips the managed PSD copy entirely and makes the
     handoff's edit target the user's own original file.
     """
 
@@ -752,8 +804,8 @@ class TestOpenPsdEditInPlace:
         meta = manager.get(handoff_id)
         assert meta.edit_in_place is False
         assert meta.original_path is None
-        assert (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes() == original
-        assert launches.calls[0][0].endswith(f"{handoff_id}/source.psd")
+        assert manager.psd_path(meta).read_bytes() == original
+        assert launches.calls[0][0].endswith(f"{handoff_id}/{meta.psd_filename}")
 
     async def test_edit_in_place_skips_the_copy(self, client, context, manager, launches, tmp_path):
         original_file = context.input_dir / "sample.psd"
@@ -763,8 +815,8 @@ class TestOpenPsdEditInPlace:
 
         assert response.status == 200
         handoff_id = (await response.json())["handoff_id"]
-        assert not (context.cpsb_input_dir / handoff_id / "source.psd").exists()
         meta = manager.get(handoff_id)
+        assert not manager.psd_path(meta).exists()
         assert meta.edit_in_place is True
         assert meta.original_path == str(original_file.resolve())
 
@@ -855,8 +907,8 @@ class TestOpenPsdEditInPlace:
         self, client, context, tmp_path
     ):
         """GET /cpsb/file/{id} (Tier 2 remote-mode download) must serve the
-        ORIGINAL bytes for an edit_in_place handoff -- there is no
-        source.psd copy to fall back to.
+        ORIGINAL bytes for an edit_in_place handoff -- there is no managed
+        PSD copy to fall back to.
         """
         original = psd_bytes(tmp_path, color=(70, 80, 90))
         (context.input_dir / "sample.psd").write_bytes(original)
@@ -985,7 +1037,7 @@ class TestTriggerPolicyWatcherGate:
 
         # Simulate Photoshop overwriting the MANAGED copy in place (a plain
         # Cmd+S), exactly like a real edit would arrive.
-        source_path = context.cpsb_input_dir / handoff_id / "source.psd"
+        source_path = manager.psd_path(manager.get(handoff_id))
         write_psd(source_path, Image.new("RGB", (16, 16), (250, 0, 0)))
 
         # Generous settle window (debounce + a margin) -- nothing should
@@ -1010,7 +1062,7 @@ class TestTriggerPolicyWatcherGate:
         handoff_id = (await response.json())["handoff_id"]
         await asyncio.sleep(0.3)
 
-        source_path = context.cpsb_input_dir / handoff_id / "source.psd"
+        source_path = manager.psd_path(manager.get(handoff_id))
         write_psd(source_path, Image.new("RGB", (16, 16), (0, 250, 0)))
 
         await wait_until(lambda: len(manager.get(handoff_id).edits) >= 1)
@@ -1598,7 +1650,7 @@ class TestPluginWebsocket:
             command = await ws.receive_json(timeout=5)
             assert command["type"] == "open_handoff"
             assert command["handoff_id"] == data["handoff_id"]
-            assert command["psd_path"].endswith("source.psd")
+            assert command["psd_path"].endswith(SOURCE_PSD_FILENAME)
             assert command["file_url"] == f"/cpsb/file/{data['handoff_id']}"
             # Tier 2: no OS launch, and status stays pending until `opened`.
             assert launches.calls == []
@@ -1810,7 +1862,7 @@ class TestPluginWebsocketFileTransfer:
             handoff_id = data["handoff_id"]
             await ws.receive_json(timeout=5)  # open_handoff command
 
-            expected = (context.cpsb_input_dir / handoff_id / "source.psd").read_bytes()
+            expected = manager.psd_path(manager.get(handoff_id)).read_bytes()
 
             await ws.send_json({"type": "request_file", "handoff_id": handoff_id})
 

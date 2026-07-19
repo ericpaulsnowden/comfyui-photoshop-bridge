@@ -12,6 +12,7 @@ from PIL import Image
 import cpsb.handoff as handoff_module
 from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
 from cpsb.handoff import (
+    DEFAULT_PSD_FILENAME,
     DEFAULT_TRIGGER_POLICY,
     TERMINAL_STATUSES,
     HandoffManager,
@@ -612,7 +613,7 @@ class TestWaitTable:
 class TestOwnSourceWrites:
     def test_signature_matches_until_file_changes(self, manager, context):
         meta = create_handoff(manager)
-        psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_path = manager.psd_path(meta)
         psd_path.write_bytes(b"fake psd contents")
         manager.note_source_written(meta.handoff_id)
 
@@ -742,7 +743,7 @@ class TestEditInPlaceFields:
         assert stored["edit_in_place"] is True
         assert stored["original_path"] == str(original.resolve())
         # orig_thumb.png is still written -- the gallery keeps working even
-        # though there is no source.psd copy for this handoff.
+        # though there is no managed PSD copy for this handoff.
         assert (context.cpsb_input_dir / meta.handoff_id / "orig_thumb.png").is_file()
 
     def test_to_dict_from_dict_round_trip(self, manager, tmp_path):
@@ -1031,3 +1032,186 @@ class TestTriggerPolicyInUpdatedEvent:
 
         payload = events.of_type("cpsb.updated")[0]
         assert payload["trigger_policy"] == "Update only (don't re-run)"
+
+
+def named_source(filename: str) -> SourceRef:
+    return SourceRef(filename=filename, subfolder="", type="input")
+
+
+class TestPsdFilename:
+    """Product-owner requirement 2026-07-18: the managed PSD copy is named
+    after its ORIGIN file (e.g. ``Eric-Headshot.jpg`` -> ``Eric-
+    Headshot.psd``) instead of the literal ``source.psd`` every handoff used
+    to get, so Photoshop's own document TITLE -- and any dropdown/gallery
+    that lists handoffs by filename -- can actually tell them apart.
+    """
+
+    def test_create_derives_filename_from_source(self, manager):
+        meta = create_handoff(manager, source=named_source("Eric-Headshot.jpg"))
+        assert meta.psd_filename == "Eric-Headshot.psd"
+
+    def test_psd_path_uses_the_derived_filename(self, manager, context):
+        meta = create_handoff(manager, source=named_source("Eric-Headshot.jpg"))
+        assert manager.psd_path(meta) == (
+            context.cpsb_input_dir / meta.handoff_id / "Eric-Headshot.psd"
+        )
+
+    def test_persisted_in_meta_json(self, manager, context):
+        meta = create_handoff(manager, source=named_source("Eric-Headshot.jpg"))
+        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
+        assert stored["psd_filename"] == "Eric-Headshot.psd"
+
+    def test_to_dict_from_dict_round_trip(self, manager):
+        meta = create_handoff(manager, source=named_source("Eric-Headshot.jpg"))
+        round_tripped = HandoffMeta.from_dict(meta.to_dict())
+        assert round_tripped.psd_filename == "Eric-Headshot.psd"
+
+    def test_load_psd_origin_keeps_its_own_psd_name(self, manager):
+        """A ``load_psd`` origin whose filename already ends in ``.psd`` with
+        a clean stem derives to the EXACT SAME name -- so two Load PSD
+        handoffs opened from different source files are distinguishable by
+        name too, not just ``bridge_node``/``load_image`` origins.
+        """
+        meta = create_handoff(
+            manager, origin_kind="load_psd", source=named_source("my-artwork.psd")
+        )
+        assert meta.psd_filename == "my-artwork.psd"
+
+    def test_legacy_meta_without_the_field_defaults_to_source_psd(self):
+        legacy = {
+            "handoff_id": "a1b2c3d4",
+            "origin_node_id": "17",
+            "origin_kind": "load_image",
+            "workflow_name": "wf",
+            "source": {"filename": "Eric-Headshot.jpg", "subfolder": "", "type": "output"},
+            "created_ts": 1.0,
+            "updated_ts": 2.0,
+            "status": "editing",
+            "error": None,
+            "edits": [],
+        }
+        assert "psd_filename" not in legacy
+        meta = HandoffMeta.from_dict(legacy)
+        assert meta.psd_filename == DEFAULT_PSD_FILENAME == "source.psd"
+        # And it round-trips explicitly rather than staying missing.
+        assert meta.to_dict()["psd_filename"] == DEFAULT_PSD_FILENAME
+
+    def test_legacy_meta_with_null_psd_filename_defaults_to_source_psd(self):
+        """Defensive: a stray ``"psd_filename": null`` (rather than an
+        absent key) must default just as safely.
+        """
+        legacy = {
+            "handoff_id": "a1b2c3d4",
+            "origin_node_id": "17",
+            "origin_kind": "load_image",
+            "workflow_name": "wf",
+            "source": {"filename": "Eric-Headshot.jpg", "subfolder": "", "type": "output"},
+            "created_ts": 1.0,
+            "updated_ts": 2.0,
+            "status": "editing",
+            "error": None,
+            "psd_filename": None,
+            "edits": [],
+        }
+        meta = HandoffMeta.from_dict(legacy)
+        assert meta.psd_filename == DEFAULT_PSD_FILENAME
+
+
+class TestDerivePsdFilenameSanitization:
+    """Direct coverage of :func:`cpsb.handoff._derive_psd_filename` -- the
+    sanitization rules themselves, independent of handoff creation.
+    """
+
+    def test_simple_name_passes_through(self):
+        assert handoff_module._derive_psd_filename("Eric-Headshot.jpg") == "Eric-Headshot.psd"
+
+    def test_underscores_and_digits_pass_through(self):
+        assert handoff_module._derive_psd_filename("bridge_17.png") == "bridge_17.psd"
+
+    def test_already_psd_extension_keeps_its_own_stem(self):
+        assert handoff_module._derive_psd_filename("Eric-Headshot.psd") == "Eric-Headshot.psd"
+
+    def test_disallowed_characters_become_a_single_dash(self):
+        # "!!@@##" (6 disallowed chars in a row) collapses to ONE dash, not six.
+        assert handoff_module._derive_psd_filename("weird!!@@##chars.png") == "weird-chars.psd"
+
+    def test_isolated_disallowed_characters_become_isolated_dashes(self):
+        # Non-adjacent invalid characters ("(" and ")" separated by "2") each
+        # become their own dash -- no run to collapse -- and a resulting
+        # TRAILING dash is trimmed off the end.
+        assert handoff_module._derive_psd_filename("photo (2).png") == "photo -2.psd"
+
+    def test_leading_and_trailing_whitespace_trimmed(self):
+        assert (
+            handoff_module._derive_psd_filename("  leading and trailing spaces  .png")
+            == "leading and trailing spaces.psd"
+        )
+
+    def test_leading_and_trailing_dash_runs_trimmed(self):
+        assert (
+            handoff_module._derive_psd_filename("---dashes-only-boundary---.png")
+            == "dashes-only-boundary.psd"
+        )
+
+    def test_caps_at_60_chars(self):
+        long_stem = "a" * 200
+        result = handoff_module._derive_psd_filename(f"{long_stem}.jpg")
+        assert result == ("a" * 60) + ".psd"
+
+    def test_capped_result_trims_a_dash_left_at_the_cut(self):
+        """The cap can land exactly ON a dash (the 60th character); the
+        implementation trims a SECOND time after capping so the final name
+        never ends in a stray dash.
+        """
+        origin = "a" * 59 + "-" + "b" * 10 + ".jpg"  # dash sits at index 59
+        result = handoff_module._derive_psd_filename(origin)
+        assert result == "a" * 59 + ".psd"
+
+    @pytest.mark.parametrize(
+        "origin_filename",
+        ["", "#.jpg", "-----.png", "     .png", ".", "..", "...", "...."],
+    )
+    def test_empty_or_degenerate_stem_falls_back_to_default(self, origin_filename):
+        """Every one of these has a stem (per ``pathlib.Path.stem`` on the
+        Python version this project actually runs on -- verified directly
+        against the installed interpreter, not assumed from memory: pathlib's
+        own suffix-parsing rules for multiple leading dots are NOT the same
+        across Python versions, e.g. ``Path("..jpg").stem`` differs between
+        3.10 and 3.14) that contains no letter or digit at all, so
+        :func:`_derive_psd_filename` must fall back to the default rather
+        than emit a punctuation-only filename.
+        """
+        assert handoff_module._derive_psd_filename(origin_filename) == DEFAULT_PSD_FILENAME
+
+    def test_dotfile_with_real_letters_is_not_degenerate(self):
+        """``".hidden.jpg"`` keeps its letters but LOSES the leading dot:
+        leading dots are stripped after extension-splitting so a dotfile
+        origin can never yield a HIDDEN managed file (a ``.name.psd`` in the
+        remote plugin's sandbox would be invisible in Finder, and hidden
+        from the very dropdowns this feature exists to improve).
+        """
+        assert handoff_module._derive_psd_filename(".hidden.jpg") == "hidden.psd"
+
+    def test_dotfile_with_no_real_name_still_has_letters_so_is_not_degenerate(self):
+        """``Path(".jpg").stem == ".jpg"`` (pathlib's own single-leading-dot
+        convention: with no OTHER dot, nothing is parsed as a suffix at all)
+        -- a leading dot is a dotfile marker, not an extension separator, and
+        leading dots are stripped so a dotfile origin can never yield a
+        HIDDEN managed file. The letters survive as the stem.
+
+        These edge names originally asserted ``Path(...).stem``'s behavior,
+        which CHANGED between Python 3.10 and 3.14 -- the derivation now
+        splits the extension manually precisely so the persisted filename
+        (matched by the watcher, recorded in meta.json) is identical on
+        every interpreter a ComfyUI install might run.
+        """
+        assert handoff_module._derive_psd_filename(".jpg") == "jpg.psd"
+
+    def test_multiple_leading_dots_collapse_to_degenerate(self):
+        """``"..jpg"``: the last dot has something before it (a dot), so it
+        IS the extension separator -- the stem is ``"."``, which strips to
+        empty and falls back to the default. Deterministic on every
+        interpreter (see the single-leading-dot case above for why the
+        manual split exists).
+        """
+        assert handoff_module._derive_psd_filename("..jpg") == DEFAULT_PSD_FILENAME

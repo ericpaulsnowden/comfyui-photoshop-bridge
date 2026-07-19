@@ -491,7 +491,8 @@ export function thumbUrl(handoffId) {
 }
 
 /**
- * Builds the URL for GET `/cpsb/file/{handoffId}` (the raw `source.psd`).
+ * Builds the URL for GET `/cpsb/file/{handoffId}` (the handoff's raw managed
+ * PSD file, whatever name the server derived for it).
  * Included for completeness with every route in PROTOCOL.md §2; this
  * frontend never fetches it itself — it exists solely for the UXP plugin's
  * remote-mode download.

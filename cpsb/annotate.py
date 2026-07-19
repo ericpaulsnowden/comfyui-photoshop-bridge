@@ -31,7 +31,7 @@ to preserve either signal independently. This node now instead writes the
 handoff PSD LAYERED (:func:`_write_instructions_psd`): the input image as a
 bottom pixel layer, plus a fully-transparent, top-level layer named exactly
 :data:`INSTRUCTIONS_LAYER_NAME` on top, ready for the user to draw on. On
-save, :func:`_read_ps_saved_psd` reopens that same saved ``source.psd`` with
+save, :func:`_read_ps_saved_psd` reopens that same saved managed PSD copy with
 psd-tools and looks for that layer BY NAME: if it is still there, its own
 painted pixels (opaque vs. transparent) become the MASK directly, and the
 IMAGE output becomes the composite of every OTHER layer -- so any edit the
@@ -153,7 +153,7 @@ def _write_instructions_psd(psd_path: Path, pil_image: Image.Image) -> None:
     "Alpha 1" channel in Photoshop's Channels panel.
 
     Args:
-        psd_path: Destination ``source.psd`` path. Parent directories are
+        psd_path: Destination managed PSD copy path. Parent directories are
             created if needed.
         pil_image: The node's input image, decoded. Always ``"RGB"`` in
             practice (:func:`cpsb.nodes._tensor_to_pil` never produces
@@ -284,7 +284,7 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None, Image.I
     (product-owner spec, 2026-07-17; *combined* added 2026-07-18.)
 
     Args:
-        psd_path: The handoff's ``source.psd`` -- the exact file Photoshop
+        psd_path: The handoff's managed PSD copy -- the exact file Photoshop
             opened and, in Tier 1 / local Tier 2, the user's Cmd/Ctrl+S
             overwrote in place.
 
@@ -317,7 +317,7 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None, Image.I
     Note:
         In REMOTE Tier 2, the connected plugin saves to its own sandbox and
         uploads a flat PNG (:mod:`cpsb.routes`' upload handler) -- it never
-        overwrites THIS server-side ``source.psd`` with a layered file, so
+        overwrites THIS server-side managed PSD copy with a layered file, so
         re-opening it here after such an edit finds the ORIGINAL,
         just-written (still-blank) Instructions layer. That degrades
         gracefully through the FOUND branch above (mask ends up all-zero,
@@ -389,7 +389,7 @@ def _create_handoff(
     Photoshop is a separate step (:func:`_open_and_block_for_edit`) so the
     "reuse an existing handoff" and "create a fresh one" branches in
     :func:`_resolve_ps_mode_edit` can share one open/block call site. Writes
-    the handoff's ``source.psd`` LAYERED (:func:`_write_instructions_psd`,
+    the handoff's managed PSD copy LAYERED (:func:`_write_instructions_psd`,
     product-owner spec 2026-07-17), not the old flat
     :func:`cpsb.psd_io.write_psd`.
 
@@ -410,7 +410,7 @@ def _create_handoff(
         original_image=pil_image,
         source_hash=source_hash,
     )
-    psd_path = state.manager.handoff_dir(meta.handoff_id) / "source.psd"
+    psd_path = state.manager.psd_path(meta)
     _write_instructions_psd(psd_path, pil_image)
     state.manager.note_source_written(meta.handoff_id)
     return meta
@@ -440,7 +440,7 @@ def _open_and_block_for_edit(
         state: The configured backend state.
         node_id: This node instance's ``unique_id``, stringified.
         meta: The handoff being opened (new or reused).
-        psd_path: The handoff's ``source.psd`` path.
+        psd_path: The handoff's managed PSD copy path.
         timeout_seconds: Bound on the blocking wait.
 
     Returns:
@@ -511,7 +511,7 @@ def _resolve_ps_mode_edit(
     is treated as matching, same documented choice as the bridge node). Once
     that's settled, two cases remain: (a) the (possibly just-refreshed)
     active handoff already has an edit -- consume it by re-opening its
-    ``source.psd`` with psd-tools (:func:`_read_ps_saved_psd`), WITHOUT
+    managed PSD copy with psd-tools (:func:`_read_ps_saved_psd`), WITHOUT
     reopening Photoshop (the existing consume behavior, unchanged); (b) no
     consumable edit exists yet (no active handoff, or one exists but hasn't
     been saved into) -- write a fresh handoff or reuse the existing one
@@ -569,7 +569,7 @@ def _resolve_ps_mode_edit(
             node_id,
             active.handoff_id,
         )
-        psd_path = manager.handoff_dir(active.handoff_id) / "source.psd"
+        psd_path = manager.psd_path(active)
         return _read_ps_saved_psd(psd_path)
 
     if active is None:
@@ -582,7 +582,7 @@ def _resolve_ps_mode_edit(
             active.handoff_id,
         )
         meta = active
-    psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+    psd_path = manager.psd_path(meta)
 
     _open_and_block_for_edit(state, node_id, meta, psd_path, timeout_seconds)
     # A normal return above means WaitOutcome.EDITED -- Photoshop's own save
@@ -638,14 +638,14 @@ class PhotoshopAnnotate:
 
     PS mode BLOCKS (PROTOCOL.md §6d, product-owner update 2026-07-17): with
     no matching edit yet, it writes (or reuses) a ``bridge_node`` handoff
-    whose ``source.psd`` is a LAYERED PSD (input image + a blank
+    whose managed PSD copy is a LAYERED PSD (input image + a blank
     "Instructions" layer, :func:`_write_instructions_psd`), opens Photoshop
     through the same tier-selecting seam the bridge node uses, and then
     blocks ``execute()`` -- identical to
     :meth:`cpsb.nodes.PhotoshopBridge.execute`'s "Wait for first save" mode
     -- until the user marks up and saves the image, cancels, or
     *timeout_seconds* elapses (see :func:`_open_and_block_for_edit`). A save
-    resumes this same call, which then re-reads the saved ``source.psd`` per
+    resumes this same call, which then re-reads the saved managed PSD copy per
     the precedence above; cancel/timeout raise ComfyUI's own
     ``InterruptProcessingException``, stopping the workflow rather than
     silently returning zeros. There is no re-run mode and so no auto-queue

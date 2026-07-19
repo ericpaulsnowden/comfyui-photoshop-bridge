@@ -80,7 +80,7 @@ DEFAULT_GROUP_NAME = "ComfyUI Layers"
 #: Base name for the pixel layers; each layer is ``"<layer_name> <index>"`` with
 #: index counting 1..N bottom-to-top. Replaces the removed ``filename_prefix``
 #: widget (which only named an intermediate file the user never saw — Photoshop
-#: opens a managed ``source.psd`` copy, not that file).
+#: opens a managed PSD copy, not that file).
 DEFAULT_LAYER_NAME = "Layer"
 
 #: The Compose-node-specific third ``mode`` string (PROTOCOL.md §6c). The
@@ -1189,7 +1189,7 @@ class PhotoshopComposePSD:
     save delivers the user's manual compositing/masking work, the same
     "consume the edit" pattern PROTOCOL.md §6/§6b establish -- or (b), when
     no edit has arrived yet, REUSES that same handoff (reopening its
-    ``source.psd``) rather than minting a second one, so a re-queue against a
+    managed PSD copy) rather than minting a second one, so a re-queue against a
     handoff that is open in Photoshop but not yet saved never orphans it with
     a duplicate. Only when the identity no longer matches (the actual
     connected images, ``group_name``, or ``layer_name`` changed) is the old
@@ -1749,7 +1749,7 @@ class PhotoshopComposePSD:
         identity_hash: str,
         composite_image: Image.Image,
     ) -> HandoffMeta:
-        """Create the ``bridge_node`` handoff whose ``source.psd`` is *psd_path* copied.
+        """Create the ``bridge_node`` handoff whose managed PSD copy is *psd_path* copied.
 
         Shared by both open paths (:meth:`_open_and_wait_for_edit`,
         :meth:`_open_passthrough`). Mirrors
@@ -1767,9 +1767,9 @@ class PhotoshopComposePSD:
 
         **v1 uses a MANAGED COPY, not ``edit_in_place``** (annotate-style
         handoff creation, the fallback the build brief calls for): the
-        handoff's ``source.psd`` is a copy of *psd_path* rather than a pointer
-        at it. PROTOCOL.md §6c's own line says the generated file is this
-        node's own output, so editing it in place would be safe by
+        handoff's managed PSD copy is a copy of *psd_path* rather than a
+        pointer at it. PROTOCOL.md §6c's own line says the generated file is
+        this node's own output, so editing it in place would be safe by
         construction -- but wiring true ``edit_in_place`` means
         ``HandoffManager.create(edit_in_place=True, original_path=...)`` PLUS
         registering that out-of-managed-folder path with the watcher
@@ -1777,9 +1777,9 @@ class PhotoshopComposePSD:
         ``cpsb/routes.py``/``cpsb/watcher.py`` plumbing this change does not
         own. The managed copy makes the blocking round trip work end-to-end
         all the same (the watcher already covers the managed folder, so a
-        Photoshop save into ``source.psd`` is ingested and unblocks the wait);
-        pointing the handoff directly at *psd_path* is the natural follow-up
-        once that ``edit_in_place`` plumbing lands.
+        Photoshop save into it is ingested and unblocks the wait); pointing
+        the handoff directly at *psd_path* is the natural follow-up once
+        that ``edit_in_place`` plumbing lands.
 
         ``source_hash`` is set to *identity_hash* (the SAME mode/prefix-FREE
         value :func:`_compute_identity_hash` recomputes from the current
@@ -1816,7 +1816,7 @@ class PhotoshopComposePSD:
             original_image=composite_image,
             source_hash=identity_hash,
         )
-        handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        handoff_psd_path = manager.psd_path(meta)
         handoff_psd_path.parent.mkdir(parents=True, exist_ok=True)
         handoff_psd_path.write_bytes(psd_bytes)
         manager.note_source_written(meta.handoff_id)
@@ -1863,7 +1863,7 @@ class PhotoshopComposePSD:
                 §6c reuse semantics, mirroring
                 :meth:`cpsb.nodes.PhotoshopBridge.execute` and
                 :func:`cpsb.annotate._resolve_ps_mode`). When given, this
-                REUSES it -- reopening the SAME ``source.psd`` the user may
+                REUSES it -- reopening the SAME managed PSD copy the user may
                 already be working in -- instead of minting a brand-new
                 handoff (and a second, orphaned Photoshop document). ``None``
                 (the default) creates a fresh one via
@@ -1890,11 +1890,12 @@ class PhotoshopComposePSD:
             )
             result_name = psd_path.name
         else:
-            # Reuse: do NOT rewrite source.psd -- the user's in-progress
-            # layers live in it. Same rule as cpsb/annotate.py:550-557.
+            # Reuse: do NOT rewrite the managed PSD copy -- the user's
+            # in-progress layers live in it. Same rule as
+            # cpsb/annotate.py:550-557.
             meta = existing
             result_name = existing.source.filename
-        handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        handoff_psd_path = manager.psd_path(meta)
 
         logger.info(
             "cpsb compose_psd: node %s handoff %s: opening Photoshop", node_id, meta.handoff_id
@@ -1995,11 +1996,12 @@ class PhotoshopComposePSD:
             )
             result_name = psd_path.name
         else:
-            # Reuse: do NOT rewrite source.psd -- the user's in-progress
-            # layers live in it. Same rule as cpsb/annotate.py:550-557.
+            # Reuse: do NOT rewrite the managed PSD copy -- the user's
+            # in-progress layers live in it. Same rule as
+            # cpsb/annotate.py:550-557.
             meta = existing
             result_name = existing.source.filename
-        handoff_psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+        handoff_psd_path = manager.psd_path(meta)
 
         if existing is not None:
             # Reusing an already-open handoff in a NON-BLOCKING mode: do not

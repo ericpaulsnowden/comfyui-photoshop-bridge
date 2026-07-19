@@ -29,6 +29,8 @@ Right-clicking an image and choosing **Open in Photoshop** is the core action, a
 
   Rename or delete the Instructions layer and it's just treated as a plain edited image.
 
+Handoffs opened in Photoshop are **named after the file they came from** — `Eric-Headshot.jpg` opens as `Eric-Headshot.psd`, not an anonymous `source.psd` — so document tabs and file dropdowns stay tellable-apart.
+
 A **"Photoshop Edits" sidebar gallery** tracks every round trip for the workflow: re-open an edit, add it as a node, reveal the file, or remove an entry from the list. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
 
 <!-- demo.gif -->

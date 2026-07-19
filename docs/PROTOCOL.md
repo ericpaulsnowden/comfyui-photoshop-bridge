@@ -24,11 +24,37 @@ Referenced design rationale lives in `/PLAN.md` (repo parent) — section number
 
 ```
 input/<managed>/<handoff_id>/
-    source.psd        # the PSD handed to Photoshop (Tier 1 opens this path directly)
+    <derived>.psd     # the managed PSD handed to Photoshop (Tier 1 opens this path directly)
     meta.json         # authoritative handoff state (schema below)
     orig_thumb.png    # thumbnail of the ORIGINAL image, max 256px long side (gallery before/after)
     edit_001.png ...  # ingested edits, in arrival order (edit_%03d.png)
 ```
+
+**Managed-copy filename is DERIVED, not literal (v0.5.26; previously always `source.psd`).**
+Recorded per handoff as `HandoffMeta.psd_filename` at creation: the ORIGIN filename's stem
+(sanitized: `[A-Za-z0-9 _.-]` kept, everything else `-`, dash runs collapsed, trimmed,
+60-char cap; extension split MANUALLY — `Path.stem`'s multi-dot behavior differs between
+Python 3.10 and 3.14 and this name is persisted + matched by the watcher, so it must be
+identical on every interpreter; leading dots stripped so a dotfile origin can never yield a
+hidden managed file) + `.psd`. Eric-Headshot.jpg → `Eric-Headshot.psd` — so Photoshop's
+document TITLE and every filename dropdown can tell handoffs apart (user request
+2026-07-19). Degenerate/empty stems fall back to `source.psd`, and a meta.json missing the
+field (every pre-v0.5.26 handoff) reads back as `source.psd` — old handoffs keep working
+untouched. Collisions are impossible by construction (one directory per handoff). ALL code
+resolves the path through `HandoffManager.psd_path(meta)` — never join `"source.psd"` by
+hand. The remote (Tier 2) plugin now saves its sandbox copy under a per-handoff SUBFOLDER
+(`handoffs/<handoffId>/<basename of psd_path>`, falling back to `<handoffId>.psd`), so two
+handoffs deriving the same name never collide in the shared sandbox; no wire change — the
+`open_handoff` message's existing `psd_path` field already carries the name.
+
+**Lock-ordering invariant in the watcher (deadlock found+fixed v0.5.26):** never call
+`observer.schedule`/`unschedule` while holding the watcher's own lock. macOS fsevents'
+`schedule` blocks coordinating with the observer's dispatch thread, and that thread runs
+`notice()` which takes the watcher lock — holding it across `schedule` deadlocks whenever a
+real save event dispatches concurrently (latent since edit_in_place shipped; the per-handoff
+filename lookup widened the window enough to hit reliably). Bookkeeping happens under the
+lock (a `None` reservation keeps concurrent callers idempotent); observer calls happen
+outside it.
 
 - There is **no separate session manifest file**: on server start, the backend rebuilds
   its in-memory state by scanning `input/<managed>/*/meta.json` (the meta files are the
@@ -50,6 +76,7 @@ input/<managed>/<handoff_id>/
   "workflow_name": "my-workflow",
   "source_hash": "<sha256 hex of the original image's normalized PNG encoding>",
   "source": {"filename": "ComfyUI_00042_.png", "subfolder": "", "type": "output"},
+  "psd_filename": "ComfyUI_00042_.psd",
   "created_ts": 1752680000.0,
   "updated_ts": 1752680123.4,
   "status": "pending" | "editing" | "edited" | "cancelled" | "discarded" | "superseded" | "error",

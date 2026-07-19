@@ -106,7 +106,7 @@ async function openHandoff(msg) {
   const handoffId = msg.handoff_id
   try {
     const isLocal = connection.getState().localMode === true
-    const doc = isLocal ? await openLocal(msg.psd_path) : await openRemote(handoffId)
+    const doc = isLocal ? await openLocal(msg.psd_path) : await openRemote(handoffId, msg.psd_path)
     /** @type {CpsbHandoffRecord} */
     const record = {
       handoffId,
@@ -131,7 +131,11 @@ async function openHandoff(msg) {
 
 /**
  * Local-mode open: the plugin and ComfyUI share a filesystem, so this opens
- * `source.psd` directly at its real path.
+ * the handoff's managed PSD copy directly at its real path -- whatever name
+ * the server derived for it (product-owner requirement 2026-07-18: named
+ * after the handoff's origin file, e.g. `Eric-Headshot.psd`, rather than the
+ * literal `source.psd` every handoff used to get). This function never
+ * hardcodes a filename at all, so it inherits the derived name automatically.
  * @param {string} psdPath - Absolute path from `open_handoff.psd_path`.
  * @returns {Promise<import('photoshop').Document>}
  */
@@ -141,11 +145,56 @@ async function openLocal(psdPath) {
 }
 
 /**
+ * Best-effort basename of a SERVER-side path string. `psd_path` in
+ * `open_handoff` is built from the ComfyUI server's own filesystem
+ * (`str(Path.resolve())`, Python) and may therefore use either `/` or `\`
+ * separators depending on the server's OS -- REMOTE mode means this plugin
+ * can be running on a DIFFERENT OS than the server, so both must be handled,
+ * not just whichever separator this platform's own `path` module would use.
+ * @param {string | undefined | null} serverPath
+ * @returns {string | null} The final path segment, or `null` if *serverPath*
+ * is missing, empty, or has no usable segment.
+ */
+function basenameOfServerPath(serverPath) {
+  if (!serverPath) return null
+  const segments = String(serverPath)
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean)
+  return segments.length ? segments[segments.length - 1] : null
+}
+
+/**
+ * Gets (or lazily creates) a named subfolder of *parent*. Mirrors
+ * `getHandoffsSandboxFolder`'s own get-or-create pattern.
+ * @param {import('uxp').storage.Folder} parent
+ * @param {string} name
+ * @returns {Promise<import('uxp').storage.Folder>}
+ */
+async function getOrCreateSubfolder(parent, name) {
+  try {
+    return await parent.getEntry(name)
+  } catch (_error) {
+    return await parent.createFolder(name)
+  }
+}
+
+/**
  * Remote-mode open: no shared filesystem, so the PSD bytes are downloaded
  * over the plugin's websocket (`connection.requestFile`, PROTOCOL.md §3:
- * `request_file`/`file_chunk`/`file_error`) and written into this plugin's
- * own sandbox folder before opening — a plain Cmd/Ctrl+S then saves in
- * place to that sandbox copy exactly as in Tier 1 (PLAN.md §5).
+ * `request_file`/`file_chunk`/`file_error`) and written into a PER-HANDOFF
+ * subfolder of this plugin's own sandbox (`handoffs/<handoffId>/<basename>`)
+ * before opening — a plain Cmd/Ctrl+S then saves in place to that sandbox
+ * copy exactly as in Tier 1 (PLAN.md §5).
+ *
+ * The written filename is *psdPath*'s own basename (product-owner requirement
+ * 2026-07-18: name the file after its origin, e.g. `Eric-Headshot.psd`, so
+ * Photoshop's document TITLE is no longer the opaque handoff id) — falling
+ * back to `${handoffId}.psd` (the old behavior) when *psdPath* is missing or
+ * has no usable basename. The PER-HANDOFF subfolder (rather than writing
+ * straight into the shared `handoffs` sandbox root, as before) is what keeps
+ * two DIFFERENT handoffs that happen to derive the SAME basename (e.g. both
+ * opened from "Eric-Headshot.jpg") from overwriting each other's file.
  *
  * This used to be a plain HTTP `fetch` GET of `file_url` (`/cpsb/file/<id>`)
  * — UXP's runtime blocks cleartext `http://` to a non-localhost host (the
@@ -154,12 +203,16 @@ async function openLocal(psdPath) {
  * `fetch()` to that same remote host does not), so the download now rides
  * the identical, already-open websocket instead of a second HTTP call.
  * @param {string} handoffId
+ * @param {string} [psdPath] - The server-side `psd_path` from `open_handoff`,
+ * used only to recover its basename (see above).
  * @returns {Promise<import('photoshop').Document>}
  */
-async function openRemote(handoffId) {
+async function openRemote(handoffId, psdPath) {
   const bytes = await connection.requestFile(handoffId)
-  const folder = await getHandoffsSandboxFolder()
-  const file = await folder.createFile(`${handoffId}.psd`, { overwrite: true })
+  const handoffsFolder = await getHandoffsSandboxFolder()
+  const handoffFolder = await getOrCreateSubfolder(handoffsFolder, handoffId)
+  const basename = basenameOfServerPath(psdPath) || `${handoffId}.psd`
+  const file = await handoffFolder.createFile(basename, { overwrite: true })
   await file.write(bytes.buffer, { format: formats.binary })
   return core.executeAsModal(() => app.open(file), { commandName: 'ComfyUI: open handoff' })
 }

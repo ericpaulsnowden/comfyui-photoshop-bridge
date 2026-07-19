@@ -15,6 +15,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 import shutil
 import threading
 import time
@@ -71,6 +72,93 @@ DEFAULT_TRIGGER_POLICY: TriggerPolicy = "Re-run workflow"
 #: while a wrongly-dropped one is unrecoverable, so ingesting is always the
 #: safe default for anything that isn't unambiguously "Ignore."
 _IGNORE_TRIGGER_POLICY: TriggerPolicy = "Ignore (do nothing)"
+
+#: `HandoffMeta.psd_filename`'s own default, and :func:`_derive_psd_filename`'s
+#: fallback for an empty/degenerate derivation (product-owner requirement
+#: 2026-07-18: "give the file a name that is related to the file it came
+#: from" instead of every managed copy literally being named ``source.psd``,
+#: which made every open Photoshop tab/dropdown entry indistinguishable).
+#: This is also what a legacy ``meta.json`` recorded before this field
+#: existed must resolve to (see :meth:`HandoffMeta.from_dict`) -- today's
+#: only pre-existing behavior, so an upgrade never renames a handoff already
+#: on disk.
+DEFAULT_PSD_FILENAME = "source.psd"
+
+#: :func:`_derive_psd_filename`'s cap on the SANITIZED STEM's length (before
+#: the trailing ``.psd`` is appended) -- generous for any real filename
+#: while keeping the managed copy's own name well clear of filesystem path-
+#: component limits.
+_PSD_FILENAME_MAX_STEM = 60
+
+#: :func:`_derive_psd_filename`'s allow-list: ASCII letters, digits, space,
+#: dash, underscore, dot. Everything else (unicode, path separators,
+#: quotes, punctuation, ...) is replaced with a dash.
+_PSD_FILENAME_DISALLOWED_RE = re.compile(r"[^A-Za-z0-9 _.-]")
+_PSD_FILENAME_DASH_RUN_RE = re.compile(r"-{2,}")
+_PSD_FILENAME_HAS_ALNUM_RE = re.compile(r"[A-Za-z0-9]")
+
+
+def _derive_psd_filename(origin_filename: str) -> str:
+    """The managed-copy filename to record on a NEW handoff.
+
+    Product-owner requirement 2026-07-18: name the managed PSD copy after
+    the file it came from (e.g. ``Eric-Headshot.jpg`` -> ``Eric-
+    Headshot.psd``) instead of the literal ``source.psd`` every handoff used
+    to get, so Photoshop's own document TITLE -- and any dropdown/gallery
+    that lists handoffs by filename -- can actually tell them apart.
+
+    Derives from *origin_filename* -- ``HandoffMeta.source.filename`` exactly
+    as recorded at the moment :meth:`HandoffManager.create` is called (a
+    ``LoadImage`` input's name, a ``terminal_output``'s ``SaveImage``
+    filename, a ``load_psd`` source's own name, or a ``bridge_node``
+    origin's descriptive placeholder, e.g. ``bridge_17.png`` -- there is no
+    real file for that last case, but deriving from the placeholder still
+    yields a stable, related name rather than special-casing it away):
+    strips its extension, sanitizes the stem (allow ASCII letters/digits/
+    space/dash/underscore/dot; every other character becomes a dash; runs
+    of 2+ dashes collapse to one; leading/trailing space/dash trimmed;
+    capped at :data:`_PSD_FILENAME_MAX_STEM` characters), and appends
+    ``.psd``. Falls back to :data:`DEFAULT_PSD_FILENAME` when the sanitized
+    stem is empty or "degenerate" (contains no letter or digit at all --
+    e.g. an all-symbol name, a bare dot, or an empty string), so a handoff
+    is never left with a nonsensical or missing managed filename.
+
+    Collisions are impossible by construction: every handoff lives in its
+    own ``<managed>/<handoff_id>/`` directory (PROTOCOL.md §1), so two
+    handoffs deriving the identical name never contend for the same path --
+    no uniquifying suffix is ever needed.
+
+    Args:
+        origin_filename: The origin's own filename (see above) -- never
+            empty in practice (every ``SourceRef.filename`` caller supplies
+            a real or placeholder name), but handled safely if it were.
+
+    Returns:
+        A filename ending in ``.psd``, safe to use as a single path
+        component (never containing ``/`` or ``\\``, never ``.``/``..``).
+    """
+    # Extension-stripping is done manually, NOT via ``Path(...).stem``:
+    # stem's handling of multi-dot edge names (e.g. ``"..jpg"``) changed
+    # between Python 3.10 and 3.14, and this derivation must produce the
+    # SAME managed filename on every interpreter a ComfyUI install might
+    # run -- the name is persisted in meta.json and matched by the watcher,
+    # so it cannot be allowed to vary by Python version. Rule: the last dot
+    # separates an extension only when something precedes it (a leading dot
+    # is a dotfile marker, not a separator). Leading dots are then stripped
+    # so a dotfile origin can never yield a hidden managed file.
+    name = Path(origin_filename).name
+    dot = name.rfind(".")
+    stem = name[:dot] if dot > 0 else name
+    stem = stem.lstrip(".")
+    sanitized = _PSD_FILENAME_DISALLOWED_RE.sub("-", stem)
+    sanitized = _PSD_FILENAME_DASH_RUN_RE.sub("-", sanitized)
+    sanitized = sanitized.strip(" -")
+    sanitized = sanitized[:_PSD_FILENAME_MAX_STEM]
+    sanitized = sanitized.strip(" -")
+    if not _PSD_FILENAME_HAS_ALNUM_RE.search(sanitized):
+        return DEFAULT_PSD_FILENAME
+    return f"{sanitized}.psd"
+
 
 #: Statuses under which a handoff still accepts new edits (PROTOCOL.md §2:
 #: the set `/cpsb/upload` accepts) and counts as "the active handoff" for a
@@ -194,7 +282,7 @@ class HandoffMeta:
     ``edit_in_place`` / ``original_path`` implement the PROTOCOL.md §6b
     "Edit-original option" (``load_psd`` origin only): when ``True``, this
     handoff's edit target is the user's OWN file at ``original_path``
-    (absolute, resolved) rather than a managed ``source.psd`` copy -- no such
+    (absolute, resolved) rather than a managed PSD copy -- no such
     copy is ever written for such a handoff, and every delete path must never
     touch ``original_path`` (see :meth:`HandoffManager._reject_unsafe_delete`).
     ``edit_in_place`` defaults ``False`` and ``original_path`` defaults
@@ -210,6 +298,18 @@ class HandoffMeta:
     ``meta.json`` recorded before this field existed -- both cases must
     behave EXACTLY as this project always has, so this default is today's
     only pre-existing behavior, never a new one.
+
+    ``psd_filename`` (product-owner requirement 2026-07-18) is the managed
+    copy's own on-disk filename -- ``<handoff_dir>/<psd_filename>``
+    (:meth:`HandoffManager.psd_path`) -- derived once at creation time from
+    the origin's own filename (:func:`_derive_psd_filename`) so Photoshop's
+    document TITLE (and any dropdown/gallery listing) names each handoff
+    after what it actually came from instead of every one being the
+    indistinguishable literal ``source.psd``. Defaults to
+    :data:`DEFAULT_PSD_FILENAME` -- today's only pre-existing, literal name
+    -- for any legacy ``meta.json`` recorded before this field existed, so
+    every handoff already on disk keeps resolving to the exact file it was
+    written as, untouched.
     """
 
     handoff_id: str
@@ -226,6 +326,7 @@ class HandoffMeta:
     edit_in_place: bool = False
     original_path: str | None = None
     trigger_policy: TriggerPolicy = DEFAULT_TRIGGER_POLICY
+    psd_filename: str = DEFAULT_PSD_FILENAME
     edits: list[EditRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -240,6 +341,7 @@ class HandoffMeta:
             "edit_in_place": self.edit_in_place,
             "original_path": self.original_path,
             "trigger_policy": self.trigger_policy,
+            "psd_filename": self.psd_filename,
             "created_ts": self.created_ts,
             "updated_ts": self.updated_ts,
             "status": self.status,
@@ -270,6 +372,13 @@ class HandoffMeta:
             # only pre-existing behavior, so an upgrade never silently
             # changes what an already-in-flight handoff does.
             trigger_policy=data.get("trigger_policy") or DEFAULT_TRIGGER_POLICY,
+            # Same "missing/falsy key defaults safely" rule as trigger_policy
+            # above (product-owner requirement 2026-07-18): every meta.json
+            # written before this field existed has no `psd_filename` key at
+            # all, and must keep resolving to the literal `source.psd` it was
+            # actually written as -- never re-derived from `source` (which
+            # would rename a file that's already sitting on disk).
+            psd_filename=data.get("psd_filename") or DEFAULT_PSD_FILENAME,
             edits=[EditRecord.from_dict(edit) for edit in data.get("edits", [])],
         )
 
@@ -357,9 +466,9 @@ class HandoffManager:
         self._lock = threading.Lock()
         self._handoffs: dict[str, HandoffMeta] = {}
         self._waiters: dict[str, _Waiter] = {}
-        # handoff_id -> (st_size, st_mtime_ns) of a source.psd THIS package
-        # wrote, so the watcher can tell our own initial write apart from a
-        # Photoshop save landing on the same path (see note_source_written).
+        # handoff_id -> (st_size, st_mtime_ns) of a managed PSD copy THIS
+        # package wrote, so the watcher can tell our own initial write apart
+        # from a Photoshop save landing on the same path (see note_source_written).
         self._own_source_writes: dict[str, tuple[int, int]] = {}
         self._scan_existing()
         self._cleanup_stale()
@@ -401,6 +510,31 @@ class HandoffManager:
     def meta_path(self, handoff_id: str) -> Path:
         return self.handoff_dir(handoff_id) / "meta.json"
 
+    def psd_path(self, meta: HandoffMeta) -> Path:
+        """Absolute path to *meta*'s managed PSD copy.
+
+        ``<input_dir>/<managed_dir>/<handoff_id>/<psd_filename>`` -- product-
+        owner requirement 2026-07-18: every handoff's managed copy is now
+        named after its ORIGIN file (:func:`_derive_psd_filename`), not
+        literally ``source.psd``, so this is the ONE accessor every call
+        site in this package uses to build that path; nothing should ever
+        hardcode a ``/ "source.psd"`` join again. Takes the already-resolved
+        *meta* directly (mirrors :meth:`managed_dir_for`) rather than
+        re-looking it up by id under the lock, since every call site already
+        has a meta in hand.
+
+        Note this is the MANAGED COPY path unconditionally -- it does not
+        know about ``edit_in_place`` (PROTOCOL.md §6b: that handoff kind has
+        no managed copy at all, and this method's result is simply never
+        written to or read for one). Callers that need "the path Photoshop
+        should actually open" for an origin that might be ``edit_in_place``
+        use :func:`cpsb.routes._psd_path_for_handoff` instead, which branches
+        on ``meta.edit_in_place`` first and calls this method only for the
+        non-``edit_in_place`` case.
+        """
+        managed = self.managed_dir_for(meta)
+        return self._ctx.input_dir / managed / meta.handoff_id / meta.psd_filename
+
     # -- creation --------------------------------------------------------
 
     def create(
@@ -418,12 +552,19 @@ class HandoffManager:
     ) -> HandoffMeta:
         """Allocate a new handoff: id, folder, ``orig_thumb.png``, ``meta.json``.
 
-        Does not write ``source.psd`` -- that is :func:`cpsb.psd_io.write_psd`,
-        called by the route handler once this returns, since PSD encoding is
-        outside this module's job. For an ``edit_in_place`` handoff
-        (PROTOCOL.md §6b), the caller never writes a ``source.psd`` copy at
-        all -- ``orig_thumb.png``/``meta.json`` are still written here exactly
-        as for any other handoff, so the gallery keeps working unchanged.
+        Does not write the managed PSD copy itself -- that is
+        :func:`cpsb.psd_io.write_psd` (or a verbatim byte copy for a
+        psd-native source), called by the route handler once this returns,
+        since PSD encoding is outside this module's job. This method DOES,
+        however, decide that copy's FILENAME: ``meta.psd_filename`` is
+        derived here, once, from *source*'s own filename
+        (:func:`_derive_psd_filename`, product-owner requirement
+        2026-07-18) -- every later reference to "the managed copy"
+        (:meth:`psd_path`) uses this recorded value, never re-deriving it.
+        For an ``edit_in_place`` handoff (PROTOCOL.md §6b), the caller never
+        writes a managed copy at all (``psd_filename`` is simply unused) --
+        ``orig_thumb.png``/``meta.json`` are still written here exactly as
+        for any other handoff, so the gallery keeps working unchanged.
 
         Args:
             origin_node_id: The graph node id (or bridge-node ``unique_id``)
@@ -481,6 +622,7 @@ class HandoffManager:
                 edit_in_place=edit_in_place,
                 original_path=original_path,
                 trigger_policy=trigger_policy,
+                psd_filename=_derive_psd_filename(source.filename),
             )
             self._handoffs[handoff_id] = meta
             self._write_meta_locked(meta)
@@ -558,7 +700,7 @@ class HandoffManager:
         Used by :class:`~cpsb.watcher.CpsbWatcher` at startup (PROTOCOL.md
         §6b) to re-establish a filesystem watch on each such handoff's own
         file after a server restart -- these live OUTSIDE the managed
-        folder, so unlike a normal handoff's ``source.psd`` they are not
+        folder, so unlike a normal handoff's managed PSD copy they are not
         automatically covered by the watcher's single recursive watch over
         it. This is a plain read of already-recovered in-memory state (see
         :meth:`_scan_existing`), so it naturally reflects boot recovery with
@@ -592,16 +734,23 @@ class HandoffManager:
     # -- own-write suppression (Tier 1 watcher support) ----------------------
 
     def note_source_written(self, handoff_id: str) -> None:
-        """Record that this package just wrote ``source.psd`` for *handoff_id*.
+        """Record that this package just wrote the managed PSD copy for *handoff_id*.
 
         The watchdog Observer cannot tell who wrote a file. Without this,
         the very write that creates the handoff PSD would settle through the
         debounce window and be ingested as if Photoshop had saved an edit.
-        Callers invoke this immediately after :func:`cpsb.psd_io.write_psd`;
-        the watcher then skips any settled event whose stat signature still
-        matches (a real Photoshop save changes size and/or mtime).
+        Callers invoke this immediately after :func:`cpsb.psd_io.write_psd`
+        (or an equivalent verbatim byte-copy write); the watcher then skips
+        any settled event whose stat signature still matches (a real
+        Photoshop save changes size and/or mtime). A no-op if *handoff_id*
+        is unknown (nothing to stat) -- not expected in practice, since
+        every real caller only invokes this right after its own
+        :meth:`create` call for the same id.
         """
-        path = self.handoff_dir(handoff_id) / "source.psd"
+        meta = self.get(handoff_id)
+        if meta is None:
+            return
+        path = self.psd_path(meta)
         try:
             stat = path.stat()
         except OSError:
@@ -610,7 +759,7 @@ class HandoffManager:
             self._own_source_writes[handoff_id] = (stat.st_size, stat.st_mtime_ns)
 
     def is_own_source_write(self, handoff_id: str, size: int, mtime_ns: int) -> bool:
-        """Whether ``source.psd``'s current stat still matches our own last write."""
+        """Whether the managed PSD copy's current stat still matches our own last write."""
         with self._lock:
             return self._own_source_writes.get(handoff_id) == (size, mtime_ns)
 

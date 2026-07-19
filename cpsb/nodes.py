@@ -429,7 +429,7 @@ class PhotoshopBridge:
             meta, psd_path = self._create_handoff(state, node_id, pil_image, incoming_hash)
         else:
             meta = active
-            psd_path = manager.handoff_dir(meta.handoff_id) / "source.psd"
+            psd_path = manager.psd_path(meta)
 
         # "Wait for first save" always (re)opens, matching the original
         # wait_for_edit=True behavior exactly. The two non-blocking modes
@@ -507,7 +507,7 @@ class PhotoshopBridge:
             original_image=pil_image,
             source_hash=source_hash,
         )
-        psd_path = state.manager.handoff_dir(meta.handoff_id) / "source.psd"
+        psd_path = state.manager.psd_path(meta)
         write_psd(psd_path, pil_image)
         state.manager.note_source_written(meta.handoff_id)
         return meta, psd_path
