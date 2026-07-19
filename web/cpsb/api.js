@@ -245,6 +245,42 @@ export function warn(...args) {
  */
 
 /**
+ * @typedef {Object} CpsbBrowseDirEntry
+ * A subdirectory (or browse root) entry from `GET /cpsb/browse`.
+ * @property {string} name
+ * @property {string} path - Absolute, server-side.
+ */
+
+/**
+ * @typedef {Object} CpsbBrowseFileEntry
+ * A `.psd`/`.psb` file entry from `GET /cpsb/browse`.
+ * @property {string} name
+ * @property {string} path - Absolute, server-side.
+ * @property {number} size - Bytes.
+ * @property {number} mtime - Unix seconds.
+ */
+
+/**
+ * @typedef {Object} CpsbBrowseResponse
+ * `GET /cpsb/browse`'s response shape (`cpsb/routes.py` `browse_route`) —
+ * either a real directory's contents, or (when `path` is `null`) the browse
+ * ROOTS listing (the user's home directory, ComfyUI's own input directory,
+ * and platform-specific drives/volumes) used by the "Browse..." dialog
+ * (`web/cpsb/browse.js`) for `PhotoshopComposePSD.existing_psd_path`.
+ * @property {string | null} path - `null` only for the roots listing.
+ * @property {string | null} parent - `null` for the roots listing, or when
+ * `path` is already a filesystem root (its own parent).
+ * @property {string} sep - This server's `os.sep` — build/display paths with
+ * this, never a hardcoded `/` or `\`, since the ComfyUI machine may not be
+ * the same platform as the browser (PROTOCOL.md's two-machine setup).
+ * @property {CpsbBrowseDirEntry[]} dirs - Sorted case-insensitively by name.
+ * @property {CpsbBrowseFileEntry[]} files - `.psd`/`.psb` only, sorted
+ * case-insensitively by name; always empty for the roots listing.
+ * @property {boolean} truncated - `true` iff this listing hit the server's
+ * per-request entry cap.
+ */
+
+/**
  * Error thrown by every helper in this module for a non-2xx response.
  * Callers that need to branch on the exact status (e.g. the 409
  * existing-handoff response from `/cpsb/open`) should catch this type and
@@ -426,6 +462,24 @@ export async function discardHandoff(handoffId) {
  */
 export async function getStatus() {
   return request('/cpsb/status', { method: 'GET' })
+}
+
+/**
+ * GET `/cpsb/browse` — list a directory (or, with *path* omitted/empty, the
+ * browse roots) on the ComfyUI machine's filesystem. Backs the "Browse..."
+ * dialog (`web/cpsb/browse.js`) for `PhotoshopComposePSD.existing_psd_path`.
+ * Deliberately NOT gated by the client-locality confirm `/cpsb/open` uses —
+ * see `cpsb/routes.py`'s `browse_route`/its section header for why a
+ * read-only listing doesn't carry that gate's "wrong machine" concern.
+ * @param {string} [path] - Omit/empty for the roots listing.
+ * @returns {Promise<CpsbBrowseResponse>}
+ * @throws {CpsbApiError} 400 if *path* is set but isn't an existing directory.
+ */
+export async function browseDirectory(path = '') {
+  const params = new URLSearchParams()
+  if (path) params.set('path', path)
+  const query = params.toString()
+  return request(`/cpsb/browse${query ? `?${query}` : ''}`, { method: 'GET' })
 }
 
 /**

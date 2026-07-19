@@ -23,6 +23,7 @@ import hashlib
 import io
 import json
 import logging
+import os
 import platform
 import time
 from dataclasses import dataclass, field
@@ -980,6 +981,278 @@ async def psd_preview_route(request: web.Request) -> web.Response:
     image.save(png_path)
     return web.json_response(
         {"filename": png_path.name, "subfolder": _PSD_PREVIEW_SUBFOLDER, "type": "temp"}
+    )
+
+
+# -- GET /cpsb/browse -----------------------------------------------------------
+#
+# Server-backed directory-browser dialog for `PhotoshopComposePSD.
+# existing_psd_path` (`cpsb/compose_psd.py`, v0.5.20): a user asked to point
+# that STRING widget at a PSD anywhere on the ComfyUI machine, but ComfyUI
+# nodes run server-side, so a real OS file-picker dialog is impossible from
+# the browser. This route is the server half of the correct pattern instead:
+# the frontend (`web/cpsb/browse.js`) asks this route to list a directory, the
+# user navigates the rendered listing, and the CHOSEN path is written into
+# `existing_psd_path` client-side -- this route never writes anything itself.
+#
+# LOCALITY-GATE DECISION (deliberate, and different from `/cpsb/open`): this
+# route is intentionally left UNGATED, like `GET /cpsb/status`, rather than
+# reusing `/cpsb/open`'s client-locality 428-confirm machinery
+# (`is_request_local`/`_tier2_bypasses_locality_gate` above). That gate exists
+# to catch a SURPRISE -- a Tier 1 Photoshop launch silently landing on a
+# screen the requesting browser can't see. Nothing analogous is possible here:
+# this route only ever reads directory entries and returns them as JSON: it
+# never launches anything, never opens a document, and never writes to disk.
+# The directory being listed is *always* the ComfyUI machine's own filesystem
+# by construction (there is no "wrong machine" this could land on) -- which is
+# exactly what a remote browser is trying to inspect on purpose when picking
+# an `existing_psd_path` for a server-side node. The frontend dialog is
+# labeled "Browse ComfyUI machine" precisely so a remote user is never
+# confused about whose filesystem this shows (mirrors the "on ComfyUI
+# machine" honesty `compose.js`'s written-file display already uses). So the
+# 428 confirm's whole reason for existing -- "you might not realize this is
+# about to happen on a different machine" -- does not apply: there is no
+# action to confirm, only a read. Flagged in the implementation report for a
+# final call.
+#
+# SECURITY POSTURE (deliberate): a read-only listing of the SAME trust domain
+# ComfyUI itself already runs in -- anyone who can reach this ComfyUI server's
+# HTTP port can already read/write/execute far more than a directory listing
+# via the rest of this pack's own routes (`/cpsb/open` writes files under
+# `input/`, the plugin websocket streams whole PSDs) or via ComfyUI core
+# itself (`/view`, arbitrary node execution). This route adds no NEW
+# capability beyond "list what's in a folder" and never follows a listing
+# into a write: `_scan_directory` only ever calls `iterdir`/`stat`, and the
+# route handler never opens, moves, deletes, or creates anything on disk.
+
+#: Cap on combined `dirs` + `files` entries returned by one `/cpsb/browse`
+#: listing (root or directory) -- so a directory with an enormous number of
+#: children can't turn one request into a multi-megabyte response. Counts only
+#: entries actually emitted (visible directories, and files matching
+#: :data:`_PSD_NATIVE_EXTENSIONS`) -- a huge pile of hidden dotfiles or
+#: non-PSD files never consumes a slot, since they were never going to be
+#: returned anyway.
+_BROWSE_MAX_ENTRIES = 500
+
+#: Label for the ComfyUI input directory when it's surfaced as a browse root
+#: (always present, regardless of platform) -- named explicitly rather than
+#: just showing its bare path, since it's where `PhotoshopComposePSD` writes
+#: by default and is worth calling out as the obvious first stop.
+_BROWSE_INPUT_ROOT_LABEL = "ComfyUI Input"
+
+#: Same for the user's home directory (always present, regardless of platform).
+_BROWSE_HOME_ROOT_LABEL = "Home"
+
+
+def _browse_root_entry(name: str, path: Path) -> dict[str, Any]:
+    return {"name": name, "path": str(path)}
+
+
+def _list_windows_drives() -> list[dict[str, Any]]:
+    """Existing drive letters (``C:\\`` etc.) on a Windows host, as browse roots.
+
+    Checked via a plain existence test on each of the 26 possible drive
+    letters -- cheap, dependency-free (no ``win32api``/``ctypes`` call needed),
+    and exactly mirrors how a user already thinks of "the drives on this
+    machine" (Explorer's own top-level view).
+    """
+    drives = []
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        drive_root = f"{letter}:\\"
+        if os.path.exists(drive_root):
+            drives.append(_browse_root_entry(f"{letter}:", Path(drive_root)))
+    return drives
+
+
+def _list_macos_volumes() -> list[dict[str, Any]]:
+    """Mounted volumes under ``/Volumes`` on a macOS (or other POSIX) host.
+
+    ``/Volumes`` always contains at least a symlink back to the boot volume
+    (e.g. ``Macintosh HD``) plus one entry per externally-mounted disk/network
+    share -- exactly the set a user reaches for when they mean "browse by
+    volume" the way Finder's own sidebar does. Hidden entries are skipped
+    (same convention :func:`_scan_directory` uses for a real directory
+    listing) and a stat failure on any one entry is skipped rather than
+    aborting the whole root listing.
+    """
+    volumes_dir = Path("/Volumes")
+    if not volumes_dir.is_dir():
+        return []
+    try:
+        entries = sorted(volumes_dir.iterdir(), key=lambda e: e.name.lower())
+    except OSError:
+        return []
+    volumes = []
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            continue
+        if is_dir:
+            volumes.append(_browse_root_entry(entry.name, entry))
+    return volumes
+
+
+def _list_browse_roots(context: CpsbContext) -> list[dict[str, Any]]:
+    """The top-level entries shown when ``/cpsb/browse`` is called with no ``path``.
+
+    Always: ComfyUI's own input directory (labeled, since that's
+    :class:`~cpsb.compose_psd.PhotoshopComposePSD`'s default write location)
+    and the user's home directory. Platform-specific beyond that: drive
+    letters on Windows (:func:`_list_windows_drives`), mounted ``/Volumes``
+    entries on macOS/other POSIX (:func:`_list_macos_volumes`) -- this server
+    runs on the user's own machine (macOS in development, Windows in
+    production), so both branches matter to real users of this pack.
+    """
+    roots = [_browse_root_entry(_BROWSE_INPUT_ROOT_LABEL, context.input_dir.resolve())]
+    roots.append(_browse_root_entry(_BROWSE_HOME_ROOT_LABEL, Path.home().resolve()))
+    if platform.system() == "Windows":
+        roots.extend(_list_windows_drives())
+    else:
+        roots.extend(_list_macos_volumes())
+    return roots
+
+
+def _scan_directory(directory: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """List *directory*'s children as ``(dirs, files, truncated)`` for ``/cpsb/browse``.
+
+    ``dirs`` holds every visible subdirectory; ``files`` holds only
+    ``.psd``/``.psb`` files (case-insensitive, :data:`_PSD_NATIVE_EXTENSIONS`)
+    -- this is a PSD-target picker, not a general file browser. Both lists are
+    sorted case-insensitively by name (directory entries are scanned in that
+    same order, so the cap below keeps the alphabetically-first entries, not
+    an arbitrary filesystem-order prefix). Hidden entries (dotfiles) are
+    skipped outright -- sufficient hidden-detection on macOS, this pack's
+    primary development platform (PROTOCOL.md's two-machine setup); Windows
+    has no dotfile convention to hide here in the first place. An entry that
+    raises on `is_dir()`/`stat()` (a permissions error, a broken symlink, ...)
+    is skipped rather than failing the whole listing.
+
+    Returns:
+        ``([{"name", "path"}, ...], [{"name", "path", "size", "mtime"}, ...],
+        truncated)`` -- ``truncated`` is ``True`` iff more qualifying entries
+        existed than :data:`_BROWSE_MAX_ENTRIES` allowed through. An
+        unreadable *directory* itself (rare: it passed an `is_dir()` check in
+        the caller moments earlier, but permissions can change concurrently)
+        yields ``([], [], False)`` rather than raising.
+    """
+    try:
+        entries = sorted(directory.iterdir(), key=lambda e: e.name.lower())
+    except OSError:
+        return [], [], False
+
+    dirs: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    count = 0
+    truncated = False
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            continue
+        if is_dir:
+            if count >= _BROWSE_MAX_ENTRIES:
+                truncated = True
+                break
+            dirs.append(_browse_root_entry(entry.name, entry.resolve()))
+            count += 1
+            continue
+        if entry.suffix.lower() not in _PSD_NATIVE_EXTENSIONS:
+            continue
+        try:
+            stat_result = entry.stat()
+        except OSError:
+            continue
+        if count >= _BROWSE_MAX_ENTRIES:
+            truncated = True
+            break
+        files.append(
+            {
+                "name": entry.name,
+                "path": str(entry.resolve()),
+                "size": stat_result.st_size,
+                "mtime": stat_result.st_mtime,
+            }
+        )
+        count += 1
+    return dirs, files, truncated
+
+
+@routes.get("/cpsb/browse")
+async def browse_route(request: web.Request) -> web.Response:
+    """A server-side directory listing, for the ``existing_psd_path`` Browse dialog.
+
+    Read-only, and NEVER gated by the client-locality confirm
+    (`/cpsb/open`'s 428) -- see this section's header comment above for why
+    that gate's concern (a Photoshop launch silently landing on the wrong
+    machine) doesn't apply to a plain directory listing.
+
+    Query params:
+        path: Optional. Omitted/empty returns the ROOTS listing
+            (:func:`_list_browse_roots`) instead of a real directory's
+            contents -- ``path`` is ``null`` and ``parent`` is ``null`` in
+            that response, since there is no single directory and nothing
+            above the roots.
+
+    With ``path`` given, it is resolved (``Path.expanduser().resolve()``, so
+    ``~`` and any ``..`` segments are normalized) and MUST name an existing
+    directory -- anything else (a file, a path that doesn't exist, an
+    unparseable string) is a 400 with this module's standard
+    ``{"error": ...}`` shape (:func:`_error`). Deliberately does NOT restrict
+    *path* to any subtree (e.g. ComfyUI's own `input/`): the whole point of
+    this feature is letting the user target a PSD anywhere on this machine
+    (PROTOCOL.md-adjacent -- this route isn't part of PROTOCOL.md itself,
+    matching `/cpsb/psd_preview`'s own "frontend nicety, not protocol" status).
+
+    Returns:
+        200 with
+        ``{"path", "parent", "sep", "dirs", "files", "truncated"}`` --
+        ``path``/``parent`` are ``None`` for the roots listing, otherwise the
+        resolved absolute directory and its parent (``None`` only when
+        *path* itself is already a filesystem root, e.g. ``/`` or ``C:\\``,
+        where the parent of a root is itself). ``sep`` is this server's
+        `os.sep`, so the frontend can build/display paths without guessing
+        the host platform's separator. ``dirs``/``files`` are
+        :func:`_scan_directory`'s output (empty ``files`` for the roots
+        listing -- roots are exclusively navigable directories). ``truncated``
+        is ``True`` iff the listing hit :data:`_BROWSE_MAX_ENTRIES`.
+    """
+    context = _context(request)
+    raw_path = request.query.get("path")
+    if not raw_path:
+        return web.json_response(
+            {
+                "path": None,
+                "parent": None,
+                "sep": os.sep,
+                "dirs": _list_browse_roots(context),
+                "files": [],
+                "truncated": False,
+            }
+        )
+
+    try:
+        resolved = Path(raw_path).expanduser().resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        return _error(400, f"Invalid path: {exc}")
+    if not resolved.is_dir():
+        return _error(400, f"Not an existing directory: {raw_path}")
+
+    dirs, files, truncated = _scan_directory(resolved)
+    parent = resolved.parent
+    return web.json_response(
+        {
+            "path": str(resolved),
+            "parent": str(parent) if parent != resolved else None,
+            "sep": os.sep,
+            "dirs": dirs,
+            "files": files,
+            "truncated": truncated,
+        }
     )
 
 

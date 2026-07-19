@@ -479,6 +479,187 @@
   color: #cfe4f7;
 }
 
+/* Browse dialog (PhotoshopComposePSD's "Browse..." button, web/cpsb/browse.js)
+   -- reuses .cpsb-dialog-backdrop's fixed overlay/fade mechanics above, but a
+   wider/taller dialog body of its own (.cpsb-dialog itself is capped at
+   360px, too narrow for a scrollable file/folder list). */
+
+.cpsb-browse-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 92vw);
+  max-height: min(560px, 85vh);
+  padding: 16px;
+  border-radius: 10px;
+  background: var(--comfy-menu-bg, #242424);
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
+  color: var(--fg-color, #e6e6e6);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+.cpsb-browse-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.cpsb-browse-title {
+  font-weight: 700;
+}
+
+.cpsb-browse-close {
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.18));
+  background: var(--comfy-input-bg, #2c2c2c);
+  color: var(--fg-color, #e6e6e6);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cpsb-browse-close:hover {
+  background: var(--content-hover-bg, #383838);
+}
+
+.cpsb-browse-path-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.cpsb-browse-path-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.18));
+  background: var(--comfy-input-bg, #1a1a1a);
+  color: var(--fg-color, #e6e6e6);
+  font-size: 12px;
+}
+
+.cpsb-browse-go-button {
+  flex-shrink: 0;
+  padding: 5px 12px;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.18));
+  background: var(--comfy-input-bg, #2c2c2c);
+  color: var(--fg-color, #e6e6e6);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cpsb-browse-go-button:hover {
+  background: var(--content-hover-bg, #383838);
+}
+
+.cpsb-browse-error {
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--error-text, #f66);
+  background: rgba(255, 102, 102, 0.12);
+  border: 1px solid rgba(255, 102, 102, 0.3);
+}
+
+.cpsb-browse-list {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.1));
+  border-radius: 6px;
+  background: var(--comfy-input-bg, #1a1a1a);
+}
+
+.cpsb-browse-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border-default, rgba(255, 255, 255, 0.06));
+}
+
+.cpsb-browse-row:last-child {
+  border-bottom: none;
+}
+
+.cpsb-browse-row:hover {
+  background: var(--content-hover-bg, #2c2c2c);
+}
+
+.cpsb-browse-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.cpsb-browse-row-dir .cpsb-browse-row-name {
+  font-weight: 600;
+}
+
+.cpsb-browse-row-meta {
+  flex-shrink: 0;
+  color: var(--muted-foreground, #888);
+  font-size: 10px;
+}
+
+.cpsb-browse-empty {
+  padding: 24px 10px;
+  text-align: center;
+  color: var(--muted-foreground, #888);
+}
+
+.cpsb-browse-truncated {
+  padding: 6px 10px;
+  color: #e0a030;
+  font-size: 10px;
+  text-align: center;
+}
+
+.cpsb-browse-new-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.cpsb-browse-new-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.18));
+  background: var(--comfy-input-bg, #1a1a1a);
+  color: var(--fg-color, #e6e6e6);
+  font-size: 12px;
+}
+
+.cpsb-browse-new-button {
+  flex-shrink: 0;
+  padding: 5px 12px;
+  border-radius: 5px;
+  border: 1px solid #5b9bd5;
+  background: rgba(91, 155, 213, 0.2);
+  color: #cfe4f7;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cpsb-browse-new-button:hover {
+  background: rgba(91, 155, 213, 0.32);
+}
+
+.cpsb-browse-new-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .cpsb-toast,
   .cpsb-dialog-backdrop,

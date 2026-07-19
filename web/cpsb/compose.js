@@ -20,7 +20,14 @@
  *    toggled back to `true` — cosmetic only, the backend always reads
  *    whatever values they hold regardless. See this file's "Append-target
  *    widgets" section below for the `widget.disabled` mechanism and why it
- *    was chosen over `widget.hidden`.
+ *    was chosen over `widget.hidden`. That same section also creates a
+ *    "Browse..." button widget directly after `existing_psd_path` (a later
+ *    user report, verbatim: "For existing psd path we need a path picker...
+ *    so a user can choose a path by navigating through it vs typing or
+ *    pasting a path"), enabled/disabled in the same lockstep as the other
+ *    two widgets; its click handler opens `browse.js`'s server-backed
+ *    directory-browser dialog (`GET /cpsb/browse`, `cpsb/routes.py`) rather
+ *    than requiring a typed/pasted server-side path.
  * 3. "Written: &lt;filename&gt;" display (product owner gap, verbatim: "And
  *    for 'don't open' how do I later find and open the file?"): the backend
  *    now emits a `cpsb.compose_written` event (`cpsb/compose_psd.py`
@@ -127,6 +134,7 @@
 
 import { app } from '../../../scripts/app.js'
 import * as api from './api.js'
+import * as browse from './browse.js'
 import * as pasteback from './pasteback.js'
 import * as state from './state.js'
 import * as ui from './ui.js'
@@ -339,6 +347,16 @@ const EXISTING_PSD_WIDGET_NAME = 'existing_psd'
 const EXISTING_PSD_PATH_WIDGET_NAME = 'existing_psd_path'
 
 /**
+ * Name for the "Browse..." button widget this file creates directly after
+ * `existing_psd_path` (this file's header, section 2). NOT one of
+ * `cpsb/compose_psd.py`'s `INPUT_TYPES` entries -- a purely client-side
+ * affordance, `serialize: false` (see {@link findOrCreateBrowseButton}) so it
+ * never appears in a saved workflow's `widgets_values` and can never collide,
+ * positionally, with a real backend-declared widget.
+ */
+const BROWSE_BUTTON_WIDGET_NAME = 'cpsb_existing_psd_browse'
+
+/**
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @param {string} name
  * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
@@ -351,10 +369,13 @@ function findWidgetByName(node, name) {
  * Applies the node's current `append_to_existing` value to the `.disabled`
  * flag of `existing_psd`/`existing_psd_path` (this section's header): both
  * disabled when `append_to_existing` is falsy, both re-enabled the instant
- * it's truthy. A no-op if `append_to_existing` itself isn't present (an
+ * it's truthy. Also applies the same `.disabled` flag to the "Browse..."
+ * button ({@link BROWSE_BUTTON_WIDGET_NAME}) in lockstep -- there is no
+ * point offering a path picker for a target the backend isn't even reading
+ * right now. A no-op if `append_to_existing` itself isn't present (an
  * impossible case for a node built from the current `INPUT_TYPES`, but
- * cheap to guard) — leaves whichever of the other two widgets DOES exist
- * untouched rather than assuming both always do.
+ * cheap to guard) — leaves whichever of the other widgets DOES exist
+ * untouched rather than assuming all of them always do.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 function updateAppendTargetWidgetsEnabled(node) {
@@ -363,9 +384,66 @@ function updateAppendTargetWidgetsEnabled(node) {
   const enabled = toggle.value === true
   const existingPsd = findWidgetByName(node, EXISTING_PSD_WIDGET_NAME)
   const existingPsdPath = findWidgetByName(node, EXISTING_PSD_PATH_WIDGET_NAME)
+  const browseButton = findWidgetByName(node, BROWSE_BUTTON_WIDGET_NAME)
   if (existingPsd) existingPsd.disabled = !enabled
   if (existingPsdPath) existingPsdPath.disabled = !enabled
+  if (browseButton) browseButton.disabled = !enabled
   node.graph?.setDirtyCanvas(true, false)
+}
+
+/**
+ * Moves *widget* (already appended to the END of `node.widgets` by
+ * `node.addWidget`) so it renders directly after *afterWidget* instead.
+ * litegraph widgets carry no explicit "position" field to set — `node.widgets`
+ * is a plain array, and the layout/draw pass positions each widget by
+ * walking that array top-to-bottom in order (the same fact this file's
+ * header already cites for socket order), so reordering the array is the
+ * only way to reorder the rendered rows. *afterWidget*'s index is looked up
+ * AGAIN after splicing *widget* out (rather than reused from before), so this
+ * is correct regardless of which of the two originally came first in the
+ * array. A no-op if either widget is missing from `node.widgets` (defensive
+ * only — both are always present when this is actually called).
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {import('../../../scripts/app.js').IBaseWidget} widget
+ * @param {import('../../../scripts/app.js').IBaseWidget} afterWidget
+ */
+function insertWidgetAfter(node, widget, afterWidget) {
+  const widgets = node.widgets
+  if (!widgets) return
+  const widgetIndex = widgets.indexOf(widget)
+  if (widgetIndex === -1 || !widgets.includes(afterWidget)) return
+  widgets.splice(widgetIndex, 1)
+  widgets.splice(widgets.indexOf(afterWidget) + 1, 0, widget)
+}
+
+/**
+ * Creates (once) the "Browse..." button widget directly after
+ * *existingPsdPathWidget* (this file's header, section 2) and wires its click
+ * to {@link browse.openBrowseDialog}. `serialize: false` + `canvasOnly: true`
+ * mirrors every other purely-client-side button this file already adds
+ * (`cpsb_written`/`cpsb_written_copy_path` below) — never written into
+ * `widgets_values`, so it can never collide positionally with a real
+ * backend-declared widget. Idempotent: a pre-existing button (found by name)
+ * is returned as-is rather than duplicated.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {import('../../../scripts/app.js').IBaseWidget} existingPsdPathWidget
+ * @returns {import('../../../scripts/app.js').IBaseWidget}
+ */
+function findOrCreateBrowseButton(node, existingPsdPathWidget) {
+  const existing = findWidgetByName(node, BROWSE_BUTTON_WIDGET_NAME)
+  if (existing) return existing
+  const browseButton = node.addWidget(
+    'button',
+    BROWSE_BUTTON_WIDGET_NAME,
+    BROWSE_BUTTON_WIDGET_NAME,
+    () => browse.openBrowseDialog(node, existingPsdPathWidget),
+    { serialize: false, canvasOnly: true }
+  )
+  browseButton.label = 'Browse...'
+  browseButton.tooltip =
+    'Navigate the ComfyUI machine’s filesystem to pick (or name a new) .psd/.psb target.'
+  insertWidgetAfter(node, browseButton, existingPsdPathWidget)
+  return browseButton
 }
 
 /**
@@ -415,6 +493,16 @@ export function attachAppendTargetWidgets(node) {
       updateAppendTargetWidgetsEnabled(node)
       return result
     }
+  }
+
+  // "Browse..." button (this file's header, section 2) -- created here,
+  // directly after existing_psd_path, rather than in a separate attach*
+  // function, so its enable/disable state is trivially kept in lockstep by
+  // the SAME updateAppendTargetWidgetsEnabled() calls that already handle
+  // existing_psd/existing_psd_path (see that function's own doc comment).
+  const existingPsdPathWidget = findWidgetByName(node, EXISTING_PSD_PATH_WIDGET_NAME)
+  if (existingPsdPathWidget) {
+    findOrCreateBrowseButton(node, existingPsdPathWidget)
   }
 
   const originalOnRemoved = node.onRemoved

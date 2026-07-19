@@ -13,6 +13,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import platform
 import threading
 import time
@@ -780,6 +781,113 @@ class TestPsdPreview:
         assert not (context.temp_dir / "cpsb").exists() or not list(
             (context.temp_dir / "cpsb").glob("*.png")
         )
+
+
+class TestBrowse:
+    """``GET /cpsb/browse`` -- the server-backed directory-browser dialog for
+    ``PhotoshopComposePSD.existing_psd_path`` (`cpsb/routes.py`'s own "GET
+    /cpsb/browse" section header has the full design rationale, including why
+    this route is deliberately left UNGATED by the `/cpsb/open` client-locality
+    428 confirm). Not part of PROTOCOL.md -- a pure frontend nicety, like
+    `/cpsb/psd_preview` above.
+    """
+
+    async def test_roots_listing_has_no_path_and_includes_input_and_home(self, client, context):
+        response = await client.get("/cpsb/browse")
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["path"] is None
+        assert data["parent"] is None
+        assert data["sep"] == os.sep
+        assert data["files"] == []
+        assert data["truncated"] is False
+
+        by_name = {entry["name"]: entry["path"] for entry in data["dirs"]}
+        assert by_name["ComfyUI Input"] == str(context.input_dir.resolve())
+        assert by_name["Home"] == str(Path.home().resolve())
+
+    async def test_empty_path_param_is_treated_as_missing(self, client):
+        """An explicit ``path=`` (empty string) is the same as omitting it
+        entirely -- both mean "show the roots" (`raw_path` is falsy either way).
+        """
+        response = await client.get("/cpsb/browse", params={"path": ""})
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["path"] is None
+
+    async def test_lists_directory_filtered_and_sorted(self, client, tmp_path):
+        target = tmp_path / "browse_target"
+        target.mkdir()
+        (target / "Zeta").mkdir()
+        (target / "alpha").mkdir()
+        (target / ".hidden_dir").mkdir()
+        (target / "cover.psd").write_bytes(b"not real psd bytes, extension-only test")
+        (target / "image.PSB").write_bytes(b"psb")
+        (target / "notes.txt").write_bytes(b"not a psd")
+        (target / ".hidden.psd").write_bytes(b"hidden psd")
+
+        response = await client.get("/cpsb/browse", params={"path": str(target)})
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["path"] == str(target.resolve())
+        assert data["parent"] == str(target.parent.resolve())
+        assert data["sep"] == os.sep
+        assert data["truncated"] is False
+
+        dir_names = [entry["name"] for entry in data["dirs"]]
+        assert dir_names == ["alpha", "Zeta"]  # case-insensitive sort, hidden dir skipped
+
+        file_names = [entry["name"] for entry in data["files"]]
+        assert file_names == ["cover.psd", "image.PSB"]  # case-insensitive sort + extension
+        for file_entry in data["files"]:
+            assert file_entry["size"] > 0
+            assert isinstance(file_entry["mtime"], float)
+
+    async def test_400_on_a_file_path(self, client, tmp_path):
+        a_file = tmp_path / "not_a_directory.psd"
+        a_file.write_bytes(b"psd")
+
+        response = await client.get("/cpsb/browse", params={"path": str(a_file)})
+
+        assert response.status == 400
+        data = await response.json()
+        assert "error" in data
+
+    async def test_400_on_a_missing_path(self, client, tmp_path):
+        response = await client.get(
+            "/cpsb/browse", params={"path": str(tmp_path / "does_not_exist")}
+        )
+
+        assert response.status == 400
+
+    async def test_400_on_garbage_path(self, client):
+        response = await client.get("/cpsb/browse", params={"path": "bad\x00path"})
+
+        assert response.status == 400
+
+    async def test_truncates_over_500_entries(self, client, tmp_path):
+        big = tmp_path / "big"
+        big.mkdir()
+        for index in range(501):
+            (big / f"{index:04d}.psd").touch()
+
+        response = await client.get("/cpsb/browse", params={"path": str(big)})
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["truncated"] is True
+        assert len(data["files"]) == 500
+
+    async def test_parent_is_null_at_a_filesystem_root(self, client):
+        response = await client.get("/cpsb/browse", params={"path": "/"})
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["path"] == "/"
+        assert data["parent"] is None
 
 
 class TestOpenPsdEditInPlace:
