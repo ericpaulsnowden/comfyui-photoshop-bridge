@@ -21,6 +21,24 @@ Every claim about psd-tools' behavior below (``has_preview()``/``topil()``
 semantics, the CMYK channel-inversion quirk, 16-bit downsampling) was
 verified against the installed ``psd-tools`` 1.17.4 by writing and reading
 back real PSD files, not taken from memory or documentation alone.
+
+CMYK note (bug postmortem, verified against ``psd_tools`` 1.17.4 SOURCE, not
+just its behavior -- see :func:`normalize_to_rgb8`): a naive round trip built
+from ``PSDImage.frompil()``/``PSDImage.new()`` does *not* reproduce a real
+Photoshop CMYK file's on-disk byte convention, because those constructors
+write raw PIL channel bytes with no inversion of their own
+(``psd_tools.api.psd_image.PSDImage.frompil``: ``channel.tobytes()``, no
+CMYK special-casing) while psd-tools' *read* side (``psd_tools.api.pil_io
+.post_process``) unconditionally un-inverts any ``"CMYK"``-mode image it
+returns. A frompil-built fixture therefore gets "corrected" once by that
+unconditional read-side invert starting from data that never needed
+correcting -- any *second* invert applied downstream then cancels that
+spurious flip and looks right by accident. Building a fixture that actually
+matches what Photoshop writes requires manually pre-inverting the CMYK bytes
+(``Image.eval(cmyk_image, lambda v: 255 - v)``) *before* handing them to
+``frompil()``/``new()``, so the on-disk bytes end up ``255 * (1 - ink)`` the
+way real Photoshop saves them; tests in ``tests/test_psd_io.py`` build
+fixtures this way for exactly this reason.
 """
 
 from __future__ import annotations
@@ -99,22 +117,53 @@ def normalize_to_rgb8(image: Image.Image) -> Image.Image:
     values), so only the color *mode* needs translating here:
 
     * ``RGB``/``RGBA`` pass through unchanged.
-    * ``CMYK`` is inverted band-by-band before conversion. PSD stores CMYK
-      channels Photoshop-inverted (byte = 255 * (1 - ink)); psd-tools passes
-      that convention straight into a PIL ``"CMYK"`` image, but Pillow's own
-      ``Image.convert("RGB")`` expects the opposite. Verified empirically:
-      converting such an image directly turns a solid orange swatch
-      near-black. ``Image.eval`` is used for the inversion because
-      ``ImageOps.invert`` does not support ``"CMYK"``.
+    * ``CMYK`` converts straight through Pillow's own ``Image.convert("RGB")``
+      -- deliberately with NO extra inversion here. PSD stores CMYK channels
+      Photoshop-inverted on disk (byte = 255 * (1 - ink)), but psd-tools
+      1.17.4 already undoes that itself before handing back a PIL image:
+      ``psd_tools.api.pil_io.post_process()`` runs
+      ``ImageChops.invert(image)`` on every ``"CMYK"``-mode result,
+      unconditionally, for BOTH of :func:`read_edited_psd`'s callers
+      (``PSDImage.topil()`` calls it directly; ``PSDImage.composite()``'s
+      layer-compositor fallback (``composite_pil``) calls the identical
+      ``post_process`` at its own tail end) -- confirmed by reading
+      ``psd_tools/api/pil_io.py`` and ``psd_tools/composite/composite.py``
+      source directly, not inferred from behavior alone. So by the time an
+      image reaches this function, its CMYK bytes are already in Pillow's
+      own standard convention (byte = ink amount directly) -- exactly what
+      ``Image.convert("RGB")`` expects. An earlier version of this function
+      inverted CMYK data AGAIN here on top of psd-tools' own fix, which is
+      what actually caused the reported "CMYK PSD loads as solid black" bug:
+      double-inverting a red pixel that arrived correctly as
+      ``(0, 255, 255, 0)`` turns it into ``(255, 0, 0, 255)`` -- full ink on
+      every channel -- which converts to black. Verified empirically against
+      a fixture whose on-disk bytes were manually pre-inverted to match
+      Photoshop's real convention (see this module's docstring): the old
+      double-invert code produced mean brightness 0.0 for a solid-red 64x64
+      fixture; removing the extra invert produces the correct ``(255, 0, 0)``.
+      This is still a NAIVE, non-color-managed conversion when no ICC
+      profile is embedded (or ``ImageCms``/little-cms isn't available) --
+      Pillow's built-in CMYK->RGB math, not a proper ICC transform -- so
+      results are preview-grade, not colorimetrically accurate; when a CMYK
+      document DOES carry an embedded ICC profile, psd-tools applies a real
+      ICC transform itself (also inside ``post_process``, via
+      ``apply_icc=True`` on both ``read_edited_psd`` call sites) and hands
+      back an already-RGB image, bypassing this branch entirely. Also note:
+      psd-tools' ``post_process`` only calls ``image.putalpha(alpha)`` for
+      ``"RGB"``/``"L"`` mode, never for ``"CMYK"`` -- a CMYK document's own
+      alpha/transparency channel is dropped by psd-tools itself before this
+      function ever sees the image, a pre-existing psd-tools limitation
+      outside this function's control.
     * ``LA`` (grayscale + alpha) becomes ``RGBA`` so alpha survives, per
       PROTOCOL.md §4 ("alpha is preserved when present").
     * Everything else (``L``, ``1``, ``P``, ``LAB``, ...) uses Pillow's
-      standard conversion to ``RGB``.
+      standard conversion to ``RGB``. Grayscale (``"L"``) needs no special
+      handling: PSD/psd-tools has no analogous inversion quirk for
+      grayscale, verified empirically against a genuine grayscale PSD
+      fixture -- ``.convert("RGB")`` alone round-trips it correctly.
     """
     if image.mode in ("RGB", "RGBA"):
         return image
-    if image.mode == "CMYK":
-        return Image.eval(image, lambda value: 255 - value).convert("RGB")
     if image.mode == "LA":
         return image.convert("RGBA")
     return image.convert("RGB")

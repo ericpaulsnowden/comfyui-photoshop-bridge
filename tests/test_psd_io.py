@@ -4,12 +4,42 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 from psd_tools import PSDImage
 from psd_tools.constants import Resource
 from psd_tools.psd.image_resources import ImageResource, VersionInfo
 
 from cpsb.psd_io import normalize_to_rgb8, read_edited_psd, write_psd
+
+
+def write_photoshop_convention_cmyk_psd(
+    path: Path, standard_cmyk: Image.Image | tuple[int, int, int, int]
+) -> None:
+    """Write a CMYK PSD whose ON-DISK bytes match what real Photoshop writes.
+
+    ``PSDImage.frompil()``/``PSDImage.new()`` write raw PIL channel bytes
+    with no inversion of their own -- verified against psd-tools 1.17.4
+    source (see ``cpsb/psd_io.py``'s module docstring) -- so a fixture built
+    straight from *standard* (Pillow-convention, ink-direct) CMYK values
+    does NOT reproduce a genuine Photoshop file's on-disk bytes. This
+    manually pre-inverts *standard_cmyk* before writing, so the bytes that
+    land on disk equal ``255 * (1 - ink)`` the way Photoshop itself saves
+    them. psd-tools then un-inverts this exactly once on read (its own
+    ``pil_io.post_process``), landing back on *standard_cmyk* -- the same as
+    it would for a document a real copy of Photoshop produced.
+
+    Args:
+        path: Destination ``.psd`` path.
+        standard_cmyk: Either a solid fill (a 4-tuple of standard-convention
+            ink bytes, filled into an 8x8 image) or an already-built PIL
+            ``"CMYK"`` image (standard convention) to use as-is.
+    """
+    image = standard_cmyk if isinstance(standard_cmyk, Image.Image) else Image.new(
+        "CMYK", (8, 8), standard_cmyk
+    )
+    photoshop_convention = Image.eval(image, lambda value: 255 - value)
+    PSDImage.frompil(photoshop_convention).save(path)
 
 
 def write_layered_psd_without_composite(path: Path) -> None:
@@ -93,10 +123,28 @@ class TestBitDepthAndColorModes:
         assert image.getpixel((0, 0)) == (102, 153, 204)  # (0.4, 0.6, 0.8) * 255
 
     def test_cmyk_reads_as_rgb_with_correct_colors(self, tmp_path):
-        """CMYK channels are stored Photoshop-inverted; naive convert() gives ~black."""
+        """Regression test for "Opening a CMYK file in Load PSD shows a
+        black square" (user report). PSD stores CMYK channels
+        Photoshop-inverted on disk, but psd-tools 1.17.4 already un-inverts
+        that internally (``pil_io.post_process``, verified against its
+        source) before ``topil()``/``composite()`` ever hand an image back
+        -- so ``read_edited_psd``/``normalize_to_rgb8`` must NOT invert a
+        second time, or the result collapses to near-black.
+
+        The fixture is built via :func:`write_photoshop_convention_cmyk_psd`
+        rather than a plain ``PSDImage.new("CMYK", ...)`` fill: the latter
+        writes RAW (non-Photoshop-inverted) bytes -- verified against
+        psd-tools' own ``frompil``/``new`` source, which just dumps PIL
+        channel bytes with no CMYK-specific handling -- so it does not
+        reproduce what a real Photoshop-saved file looks like on disk. An
+        earlier version of this test used that non-representative fixture
+        and made a double-inverting implementation look correct by
+        accident; that implementation shipped the exact bug being
+        regression-tested here.
+        """
         psd_path = tmp_path / "cmyk.psd"
-        # C=0, M=0.5, Y=1, K=0 -- an orange. Stored inverted per PSD convention.
-        PSDImage.new("CMYK", (8, 8), color=(0.0, 0.5, 1.0, 0.0), depth=8).save(psd_path)
+        # C=0, M=~0.5, Y=1, K=0 -- orange, standard (ink-direct) convention.
+        write_photoshop_convention_cmyk_psd(psd_path, (0, 127, 255, 0))
 
         image, _ = read_edited_psd(psd_path)
         assert image.mode == "RGB"
@@ -105,7 +153,40 @@ class TestBitDepthAndColorModes:
         assert 120 <= green <= 135
         assert blue == 0
 
+    def test_colorful_cmyk_psd_is_not_black(self, tmp_path):
+        """A varied, multi-color CMYK document must not collapse to solid
+        (or near) black -- the precise symptom the user reported. A single
+        uniform-colored fixture could pass by a lucky cancellation; this
+        checks overall brightness across many distinct colors instead.
+        """
+        size = (32, 32)
+        standard = Image.new("CMYK", size)
+        pixels = standard.load()
+        for x in range(size[0]):
+            for y in range(size[1]):
+                pixels[x, y] = (
+                    (x * 8) % 256,
+                    (y * 8) % 256,
+                    ((x + y) * 4) % 256,
+                    0,
+                )
+        psd_path = tmp_path / "gradient_cmyk.psd"
+        write_photoshop_convention_cmyk_psd(psd_path, standard)
+
+        image, _ = read_edited_psd(psd_path)
+        assert image.mode == "RGB"
+        mean_brightness = np.asarray(image, dtype=np.float64).mean()
+        # Solid black would be 0.0; a double-inverted CMYK image lands near
+        # it too (heavy over-inking pushes most pixels toward black).
+        assert mean_brightness > 60.0
+
     def test_16bit_grayscale_reads_as_rgb(self, tmp_path):
+        """Grayscale has no analogous inversion quirk (checked empirically
+        while investigating the CMYK bug above): psd-tools applies no
+        special-casing for ``"L"``-mode images anywhere in ``pil_io.py``, so
+        plain ``.convert("RGB")`` round-trips it correctly with no extra
+        handling needed here.
+        """
         psd_path = tmp_path / "gray16.psd"
         PSDImage.new("L", (8, 8), color=0.3, depth=16).save(psd_path)
 
@@ -133,9 +214,21 @@ class TestNormalizeToRgb8:
         assert result.mode == "RGB"
         assert result.getpixel((0, 0)) == (77, 77, 77)
 
-    def test_cmyk_inverted_before_conversion(self):
-        # Raw PSD-convention CMYK bytes for the orange above: (255, 127, 0, 255).
-        cmyk = Image.new("CMYK", (2, 2), (255, 127, 0, 255))
+    def test_cmyk_passes_through_without_extra_inversion(self):
+        """``normalize_to_rgb8`` must NOT invert CMYK data itself: psd-tools
+        (``pil_io.post_process``) already un-inverts any ``"CMYK"``-mode
+        image before ``read_edited_psd`` ever sees it (verified against
+        psd-tools 1.17.4 source; see this module's own docstring and
+        ``cpsb/psd_io.py``'s), so by the time an image reaches this
+        function its bytes are already in Pillow's standard (ink-direct)
+        convention -- exactly what ``Image.convert("RGB")`` expects with no
+        further help. Feeding it a second, already-inverted-on-disk-style
+        value here (as an earlier version of this test did) would only be
+        correct if this function DID invert again, which is precisely the
+        double-inversion that produced the reported black-square bug.
+        """
+        # Standard (Pillow ink-direct) CMYK bytes for the orange used above.
+        cmyk = Image.new("CMYK", (2, 2), (0, 127, 255, 0))
         result = normalize_to_rgb8(cmyk)
         assert result.mode == "RGB"
         red, green, blue = result.getpixel((0, 0))

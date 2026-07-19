@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 from PIL import Image
+from psd_tools import PSDImage
 
 import cpsb.load_psd as load_psd_module
 import cpsb.nodes as nodes_module
@@ -37,6 +38,25 @@ def write_test_psd(
     path: Path, color: tuple[int, int, int] = (10, 20, 30), size: tuple[int, int] = (16, 16)
 ) -> None:
     write_psd(path, Image.new("RGB", size, color))
+
+
+def write_test_cmyk_psd(
+    path: Path, standard_cmyk: tuple[int, int, int, int], size: tuple[int, int] = (16, 16)
+) -> None:
+    """A native CMYK ``.psd`` whose on-disk bytes match real Photoshop's.
+
+    Mirrors ``tests/test_psd_io.py``'s ``write_photoshop_convention_cmyk_psd``
+    (see its docstring for the full "why"): ``PSDImage.frompil()`` writes raw
+    PIL channel bytes with no CMYK inversion of its own, so *standard_cmyk*
+    (Pillow ink-direct convention) is manually pre-inverted here before
+    writing, landing on bytes shaped like a genuine Photoshop save
+    (``255 * (1 - ink)``). Used to exercise this node's actual ``execute()``
+    IMAGE-output path end-to-end for the "CMYK PSD loads as solid black"
+    regression, not just ``cpsb.psd_io`` directly.
+    """
+    standard = Image.new("CMYK", size, standard_cmyk)
+    photoshop_convention = Image.eval(standard, lambda value: 255 - value)
+    PSDImage.frompil(photoshop_convention).save(path)
 
 
 class TestImportability:
@@ -474,6 +494,29 @@ class TestExecuteFlatten:
         assert array.shape == (8, 12, 3)  # (height, width, channels)
         assert tuple(array[0, 0]) == source_color
         assert mask_tensor.shape == (1, 8, 12)
+
+    def test_flatten_cmyk_psd_is_not_black(self, context, manager, configured):
+        """Regression test for the user-reported bug: "Opening a CMYK file
+        in Load PSD shows a black square." Exercises this node's real
+        ``execute()`` IMAGE output (not just ``cpsb.psd_io`` directly) --
+        ``execute()`` calls ``cpsb.psd_io.read_edited_psd`` the same way
+        ``GET /cpsb/psd_preview`` (``cpsb/routes.py``) does for the node's
+        own preview thumbnail, so this also confirms the preview and IMAGE
+        output share the same healed conversion path.
+        """
+        psd_path = context.input_dir / "cmyk.psd"
+        # C=0, M=~0.5, Y=1, K=0 -- orange, standard (ink-direct) convention.
+        write_test_cmyk_psd(psd_path, (0, 127, 255, 0), size=(8, 8))
+
+        node = load_psd_module.PhotoshopLoadPSD()
+        image_tensor, _mask_tensor = node.execute(psd="cmyk.psd", unique_id="1")
+
+        array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
+        red, green, blue = (int(v) for v in array[0, 0])
+        assert red == 255
+        assert 120 <= green <= 135
+        assert blue == 0
+        assert array.astype("float64").mean() > 60.0  # far from solid black
 
 
 class TestExecuteMaskChain:
