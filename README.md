@@ -111,7 +111,7 @@ The round trip, the four nodes, the gallery, and cross-machine editing all work 
 ## Limitations
 
 - **Layers don't round-trip into the graph.** A ComfyUI image is flat RGB, so what returns to the node is always a flattened raster. Your layers survive in Photoshop (and on the edit-in-place path, in the file), but aren't exposed as layers in ComfyUI.
-- **16-bit and non-RGB images are converted to RGB8.** CMYK, Grayscale, Lab, or 16-bit sources are converted on the way back in, with a toast telling you. Full-fidelity high-bit-depth or color-managed round-tripping is out of scope.
+- **16-bit and non-RGB images are converted to RGB8.** CMYK, Grayscale, Lab, or 16-bit sources are converted on the way in — a plain, non-color-managed conversion (a CMYK PSD loads as recognizable RGB, not a colorimetric match). Full-fidelity high-bit-depth or color-managed round-tripping is out of scope. (Compose's *append-to-existing* is stricter: it refuses a non-RGB target outright rather than silently converting your artwork.)
 - **Save-As to a different file or format breaks the automatic link.** The watcher only watches the exact managed hand-off path. If you Save As elsewhere, the sidebar gallery marks that hand-off "Stale" and accepts drag-and-drop of any image as a manual import to recover it.
 - **Remote/headless ComfyUI needs Tier 2.** Tier 1 opens a local file and watches the local filesystem, so it needs Photoshop and ComfyUI on the same machine (with a GUI session). For remote ComfyUI, use the Tier 2 plugin and point it at the server's address.
 
@@ -141,21 +141,22 @@ ComfyUI backend (on ComfyUI's own PromptServer)
       |   writes a handoff PSD under input/<managed>/<id>/
       |
       +-- Tier 1: OS opens Photoshop; a watchdog watches
-      |           source.psd for the save
+      |           the handoff PSD for the save
       |
       +-- Tier 2: WebSocket "open_handoff" to the Photoshop
-                  plugin (local file path, or fetched over
-                  HTTP when ComfyUI and Photoshop are on
-                  different machines)
+                  plugin (opens a local file path directly, or
+                  streams the PSD over the same WebSocket when
+                  ComfyUI and Photoshop are on different machines)
 
            User edits, hits Cmd/Ctrl+S
 
       +-- Tier 1: watchdog reads the Maximize-Compatibility
       |           composite back out of the saved PSD
       |
-      +-- Tier 2: plugin exports a flattened PNG on
-                  Photoshop's native `save` event, POSTs it
-                  to /cpsb/upload
+      +-- Tier 2: plugin exports a flattened PNG on Photoshop's
+                  native `save` event and returns it — POSTed to
+                  /cpsb/upload locally, or streamed back over the
+                  WebSocket when cross-machine
       |
       v
 Node updates in ComfyUI; sidebar gallery gets an entry
