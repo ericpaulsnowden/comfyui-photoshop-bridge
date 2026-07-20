@@ -246,36 +246,46 @@ export function warn(...args) {
 
 /**
  * @typedef {Object} CpsbBrowseDirEntry
- * A subdirectory (or browse root) entry from `GET /cpsb/browse`.
+ * A subdirectory (or browse root) entry from `GET /cpsb/fs/list`
+ * (STANDARD-fs-browse.md).
  * @property {string} name
- * @property {string} path - Absolute, server-side.
+ * @property {string} [path] - Absolute, server-side. Present ONLY for a
+ * `dir === "ROOTS"` listing's entries (each one is independently rooted, so
+ * the client can't derive it by joining) — absent for a real directory's
+ * entries, which are names-only; join with the response's own `dir` + `sep`.
  */
 
 /**
  * @typedef {Object} CpsbBrowseFileEntry
- * A `.psd`/`.psb` file entry from `GET /cpsb/browse`.
+ * A `.psd`/`.psb` file entry from `GET /cpsb/fs/list` (STANDARD-fs-browse.md)
+ * — names-only, like {@link CpsbBrowseDirEntry}; join with the response's
+ * own `dir` + `sep` for the full path.
  * @property {string} name
- * @property {string} path - Absolute, server-side.
  * @property {number} size - Bytes.
  * @property {number} mtime - Unix seconds.
  */
 
 /**
  * @typedef {Object} CpsbBrowseResponse
- * `GET /cpsb/browse`'s response shape (`cpsb/routes.py` `browse_route`) —
- * either a real directory's contents, or (when `path` is `null`) the browse
- * ROOTS listing (the user's home directory, ComfyUI's own input directory,
- * and platform-specific drives/volumes) used by the "Browse..." dialog
+ * `GET /cpsb/fs/list`'s response shape (`cpsb/routes.py` `fs_list_route`) —
+ * STANDARD-fs-browse.md, the cross-plugin "server filesystem Browse"
+ * contract shared with cprb/epsnodes (migrated 2026-07-19 off the old
+ * `GET /cpsb/browse`, `path` param, full-path-per-entry shape). Either a
+ * real directory's contents, or (when `dir === "ROOTS"`) the virtual ROOTS
+ * listing (the user's home directory, ComfyUI's own input directory, and
+ * platform-specific drives/volumes) used by the "Browse..." dialog
  * (`web/cpsb/browse.js`) for `PhotoshopComposePSD.existing_psd_path`.
- * @property {string | null} path - `null` only for the roots listing.
+ * @property {string} dir - The resolved absolute directory, or the literal
+ * `"ROOTS"` sentinel for the roots listing.
  * @property {string | null} parent - `null` for the roots listing, or when
- * `path` is already a filesystem root (its own parent).
+ * `dir` is already a filesystem root (its own parent).
  * @property {string} sep - This server's `os.sep` — build/display paths with
  * this, never a hardcoded `/` or `\`, since the ComfyUI machine may not be
  * the same platform as the browser (PROTOCOL.md's two-machine setup).
  * @property {CpsbBrowseDirEntry[]} dirs - Sorted case-insensitively by name.
- * @property {CpsbBrowseFileEntry[]} files - `.psd`/`.psb` only, sorted
- * case-insensitively by name; always empty for the roots listing.
+ * @property {CpsbBrowseFileEntry[]} files - `.psd`/`.psb` only (narrowable
+ * via `ext`), sorted case-insensitively by name; always empty for the roots
+ * listing.
  * @property {boolean} truncated - `true` iff this listing hit the server's
  * per-request entry cap.
  */
@@ -465,21 +475,28 @@ export async function getStatus() {
 }
 
 /**
- * GET `/cpsb/browse` — list a directory (or, with *path* omitted/empty, the
- * browse roots) on the ComfyUI machine's filesystem. Backs the "Browse..."
- * dialog (`web/cpsb/browse.js`) for `PhotoshopComposePSD.existing_psd_path`.
- * Deliberately NOT gated by the client-locality confirm `/cpsb/open` uses —
- * see `cpsb/routes.py`'s `browse_route`/its section header for why a
- * read-only listing doesn't carry that gate's "wrong machine" concern.
- * @param {string} [path] - Omit/empty for the roots listing.
+ * GET `/cpsb/fs/list` — list a directory (or, with *dir* set to `"ROOTS"`,
+ * the virtual browse roots; omitted/empty resolves to this pack's own
+ * default directory) on the ComfyUI machine's filesystem. STANDARD-fs-
+ * browse.md's cross-plugin contract (migrated 2026-07-19 off the old
+ * `GET /cpsb/browse`, whose `path` param this function used to send).
+ * Backs the "Browse..." dialog (`web/cpsb/browse.js`) for
+ * `PhotoshopComposePSD.existing_psd_path`. Deliberately NOT gated by the
+ * client-locality confirm `/cpsb/open` uses — see `cpsb/routes.py`'s
+ * `fs_list_route`/its section header for why a read-only listing doesn't
+ * carry that gate's "wrong machine" concern (cpsb's `FS_LIST_LOCAL_ONLY`
+ * build-time flag is `False`).
+ * @param {string} [dir] - Omit/empty for this pack's default directory, or
+ * `"ROOTS"` for the virtual top-level listing.
  * @returns {Promise<CpsbBrowseResponse>}
- * @throws {CpsbApiError} 400 if *path* is set but isn't an existing directory.
+ * @throws {CpsbApiError} 400 if *dir* is set but isn't `"ROOTS"` and isn't an
+ * existing absolute directory.
  */
-export async function browseDirectory(path = '') {
+export async function browseDirectory(dir = '') {
   const params = new URLSearchParams()
-  if (path) params.set('path', path)
+  if (dir) params.set('dir', dir)
   const query = params.toString()
-  return request(`/cpsb/browse${query ? `?${query}` : ''}`, { method: 'GET' })
+  return request(`/cpsb/fs/list${query ? `?${query}` : ''}`, { method: 'GET' })
 }
 
 /**

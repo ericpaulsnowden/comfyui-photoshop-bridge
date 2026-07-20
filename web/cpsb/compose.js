@@ -16,9 +16,11 @@
  *    navigating through it vs typing or pasting a path"): created directly
  *    after `existing_psd_path` (`cpsb/compose_psd.py`'s `INPUT_TYPES`) --
  *    its click handler opens `browse.js`'s server-backed directory-browser
- *    dialog (`GET /cpsb/browse`, `cpsb/routes.py`) rather than requiring a
- *    typed/pasted server-side path. v0.5.28 removed the `append_to_existing`
- *    BOOLEAN and `existing_psd` COMBO this button used to sit alongside
+ *    dialog (`GET /cpsb/fs/list`, `cpsb/routes.py` -- STANDARD-fs-browse.md,
+ *    migrated 2026-07-19 off the old `GET /cpsb/browse`) rather than
+ *    requiring a typed/pasted server-side path. v0.5.28 removed the
+ *    `append_to_existing` BOOLEAN and `existing_psd` COMBO this button used
+ *    to sit alongside
  *    (product owner, verbatim: "Remove the append_to_existing checkbox and
  *    always make that on. Also remove the existing_psd selector. Just have
  *    the browse capability.") — `existing_psd_path` alone now drives the
@@ -280,7 +282,8 @@ function scheduleStabilize(node) {
 // path"): creates a "Browse..." button widget directly after
 // `existing_psd_path` (`cpsb/compose_psd.py`'s `INPUT_TYPES`) whose click
 // handler opens `browse.js`'s server-backed directory-browser dialog
-// (`GET /cpsb/browse`, `cpsb/routes.py`) and writes the chosen path back
+// (`GET /cpsb/fs/list`, `cpsb/routes.py` -- STANDARD-fs-browse.md) and
+// writes the chosen path back
 // onto `existing_psd_path`.
 //
 // v0.5.28 simplification (product owner, verbatim: "Remove the

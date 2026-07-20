@@ -1,17 +1,32 @@
 /**
+ * fs-browse dialog v1 — synced from STANDARD-fs-browse.md
+ *
  * @file The "Browse..." dialog for `PhotoshopComposePSD.existing_psd_path`
  * (`cpsb/compose_psd.py`, added v0.5.20): a user report (a test-checklist
  * note, verbatim) that they "can't seem to get an arbitrary PSD to show up"
  * when asked to type/paste a server-side path into that STRING widget.
  * ComfyUI nodes run server-side, so a real OS file-open dialog is impossible
  * from the browser — this is the correct pattern instead: the frontend asks
- * `GET /cpsb/browse` (`cpsb/routes.py`) to list a directory, this module
+ * `GET /cpsb/fs/list` (`cpsb/routes.py`) to list a directory, this module
  * renders that listing as a navigable dialog, the user clicks their way to a
  * folder/file, and the CHOSEN path is written back onto the node's
  * `existing_psd_path` widget. This module talks to exactly that one
  * read-only route — it never writes anything itself (the actual PSD, new or
  * appended-to, is only ever written later by `cpsb/compose_psd.py`'s own
  * `execute()`, when the node runs).
+ *
+ * STANDARDIZED 2026-07-19 (../../STANDARD-fs-browse.md, the cross-plugin
+ * "server filesystem Browse" contract shared with cprb's and epsnodes'
+ * pickers): migrated off `GET /cpsb/browse` (`path` param, full-path objects
+ * in every entry) onto `GET /cpsb/fs/list` (`dir` param, a `ROOTS` sentinel
+ * for the virtual top, NAMES-ONLY `dirs`/`files` entries — the client joins
+ * `dir` + `sep` + `name` itself, see {@link joinDir}). The dialog still opens
+ * at the roots view (ComfyUI Input / Home / volumes-or-drives) by requesting
+ * `dir=ROOTS` explicitly on first paint, matching this dialog's pre-existing
+ * UX exactly — only the wire shape changed, not the shape of the dialog
+ * itself. Locality: cpsb's `FS_LIST_LOCAL_ONLY` build-time flag is `False`
+ * (STANDARD-fs-browse.md), so this route stays ungated here too, unchanged
+ * from `/cpsb/browse`'s own posture.
  *
  * Wired from `compose.js`'s `attachAppendTargetWidgets`: the "Browse..."
  * button widget that function creates (directly after `existing_psd_path`,
@@ -43,7 +58,17 @@ const PSD_EXTENSIONS = ['.psd', '.psb']
 const DEFAULT_NEW_PSD_EXTENSION = '.psd'
 
 /**
- * Mirrors `cpsb/routes.py`'s `_BROWSE_MAX_ENTRIES` for the truncation
+ * STANDARD-fs-browse.md's `dir` sentinel for the virtual top-level listing
+ * (`cpsb/routes.py`'s `_FS_LIST_ROOTS`) — requested explicitly on first
+ * paint ({@link openBrowseDialog}'s `load(FS_ROOTS)`) so the dialog still
+ * opens at the roots view, matching its pre-migration UX (an empty/omitted
+ * `dir` now means "the pack's own default directory" instead, per the
+ * shared contract).
+ */
+const FS_ROOTS = 'ROOTS'
+
+/**
+ * Mirrors `cpsb/routes.py`'s `_FS_LIST_MAX_ENTRIES` for the truncation
  * notice's wording only (hand-synced by value, never imported — the same
  * small-stable-constant hand-mirroring convention `compose.js`'s own
  * `MAX_IMAGE_INPUTS` doc comment already establishes for a frontend/backend
@@ -53,6 +78,20 @@ const DEFAULT_NEW_PSD_EXTENSION = '.psd'
  * message's number wrong, never let more entries through.
  */
 const BROWSE_MAX_ENTRIES_DISPLAY = 500
+
+/**
+ * Joins a `GET /cpsb/fs/list` `dir` + a names-only child entry's `name`
+ * using the server-reported `sep` (STANDARD-fs-browse.md: entries are
+ * names, the client joins with `dir` + `sep` — halves payload size, and the
+ * client always knows `dir`/`sep` from the very response it's rendering).
+ * @param {string} dir
+ * @param {string} sep
+ * @param {string} name
+ * @returns {string}
+ */
+function joinDir(dir, sep, name) {
+  return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`
+}
 
 /**
  * @param {string} raw
@@ -217,13 +256,14 @@ export function openBrowseDialog(node, pathWidget) {
   /** @param {import('./api.js').CpsbBrowseResponse} data */
   function render(data) {
     current = data
-    pathInput.value = data.path ?? ''
+    const isRootsList = data.dir === FS_ROOTS
+    pathInput.value = isRootsList ? '' : data.dir
     // "New PSD here" only makes sense once a real, existing directory is
-    // being browsed -- the roots listing (data.path === null) is a virtual
+    // being browsed -- the roots listing (data.dir === FS_ROOTS) is a virtual
     // view (Home / ComfyUI Input / volumes), not itself a directory a file
     // could be created in.
-    newNameInput.disabled = data.path == null
-    newButton.disabled = data.path == null
+    newNameInput.disabled = isRootsList
+    newButton.disabled = isRootsList
     list.replaceChildren()
 
     const rows = []
@@ -237,21 +277,28 @@ export function openBrowseDialog(node, pathWidget) {
       )
     }
     for (const dir of data.dirs) {
+      // At the ROOTS listing, each entry is independently rooted (ComfyUI
+      // Input, Home, a volume/drive) and carries its own `path` (STANDARD-
+      // fs-browse.md's documented ROOTS extension, `cpsb/routes.py`'s
+      // `_fs_entry`) -- navigate straight there. Everywhere else, entries
+      // are names-only; join onto the CURRENT `dir` + `sep` (see joinDir()).
+      const target = isRootsList ? dir.path : joinDir(data.dir, data.sep, dir.name)
       rows.push(
         browseRow({
           className: 'cpsb-browse-row-dir',
           name: `${dir.name}/`,
-          onClick: () => load(dir.path)
+          onClick: () => load(target)
         })
       )
     }
     for (const file of data.files) {
+      const target = joinDir(data.dir, data.sep, file.name)
       rows.push(
         browseRow({
           className: 'cpsb-browse-row-file',
           name: file.name,
           meta: formatFileSize(file.size),
-          onClick: () => choosePath(file.path)
+          onClick: () => choosePath(target)
         })
       )
     }
@@ -272,10 +319,11 @@ export function openBrowseDialog(node, pathWidget) {
     }
   }
 
-  /** @param {string} path */
-  async function load(path) {
+  /** @param {string} dir - Omit/empty for this pack's default directory, or
+   * {@link FS_ROOTS} for the virtual top-level listing. */
+  async function load(dir) {
     try {
-      const data = await api.browseDirectory(path || '')
+      const data = await api.browseDirectory(dir || '')
       clearError()
       render(data)
     } catch (error) {
@@ -284,12 +332,12 @@ export function openBrowseDialog(node, pathWidget) {
   }
 
   function confirmNewName() {
-    if (!current || current.path == null) return
+    if (!current || current.dir === FS_ROOTS) return
     const raw = newNameInput.value
     if (!raw.trim()) return
     const filename = normalizeNewFilename(raw)
     const sep = current.sep || '/'
-    const basePath = current.path.endsWith(sep) ? current.path : `${current.path}${sep}`
+    const basePath = current.dir.endsWith(sep) ? current.dir : `${current.dir}${sep}`
     choosePath(`${basePath}${filename}`)
   }
 
@@ -313,5 +361,5 @@ export function openBrowseDialog(node, pathWidget) {
   document.body.appendChild(backdrop)
   requestAnimationFrame(() => backdrop.classList.add('cpsb-dialog-visible'))
 
-  load('') // initial paint: the browse roots
+  load(FS_ROOTS) // initial paint: the browse roots
 }

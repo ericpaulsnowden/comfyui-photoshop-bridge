@@ -984,7 +984,7 @@ async def psd_preview_route(request: web.Request) -> web.Response:
     )
 
 
-# -- GET /cpsb/browse -----------------------------------------------------------
+# -- GET /cpsb/fs/list -----------------------------------------------------------
 #
 # Server-backed directory-browser dialog for `PhotoshopComposePSD.
 # existing_psd_path` (`cpsb/compose_psd.py`, v0.5.20): a user asked to point
@@ -995,8 +995,21 @@ async def psd_preview_route(request: web.Request) -> web.Response:
 # user navigates the rendered listing, and the CHOSEN path is written into
 # `existing_psd_path` client-side -- this route never writes anything itself.
 #
-# LOCALITY-GATE DECISION (deliberate, and different from `/cpsb/open`): this
-# route is intentionally left UNGATED, like `GET /cpsb/status`, rather than
+# STANDARDIZED 2026-07-19 (../STANDARD-fs-browse.md, the cross-plugin
+# "server filesystem Browse" contract shared with cprb's `/cprb/fs/list` and
+# epsnodes' `/lora_library/fs/list`): route renamed from `/cpsb/browse`
+# (`path` param, full-path objects in every entry, no `ROOTS` sentinel) to
+# `/cpsb/fs/list` (`dir` param, names-only entries the client joins with
+# `dir`+`sep`, a `ROOTS` sentinel for the virtual top). The dialog
+# (`web/cpsb/browse.js`) migrated in the same change, so no `/cpsb/browse`
+# alias is kept (the standard's own porting checklist: "keep the alias until
+# its dialog is migrated, then drop it" -- both happened here at once).
+#
+# LOCALITY-GATE DECISION (deliberate, and different from `/cpsb/open`):
+# STANDARD-fs-browse.md makes this an explicit, documented, per-pack
+# build-time flag (:data:`FS_LIST_LOCAL_ONLY`) rather than a hardcoded
+# posture -- cpsb's is `False` (ungated), unlike cprb/epsnodes'
+# loopback-only `True`. Left OPEN here, like `GET /cpsb/status`, rather than
 # reusing `/cpsb/open`'s client-locality 428-confirm machinery
 # (`is_request_local`/`_tier2_bypasses_locality_gate` above). That gate exists
 # to catch a SURPRISE -- a Tier 1 Photoshop launch silently landing on a
@@ -1006,14 +1019,14 @@ async def psd_preview_route(request: web.Request) -> web.Response:
 # The directory being listed is *always* the ComfyUI machine's own filesystem
 # by construction (there is no "wrong machine" this could land on) -- which is
 # exactly what a remote browser is trying to inspect on purpose when picking
-# an `existing_psd_path` for a server-side node. The frontend dialog is
-# labeled "Browse ComfyUI machine" precisely so a remote user is never
-# confused about whose filesystem this shows (mirrors the "on ComfyUI
-# machine" honesty `compose.js`'s written-file display already uses). So the
-# 428 confirm's whole reason for existing -- "you might not realize this is
-# about to happen on a different machine" -- does not apply: there is no
-# action to confirm, only a read. Flagged in the implementation report for a
-# final call.
+# an `existing_psd_path` for a server-side node, and STANDARD-fs-browse.md's
+# own locality section names this exact case as the deliberate `False`
+# rationale. The frontend dialog is labeled "Browse ComfyUI machine"
+# precisely so a remote user is never confused about whose filesystem this
+# shows (mirrors the "on ComfyUI machine" honesty `compose.js`'s written-file
+# display already uses). So the 428 confirm's whole reason for existing --
+# "you might not realize this is about to happen on a different machine" --
+# does not apply: there is no action to confirm, only a read.
 #
 # SECURITY POSTURE (deliberate): a read-only listing of the SAME trust domain
 # ComfyUI itself already runs in -- anyone who can reach this ComfyUI server's
@@ -1022,58 +1035,85 @@ async def psd_preview_route(request: web.Request) -> web.Response:
 # `input/`, the plugin websocket streams whole PSDs) or via ComfyUI core
 # itself (`/view`, arbitrary node execution). This route adds no NEW
 # capability beyond "list what's in a folder" and never follows a listing
-# into a write: `_scan_directory` only ever calls `iterdir`/`stat`, and the
+# into a write: `_fs_list_scan` only ever calls `iterdir`/`stat`, and the
 # route handler never opens, moves, deletes, or creates anything on disk.
 
-#: Cap on combined `dirs` + `files` entries returned by one `/cpsb/browse`
+#: STANDARD-fs-browse.md's locality policy for THIS pack, as an explicit,
+#: documented, build-time flag (not a request-time param -- flipping this via
+#: a query string would let any caller downgrade their own security posture).
+#: `False` here is a deliberate choice (this section's header above), matching
+#: cpsb's pre-existing ungated `/cpsb/browse` behavior exactly -- porting to
+#: the shared contract must never silently flip a pack's posture.
+FS_LIST_LOCAL_ONLY: bool = False
+
+#: STANDARD-fs-browse.md's `dir` sentinel for the virtual top-level listing.
+_FS_LIST_ROOTS = "ROOTS"
+
+#: Cap on combined `dirs` + `files` entries returned by one `/cpsb/fs/list`
 #: listing (root or directory) -- so a directory with an enormous number of
 #: children can't turn one request into a multi-megabyte response. Counts only
-#: entries actually emitted (visible directories, and files matching
-#: :data:`_PSD_NATIVE_EXTENSIONS`) -- a huge pile of hidden dotfiles or
-#: non-PSD files never consumes a slot, since they were never going to be
-#: returned anyway.
-_BROWSE_MAX_ENTRIES = 500
+#: entries actually emitted (visible directories, and files matching the
+#: active extension filter) -- a huge pile of hidden dotfiles or filtered-out
+#: files never consumes a slot, since they were never going to be returned
+#: anyway.
+_FS_LIST_MAX_ENTRIES = 500
 
-#: Label for the ComfyUI input directory when it's surfaced as a browse root
+#: Label for the ComfyUI input directory when it's surfaced as a ROOTS entry
 #: (always present, regardless of platform) -- named explicitly rather than
 #: just showing its bare path, since it's where `PhotoshopComposePSD` writes
-#: by default and is worth calling out as the obvious first stop.
-_BROWSE_INPUT_ROOT_LABEL = "ComfyUI Input"
+#: by default and is worth calling out as the obvious first stop. This is
+#: cpsb's declared "pack default dir" label (STANDARD-fs-browse.md's ROOTS
+#: listing: "the pack's default dir first (labeled)").
+_FS_LIST_DEFAULT_DIR_LABEL = "ComfyUI Input"
 
 #: Same for the user's home directory (always present, regardless of platform).
-_BROWSE_HOME_ROOT_LABEL = "Home"
+_FS_LIST_HOME_LABEL = "Home"
 
 
-def _browse_root_entry(name: str, path: Path) -> dict[str, Any]:
+def _fs_entry(name: str, path: Path) -> dict[str, Any]:
+    """A labeled, directly-navigable ROOTS entry: ``{"name", "path"}``.
+
+    Only ROOTS-listing entries carry ``path`` -- STANDARD-fs-browse.md's
+    general contract is names-only (the client joins ``dir``+``sep``+``name``
+    for a REAL directory listing, :func:`_fs_list_scan`), but a ROOTS entry
+    (the pack's default dir, "Home", a `/Volumes` mount, a Windows drive) has
+    no single parent directory to join against -- each one is independently
+    rooted, so the server hands back its actual absolute path directly rather
+    than asking the client to fabricate a nonsensical `"ROOTS" + sep + name`
+    join. A deliberate, documented, additive extension of the base schema
+    (flagged in the implementation report), not a departure from it: any
+    consumer that only reads ``name`` still gets a sensible label.
+    """
     return {"name": name, "path": str(path)}
 
 
-def _list_windows_drives() -> list[dict[str, Any]]:
-    """Existing drive letters (``C:\\`` etc.) on a Windows host, as browse roots.
+def _list_windows_drives() -> list[str]:
+    """Existing drive roots (``C:\\`` etc.) on a Windows host, as raw paths.
 
     Checked via a plain existence test on each of the 26 possible drive
     letters -- cheap, dependency-free (no ``win32api``/``ctypes`` call needed),
     and exactly mirrors how a user already thinks of "the drives on this
-    machine" (Explorer's own top-level view).
+    machine" (Explorer's own top-level view). Returns raw path strings (not
+    yet labeled) -- :func:`_platform_root_entries` labels them -- matching
+    cprb's/epsnodes' identical seam of the same name, so this is exercisable
+    the same way in every pack's tests: monkeypatch this one function.
     """
-    drives = []
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        drive_root = f"{letter}:\\"
-        if os.path.exists(drive_root):
-            drives.append(_browse_root_entry(f"{letter}:", Path(drive_root)))
-    return drives
+    return [
+        f"{letter}:\\" for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{letter}:\\")
+    ]
 
 
-def _list_macos_volumes() -> list[dict[str, Any]]:
-    """Mounted volumes under ``/Volumes`` on a macOS (or other POSIX) host.
+def _list_macos_volumes() -> list[str]:
+    """Mounted volumes under ``/Volumes`` on a macOS (or other POSIX) host, as raw paths.
 
     ``/Volumes`` always contains at least a symlink back to the boot volume
     (e.g. ``Macintosh HD``) plus one entry per externally-mounted disk/network
     share -- exactly the set a user reaches for when they mean "browse by
     volume" the way Finder's own sidebar does. Hidden entries are skipped
-    (same convention :func:`_scan_directory` uses for a real directory
-    listing) and a stat failure on any one entry is skipped rather than
-    aborting the whole root listing.
+    (same convention :func:`_fs_list_scan` uses for a real directory listing)
+    and a stat failure on any one entry is skipped rather than aborting the
+    whole root listing. Returns raw path strings (not yet labeled) --
+    :func:`_platform_root_entries` labels them.
     """
     volumes_dir = Path("/Volumes")
     if not volumes_dir.is_dir():
@@ -1091,52 +1131,83 @@ def _list_macos_volumes() -> list[dict[str, Any]]:
         except OSError:
             continue
         if is_dir:
-            volumes.append(_browse_root_entry(entry.name, entry))
+            volumes.append(str(entry))
     return volumes
 
 
-def _list_browse_roots(context: CpsbContext) -> list[dict[str, Any]]:
-    """The top-level entries shown when ``/cpsb/browse`` is called with no ``path``.
+def _platform_root_entries(windows: bool) -> list[dict[str, Any]]:
+    """STANDARD-fs-browse.md ROOTS listing's platform-specific tail.
 
-    Always: ComfyUI's own input directory (labeled, since that's
-    :class:`~cpsb.compose_psd.PhotoshopComposePSD`'s default write location)
-    and the user's home directory. Platform-specific beyond that: drive
-    letters on Windows (:func:`_list_windows_drives`), mounted ``/Volumes``
-    entries on macOS/other POSIX (:func:`_list_macos_volumes`) -- this server
+    Every existing drive letter on Windows (:func:`_list_windows_drives`,
+    labeled by its short drive-letter form, e.g. ``"C:"``), or every mounted
+    ``/Volumes`` entry on macOS/other POSIX (:func:`_list_macos_volumes`,
+    labeled by its bare volume name, e.g. ``"Macintosh HD"``) -- this server
     runs on the user's own machine (macOS in development, Windows in
     production), so both branches matter to real users of this pack.
     """
-    roots = [_browse_root_entry(_BROWSE_INPUT_ROOT_LABEL, context.input_dir.resolve())]
-    roots.append(_browse_root_entry(_BROWSE_HOME_ROOT_LABEL, Path.home().resolve()))
-    if platform.system() == "Windows":
-        roots.extend(_list_windows_drives())
-    else:
-        roots.extend(_list_macos_volumes())
+    if windows:
+        return [_fs_entry(raw.rstrip("\\"), Path(raw)) for raw in _list_windows_drives()]
+    return [_fs_entry(Path(raw).name, Path(raw)) for raw in _list_macos_volumes()]
+
+
+def _fs_list_roots(context: CpsbContext) -> list[dict[str, Any]]:
+    """The top-level entries shown when ``/cpsb/fs/list`` is called with ``dir=ROOTS``.
+
+    Always: ComfyUI's own input directory (labeled, since that's
+    :class:`~cpsb.compose_psd.PhotoshopComposePSD`'s default write location)
+    and the user's home directory, then :func:`_platform_root_entries`'s
+    platform-specific tail -- STANDARD-fs-browse.md's exact ROOTS ordering
+    ("the pack's default dir first (labeled) ... 'Home', then platform
+    roots").
+    """
+    roots = [
+        _fs_entry(_FS_LIST_DEFAULT_DIR_LABEL, context.input_dir.resolve()),
+        _fs_entry(_FS_LIST_HOME_LABEL, Path.home().resolve()),
+    ]
+    roots.extend(_platform_root_entries(platform.system() == "Windows"))
     return roots
 
 
-def _scan_directory(directory: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
-    """List *directory*'s children as ``(dirs, files, truncated)`` for ``/cpsb/browse``.
+def _parse_fs_list_extensions(raw: str) -> tuple[str, ...]:
+    """STANDARD-fs-browse.md's `ext` query param: a comma-separated,
+    case-insensitive extension filter for ``GET /cpsb/fs/list``.
 
-    ``dirs`` holds every visible subdirectory; ``files`` holds only
-    ``.psd``/``.psb`` files (case-insensitive, :data:`_PSD_NATIVE_EXTENSIONS`)
-    -- this is a PSD-target picker, not a general file browser. Both lists are
-    sorted case-insensitively by name (directory entries are scanned in that
-    same order, so the cap below keeps the alphabetically-first entries, not
-    an arbitrary filesystem-order prefix). Hidden entries (dotfiles) are
-    skipped outright -- sufficient hidden-detection on macOS, this pack's
-    primary development platform (PROTOCOL.md's two-machine setup); Windows
-    has no dotfile convention to hide here in the first place. An entry that
-    raises on `is_dir()`/`stat()` (a permissions error, a broken symlink, ...)
-    is skipped rather than failing the whole listing.
+    Entries may be given with or without a leading dot. An empty/blank value
+    means "the pack's default allowlist" (:data:`_PSD_NATIVE_EXTENSIONS` --
+    this is a PSD-target picker, not a general file browser) -- mirrors
+    cprb's/epsnodes' identical ``_parse_extensions`` helper (same contract,
+    independently implemented per pack per STANDARD-fs-browse.md).
+    """
+    parts = [part.strip().lower() for part in (raw or "").split(",")]
+    cleaned = tuple(f".{p.lstrip('.')}" for p in parts if p.strip(". "))
+    return cleaned or _PSD_NATIVE_EXTENSIONS
+
+
+def _fs_list_scan(
+    directory: Path, extensions: tuple[str, ...]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    """List *directory*'s children as ``(dirs, files, truncated)`` for ``/cpsb/fs/list``.
+
+    ``dirs`` holds every visible subdirectory (names only,
+    STANDARD-fs-browse.md); ``files`` holds only files matching *extensions*
+    (case-insensitive) -- this is a PSD-target picker, not a general file
+    browser. Both lists are sorted case-insensitively by name (directory
+    entries are scanned in that same order, so the cap below keeps the
+    alphabetically-first entries, not an arbitrary filesystem-order prefix).
+    Hidden entries (dotfiles) are skipped outright -- sufficient
+    hidden-detection on macOS, this pack's primary development platform
+    (PROTOCOL.md's two-machine setup); Windows has no dotfile convention to
+    hide here in the first place. An entry that raises on `is_dir()`/`stat()`
+    (a permissions error, a broken symlink, ...) is skipped rather than
+    failing the whole listing.
 
     Returns:
-        ``([{"name", "path"}, ...], [{"name", "path", "size", "mtime"}, ...],
-        truncated)`` -- ``truncated`` is ``True`` iff more qualifying entries
-        existed than :data:`_BROWSE_MAX_ENTRIES` allowed through. An
-        unreadable *directory* itself (rare: it passed an `is_dir()` check in
-        the caller moments earlier, but permissions can change concurrently)
-        yields ``([], [], False)`` rather than raising.
+        ``([{"name"}, ...], [{"name", "size", "mtime"}, ...], truncated)`` --
+        ``truncated`` is ``True`` iff more qualifying entries existed than
+        :data:`_FS_LIST_MAX_ENTRIES` allowed through. An unreadable
+        *directory* itself (rare: it passed an `is_dir()` check in the caller
+        moments earlier, but permissions can change concurrently) yields
+        ``([], [], False)`` rather than raising.
     """
     try:
         entries = sorted(directory.iterdir(), key=lambda e: e.name.lower())
@@ -1155,98 +1226,111 @@ def _scan_directory(directory: Path) -> tuple[list[dict[str, Any]], list[dict[st
         except OSError:
             continue
         if is_dir:
-            if count >= _BROWSE_MAX_ENTRIES:
+            if count >= _FS_LIST_MAX_ENTRIES:
                 truncated = True
                 break
-            dirs.append(_browse_root_entry(entry.name, entry.resolve()))
+            dirs.append({"name": entry.name})
             count += 1
             continue
-        if entry.suffix.lower() not in _PSD_NATIVE_EXTENSIONS:
+        if entry.suffix.lower() not in extensions:
             continue
         try:
             stat_result = entry.stat()
         except OSError:
             continue
-        if count >= _BROWSE_MAX_ENTRIES:
+        if count >= _FS_LIST_MAX_ENTRIES:
             truncated = True
             break
         files.append(
-            {
-                "name": entry.name,
-                "path": str(entry.resolve()),
-                "size": stat_result.st_size,
-                "mtime": stat_result.st_mtime,
-            }
+            {"name": entry.name, "size": stat_result.st_size, "mtime": stat_result.st_mtime}
         )
         count += 1
     return dirs, files, truncated
 
 
-@routes.get("/cpsb/browse")
-async def browse_route(request: web.Request) -> web.Response:
+@routes.get("/cpsb/fs/list")
+async def fs_list_route(request: web.Request) -> web.Response:
     """A server-side directory listing, for the ``existing_psd_path`` Browse dialog.
 
-    Read-only, and NEVER gated by the client-locality confirm
-    (`/cpsb/open`'s 428) -- see this section's header comment above for why
-    that gate's concern (a Photoshop launch silently landing on the wrong
-    machine) doesn't apply to a plain directory listing.
+    STANDARD-fs-browse.md's shared cross-plugin contract (route renamed from
+    ``/cpsb/browse`` 2026-07-19 -- see this section's header comment above).
+    Gated by :data:`FS_LIST_LOCAL_ONLY` (``False`` for cpsb -- never gated by
+    the client-locality confirm `/cpsb/open`'s 428 uses either; see this
+    section's header for why that gate's concern doesn't apply here).
 
     Query params:
-        path: Optional. Omitted/empty returns the ROOTS listing
-            (:func:`_list_browse_roots`) instead of a real directory's
-            contents -- ``path`` is ``null`` and ``parent`` is ``null`` in
-            that response, since there is no single directory and nothing
-            above the roots.
-
-    With ``path`` given, it is resolved (``Path.expanduser().resolve()``, so
-    ``~`` and any ``..`` segments are normalized) and MUST name an existing
-    directory -- anything else (a file, a path that doesn't exist, an
-    unparseable string) is a 400 with this module's standard
-    ``{"error": ...}`` shape (:func:`_error`). Deliberately does NOT restrict
-    *path* to any subtree (e.g. ComfyUI's own `input/`): the whole point of
-    this feature is letting the user target a PSD anywhere on this machine
-    (PROTOCOL.md-adjacent -- this route isn't part of PROTOCOL.md itself,
-    matching `/cpsb/psd_preview`'s own "frontend nicety, not protocol" status).
+        dir: Optional. Two special values -- empty/omitted resolves to this
+            pack's own default directory (ComfyUI's input dir); the literal
+            ``"ROOTS"`` (:data:`_FS_LIST_ROOTS`) returns the virtual top-level
+            listing (:func:`_fs_list_roots`) instead of a real directory's
+            contents. Any other value MUST be an absolute path naming an
+            existing directory -- a relative path, a file, a path that
+            doesn't exist, or an unparseable string is a 400 with this
+            module's standard ``{"error": ...}`` shape (:func:`_error`).
+            Deliberately does NOT restrict *dir* to any subtree (e.g.
+            ComfyUI's own `input/`): the whole point of this feature is
+            letting the user target a PSD anywhere on this machine
+            (PROTOCOL.md-adjacent -- this route isn't part of PROTOCOL.md
+            itself, matching `/cpsb/psd_preview`'s own "frontend nicety, not
+            protocol" status).
+        ext: Optional, comma-separated, case-insensitive
+            (:func:`_parse_fs_list_extensions`) -- defaults to
+            :data:`_PSD_NATIVE_EXTENSIONS` (``.psd``/``.psb``).
 
     Returns:
-        200 with
-        ``{"path", "parent", "sep", "dirs", "files", "truncated"}`` --
-        ``path``/``parent`` are ``None`` for the roots listing, otherwise the
-        resolved absolute directory and its parent (``None`` only when
-        *path* itself is already a filesystem root, e.g. ``/`` or ``C:\\``,
-        where the parent of a root is itself). ``sep`` is this server's
-        `os.sep`, so the frontend can build/display paths without guessing
-        the host platform's separator. ``dirs``/``files`` are
-        :func:`_scan_directory`'s output (empty ``files`` for the roots
-        listing -- roots are exclusively navigable directories). ``truncated``
-        is ``True`` iff the listing hit :data:`_BROWSE_MAX_ENTRIES`.
+        200 with ``{"dir", "parent", "sep", "dirs", "files", "truncated"}``
+        (STANDARD-fs-browse.md) -- ``dir`` is ``"ROOTS"`` for the roots
+        listing, otherwise the resolved absolute directory; ``parent`` is
+        ``None`` for the roots listing or when *dir* itself is already a
+        filesystem root (e.g. ``/`` or ``C:\\``, where the parent of a root
+        is itself), otherwise the resolved absolute parent. ``sep`` is this
+        server's `os.sep`, so the frontend can build/display paths without
+        guessing the host platform's separator. ``dirs``/``files`` are
+        :func:`_fs_list_scan`'s output (empty ``files`` for the roots listing
+        -- roots are exclusively navigable directories; roots' ``dirs``
+        entries additionally carry ``path``, see :func:`_fs_entry`).
+        ``truncated`` is ``True`` iff the listing hit
+        :data:`_FS_LIST_MAX_ENTRIES`. 403 (this module's standard
+        ``{"error": ...}`` shape) when :data:`FS_LIST_LOCAL_ONLY` is set and
+        the caller isn't local.
     """
+    if FS_LIST_LOCAL_ONLY and not is_request_local(request):
+        return _error(403, "file browsing is host-machine-only")
+
     context = _context(request)
-    raw_path = request.query.get("path")
-    if not raw_path:
+    raw_dir = (request.query.get("dir") or "").strip()
+    extensions = _parse_fs_list_extensions(request.query.get("ext", ""))
+
+    if raw_dir == _FS_LIST_ROOTS:
         return web.json_response(
             {
-                "path": None,
+                "dir": _FS_LIST_ROOTS,
                 "parent": None,
                 "sep": os.sep,
-                "dirs": _list_browse_roots(context),
+                "dirs": _fs_list_roots(context),
                 "files": [],
                 "truncated": False,
             }
         )
 
-    try:
-        resolved = Path(raw_path).expanduser().resolve()
-    except (OSError, ValueError, RuntimeError) as exc:
-        return _error(400, f"Invalid path: {exc}")
+    if not raw_dir:
+        resolved = context.input_dir.resolve()
+    else:
+        candidate = Path(raw_dir)
+        if not candidate.is_absolute():
+            return _error(400, f"dir must be an absolute path (got {raw_dir!r})")
+        try:
+            resolved = candidate.resolve()
+        except (OSError, ValueError, RuntimeError) as exc:
+            return _error(400, f"Invalid dir: {exc}")
     if not resolved.is_dir():
-        return _error(400, f"Not an existing directory: {raw_path}")
+        return _error(400, f"Not an existing directory: {raw_dir or resolved}")
 
-    dirs, files, truncated = _scan_directory(resolved)
+    dirs, files, truncated = _fs_list_scan(resolved, extensions)
     parent = resolved.parent
     return web.json_response(
         {
-            "path": str(resolved),
+            "dir": str(resolved),
             "parent": str(parent) if parent != resolved else None,
             "sep": os.sep,
             "dirs": dirs,

@@ -193,22 +193,28 @@ latest edit's filename, no new edit recorded.
 Returns `source.psd` bytes (`Content-Type: image/vnd.adobe.photoshop`). Used by the
 plugin in remote mode. 404 for unknown id or non-active status.
 
-### GET `/cpsb/browse`
+### GET `/cpsb/fs/list`
 Server-side directory listing backing the Compose node's `existing_psd_path` **Browse
-dialog** (v0.5.27 — user request: "so a user can choose a path by navigating through it vs
-typing or pasting a path"; a true OS file dialog is impossible for a server-side node).
-Query param `path`: omitted/empty → the ROOTS listing (`path`/`parent` null): always
-"ComfyUI Input" + "Home", plus /Volumes mounts (macOS) or drive letters (Windows). With
-`path` → must resolve to an existing directory (400 otherwise): `{path, parent (null at a
-filesystem root), sep, dirs:[{name,path}], files:[{name,path,size,mtime}] (.psd/.psb only,
-case-insensitive), truncated}`. Both lists case-insensitively sorted; dotfiles and
-stat-failing entries skipped; 500-entry cap with `truncated: true`. **Deliberately
-read-only and ungated** (like `/cpsb/status`): the locality 428 exists to stop a Tier-1
-Photoshop launch landing on the wrong machine, and no listing can do that — while the
-filesystem shown being the COMFYUI machine's is exactly what a remote user is intentionally
-inspecting. The frontend dialog (web/cpsb/browse.js) is titled "Browse ComfyUI machine"
-for the same honesty, offers a "New PSD here" input (append_to_existing creates missing
-targets), and its Browse... button tracks the append toggle's disabled state.
+dialog** (v0.5.27 as `/cpsb/browse`; renamed + reshaped to the shared cross-pack contract
+in v0.5.33 — see `../../STANDARD-fs-browse.md`, which cpsb, comfyui-premiere-bridge, and
+comfyui-epsnodes now all implement). A true OS file dialog is impossible for a server-side
+node, so this is the idiomatic substitute.
+Query param `dir`: omitted/empty → the pack default dir (ComfyUI input); the literal
+`dir=ROOTS` → the roots listing (`dir`/`parent` null): "ComfyUI Input" + "Home" + /Volumes
+(macOS) / drive letters (Windows). Otherwise `dir` must be an absolute existing directory
+(400 on relative/missing/not-a-dir). Optional `ext` narrows the extension filter (default
+`.psd`/`.psb`). Response: `{dir, parent (null at a filesystem root), sep, dirs:[{name}],
+files:[{name,size,mtime}], truncated}` — **names only** (the client joins each with
+`dir`+`sep`; ROOTS entries additionally carry an absolute `path`, since there's nothing to
+join the sentinel against). Case-insensitively sorted, dirs then files; dotfiles and
+stat-failing entries skipped; 500-entry cap → `truncated:true`. **Locality is an explicit
+build-time flag** `FS_LIST_LOCAL_ONLY` (cpsb = `False`/ungated — the cross-machine
+Mac-browser→PC-paths flow needs it, and a read-only listing can't launch anything on the
+wrong machine, unlike the Tier-1 428 gate; premiere/epsnodes set it `True`/loopback-only).
+The frontend dialog (`web/cpsb/browse.js`, header comment `fs-browse dialog v1 — synced
+from STANDARD-fs-browse.md`) opens at `dir=ROOTS`, is titled "Browse ComfyUI machine",
+offers a "New PSD here" input (append creates missing targets), and reshapes the response
+via `web/cpsb/api.js`'s `browseDirectory()` (the pack's single network-boundary module).
 
 ### POST `/cpsb/cancel/{handoff_id}`
 Marks the handoff `cancelled`, unblocks a waiting bridge node (which then raises

@@ -783,21 +783,25 @@ class TestPsdPreview:
         )
 
 
-class TestBrowse:
-    """``GET /cpsb/browse`` -- the server-backed directory-browser dialog for
+class TestFsList:
+    """``GET /cpsb/fs/list`` -- the server-backed directory-browser dialog for
     ``PhotoshopComposePSD.existing_psd_path`` (`cpsb/routes.py`'s own "GET
-    /cpsb/browse" section header has the full design rationale, including why
+    /cpsb/fs/list" section header has the full design rationale, including why
     this route is deliberately left UNGATED by the `/cpsb/open` client-locality
     428 confirm). Not part of PROTOCOL.md -- a pure frontend nicety, like
-    `/cpsb/psd_preview` above.
+    `/cpsb/psd_preview` above. Route/response shape standardized 2026-07-19
+    across cpsb/cprb/epsnodes (../STANDARD-fs-browse.md) -- migrated from the
+    old `/cpsb/browse` (`path` param, full-path objects, no `ROOTS` sentinel).
     """
 
-    async def test_roots_listing_has_no_path_and_includes_input_and_home(self, client, context):
-        response = await client.get("/cpsb/browse")
+    async def test_roots_listing_has_no_parent_and_includes_default_dir_and_home(
+        self, client, context
+    ):
+        response = await client.get("/cpsb/fs/list", params={"dir": "ROOTS"})
 
         assert response.status == 200
         data = await response.json()
-        assert data["path"] is None
+        assert data["dir"] == "ROOTS"
         assert data["parent"] is None
         assert data["sep"] == os.sep
         assert data["files"] == []
@@ -807,15 +811,23 @@ class TestBrowse:
         assert by_name["ComfyUI Input"] == str(context.input_dir.resolve())
         assert by_name["Home"] == str(Path.home().resolve())
 
-    async def test_empty_path_param_is_treated_as_missing(self, client):
-        """An explicit ``path=`` (empty string) is the same as omitting it
-        entirely -- both mean "show the roots" (`raw_path` is falsy either way).
+    async def test_empty_dir_param_lists_the_pack_default_directory(self, client, context):
+        """Empty/omitted ``dir`` means "the pack's own default directory"
+        (STANDARD-fs-browse.md) -- NOT the roots listing, which now requires
+        the explicit ``ROOTS`` sentinel.
         """
-        response = await client.get("/cpsb/browse", params={"path": ""})
+        response = await client.get("/cpsb/fs/list", params={"dir": ""})
 
         assert response.status == 200
         data = await response.json()
-        assert data["path"] is None
+        assert data["dir"] == str(context.input_dir.resolve())
+
+    async def test_missing_dir_param_lists_the_pack_default_directory(self, client, context):
+        response = await client.get("/cpsb/fs/list")
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["dir"] == str(context.input_dir.resolve())
 
     async def test_lists_directory_filtered_and_sorted(self, client, tmp_path):
         target = tmp_path / "browse_target"
@@ -828,43 +840,64 @@ class TestBrowse:
         (target / "notes.txt").write_bytes(b"not a psd")
         (target / ".hidden.psd").write_bytes(b"hidden psd")
 
-        response = await client.get("/cpsb/browse", params={"path": str(target)})
+        response = await client.get("/cpsb/fs/list", params={"dir": str(target)})
 
         assert response.status == 200
         data = await response.json()
-        assert data["path"] == str(target.resolve())
+        assert data["dir"] == str(target.resolve())
         assert data["parent"] == str(target.parent.resolve())
         assert data["sep"] == os.sep
         assert data["truncated"] is False
 
-        dir_names = [entry["name"] for entry in data["dirs"]]
-        assert dir_names == ["alpha", "Zeta"]  # case-insensitive sort, hidden dir skipped
+        # Names-only entries (STANDARD-fs-browse.md): the client joins with
+        # `dir` + `sep`, so a regular listing's dirs/files carry no `path`.
+        assert data["dirs"] == [{"name": "alpha"}, {"name": "Zeta"}]  # case-insensitive sort
 
         file_names = [entry["name"] for entry in data["files"]]
         assert file_names == ["cover.psd", "image.PSB"]  # case-insensitive sort + extension
         for file_entry in data["files"]:
+            assert "path" not in file_entry
             assert file_entry["size"] > 0
             assert isinstance(file_entry["mtime"], float)
+
+    async def test_ext_param_narrows_the_default_allowlist(self, client, tmp_path):
+        target = tmp_path / "ext_target"
+        target.mkdir()
+        (target / "a.psd").write_bytes(b"psd")
+        (target / "b.psb").write_bytes(b"psb")
+
+        response = await client.get(
+            "/cpsb/fs/list", params={"dir": str(target), "ext": ".psd"}
+        )
+
+        assert response.status == 200
+        data = await response.json()
+        assert [entry["name"] for entry in data["files"]] == ["a.psd"]
 
     async def test_400_on_a_file_path(self, client, tmp_path):
         a_file = tmp_path / "not_a_directory.psd"
         a_file.write_bytes(b"psd")
 
-        response = await client.get("/cpsb/browse", params={"path": str(a_file)})
+        response = await client.get("/cpsb/fs/list", params={"dir": str(a_file)})
 
         assert response.status == 400
         data = await response.json()
         assert "error" in data
 
-    async def test_400_on_a_missing_path(self, client, tmp_path):
+    async def test_400_on_a_missing_dir(self, client, tmp_path):
         response = await client.get(
-            "/cpsb/browse", params={"path": str(tmp_path / "does_not_exist")}
+            "/cpsb/fs/list", params={"dir": str(tmp_path / "does_not_exist")}
         )
 
         assert response.status == 400
 
+    async def test_400_on_a_relative_dir(self, client):
+        response = await client.get("/cpsb/fs/list", params={"dir": "not/absolute"})
+
+        assert response.status == 400
+
     async def test_400_on_garbage_path(self, client):
-        response = await client.get("/cpsb/browse", params={"path": "bad\x00path"})
+        response = await client.get("/cpsb/fs/list", params={"dir": "bad\x00path"})
 
         assert response.status == 400
 
@@ -874,7 +907,7 @@ class TestBrowse:
         for index in range(501):
             (big / f"{index:04d}.psd").touch()
 
-        response = await client.get("/cpsb/browse", params={"path": str(big)})
+        response = await client.get("/cpsb/fs/list", params={"dir": str(big)})
 
         assert response.status == 200
         data = await response.json()
@@ -882,12 +915,27 @@ class TestBrowse:
         assert len(data["files"]) == 500
 
     async def test_parent_is_null_at_a_filesystem_root(self, client):
-        response = await client.get("/cpsb/browse", params={"path": "/"})
+        response = await client.get("/cpsb/fs/list", params={"dir": "/"})
 
         assert response.status == 200
         data = await response.json()
-        assert data["path"] == "/"
+        assert data["dir"] == "/"
         assert data["parent"] is None
+
+    async def test_locality_flag_defaults_to_ungated_for_a_simulated_remote_caller(
+        self, client, monkeypatch
+    ):
+        """STANDARD-fs-browse.md's locality policy: cpsb's `FS_LIST_LOCAL_ONLY`
+        defaults to `False` (unlike cprb/epsnodes) -- a simulated non-loopback
+        caller (`is_request_local` patched False, the same seam
+        `TestClientLocalityGate` uses for `/cpsb/open`) must still get a 200,
+        never a 403.
+        """
+        monkeypatch.setattr(routes_module, "is_request_local", lambda request: False)
+
+        response = await client.get("/cpsb/fs/list", params={"dir": "ROOTS"})
+
+        assert response.status == 200
 
 
 class TestOpenPsdEditInPlace:
