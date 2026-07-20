@@ -16,13 +16,12 @@ Load Image ──▶ Annotate for Edit ──▶ Qwen-Image-Edit (subgraph) ─�
 
 1. Pick an image in **Load Image**.
 2. **Queue** the workflow. **Annotate for Edit** opens that image in Photoshop
-   and pauses the run there (`annotate_mode = Open in Photoshop (mask from
-   edits)`).
-3. In Photoshop, **paint a box / region** over what you want to change — any
-   tool, any color — then **save** (Cmd/Ctrl+S).
-4. The run resumes. The node derives a mask from the pixel diff, composites a
-   red box at that region (`box_composite = true`), and passes the annotated
-   image on to Qwen-Image-Edit → Save Image.
+   and pauses the run there (`mode = Wait for first save`).
+3. In Photoshop, **paint a box / region** on the auto-created "Instructions"
+   layer — any tool, any color — then **save** (Cmd/Ctrl+S).
+4. The run resumes. The node derives a mask from that layer's own painted
+   pixels, composites a red box at that region (`box_composite = true`), and
+   passes the annotated image on to Qwen-Image-Edit → Save Image.
 
 ### The prompt
 

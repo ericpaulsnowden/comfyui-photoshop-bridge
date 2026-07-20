@@ -27,7 +27,7 @@ Right-clicking an image and choosing **Open in Photoshop** is the core action, a
   - `annotated` — image **and** marks combined, for visual-prompt edit models that take no mask ("edit what I circled"). The `box_composite` toggle picks the form: off = your real strokes, on = a tidy red box at their bounding box (what Kontext / Qwen-Image-Edit respond to).
   - `instruction` — your text, verbatim.
 
-  Rename or delete the Instructions layer and it's just treated as a plain edited image.
+  Rename or delete the Instructions layer and it's just treated as a plain edited image. A **`mode`** widget matches the other nodes — *Wait for first save* (block until you save) or *Re-run on every save* (keep the doc open and re-run with your new mask each save, to iterate on the drawing), plus *Pass through*. A **Re-open in Photoshop** button on the node gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
 
 Handoffs opened in Photoshop are **named after the file they came from** — `Eric-Headshot.jpg` opens as `Eric-Headshot.psd`, not an anonymous `source.psd` — so document tabs and file dropdowns stay tellable-apart.
 

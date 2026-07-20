@@ -24,6 +24,7 @@ import * as badges from './cpsb/badges.js'
 import * as gallery from './cpsb/gallery.js'
 import * as loadpsd from './cpsb/loadpsd.js'
 import * as compose from './cpsb/compose.js'
+import * as annotate from './cpsb/annotate.js'
 import * as ui from './cpsb/ui.js'
 import { SETTINGS } from './cpsb/settings.js'
 
@@ -138,8 +139,11 @@ app.registerExtension({
    * badge hook (badges.js); for Load PSD nodes only, the hand-rolled upload
    * button + drag-and-drop (loadpsd.js — PROTOCOL.md §6b: the stock
    * IMAGEUPLOAD widget can't accept `.psd`/`.psb`; see loadpsd.js's header
-   * for why); and, for Compose nodes only, the auto-growing `image_N` inputs
-   * plus the "Written: ..." display's `localStorage` restore (compose.js).
+   * for why); for Compose nodes only, the auto-growing `image_N` inputs
+   * plus the "Written: ..." display's `localStorage` restore (compose.js);
+   * and, for Annotate nodes only, the "Re-open in Photoshop" button
+   * (annotate.js — PROTOCOL.md §6d: that node has no context-menu entry, so
+   * this is its only on-node way to reopen an in-progress annotation).
    */
   nodeCreated(node) {
     safely('badges.installBadgeHook', () => badges.installBadgeHook(node))
@@ -147,6 +151,7 @@ app.registerExtension({
     safely('compose.attachAutoGrowInputs', () => compose.attachAutoGrowInputs(node))
     safely('compose.attachAppendTargetWidgets', () => compose.attachAppendTargetWidgets(node))
     safely('compose.attachWrittenDisplay', () => compose.attachWrittenDisplay(node))
+    safely('annotate.attachReopenButton', () => annotate.attachReopenButton(node))
   },
 
   /**

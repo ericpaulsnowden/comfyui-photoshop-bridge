@@ -48,15 +48,33 @@ document the additional psd-tools claims specific to reading an alpha-
 carrying layer back out of an RGB-mode document, verified the same way by
 this module's own test suite.
 
-PS mode BLOCKS the workflow until the user saves (PROTOCOL.md §6d, product-
-owner update 2026-07-17): when there is no consumable edit yet, this node
-writes/reuses a handoff, opens Photoshop through the shared seam above, and
-then blocks in :meth:`cpsb.handoff.HandoffManager.wait_for_edit` -- the exact
-same blocking primitive :meth:`cpsb.nodes.PhotoshopBridge.execute`'s "Wait
-for first save" mode uses -- until the first save lands, the user cancels, or
-*timeout_seconds* elapses. Cancel/timeout raise ComfyUI's own
-``InterruptProcessingException`` via :func:`cpsb.nodes._raise_interrupt`,
-reused rather than reimplemented for the identical reason.
+**Mode options match the bridge node's (product-owner spec, 2026-07-19).**
+The ``mode`` COMBO (:class:`AnnotateMode`) now has three values, the last two
+of which literally alias :class:`cpsb.nodes.BridgeMode`'s own constants
+rather than duplicating the strings: :data:`~AnnotateMode.PASS_THROUGH`
+(unchanged), :data:`~AnnotateMode.WAIT_FIRST_SAVE` -- a pure rename of the
+old ``PS_MODE``, still BLOCKING (see below) -- and
+:data:`~AnnotateMode.RERUN_EVERY_SAVE`, new: mirrors
+:meth:`cpsb.nodes.PhotoshopBridge.execute`'s own non-blocking rerun mode,
+opening (or reusing) the handoff without ever waiting, so the user can keep
+the Instructions document open in Photoshop, paint, save, and let the
+frontend's auto-queue (``web/cpsb/pasteback.js``'s ``maybeAutoQueue``, gated
+on this exact mode string) drive a re-run per save instead of relaunching
+Photoshop each time.
+
+"Wait for first save" BLOCKS the workflow until the user saves (PROTOCOL.md
+§6d, product-owner update 2026-07-17): when there is no consumable edit yet,
+this node writes/reuses a handoff, opens Photoshop through the shared seam
+above, and then blocks in :meth:`cpsb.handoff.HandoffManager.wait_for_edit`
+-- the exact same blocking primitive
+:meth:`cpsb.nodes.PhotoshopBridge.execute`'s own "Wait for first save" mode
+uses -- until the first save lands, the user cancels, or *timeout_seconds*
+elapses. Cancel/timeout raise ComfyUI's own ``InterruptProcessingException``
+via :func:`cpsb.nodes._raise_interrupt`, reused rather than reimplemented
+for the identical reason. "Re-run on every save" shares the identical OPEN
+step (:func:`_open_only`, factored out of the blocking
+:func:`_open_and_block_for_edit`) but never calls ``wait_for_edit`` at all --
+see :func:`_resolve_rerun_edit`.
 
 Like :mod:`cpsb.nodes`, this module never imports ``torch``/``numpy`` at
 module level: :func:`cpsb.nodes._tensor_to_pil` already proves plain
@@ -80,7 +98,7 @@ from typing import TYPE_CHECKING, Any
 from PIL import Image, ImageDraw
 from psd_tools import PSDImage
 
-from . import nodes
+from . import nodes, routes
 from .handoff import HandoffManager, HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
 
 if TYPE_CHECKING:
@@ -109,17 +127,29 @@ _BOX_COLOR = (255, 0, 0)
 
 
 class AnnotateMode:
-    """String constants for the ``annotate_mode`` COMBO input (PROTOCOL.md §6d).
+    """String constants for the ``mode`` COMBO input (PROTOCOL.md §6d).
 
-    Unlike :class:`cpsb.nodes.BridgeMode`, the frontend does not string-match
-    on these (this node has no per-mode auto-queue policy -- PROTOCOL.md §6d:
-    "No auto-queue... this node has no re-run mode"), but the literal text is
-    still part of the protocol contract, so it is named here rather than
-    inlined.
+    Product-owner spec, 2026-07-19: this node's mode options must be
+    CONSISTENT with the bridge node's, so the user can iterate on a drawing
+    the same way in either node. :data:`WAIT_FIRST_SAVE` and
+    :data:`RERUN_EVERY_SAVE` therefore alias
+    :class:`cpsb.nodes.BridgeMode`'s own constants directly -- not duplicate
+    string literals -- so the two node's option sets can never silently
+    drift apart. (This codebase has already paid for that exact mistake
+    once: ``docs/PROTOCOL.md``'s trigger-policy string is independently
+    duplicated across four modules that cannot import one another, and needs
+    its own dedicated drift-guard test, ``tests/test_load_psd.py``, to catch
+    a reworded copy. Importing the constant instead makes that whole class of
+    bug structurally impossible here.) Unlike :class:`cpsb.nodes.BridgeMode`,
+    the frontend DOES now string-match on :data:`RERUN_EVERY_SAVE` too (the
+    same ``maybeAutoQueue`` gate the bridge node relies on,
+    ``web/cpsb/pasteback.js``) -- the "no auto-queue, no re-run mode" note
+    that used to live here is no longer true.
     """
 
     PASS_THROUGH = "Pass through"
-    PS_MODE = "Open in Photoshop (mask from edits)"
+    WAIT_FIRST_SAVE = nodes.BridgeMode.WAIT_FIRST_SAVE
+    RERUN_EVERY_SAVE = nodes.BridgeMode.RERUN_EVERY_SAVE
 
 
 def _write_instructions_psd(psd_path: Path, pil_image: Image.Image) -> None:
@@ -386,10 +416,11 @@ def _create_handoff(
     Mirrors :meth:`cpsb.nodes.PhotoshopBridge._create_handoff` (a bridge-node
     input is an in-memory tensor, not a file ``/view`` could address, so
     ``source`` is a descriptive placeholder -- PROTOCOL.md §6). Opening
-    Photoshop is a separate step (:func:`_open_and_block_for_edit`) so the
-    "reuse an existing handoff" and "create a fresh one" branches in
-    :func:`_resolve_ps_mode_edit` can share one open/block call site. Writes
-    the handoff's managed PSD copy LAYERED (:func:`_write_instructions_psd`,
+    Photoshop is a separate step (:func:`_open_and_block_for_edit` /
+    :func:`_open_only`) so the "reuse an existing handoff" and "create a
+    fresh one" branches in both :func:`_resolve_wait_for_save_edit` and
+    :func:`_resolve_rerun_edit` can share one call site each. Writes the
+    handoff's managed PSD copy LAYERED (:func:`_write_instructions_psd`,
     product-owner spec 2026-07-17), not the old flat
     :func:`cpsb.psd_io.write_psd`.
 
@@ -416,6 +447,62 @@ def _create_handoff(
     return meta
 
 
+def _open_only(
+    state: _NodeState,
+    node_id: str,
+    meta: HandoffMeta,
+    psd_path: Path,
+) -> routes.OpenAttempt:
+    """Open Photoshop (tier-selected) WITHOUT waiting for a save (PROTOCOL.md §6d).
+
+    Factored out of :func:`_open_and_block_for_edit` -- which now does
+    nothing more than call this and then add the blocking wait on top -- so
+    BOTH "Wait for first save" and "Re-run on every save" share the
+    identical open step: the shared, tier-selecting seam
+    (:meth:`cpsb.nodes.PhotoshopBridge._open_in_photoshop`, reused rather
+    than reimplemented -- it already logs tier selection and the launch
+    result under its own ``cpsb bridge:`` prefix). Every step is ALSO logged
+    here under ``cpsb annotate:`` so a "didn't open Photoshop" report is
+    diagnosable from this node's own log trail alone, without having to
+    cross-reference the bridge node's prefix.
+
+    Args:
+        state: The configured backend state.
+        node_id: This node instance's ``unique_id``, stringified (logging
+            only).
+        meta: The handoff being opened (new or reused).
+        psd_path: The handoff's managed PSD copy path.
+
+    Returns:
+        The launch attempt (``ok``/``error``/``tier``). On failure,
+        :meth:`~cpsb.nodes.PhotoshopBridge._open_in_photoshop` has already
+        called ``manager.mark_error(...)`` for the caller -- what an
+        unsuccessful attempt MEANS is entirely the caller's call:
+        :func:`_open_and_block_for_edit` interrupts (nothing left to wait
+        for); :func:`_resolve_rerun_edit` does not, mirroring
+        :meth:`cpsb.nodes.PhotoshopBridge.execute`'s own non-blocking modes,
+        which never interrupt on a failed open either.
+    """
+    logger.info("cpsb annotate: node %s handoff %s: opening Photoshop", node_id, meta.handoff_id)
+    attempt = nodes.PhotoshopBridge._open_in_photoshop(state, meta, psd_path)
+    if attempt.ok:
+        logger.info(
+            "cpsb annotate: node %s handoff %s: launch result ok (tier %d)",
+            node_id,
+            meta.handoff_id,
+            attempt.tier,
+        )
+    else:
+        logger.warning(
+            "cpsb annotate: node %s handoff %s: could not open Photoshop (tier %d): %s",
+            node_id,
+            meta.handoff_id,
+            attempt.tier,
+            attempt.error,
+        )
+    return attempt
+
+
 def _open_and_block_for_edit(
     state: _NodeState,
     node_id: str,
@@ -423,18 +510,13 @@ def _open_and_block_for_edit(
     psd_path: Path,
     timeout_seconds: float,
 ) -> None:
-    """Open Photoshop (tier-selected) and BLOCK until the first save (PROTOCOL.md §6d).
+    """Open Photoshop (:func:`_open_only`) and BLOCK until the first save (PROTOCOL.md §6d).
 
     Identical in shape to :meth:`cpsb.nodes.PhotoshopBridge.execute`'s "Wait
-    for first save" tail: open via the shared, tier-selecting seam
-    (:meth:`cpsb.nodes.PhotoshopBridge._open_in_photoshop`, reused rather than
-    reimplemented -- it already logs tier selection and the launch result
-    under its own ``cpsb bridge:`` prefix), then poll
+    for first save" tail: open via :func:`_open_only`, then poll
     :meth:`cpsb.handoff.HandoffManager.wait_for_edit` on this thread (which
     does not block ComfyUI's event loop -- see ``cpsb.nodes``'s own module
-    docstring). Every step is ALSO logged here under ``cpsb annotate:`` so a
-    "didn't open Photoshop" report is diagnosable from this node's own log
-    trail alone, without having to cross-reference the bridge node's prefix.
+    docstring).
 
     Args:
         state: The configured backend state.
@@ -455,26 +537,15 @@ def _open_and_block_for_edit(
         fails (never reaches the wait -- nothing to wait for), or the wait
         ends in ``CANCELLED``/``TIMEOUT``.
     """
-    logger.info("cpsb annotate: node %s handoff %s: opening Photoshop", node_id, meta.handoff_id)
-    attempt = nodes.PhotoshopBridge._open_in_photoshop(state, meta, psd_path)
-    if attempt.ok:
-        logger.info(
-            "cpsb annotate: node %s handoff %s: launch result ok (tier %d)",
-            node_id,
-            meta.handoff_id,
-            attempt.tier,
-        )
-    else:
+    attempt = _open_only(state, node_id, meta, psd_path)
+    if not attempt.ok:
         logger.warning(
-            "cpsb annotate: node %s handoff %s: could not open Photoshop (tier %d): %s, "
-            "interrupting",
+            "cpsb annotate: node %s handoff %s: could not open Photoshop, interrupting",
             node_id,
             meta.handoff_id,
-            attempt.tier,
-            attempt.error,
         )
-        # _open_in_photoshop already called manager.mark_error(...) for us
-        # (both tiers' failure branches do); nothing left to do but stop the
+        # _open_only (via _open_in_photoshop) already called manager.mark_error(...)
+        # for us (both tiers' failure branches do); nothing left to do but stop the
         # workflow rather than hang waiting for a save that can never arrive.
         nodes._raise_interrupt()
 
@@ -495,21 +566,59 @@ def _open_and_block_for_edit(
         nodes._raise_interrupt()
 
 
-def _resolve_ps_mode_edit(
+def _supersede_stale_handoff(
+    manager: HandoffManager, node_id: str, active: HandoffMeta | None, source_hash: str
+) -> HandoffMeta | None:
+    """Retire *active* if its recorded ``source_hash`` no longer matches the input.
+
+    Shared by both :func:`_resolve_wait_for_save_edit` and
+    :func:`_resolve_rerun_edit`: an active handoff whose ``source_hash``
+    mismatches belongs to OLD pixels and must not have its (or a future)
+    edit served against the new input -- mirrors
+    :meth:`cpsb.nodes.PhotoshopBridge.execute`'s identical check exactly,
+    including its documented choice to treat a legacy handoff with no
+    recorded ``source_hash`` as matching (never mass-superseding handoffs
+    written before ``source_hash`` existed).
+
+    Args:
+        manager: The handoff manager.
+        node_id: This node instance's ``unique_id``, stringified (logging
+            only).
+        active: The node's current active handoff, or ``None``.
+        source_hash: :func:`cpsb.handoff.compute_source_hash` of the current
+            input.
+
+    Returns:
+        *active* unchanged if it still matches (or there was none to begin
+        with); ``None`` if it was just superseded.
+    """
+    if active is not None and active.source_hash is not None and active.source_hash != source_hash:
+        logger.info(
+            "cpsb annotate: node %s: input changed, superseding handoff %s",
+            node_id,
+            active.handoff_id,
+        )
+        manager.supersede(active.handoff_id)
+        return None
+    return active
+
+
+def _resolve_wait_for_save_edit(
     state: _NodeState,
     node_id: str,
     pil_image: Image.Image,
     source_hash: str,
     timeout_seconds: float,
 ) -> tuple[Image.Image, Any | None, Image.Image]:
-    """The PS-mode ``(image, mask, combined)`` resolution (PROTOCOL.md §6d) -- BLOCKS.
+    """The "Wait for first save" ``(image, mask, combined)`` resolution (PROTOCOL.md §6d) -- BLOCKS.
+
+    (Renamed from ``_resolve_ps_mode_edit`` -- product-owner spec,
+    2026-07-19 -- when ``AnnotateMode.PS_MODE`` became
+    :data:`AnnotateMode.WAIT_FIRST_SAVE`; behavior is otherwise unchanged.)
 
     Node-reuse semantics mirror :meth:`cpsb.nodes.PhotoshopBridge.execute`
-    exactly: an active handoff whose recorded ``source_hash`` no longer
-    matches the current input belongs to OLD pixels and is superseded before
-    anything else happens (a legacy handoff with no recorded ``source_hash``
-    is treated as matching, same documented choice as the bridge node). Once
-    that's settled, two cases remain: (a) the (possibly just-refreshed)
+    exactly (:func:`_supersede_stale_handoff` factors out the shared check).
+    Once that's settled, two cases remain: (a) the (possibly just-refreshed)
     active handoff already has an edit -- consume it by re-opening its
     managed PSD copy with psd-tools (:func:`_read_ps_saved_psd`), WITHOUT
     reopening Photoshop (the existing consume behavior, unchanged); (b) no
@@ -520,10 +629,10 @@ def _resolve_ps_mode_edit(
     (:func:`_open_and_block_for_edit`) until the user saves, cancels, or
     *timeout_seconds* elapses. This is the same "always (re)open, then wait"
     shape as the bridge node's "Wait for first save" mode -- there is no
-    non-blocking mode left to preserve here (PROTOCOL.md §6d, product-owner
-    update 2026-07-17): a manual re-queue after a prior timeout reuses and
-    reopens the SAME handoff (layers intact), exactly like the bridge node's
-    own documented re-queue-after-timeout behavior.
+    non-blocking behavior here (unlike :func:`_resolve_rerun_edit`): a
+    manual re-queue after a prior timeout reuses and reopens the SAME
+    handoff (layers intact), exactly like the bridge node's own documented
+    re-queue-after-timeout behavior.
 
     Args:
         state: The configured backend state.
@@ -552,15 +661,7 @@ def _resolve_ps_mode_edit(
     """
     manager = state.manager
     active = manager.find_active_for_node(node_id)
-
-    if active is not None and active.source_hash is not None and active.source_hash != source_hash:
-        logger.info(
-            "cpsb annotate: node %s: input changed, superseding handoff %s",
-            node_id,
-            active.handoff_id,
-        )
-        manager.supersede(active.handoff_id)
-        active = None
+    active = _supersede_stale_handoff(manager, node_id, active, source_hash)
 
     if active is not None and active.edits:
         logger.info(
@@ -590,10 +691,86 @@ def _resolve_ps_mode_edit(
     return _read_ps_saved_psd(psd_path)
 
 
+def _resolve_rerun_edit(
+    state: _NodeState,
+    node_id: str,
+    pil_image: Image.Image,
+    source_hash: str,
+) -> tuple[Image.Image, Any | None, Image.Image] | None:
+    """The "Re-run on every save" resolution (PROTOCOL.md §6d) -- NEVER BLOCKS.
+
+    New in this node (product-owner spec, 2026-07-19), mirroring
+    :meth:`cpsb.nodes.PhotoshopBridge.execute`'s own "Re-run on every save"
+    mode: identical node-reuse semantics to
+    :func:`_resolve_wait_for_save_edit` (:func:`_supersede_stale_handoff`,
+    consume-without-reopening once an edit has arrived), but the open step
+    is :func:`_open_only` -- never :func:`_open_and_block_for_edit` -- and
+    only for a genuinely NEW handoff (none existed yet, or the old one was
+    just superseded). Reusing an existing, unsaved handoff must not
+    relaunch/refocus Photoshop on every single re-run (PROTOCOL.md §5/§6,
+    same reasoning as the bridge node's own non-blocking modes): the
+    frontend keeps the Instructions document open and auto-re-queues this
+    node on save (``web/cpsb/pasteback.js``'s ``maybeAutoQueue``, gated on
+    this exact mode string), so by the time this runs again either an edit
+    has already arrived (the consume branch, above) or nothing has changed
+    (this function returns ``None`` either way for "nothing to consume yet").
+
+    Args:
+        state: The configured backend state.
+        node_id: This node instance's ``unique_id``, stringified.
+        pil_image: The current input, decoded.
+        source_hash: :func:`cpsb.handoff.compute_source_hash` of *pil_image*.
+
+    Returns:
+        ``(image, mask, combined)`` (:func:`_read_ps_saved_psd`'s own
+        contract) when a save was consumed; ``None`` when there is nothing
+        consumable yet -- signalling the caller to pass the input straight
+        through unchanged (same shape as Pass-through mode's own
+        resolution) while a (possibly just-created) handoff sits open in
+        Photoshop, waiting for the user's next save.
+    """
+    manager = state.manager
+    active = manager.find_active_for_node(node_id)
+    active = _supersede_stale_handoff(manager, node_id, active, source_hash)
+
+    if active is not None and active.edits:
+        logger.info(
+            "cpsb annotate: node %s handoff %s: edit already arrived, consuming without "
+            "reopening",
+            node_id,
+            active.handoff_id,
+        )
+        return _read_ps_saved_psd(manager.psd_path(active))
+
+    if active is None:
+        logger.info("cpsb annotate: node %s: no active handoff, creating", node_id)
+        meta = _create_handoff(state, node_id, pil_image, source_hash)
+        _open_only(state, node_id, meta, manager.psd_path(meta))
+    else:
+        logger.info(
+            "cpsb annotate: node %s handoff %s: mode=%r, handoff already open, not reopening",
+            node_id,
+            active.handoff_id,
+            AnnotateMode.RERUN_EVERY_SAVE,
+        )
+
+    # No consumable edit yet: nothing for the caller to derive image/mask
+    # from -- it falls back to the same pass-through shape Pass-through
+    # mode itself uses.
+    return None
+
+
 def _fold_edit_hash_for_is_changed(
     manager: HandoffManager, node_id: str, source_hash: str
 ) -> str | None:
-    """The latest-edit hash to fold into ``IS_CHANGED``, if any (PROTOCOL.md §6d)."""
+    """The latest-edit hash to fold into ``IS_CHANGED``, if any (PROTOCOL.md §6d).
+
+    Mode-agnostic by design: shared by both non-pass-through modes'
+    ``IS_CHANGED`` folding (:meth:`PhotoshopAnnotate.IS_CHANGED`) -- an
+    arriving edit must force re-execution the same way whether the node is
+    about to BLOCK for it ("Wait for first save") or simply consume it on
+    the frontend's next auto-queued re-run ("Re-run on every save").
+    """
     active = manager.find_active_for_node(node_id)
     if (
         active is not None
@@ -621,9 +798,11 @@ class PhotoshopAnnotate:
     * **Pass-through mode** (:data:`AnnotateMode.PASS_THROUGH`, the default):
       never even looks up a handoff. IMAGE is the unchanged input; MASK is
       the ``mask`` input socket if connected, else all-zero.
-    * **PS mode** (:data:`AnnotateMode.PS_MODE`), once a save is consumable
-      (see below): this node re-opens the saved handoff PSD with psd-tools
-      and looks for a top-level layer named exactly
+    * **"Wait for first save" / "Re-run on every save"**
+      (:data:`AnnotateMode.WAIT_FIRST_SAVE` /
+      :data:`AnnotateMode.RERUN_EVERY_SAVE`), once a save is consumable (see
+      below): this node re-opens the saved handoff PSD with psd-tools and
+      looks for a top-level layer named exactly
       :data:`INSTRUCTIONS_LAYER_NAME` (:func:`_read_ps_saved_psd`):
 
       - **Found**: MASK = that layer's own painted pixels (its opacity,
@@ -636,22 +815,47 @@ class PhotoshopAnnotate:
         image; MASK falls back to the ordinary tiers -- the ``mask`` input
         socket if connected, else all-zero.
 
-    PS mode BLOCKS (PROTOCOL.md §6d, product-owner update 2026-07-17): with
-    no matching edit yet, it writes (or reuses) a ``bridge_node`` handoff
-    whose managed PSD copy is a LAYERED PSD (input image + a blank
-    "Instructions" layer, :func:`_write_instructions_psd`), opens Photoshop
-    through the same tier-selecting seam the bridge node uses, and then
-    blocks ``execute()`` -- identical to
-    :meth:`cpsb.nodes.PhotoshopBridge.execute`'s "Wait for first save" mode
-    -- until the user marks up and saves the image, cancels, or
-    *timeout_seconds* elapses (see :func:`_open_and_block_for_edit`). A save
-    resumes this same call, which then re-reads the saved managed PSD copy per
-    the precedence above; cancel/timeout raise ComfyUI's own
-    ``InterruptProcessingException``, stopping the workflow rather than
-    silently returning zeros. There is no re-run mode and so no auto-queue
-    (PROTOCOL.md §5/§6d) -- once this node returns with a real result, the
-    user is done; a re-queue only reopens Photoshop if they explicitly want
-    another pass.
+    **Mode options match the bridge node's, so the user can iterate on a
+    drawing the same way in either node (product-owner spec, 2026-07-19).**
+
+    * :data:`~AnnotateMode.WAIT_FIRST_SAVE` BLOCKS (PROTOCOL.md §6d,
+      product-owner update 2026-07-17; this is a pure rename of the old
+      ``PS_MODE``, behavior unchanged): with no matching edit yet, it writes
+      (or reuses) a ``bridge_node`` handoff whose managed PSD copy is a
+      LAYERED PSD (input image + a blank "Instructions" layer,
+      :func:`_write_instructions_psd`), opens Photoshop through the same
+      tier-selecting seam the bridge node uses, and then blocks
+      ``execute()`` -- identical to
+      :meth:`cpsb.nodes.PhotoshopBridge.execute`'s own "Wait for first
+      save" mode -- until the user marks up and saves the image, cancels,
+      or *timeout_seconds* elapses (see :func:`_open_and_block_for_edit`). A
+      save resumes this same call, which then re-reads the saved managed
+      PSD copy per the precedence above; cancel/timeout raise ComfyUI's own
+      ``InterruptProcessingException``, stopping the workflow rather than
+      silently returning zeros. A manual re-queue always reopens the same
+      handoff (layers intact), exactly like the bridge node's own
+      re-queue-after-timeout behavior.
+    * :data:`~AnnotateMode.RERUN_EVERY_SAVE` NEVER BLOCKS (new,
+      product-owner spec 2026-07-19; see :func:`_resolve_rerun_edit`): it
+      opens (or reuses) the same handoff without ever waiting for a save,
+      so the user keeps the Instructions document open in Photoshop, paints,
+      saves -- the frontend auto-queues a re-run per save
+      (``web/cpsb/pasteback.js``'s ``maybeAutoQueue``, gated on this exact
+      mode string, mirroring the bridge node's own gate), each of which then
+      consumes the latest edit via the SAME node-reuse semantics as "Wait
+      for first save" (supersede-on-changed-input,
+      consume-without-reopening once an edit has arrived) -- just without
+      the blocking wait. No relaunch per save: Photoshop opens once and the
+      document stays open for the whole iteration loop.
+
+    **BREAKING CHANGE (pre-1.0, product-owner approved, 2026-07-19):** the
+    widget backing these modes was renamed from ``annotate_mode`` to
+    ``mode``, and its option strings changed (``"Open in Photoshop (mask
+    from edits)"`` no longer exists -- see :data:`AnnotateMode.WAIT_FIRST_SAVE`
+    instead). A workflow saved before v0.5.30 stores its OLD widget value
+    under the OLD name; ComfyUI will not carry it over. **Workflows saved
+    before v0.5.30 will need the Annotate node's mode re-selected.** No
+    migration shim is provided.
     """
 
     CATEGORY = "image/photoshop"
@@ -668,8 +872,12 @@ class PhotoshopAnnotate:
             "required": {
                 "image": ("IMAGE",),
                 "instruction": ("STRING", {"multiline": True, "default": ""}),
-                "annotate_mode": (
-                    [AnnotateMode.PASS_THROUGH, AnnotateMode.PS_MODE],
+                "mode": (
+                    [
+                        AnnotateMode.PASS_THROUGH,
+                        AnnotateMode.WAIT_FIRST_SAVE,
+                        AnnotateMode.RERUN_EVERY_SAVE,
+                    ],
                     {"default": AnnotateMode.PASS_THROUGH},
                 ),
                 "box_composite": ("BOOLEAN", {"default": False}),
@@ -688,7 +896,7 @@ class PhotoshopAnnotate:
         cls,
         image: Any,
         instruction: str,
-        annotate_mode: str,
+        mode: str,
         box_composite: bool,
         timeout_seconds: int,
         unique_id: str,
@@ -698,7 +906,7 @@ class PhotoshopAnnotate:
 
         Base hash covers *image* (its :func:`cpsb.handoff.compute_source_hash`,
         the same PNG-encoding hash a handoff's own identity is keyed on),
-        *instruction*, *annotate_mode*, *box_composite*, and whether *mask*
+        *instruction*, *mode*, *box_composite*, and whether *mask*
         is connected at all -- every input that can change this node's
         output on its own, without any Photoshop round trip (PROTOCOL.md
         §6d: "image+instruction+mask-presence+params hash"). *timeout_seconds*
@@ -707,20 +915,25 @@ class PhotoshopAnnotate:
         own ``IS_CHANGED`` (PROTOCOL.md §6), it only bounds how long
         ``execute()`` waits, it never changes what a completed run produces,
         so hashing it would force needless re-execution on a mere timeout
-        tweak. When *annotate_mode* is PS mode AND this node's active handoff
+        tweak. When *mode* is :data:`AnnotateMode.WAIT_FIRST_SAVE` or
+        :data:`AnnotateMode.RERUN_EVERY_SAVE` AND this node's active handoff
         (source_hash-matched) already has an edit, that edit's own hash is
-        folded in too, so an arriving Photoshop save forces re-execution the
-        same way an arriving bridge-node edit does (the "standard" pattern,
-        PROTOCOL.md §6/§6c) -- gated to PS mode specifically so a stale
-        handoff left over from a since-switched-away-from PS-mode run never
-        causes a pass-through execution to needlessly re-fire.
+        folded in too (:func:`_fold_edit_hash_for_is_changed`), so an
+        arriving Photoshop save forces re-execution the same way an arriving
+        bridge-node edit does (the "standard" pattern, PROTOCOL.md §6/§6c)
+        -- for "Re-run on every save" this is what lets the frontend's
+        auto-queued re-run actually pick up the new mask instead of
+        re-executing to an identical result. Gated to those two modes
+        specifically (never plain Pass-through) so a stale handoff left
+        over from a since-switched-away-from mode never causes a
+        pass-through execution to needlessly re-fire.
         """
         pil_image = nodes._tensor_to_pil(image)
         image_hash = compute_source_hash(pil_image)
-        params_blob = f"{instruction}|{annotate_mode}|{bool(box_composite)}|{mask is not None}"
+        params_blob = f"{instruction}|{mode}|{bool(box_composite)}|{mask is not None}"
         base = hashlib.sha256(f"{image_hash}:{params_blob}".encode()).hexdigest()
 
-        if annotate_mode != AnnotateMode.PS_MODE:
+        if mode == AnnotateMode.PASS_THROUGH:
             return base
 
         manager = nodes._require_state().manager
@@ -731,7 +944,7 @@ class PhotoshopAnnotate:
         self,
         image: Any,
         instruction: str,
-        annotate_mode: str,
+        mode: str,
         box_composite: bool,
         timeout_seconds: int,
         unique_id: str,
@@ -739,53 +952,66 @@ class PhotoshopAnnotate:
     ) -> tuple[Any, Any, str, Any]:
         """``(IMAGE, MASK, STRING, IMAGE)`` per the class docstring's precedence rules.
 
-        In PS mode with no consumable edit yet, this call BLOCKS (see the
-        class docstring, :func:`_resolve_ps_mode_edit`,
+        In "Wait for first save" mode with no consumable edit yet, this call
+        BLOCKS (see the class docstring, :func:`_resolve_wait_for_save_edit`,
         :func:`_open_and_block_for_edit`) until the user saves in Photoshop,
         cancels, or *timeout_seconds* elapses -- the latter two raise
-        ComfyUI's own ``InterruptProcessingException`` rather than returning.
+        ComfyUI's own ``InterruptProcessingException`` rather than
+        returning. "Re-run on every save" never blocks (see
+        :func:`_resolve_rerun_edit`) -- with no consumable edit yet it opens
+        (or reuses) Photoshop non-blocking and returns immediately, same
+        shape as Pass-through mode's own return.
 
         Args:
             image: The ``IMAGE`` input tensor.
             instruction: The typed instruction, returned verbatim.
-            annotate_mode: One of :class:`AnnotateMode`'s two values.
+            mode: One of :class:`AnnotateMode`'s three values.
             box_composite: Whether to draw a red box on the *annotated*
                 output.
-            timeout_seconds: Bound on the PS-mode blocking wait; unused in
-                Pass-through mode.
+            timeout_seconds: Bound on "Wait for first save"'s blocking wait;
+                unused otherwise.
             unique_id: This node instance's id (ComfyUI's hidden
                 ``UNIQUE_ID`` input), used to key its handoff lookup.
             mask: The optional ``MASK`` input socket.
 
         Returns:
-            ``(image, mask, instruction, annotated)``. In Pass-through mode,
-            *image* is the exact same tensor object passed in. In PS mode,
-            *image* is derived from the saved handoff PSD (see the class
-            docstring) -- it is the same object as the input only by
-            coincidence, never guaranteed.
+            ``(image, mask, instruction, annotated)``. *image* is the exact
+            same tensor object passed in for Pass-through mode and for
+            "Re-run on every save" whenever there is nothing new to consume
+            yet; it is derived from the saved handoff PSD (see the class
+            docstring) once either PS-touching mode has a consumable edit --
+            the same object as the input only by coincidence there, never
+            guaranteed.
         """
         state = nodes._require_state()
         node_id = str(unique_id)
-        logger.info(
-            "cpsb annotate: node %s: execute() starting (mode=%r)", node_id, annotate_mode
-        )
+        logger.info("cpsb annotate: node %s: execute() starting (mode=%r)", node_id, mode)
 
         pil_image = nodes._tensor_to_pil(image)
         source_hash = compute_source_hash(pil_image)
 
-        if annotate_mode == AnnotateMode.PS_MODE:
-            result_image, ps_mask_array, combined_image = _resolve_ps_mode_edit(
+        consumed: tuple[Image.Image, Any | None, Image.Image] | None
+        if mode == AnnotateMode.WAIT_FIRST_SAVE:
+            consumed = _resolve_wait_for_save_edit(
                 state, node_id, pil_image, source_hash, timeout_seconds
             )
-            image_tensor = nodes._pil_to_tensor(result_image)
+        elif mode == AnnotateMode.RERUN_EVERY_SAVE:
+            consumed = _resolve_rerun_edit(state, node_id, pil_image, source_hash)
         else:
+            consumed = None  # Pass-through: never looks up a handoff at all.
+
+        if consumed is None:
             result_image = pil_image
             ps_mask_array = None
-            # Pass-through (ComfyUI-only tier): there is no Photoshop document,
-            # so no painted strokes exist to combine -- `annotated` degrades to
-            # the box-or-unchanged behavior below.
+            # No Photoshop save consumed this call (Pass-through, or
+            # "Re-run on every save" with nothing new yet): there is no
+            # painted-strokes view to combine -- `annotated` degrades to the
+            # box-or-unchanged behavior below.
             combined_image = None
-            image_tensor = image  # same tensor object: pass-through never re-encodes
+            image_tensor = image  # same tensor object: never re-encodes when passing through
+        else:
+            result_image, ps_mask_array, combined_image = consumed
+            image_tensor = nodes._pil_to_tensor(result_image)
 
         mask_array = self._resolve_mask_array(ps_mask_array, mask, result_image)
         mask_tensor = _array_to_mask_tensor(mask_array)
@@ -799,20 +1025,22 @@ class PhotoshopAnnotate:
     def _resolve_mask_array(
         ps_mask_array: Any | None, mask_socket: Any, image_for_sizing: Image.Image
     ):
-        """MASK fallback tiers (PROTOCOL.md §6d) -- the PS-mode layer read is resolved
-        by the caller.
+        """MASK fallback tiers (PROTOCOL.md §6d) -- the Instructions-layer read
+        (either PS-touching mode) is resolved by the caller.
 
         Args:
             ps_mask_array: The Instructions layer's own opacity
                 (:func:`_read_ps_saved_psd`), or ``None`` when unavailable
-                (pass-through mode, or PS mode with no Instructions layer
-                found).
+                (Pass-through mode; "Re-run on every save" with nothing
+                consumed yet; or either mode's saved PSD with no
+                Instructions layer found).
             mask_socket: The node's optional ``mask`` input tensor, or
                 ``None`` if unconnected.
             image_for_sizing: The resolved image for this execution (for
-                zero-mask sizing only) -- PS mode's own resolved image, which
-                may differ in size from the original input if the user
-                resized the canvas in Photoshop.
+                zero-mask sizing only) -- the Photoshop-derived resolved
+                image when one was consumed, which may differ in size from
+                the original input if the user resized the canvas in
+                Photoshop.
 
         Returns:
             A ``(H, W)`` float32 numpy array.

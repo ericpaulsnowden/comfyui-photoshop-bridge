@@ -10,21 +10,25 @@ loop is needed here: with no Tier 2 plugin ever connected in these tests,
 every open this node attempts takes the synchronous Tier 1 path, which never
 touches the loop at all (see ``cpsb.nodes``'s own module docstring).
 
-PS mode BLOCKS (PROTOCOL.md §6d, 2026-07-17 update), so its tests mirror
-``test_nodes.py``'s ``TestWaitForFirstSaveMode`` shape too: a
+"Wait for first save" mode BLOCKS (PROTOCOL.md §6d, 2026-07-17 update), so
+its tests mirror ``test_nodes.py``'s ``TestWaitForFirstSaveMode`` shape too: a
 ``threading.Timer`` delivers a delayed edit/cancel from a background thread
 while ``execute()`` blocks on the main thread, exactly like real Photoshop
 usage (a human's save always arrives long after the launch call returns).
+"Re-run on every save" mode (product-owner spec, 2026-07-19 -- this node's
+``mode`` options now match the bridge node's) NEVER blocks; its tests mirror
+``test_nodes.py``'s ``TestRerunEverySaveMode`` shape instead.
 
-**The "Instructions" layer redesign (product-owner spec, 2026-07-17).** PS
-mode no longer diffs the whole image against a flat re-save; it writes the
-handoff PSD LAYERED (input image + a blank top-level "Instructions" layer)
-and, on save, reopens that same file with psd-tools to read the Instructions
-layer's own painted pixels as the MASK and the composite of every OTHER
-layer as the IMAGE. ``make_layered_psd``/``make_handoff_with_layered_edit``
-below build those saved-PSD fixtures directly (independent of the node's own
-write helper, ``cpsb.annotate._write_instructions_psd``) so the READ path is
-never just asserted against itself. The old whole-image diff machinery
+**The "Instructions" layer redesign (product-owner spec, 2026-07-17).** Both
+Photoshop-touching modes no longer diff the whole image against a flat
+re-save; they write the handoff PSD LAYERED (input image + a blank
+top-level "Instructions" layer) and, on save, reopen that same file with
+psd-tools to read the Instructions layer's own painted pixels as the MASK
+and the composite of every OTHER layer as the IMAGE. ``make_layered_psd``/
+``make_handoff_with_layered_edit`` below build those saved-PSD fixtures
+directly (independent of the node's own write helper,
+``cpsb.annotate._write_instructions_psd``) so the READ path is never just
+asserted against itself. The old whole-image diff machinery
 (``_raw_diff_mask``, ``_close_and_fill_mask``, the scipy/PIL-fallback
 morphology, and their dedicated test classes) is gone along with the
 feature it implemented.
@@ -144,9 +148,10 @@ def configured(context: CpsbContext, manager: HandoffManager):
     """Wire ``nodes.configure`` with a fake app/loop.
 
     Fine for anything that never actually opens Photoshop: pass-through mode
-    (which never looks up a handoff at all), or PS mode against a handoff
-    that already has an edit (``_resolve_ps_mode_edit`` only reaches the
-    open/block path when there is no consumable edit yet).
+    (which never looks up a handoff at all), or either Photoshop-touching
+    mode against a handoff that already has an edit
+    (``_resolve_wait_for_save_edit``/``_resolve_rerun_edit`` only reach the
+    open path when there is no consumable edit yet).
     """
     nodes_module.configure(context, manager, cast("object", None), cast("object", None))
     yield
@@ -271,8 +276,8 @@ class TestContractShape:
         spec = annotate_module.PhotoshopAnnotate.INPUT_TYPES()
         assert spec["required"]["image"] == ("IMAGE",)
         assert spec["required"]["instruction"] == ("STRING", {"multiline": True, "default": ""})
-        assert spec["required"]["annotate_mode"] == (
-            ["Pass through", "Open in Photoshop (mask from edits)"],
+        assert spec["required"]["mode"] == (
+            ["Pass through", "Wait for first save", "Re-run on every save"],
             {"default": "Pass through"},
         )
         assert spec["required"]["box_composite"] == ("BOOLEAN", {"default": False})
@@ -282,6 +287,27 @@ class TestContractShape:
         )
         assert spec["optional"] == {"mask": ("MASK",)}
         assert spec["hidden"] == {"unique_id": "UNIQUE_ID"}
+
+    def test_mode_widget_matches_bridge_node_options_exactly(self):
+        """Product-owner spec, 2026-07-19: this node's ``mode`` options must be
+        CONSISTENT with the bridge node's -- a drift guard. The last two
+        options are literally the SAME string objects as
+        ``cpsb.nodes.BridgeMode``'s constants (:class:`AnnotateMode` imports
+        them rather than duplicating the literals), so this can never
+        silently reword itself away from the bridge node's own values.
+        """
+        spec = annotate_module.PhotoshopAnnotate.INPUT_TYPES()
+        options, config = spec["required"]["mode"]
+        assert options == [
+            annotate_module.AnnotateMode.PASS_THROUGH,
+            nodes_module.BridgeMode.WAIT_FIRST_SAVE,
+            nodes_module.BridgeMode.RERUN_EVERY_SAVE,
+        ]
+        assert config == {"default": annotate_module.AnnotateMode.PASS_THROUGH}
+        wait_first_save = annotate_module.AnnotateMode.WAIT_FIRST_SAVE
+        rerun_every_save = annotate_module.AnnotateMode.RERUN_EVERY_SAVE
+        assert wait_first_save == nodes_module.BridgeMode.WAIT_FIRST_SAVE
+        assert rerun_every_save == nodes_module.BridgeMode.RERUN_EVERY_SAVE
 
     def test_node_attributes(self):
         node_cls = annotate_module.PhotoshopAnnotate
@@ -297,7 +323,7 @@ class TestInstructionPassthrough:
         result = node.execute(
             image=tensor,
             instruction=text,
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=60,
             unique_id="60",
@@ -316,7 +342,7 @@ class TestInstructionPassthrough:
         result = node.execute(
             image=tensor_from_image(source),
             instruction="fix the sky",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id="61",
@@ -341,7 +367,7 @@ class TestWriteLayeredHandoff:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -398,7 +424,7 @@ class TestWriteLayeredHandoff:
             node.execute(
                 image=make_tensor(RED),
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -440,7 +466,7 @@ class TestWriteLayeredHandoff:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -473,7 +499,7 @@ class TestReadFoundInstructionsLayer:
         image_out, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -506,7 +532,7 @@ class TestReadFoundInstructionsLayer:
         image_out, _mask_out, _instruction, annotated_out = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -540,7 +566,7 @@ class TestReadFoundInstructionsLayer:
         image_out, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -570,7 +596,7 @@ class TestReadFoundInstructionsLayer:
         _, _, _, annotated_out = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=True,
             timeout_seconds=60,
             unique_id=node_id,
@@ -601,7 +627,7 @@ class TestReadMissingInstructionsLayer:
         image_out, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -631,7 +657,7 @@ class TestReadMissingInstructionsLayer:
         _, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -664,7 +690,7 @@ class TestReadMissingInstructionsLayer:
         image_out, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -803,7 +829,7 @@ class TestMaskPrecedence:
         _, mask_out, _, _ = node.execute(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=60,
             unique_id="80",
@@ -821,7 +847,7 @@ class TestMaskPrecedence:
         _, mask_out, _, _ = node.execute(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=60,
             unique_id="81",
@@ -845,7 +871,7 @@ class TestMaskPrecedence:
         _, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -854,7 +880,7 @@ class TestMaskPrecedence:
         assert mask_out[0, 5, 5] > 0  # the layer-mask pixel
         assert mask_out[0, 10, 10] == 0  # the socket-only pixel is NOT used
 
-    def test_ps_mode_ignored_when_annotate_mode_is_pass_through(self, node, manager):
+    def test_ps_mode_ignored_when_mode_is_pass_through(self, node, manager):
         """A leftover handoff+edit must not leak into pass-through mode."""
         import torch
 
@@ -867,7 +893,7 @@ class TestMaskPrecedence:
         _, mask_out, _, _ = node.execute(
             image=tensor_from_image(source),
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -876,11 +902,14 @@ class TestMaskPrecedence:
         assert torch.count_nonzero(mask_out).item() == 0  # zeros tier: handoff never consulted
 
 
-class TestPsModeBlocking:
-    """PROTOCOL.md §6d (2026-07-17 update): PS mode with no consumable edit
-    BLOCKS ``execute()`` -- open Photoshop, then wait -- instead of the
-    earlier fire-and-forget open. Mirrors ``test_nodes.py``'s
-    ``TestWaitForFirstSaveMode``/``TestExecute`` shapes.
+class TestWaitForFirstSaveBlocking:
+    """PROTOCOL.md §6d (2026-07-17 update; mode renamed to
+    :data:`AnnotateMode.WAIT_FIRST_SAVE`, product-owner spec 2026-07-19):
+    "Wait for first save" with no consumable edit BLOCKS ``execute()`` --
+    open Photoshop, then wait -- instead of the earlier fire-and-forget
+    open. Mirrors ``test_nodes.py``'s ``TestWaitForFirstSaveMode``/
+    ``TestExecute`` shapes. See :class:`TestRerunEverySaveMode` below for
+    the NON-blocking mode's tests.
     """
 
     def test_blocks_until_edit_then_returns_instructions_mask(self, node, manager, monkeypatch):
@@ -911,7 +940,7 @@ class TestPsModeBlocking:
         _, mask_out, instruction_out, _ = node.execute(
             image=tensor,
             instruction="mark the sky",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=10,
             unique_id=node_id,
@@ -942,7 +971,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -967,7 +996,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -1000,7 +1029,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=30,
                 unique_id=node_id,
@@ -1025,7 +1054,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -1038,7 +1067,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -1057,7 +1086,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=red_tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -1070,7 +1099,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=green_tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -1087,7 +1116,7 @@ class TestPsModeBlocking:
         node.execute(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=60,
             unique_id="93",
@@ -1099,9 +1128,10 @@ class TestPsModeBlocking:
     def test_open_seam_invoked_with_diagnosable_log_trail(self, node, manager, launches, caplog):
         """Regression guard for the field report "the toggle didn't open
         Photoshop": proves the SAME tier-selecting launch seam the bridge
-        node uses genuinely fires for a fresh PS-mode execute(), and that
-        every step is logged under the ``cpsb annotate:`` prefix so a future
-        non-open is diagnosable from this node's own log trail alone.
+        node uses genuinely fires for a fresh "Wait for first save"
+        execute(), and that every step is logged under the ``cpsb
+        annotate:`` prefix so a future non-open is diagnosable from this
+        node's own log trail alone.
         """
         node_id = "116"
         tensor = make_tensor(RED)
@@ -1111,7 +1141,7 @@ class TestPsModeBlocking:
             node.execute(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -1130,6 +1160,11 @@ class TestPsModeBlocking:
 
 
 class TestConsumePath:
+    """"Wait for first save"'s consume-without-reopening path. See
+    :class:`TestRerunEverySaveMode` for the identical check under "Re-run on
+    every save".
+    """
+
     def test_consumes_existing_edit_without_reopening(self, node, manager, launches):
         node_id = "94"
         width, height = 24, 16
@@ -1142,7 +1177,7 @@ class TestConsumePath:
         result = node.execute(
             image=tensor,
             instruction="check this",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=60,
             unique_id=node_id,
@@ -1153,13 +1188,199 @@ class TestConsumePath:
         assert result[1][0, 2, 2] > 0
 
 
+class TestRerunEverySaveMode:
+    """PROTOCOL.md §6d (product-owner spec, 2026-07-19): "Re-run on every
+    save" NEVER blocks -- it opens (or reuses) the handoff and returns
+    immediately, relying on the frontend's auto-queue to re-invoke this node
+    once the user saves. Mirrors ``test_nodes.py``'s
+    ``TestRerunEverySaveMode`` shape.
+    """
+
+    def test_first_run_opens_non_blocking_and_passes_input_through(
+        self, node, manager, launches
+    ):
+        """No hang: with no consumable edit yet, ``execute()`` returns
+        immediately -- the input image and instruction straight through,
+        the resolved (here: zero) mask -- while Photoshop opens in the
+        background, exactly like Pass-through mode's own return shape.
+        """
+        node_id = "150"
+        tensor = make_tensor(RED)
+
+        start = time.monotonic()
+        result = node.execute(
+            image=tensor,
+            instruction="mark it up",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        elapsed = time.monotonic() - start
+        assert elapsed < 5  # never blocked waiting for a save
+
+        assert result[0] is tensor  # passthrough: the same tensor object
+        assert result[2] == "mark it up"
+
+        import torch
+
+        assert torch.count_nonzero(result[1]).item() == 0  # no edit yet: zero mask
+
+        active = manager.find_active_for_node(node_id)
+        assert active is not None
+        assert active.status == "editing"  # Photoshop was opened
+        assert len(launches) == 1
+
+    def test_requeue_after_save_consumes_edit_without_reopening(
+        self, node, manager, launches
+    ):
+        """The frontend's auto-queue delivers a re-run once the handoff has
+        an edit -- that re-run must CONSUME the new mask (same as "Wait for
+        first save"'s consume path) withOUT relaunching Photoshop, since the
+        document is already open.
+        """
+        node_id = "151"
+        width, height = 24, 16
+        tensor = make_tensor(RED, size=(width, height))
+
+        node.execute(
+            image=tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        assert len(launches) == 1
+
+        active = manager.find_active_for_node(node_id)
+        saved_psd_path = manager.psd_path(active)
+        base = Image.new("RGB", (width, height), RED)
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).point((5, 5), fill=(255, 255, 255, 255))
+        make_layered_psd(saved_psd_path, base, instructions)
+        manager.ingest_edit(active.handoff_id, base, "plugin")
+
+        result = node.execute(
+            image=tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        assert len(launches) == 1  # no relaunch: consumed the existing edit instead
+        assert result[1][0, 5, 5] > 0  # the newly consumed Instructions-layer pixel
+
+    def test_reexecution_before_any_save_does_not_relaunch(self, node, manager, launches):
+        """A re-run-mode passthrough execution against a handoff that is
+        already open -- whether or not it has been saved yet -- must never
+        reopen Photoshop. Only a genuinely new handoff does (mirrors
+        ``cpsb.nodes.PhotoshopBridge``'s identical guarantee).
+        """
+        node_id = "152"
+        tensor = make_tensor(RED)
+        node.execute(
+            image=tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        assert len(launches) == 1
+
+        result = node.execute(
+            image=tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        assert result[0] is tensor
+        assert len(launches) == 1  # still just one launch
+
+    def test_stale_handoff_from_changed_input_is_superseded_and_reopened(
+        self, node, manager, launches
+    ):
+        node_id = "153"
+        red_tensor = make_tensor(RED)
+        node.execute(
+            image=red_tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        old = manager.find_active_for_node(node_id)
+
+        green_tensor = make_tensor(GREEN)
+        result = node.execute(
+            image=green_tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        assert manager.get(old.handoff_id).status == "superseded"
+        fresh = manager.find_active_for_node(node_id)
+        assert fresh.handoff_id != old.handoff_id
+        assert fresh.edits == []
+        assert len(launches) == 2  # reopened for the fresh handoff
+        assert result[0] is green_tensor  # passthrough: no edit yet for the fresh handoff
+
+    def test_open_failure_does_not_interrupt_and_still_passes_through(
+        self, node, manager, monkeypatch
+    ):
+        """Non-blocking modes never interrupt on a failed open (mirrors
+        ``cpsb.nodes.PhotoshopBridge.execute``'s own non-blocking modes,
+        which don't check the launch attempt's ``ok`` at all): there is
+        nothing to wait for, so the run still completes with a pass-through
+        result instead of stopping the workflow -- unlike "Wait for first
+        save", which interrupts (see
+        ``TestWaitForFirstSaveBlocking.test_open_failure_marks_error_and_interrupts_without_hanging``).
+        """
+        node_id = "154"
+        tensor = make_tensor(RED)
+        monkeypatch.setattr(
+            routes_module,
+            "launch_photoshop",
+            lambda psd_path, override="": LaunchResult(ok=False, error="no Photoshop found"),
+        )
+
+        result = node.execute(
+            image=tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        assert result[0] is tensor  # no interrupt: passthrough despite the failed open
+
+        matching = [h for h in manager.list_all() if h.origin_node_id == node_id]
+        assert len(matching) == 1
+        assert matching[0].status == "error"  # mark_error still fired
+
+
 class TestIsChanged:
     def test_stable_for_identical_inputs(self, configured):
         tensor = make_tensor(RED)
         kwargs = {
             "image": tensor,
             "instruction": "hi",
-            "annotate_mode": AnnotateMode.PASS_THROUGH,
+            "mode": AnnotateMode.PASS_THROUGH,
             "box_composite": False,
             "timeout_seconds": 1800,
             "unique_id": "100",
@@ -1173,7 +1394,7 @@ class TestIsChanged:
         a = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="hi",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id="101",
@@ -1181,7 +1402,7 @@ class TestIsChanged:
         b = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="bye",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id="101",
@@ -1195,7 +1416,7 @@ class TestIsChanged:
         without = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id="102",
@@ -1204,7 +1425,7 @@ class TestIsChanged:
         with_mask = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id="102",
@@ -1217,7 +1438,7 @@ class TestIsChanged:
         off = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id="103",
@@ -1225,7 +1446,7 @@ class TestIsChanged:
         on = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=True,
             timeout_seconds=1800,
             unique_id="103",
@@ -1241,7 +1462,7 @@ class TestIsChanged:
         short = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="hi",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=10,
             unique_id="109",
@@ -1249,7 +1470,7 @@ class TestIsChanged:
         long = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="hi",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=86400,
             unique_id="109",
@@ -1267,7 +1488,7 @@ class TestIsChanged:
         with_real_handoff = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id=node_id,
@@ -1278,14 +1499,14 @@ class TestIsChanged:
         without_any_handoff = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id="does-not-exist",
         )
         assert with_real_handoff == without_any_handoff
 
-    def test_ps_mode_folds_in_the_latest_edit_hash(self, configured, manager):
+    def test_wait_for_save_mode_folds_in_the_latest_edit_hash(self, configured, manager):
         node_id = "105"
         source = Image.new("RGB", (24, 16), (0, 0, 0))
         meta = manager.create(
@@ -1299,7 +1520,7 @@ class TestIsChanged:
         before = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
             box_composite=False,
             timeout_seconds=1800,
             unique_id=node_id,
@@ -1310,7 +1531,44 @@ class TestIsChanged:
         after = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PS_MODE,
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+        )
+        assert before != after
+
+    def test_rerun_mode_folds_in_the_latest_edit_hash(self, configured, manager):
+        """The same fold must fire for "Re-run on every save" -- this is
+        what makes the frontend's auto-queued re-run after a save actually
+        pick up the new mask instead of re-executing to an identical
+        (therefore skipped) result.
+        """
+        node_id = "108"
+        source = Image.new("RGB", (24, 16), (0, 0, 0))
+        meta = manager.create(
+            origin_node_id=node_id,
+            origin_kind="bridge_node",
+            workflow_name="",
+            source=SourceRef(filename="x.png", subfolder="", type="temp"),
+            original_image=source,
+        )
+        tensor = tensor_from_image(source)
+        before = annotate_module.PhotoshopAnnotate.IS_CHANGED(
+            image=tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+        )
+        edit = source.copy()
+        edit.putpixel((1, 1), (255, 255, 255))
+        manager.ingest_edit(meta.handoff_id, edit, "plugin")
+        after = annotate_module.PhotoshopAnnotate.IS_CHANGED(
+            image=tensor,
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
             box_composite=False,
             timeout_seconds=1800,
             unique_id=node_id,
@@ -1324,7 +1582,7 @@ class TestIsChanged:
             annotate_module.PhotoshopAnnotate.IS_CHANGED(
                 image=tensor,
                 instruction="",
-                annotate_mode=AnnotateMode.PS_MODE,
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
                 box_composite=False,
                 timeout_seconds=1800,
                 unique_id="106",
@@ -1337,7 +1595,7 @@ class TestIsChanged:
         result = annotate_module.PhotoshopAnnotate.IS_CHANGED(
             image=tensor,
             instruction="",
-            annotate_mode=AnnotateMode.PASS_THROUGH,
+            mode=AnnotateMode.PASS_THROUGH,
             box_composite=False,
             timeout_seconds=1800,
             unique_id="107",

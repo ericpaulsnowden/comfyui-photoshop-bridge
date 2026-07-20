@@ -741,9 +741,14 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 - Class `PhotoshopAnnotate`, display name "Annotate for Edit", category
   `image/photoshop`.
 - Inputs: `image` (IMAGE); `instruction` (STRING, multiline, default ""); optional
-  `mask` (MASK). Widgets: `annotate_mode` (COMBO: "Pass through" (default) |
-  "Open in Photoshop (mask from edits)"); `box_composite` (BOOLEAN, default False).
-  Hidden: `unique_id`.
+  `mask` (MASK). Widgets: `mode` (COMBO, renamed from `annotate_mode` in v0.5.30 —
+  breaking, see below: "Pass through" (default) | "Wait for first save" |
+  "Re-run on every save"); `box_composite` (BOOLEAN, default False). Hidden: `unique_id`.
+  The last two `mode` values ALIAS `BridgeMode.WAIT_FIRST_SAVE`/`.RERUN_EVERY_SAVE`
+  (constant reuse, not duplicated strings — a `tests/test_annotate.py` drift guard asserts
+  equality) so the node speaks the same vocabulary as Edit-in-Photoshop/Compose (user
+  request 2026-07-19). Widget renamed AND its option strings changed = a workflow saved
+  before v0.5.30 needs the Annotate node's mode re-selected once (pre-1.0, no shim).
 - Outputs: (IMAGE, MASK, STRING instruction, IMAGE annotated). In PS mode the IMAGE is
   the SAVED composite EXCLUDING the `Instructions` layer (so any edit the user made to
   the base image BAKES IN); pass-through mode passes the input image through unchanged.
@@ -804,12 +809,34 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 - MASK resolution precedence: (1) the PS-mode `Instructions`-layer mask above; (2) else
   the `mask` input socket (ComfyUI-only tier: MaskEditor or any mask source upstream);
   (3) else zeros.
-- PS mode BLOCKS (product-owner update 2026-07-17): on execute with no matching edit,
-  write the LAYERED handoff (origin_kind `bridge_node`), open Photoshop, and BLOCK via
-  `manager.wait_for_edit` (like the §6 bridge node's "Wait for first save") until the user
-  marks up and saves; then read the saved PSD (above). Cancel/timeout/error interrupt via
-  InterruptProcessingException (§8, incl. ComfyUI's native cancel). The open logs a
-  `cpsb annotate:` trail so a "didn't open" report is diagnosable.
+- Mode behavior (v0.5.30 — two Photoshop modes, mirroring §6's bridge node so the user can
+  iterate on a drawing identically in either):
+  - **"Wait for first save"** (was the only PS mode): on execute with no consumable edit,
+    write the LAYERED handoff (origin_kind `bridge_node`), open Photoshop, and BLOCK via
+    `manager.wait_for_edit` until the user marks up and saves; then read the saved PSD
+    (above). Cancel/timeout/error interrupt via InterruptProcessingException (§8, incl.
+    ComfyUI's native cancel).
+  - **"Re-run on every save"** (new): the SAME open (factored into `_open_only`, shared with
+    the blocking path) but NEVER waits — returns the input + resolved mask immediately. The
+    user keeps the Instructions doc open; each save auto-re-queues via `pasteback.js`'s
+    `maybeAutoQueue` (gated on this exact mode string, generic over any `bridge_node` node),
+    and the re-queue CONSUMES the new mask without relaunching Photoshop. Open failure does
+    NOT interrupt in this mode (matches the bridge node's non-blocking modes; surfaced via
+    the handoff's `error` status + logs). This is the iterate-on-the-drawing loop.
+  - Both Photoshop modes CONSUME an already-arrived edit on re-queue without reopening (so
+    downstream iteration doesn't reopen PS every run); once the doc is closed, re-entry is
+    the **Re-open in Photoshop button** below, NOT a re-queue.
+  - IS_CHANGED returns early only for "Pass through"; both PS modes fold the latest-edit
+    hash so an auto-queued re-run actually re-executes with the new mask.
+- **Re-open button** (v0.5.30, `web/cpsb/annotate.js`): the Annotate node has no context menu
+  (no `node.imgs`; excluded from §8's allowlist), so a `button`-type widget "Re-open in
+  Photoshop" (serialize:false) is added on `nodeCreated`. It looks up the node's active
+  handoff (`state.getActiveHandoffForNode`) and reopens it through the shared
+  `open.openInteractive` with `mode:"original"` — the one path that reopens an EXISTING
+  handoff's `psd_path` with no rewrite, so the Instructions layer + painted strokes survive
+  (identical to the gallery card's Re-open, now surfaced on the node). No active handoff →
+  an info toast, not an error. The open logs a `cpsb annotate:` trail so a "didn't open"
+  report is diagnosable.
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 
