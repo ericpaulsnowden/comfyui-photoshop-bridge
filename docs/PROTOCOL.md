@@ -357,6 +357,21 @@ widened; a least-privilege allowlist is a possible follow-up for a locked-down r
 capability REMOTE mode now depends on — and (b) the ComfyUI server reachable over the
 network, i.e. started with `--listen`.
 
+- **Auto-set Maximize PSD Compatibility on connect** (v0.5.31, `photoshop_plugin/prefs.js`;
+  addresses SPIKES.md spike 8). On the first successful connect of a session, the plugin
+  reads `app.preferences.fileHandling.maximizeCompatibility` (UXP's typed preferences API,
+  PS ≥ 24.0) and, if it isn't already `constants.MaximizeCompatibility.ALWAYS`, sets it to
+  ALWAYS inside a `core.executeAsModal` — retiring the documented one-time manual step (a
+  layered PSD saved without it pops a compatibility dialog every save, and the Tier-1
+  watcher reads the Maximize-Compatibility composite, so it matters for fidelity too).
+  Fire-and-forget (never awaited, never blocks the handshake); once-per-session and
+  idempotent (only writes on a real difference); wrapped in try/catch so any failure logs a
+  warning and connect proceeds. Gated by a default-ON Advanced-section toggle persisted at
+  `localStorage` key `cpsb.autoMaxCompat` (only a stored `"0"` disables it). NOT a raw
+  batchPlay guess — the typed setter with a documented enum value; worst-case failure is a
+  caught exception, never corrupted unrelated prefs. Live-validation on real Photoshop is
+  the remaining open part of spike 8.
+
 ---
 
 ## 4. Ingest pipeline (backend, both tiers)

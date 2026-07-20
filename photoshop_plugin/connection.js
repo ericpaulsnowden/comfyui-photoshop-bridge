@@ -17,6 +17,7 @@
  */
 
 const { logInfo, logWarn, logError, describeError } = require('./log.js')
+const { ensureMaximizeCompatibility } = require('./prefs.js')
 
 const uxp = require('uxp')
 const { localFileSystem } = uxp.storage
@@ -837,6 +838,14 @@ class ConnectionManager extends EventTarget {
     logInfo(
       `connected to server ${msg.server_version} (${this.localMode ? 'local' : 'remote'} mode)`
     )
+    // Fire-and-forget: this plugin's one-per-session attempt at fixing
+    // Photoshop's "Maximize PSD Compatibility" preference (docs/SPIKES.md
+    // spike 8). Deliberately NOT awaited — ensureMaximizeCompatibility()
+    // never throws (every failure is caught and logged internally as a
+    // warning) and its own `executeAsModal` round-trip must not delay this
+    // handshake completing or hold up whatever the caller of `_onMessage`
+    // does next.
+    ensureMaximizeCompatibility()
   }
 
   /**

@@ -338,6 +338,22 @@
         </div>
         <div id="cpsb-server-error" class="cpsb-error-line cpsb-conn-line"></div>
 
+        <!-- Auto-fix for Photoshop's "Maximize PSD Compatibility" preference
+             (docs/SPIKES.md spike 8): on each connect, this plugin can set
+             that preference to Always so saves never pop a compatibility
+             dialog and the bridge can read back true layered content
+             instead of a flattened composite. Default ON, but visible and
+             reversible here — some users may not want a global Photoshop
+             preference changed without asking (prefs.js -> panel.js). -->
+        <sp-checkbox id="cpsb-maxcompat-toggle" class="cpsb-conn-line">
+          Auto-set "Maximize PSD Compatibility" to Always on connect
+        </sp-checkbox>
+        <div class="cpsb-muted cpsb-conn-line">
+          Avoids Photoshop's save dialog on layered files and keeps the
+          bridge reading true layered content. Takes effect on the next
+          connect; unchecked leaves your Photoshop preference alone.
+        </div>
+
         <div id="cpsb-server-url" class="cpsb-muted cpsb-conn-line"></div>
         <!-- Diagnostic home for a TRANSIENT connection error (server not up
              yet / retrying — the "just wait" case). It stays inside Advanced,

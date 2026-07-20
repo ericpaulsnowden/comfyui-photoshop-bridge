@@ -72,7 +72,7 @@ Today the plugin installs as an **unpackaged developer plugin** (a packaged, one
 
 Once installed, a plain Cmd/Ctrl+S sends your edit back automatically — the panel's "Send" button (one per open document) is just a manual fallback for saves that don't fire a normal save event (e.g. Export As).
 
-Same one-time note as Tier 1: the plugin also opens a PSD (an untitled document would force a where-to-save dialog on every save), so keep Maximize PSD Compatibility on **Always**.
+The plugin **sets Maximize PSD Compatibility to Always for you** the first time it connects (v0.5.31) — so you can skip the manual Tier-1 step above. It only writes the preference if it isn't already Always, logs what it did in the panel, and never blocks connecting if it can't. You can turn this off in the panel's **Advanced** section if you'd rather manage the preference yourself.
 
 ### Editing across two machines
 

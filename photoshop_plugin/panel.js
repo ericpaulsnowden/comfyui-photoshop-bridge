@@ -18,6 +18,7 @@
 const { connection } = require('./connection.js')
 const { getActiveHandoffs, registryEvents, deliverEdit, clearAllHandoffs } = require('./handoffs.js')
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
+const { isAutoFixEnabled, setAutoFixEnabled } = require('./prefs.js')
 
 // Same version source the `hello` handshake message uses (connection.js):
 // require('uxp').versions.plugin is documented to match manifest.json's
@@ -78,6 +79,11 @@ function initPanel() {
   const handoffClear = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-clear'))
   const handoffActions = /** @type {HTMLElement} */ (
     document.getElementById('cpsb-handoff-actions')
+  )
+  // Advanced-section opt-out for the Maximize PSD Compatibility auto-fix
+  // (prefs.js) — default ON, persisted like the server-address field.
+  const maxCompatToggle = /** @type {HTMLInputElement} */ (
+    document.getElementById('cpsb-maxcompat-toggle')
   )
   const logEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-log'))
   // The whole Advanced body (version, URL, log) collapses together.
@@ -317,6 +323,16 @@ function initPanel() {
   // Prefill with the active base and start with the error line hidden.
   serverInput.value = connection.getServerBase()
   serverErrorEl.style.display = 'none'
+
+  // Maximize PSD Compatibility auto-fix toggle: prefill from the persisted
+  // setting (default ON — see prefs.js's isAutoFixEnabled), persist on every
+  // change. The new value is read fresh by prefs.js on the NEXT connect —
+  // toggling it does not retroactively affect an attempt already made this
+  // session (see prefs.js's `_attempted` doc comment).
+  maxCompatToggle.checked = isAutoFixEnabled()
+  maxCompatToggle.addEventListener('change', () => {
+    setAutoFixEnabled(Boolean(maxCompatToggle.checked))
+  })
 
   // Connect/Disconnect: Connect when standing by (reclaim the slot), otherwise
   // Disconnect (bow out / stop retrying). The label is kept in sync by
