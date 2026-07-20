@@ -1,12 +1,15 @@
 """The ``PhotoshopLoadPSD`` ComfyUI node (PROTOCOL.md §6b).
 
-Lets a workflow START from a ``.psd``/``.psb`` file living in ComfyUI's
-``input/`` directory instead of a flat raster image: the ``psd`` COMBO input
-lists those files, mirroring ``LoadImage.INPUT_TYPES`` -- verified against
-ComfyUI's real source (``comfyanonymous/ComfyUI``, ``nodes.py``, current
-``master``, fetched directly from raw.githubusercontent.com while building
-this node, the same verification standard :mod:`cpsb.nodes`'s own module
-docstring uses):
+Lets a workflow START from a ``.psd``/``.psb`` file (or, since 2026-07-19,
+TIFF/``.ai``/camera-raw -- Eric's ask: "I asked for file support beyond
+psd... especially dng, tiff and ai", answered by broadening this ONE node's
+accepted formats rather than adding new nodes, per this project's
+reduce-custom-nodes ethos) living in ComfyUI's ``input/`` directory instead
+of a flat raster image: the ``psd`` COMBO input lists those files, mirroring
+``LoadImage.INPUT_TYPES`` -- verified against ComfyUI's real source
+(``comfyanonymous/ComfyUI``, ``nodes.py``, current ``master``, fetched
+directly from raw.githubusercontent.com while building this node, the same
+verification standard :mod:`cpsb.nodes`'s own module docstring uses):
 
 .. code-block:: python
 
@@ -32,6 +35,29 @@ ComfyUI's own core ``uploadImage.ts`` extension -- key off to attach the stock
 upload widget, which is hardcoded to ``png``/``jpeg``/``webp`` and cannot
 accept a ``.psd``/``.psb`` file at all (PROTOCOL.md §6b: the frontend instead
 adds its own hand-rolled upload widget, out of this package's scope).
+
+Non-PSD formats (:func:`_accepted_extensions`, :mod:`cpsb.raster_io`) are
+flat rasters with no layers/handoff-round-trip concept -- decoding one is a
+single :func:`cpsb.raster_io.decode_to_rgb8` call rather than
+:func:`cpsb.psd_io.read_edited_psd`'s composite/recomposite machinery (see
+:meth:`PhotoshopLoadPSD.execute`'s dispatch). TIFF ships unconditionally (no
+new dependency: Pillow already reads it); ``.ai``/camera-raw are each gated
+on an OPTIONAL library (``pypdfium2``/``rawpy`` respectively) being
+importable, so this node's combo never offers a format this interpreter
+can't actually decode, and a missing library never surfaces as a raw
+``ImportError`` -- see :mod:`cpsb.raster_io`'s own module docstring for the
+full feasibility assessment and verification notes. The PROTOCOL.md §6b
+``edit_original`` option is NOT extended to these formats here: whether
+"edit the original file in place" is even meaningful is a frontend
+(``web/cpsb``) and ``/cpsb/open`` (``cpsb.routes``) decision, both out of
+this change's scope (routes.py's ``_PSD_NATIVE_EXTENSIONS`` gate still only
+recognizes ``.psd``/``.psb`` for the handoff-creation/round-trip path today,
+so opening one of these new formats "in Photoshop" isn't wired up yet
+regardless of what this node's own combo now lists) -- see
+:data:`cpsb.raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS` for the recommended
+policy (TIFF: yes, Photoshop can re-save a ``.tif`` in place; ``.ai``/raw:
+no, always copy the flattened image into a managed ``.psd`` instead) left
+there for whichever future change wires that up.
 
 Shares its tensor plumbing with :mod:`cpsb.nodes`
 (:class:`~cpsb.nodes.PhotoshopBridge`) rather than duplicating it: both nodes
@@ -59,20 +85,42 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import nodes, routes
+from . import nodes, raster_io, routes
 from .context import CpsbContext
 from .handoff import HandoffManager, HandoffMeta
 from .psd_io import read_edited_psd
 
 logger = logging.getLogger("cpsb")
 
-#: Extensions this node's combo lists and ``VALIDATE_INPUTS`` accepts,
-#: case-insensitive (PROTOCOL.md §6b). Kept in sync with
+#: PSD-native extensions this node's combo lists and ``VALIDATE_INPUTS``
+#: accepts, case-insensitive (PROTOCOL.md §6b). Kept in sync with
 #: ``cpsb.routes._PSD_NATIVE_EXTENSIONS`` (the `/cpsb/open` side of the same
 #: constraint) by hand -- both are short, stable, two-entry tuples unlikely
 #: to drift, and importing one module's "private" constant into the other
-#: would couple them for no real benefit.
+#: would couple them for no real benefit. Deliberately NOT broadened to the
+#: other formats this node now also accepts (below): this specific tuple's
+#: whole reason for existing is staying byte-identical to routes.py's own
+#: "can this be handed off/edited in Photoshop as a raw-bytes-preserving
+#: .psd" set -- see :func:`_accepted_extensions` for the combo's actual,
+#: broader accept-list, and :data:`cpsb.raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS`
+#: for which of the broader set could plausibly join this one later.
 PSD_EXTENSIONS: tuple[str, ...] = (".psd", ".psb")
+
+
+def _accepted_extensions() -> tuple[str, ...]:
+    """Every extension this node currently accepts, case-insensitive.
+
+    :data:`PSD_EXTENSIONS` (handled via :func:`cpsb.psd_io.read_edited_psd`,
+    with the full handoff/round-trip machinery) plus whatever
+    :func:`cpsb.raster_io.available_extensions` can decode on THIS
+    interpreter right now (TIFF unconditionally; ``.ai``/raw only when their
+    optional library actually imports) -- so the combo never lists, and
+    ``VALIDATE_INPUTS`` never accepts, a file type that would error on
+    selection (PROTOCOL.md-adjacent product requirement, 2026-07-19: "I
+    asked for file support beyond psd"). Shared by :func:`_list_psd_files`
+    and :meth:`PhotoshopLoadPSD.VALIDATE_INPUTS` so the two can't drift.
+    """
+    return PSD_EXTENSIONS + raster_io.available_extensions()
 
 
 class OnSaveMode:
@@ -120,25 +168,34 @@ class OnSaveMode:
 
 
 def _list_psd_files(input_dir: Path) -> list[str]:
-    """Sorted ``.psd``/``.psb`` filenames directly under *input_dir*.
+    """Sorted accepted-format filenames directly under *input_dir*.
 
-    Non-recursive, matching ``LoadImage.INPUT_TYPES``'s own flat directory
-    listing (see this module's docstring) -- a PSD nested in a subfolder is
-    not offered, the same as an image would not be.
+    Despite the name (kept for minimal diff against this function's
+    long-standing PSD-only history -- every call site/test already spells it
+    this way), this now lists every extension :func:`_accepted_extensions`
+    covers: PSD-native (``.psd``/``.psb``) plus TIFF/``.ai``/raw, whichever
+    of the latter group's optional dependencies actually import on this
+    interpreter (2026-07-19 product ask: "I asked for file support beyond
+    psd... especially dng, tiff and ai"). Non-recursive, matching
+    ``LoadImage.INPUT_TYPES``'s own flat directory listing (see this
+    module's docstring) -- a file nested in a subfolder is not offered, the
+    same as an image would not be.
 
     Args:
         input_dir: ComfyUI's input directory (``CpsbContext.input_dir``).
 
     Returns:
         Sorted filenames (not full paths) whose extension, lower-cased, is
-        ``.psd`` or ``.psb``. Empty if *input_dir* doesn't exist yet.
+        one :func:`_accepted_extensions` currently covers. Empty if
+        *input_dir* doesn't exist yet.
     """
     if not input_dir.is_dir():
         return []
+    accepted = _accepted_extensions()
     return sorted(
         entry.name
         for entry in input_dir.iterdir()
-        if entry.is_file() and entry.suffix.lower() in PSD_EXTENSIONS
+        if entry.is_file() and entry.suffix.lower() in accepted
     )
 
 
@@ -223,22 +280,39 @@ def _find_matching_active_handoff(
 
 
 class PhotoshopLoadPSD:
-    """Loads and flattens a ``.psd``/``.psb`` from ComfyUI's input dir (PROTOCOL.md §6b).
+    """Loads and flattens a ``.psd``/``.psb`` (or TIFF/``.ai``/raw) from
+    ComfyUI's input dir (PROTOCOL.md §6b).
 
-    The ``psd`` COMBO input lists ``.psd``/``.psb`` files in ComfyUI's input
-    directory (:func:`_list_psd_files`); the frontend additionally offers a
-    hand-rolled upload widget for those extensions (out of this package's
-    scope -- see this module's own docstring). Outputs are ``(IMAGE, MASK)``:
-    the selected file is flattened via :func:`cpsb.psd_io.read_edited_psd`
-    (embedded Maximize-Compatibility composite, falling back to psd-tools'
-    own recompositing) and its MASK is ``1 - alpha`` of that flattened image
-    when it carries transparency, else zeros -- the identical derivation
-    :class:`~cpsb.nodes.PhotoshopBridge` uses (PROTOCOL.md §6).
+    The ``psd`` COMBO input lists every currently-accepted file in ComfyUI's
+    input directory (:func:`_list_psd_files`/:func:`_accepted_extensions`):
+    ``.psd``/``.psb`` always, plus TIFF/``.ai``/camera-raw since 2026-07-19
+    (whichever of the latter two's optional libraries actually import on
+    this interpreter -- see :mod:`cpsb.raster_io`); the frontend additionally
+    offers a hand-rolled upload widget for those extensions (out of this
+    package's scope -- see this module's own docstring). Outputs are
+    ``(IMAGE, MASK)``: a PSD-native file is flattened via
+    :func:`cpsb.psd_io.read_edited_psd` (embedded Maximize-Compatibility
+    composite, falling back to psd-tools' own recompositing); anything else
+    is decoded via :func:`cpsb.raster_io.decode_to_rgb8` (a flat raster --
+    no layers/composite-fidelity concept applies). Either way the resulting
+    image's MASK is ``1 - alpha`` when it carries transparency, else zeros --
+    the identical derivation :class:`~cpsb.nodes.PhotoshopBridge` uses
+    (PROTOCOL.md §6).
 
     Round trip (PROTOCOL.md §6b): a right-click "Open in Photoshop" on this
     node creates a ``load_psd`` handoff whose ``source.psd`` is a byte-for-
     byte copy of the selected file (PROTOCOL.md §2 -- never a re-encoded
-    flatten, so the user's own layers survive the round trip). While an
+    flatten, so the user's own layers survive the round trip). This part is
+    UNCHANGED by the 2026-07-19 format broadening above and still only works
+    for a PSD-native selection: ``cpsb.routes``' handoff-creation route
+    (``POST /cpsb/open``, out of this change's scope) still gates
+    ``origin_kind: "load_psd"`` on its own ``_PSD_NATIVE_EXTENSIONS``
+    (``.psd``/``.psb`` only), so selecting a newly-supported TIFF/``.ai``/raw
+    file and right-clicking "Open in Photoshop" is not yet wired up end to
+    end -- this node's own :meth:`execute`/:meth:`IS_CHANGED` below are
+    written format-agnostically (any consumable active edit is served
+    regardless of the selected file's extension) specifically so no further
+    change is needed HERE once that route-side gate is extended. While an
     ACTIVE handoff for this node has a ``source_hash`` matching the
     currently-selected file's raw bytes AND at least one edit,
     :meth:`execute` returns that edit's tensors instead of re-flattening the
@@ -348,17 +422,19 @@ class PhotoshopLoadPSD:
     def VALIDATE_INPUTS(cls, psd: str) -> bool | str:
         """Friendly upfront check, mirroring ``LoadImage.VALIDATE_INPUTS``.
 
-        Confirms the selected file still exists and is a ``.psd``/``.psb``
+        Confirms the selected file still exists and has an accepted
+        extension (:func:`_accepted_extensions` -- PSD-native plus whichever
+        of TIFF/``.ai``/raw are decodable on this interpreter right now)
         before the prompt is queued, rather than surfacing a raw
-        ``FileNotFoundError`` mid-run. A no-op (``True``) when unconfigured,
-        for the same tooling-without-a-live-backend reason as
+        ``FileNotFoundError``/decode error mid-run. A no-op (``True``) when
+        unconfigured, for the same tooling-without-a-live-backend reason as
         :meth:`INPUT_TYPES`.
         """
         state = nodes._state_if_configured()
         if state is None:
             return True
-        if Path(psd).suffix.lower() not in PSD_EXTENSIONS:
-            return f"Not a .psd/.psb file: {psd!r}"
+        if Path(psd).suffix.lower() not in _accepted_extensions():
+            return f"Unsupported file type: {psd!r}"
         resolved = _resolve_psd_path(state.context, psd)
         if resolved is None or not resolved.is_file():
             return f"PSD file not found: {psd!r}"
@@ -427,11 +503,16 @@ class PhotoshopLoadPSD:
         edit_original: bool = False,
         on_save: str = OnSaveMode.RERUN,
     ) -> tuple[Any, Any]:
-        """``(IMAGE, MASK)`` for the selected PSD (PROTOCOL.md §6b).
+        """``(IMAGE, MASK)`` for the selected file (PROTOCOL.md §6b).
 
         Serves a consumable active edit first (see the class docstring's
-        "Round trip" paragraph); otherwise flattens *psd* fresh via
-        :func:`cpsb.psd_io.read_edited_psd`.
+        "Round trip" paragraph -- format-agnostic: an ingested edit is
+        always a plain PNG regardless of which format the handoff
+        originated from); otherwise decodes *psd* fresh -- via
+        :func:`cpsb.psd_io.read_edited_psd` for a PSD-native
+        (:data:`PSD_EXTENSIONS`) file (full composite/recomposite fidelity
+        logic), or :func:`cpsb.raster_io.decode_to_rgb8` for anything else
+        this node's combo now also accepts (2026-07-19: TIFF/``.ai``/raw).
 
         Args:
             psd: The selected combo filename.
@@ -488,5 +569,8 @@ class PhotoshopLoadPSD:
                 return consumed
 
         logger.info("cpsb load_psd: node %s: flattening %s", node_id, psd_path)
-        image, _fidelity = read_edited_psd(psd_path)
+        if psd_path.suffix.lower() in PSD_EXTENSIONS:
+            image, _fidelity = read_edited_psd(psd_path)
+        else:
+            image = raster_io.decode_to_rgb8(psd_path)
         return nodes._tensors_from_image(image)

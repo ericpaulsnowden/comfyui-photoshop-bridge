@@ -1,15 +1,23 @@
-"""psd_io: PSD write/read round trip, composite-vs-recomposite, normalization."""
+"""psd_io: PSD write/read round trip, composite-vs-recomposite, normalization.
+
+Also covers ``cpsb.raster_io`` (the non-PSD decoders TIFF/``.ai``/raw share)
+-- kept in this file rather than a new ``tests/test_raster_io.py`` per this
+change's own file-scope constraints (see ``requirements.txt``'s optional-dep
+comment block for where those two libraries are declared).
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 from psd_tools import PSDImage
 from psd_tools.constants import Resource
 from psd_tools.psd.image_resources import ImageResource, VersionInfo
 
+from cpsb import raster_io
 from cpsb.psd_io import normalize_to_rgb8, read_edited_psd, write_psd
 
 
@@ -236,3 +244,345 @@ class TestNormalizeToRgb8:
         assert 120 <= green <= 135
         assert blue == 0
 
+
+# ---------------------------------------------------------------------------
+# cpsb.raster_io -- TIFF/`.ai`/raw decoders (2026-07-19: "I asked for file
+# support beyond psd... especially dng, tiff and ai").
+# ---------------------------------------------------------------------------
+
+
+def write_rgb_tiff(path: Path, color: tuple[int, int, int] = (10, 20, 30), size=(16, 16)) -> None:
+    """A plain 8-bit RGB TIFF, via the optional ``tifffile`` (test-only; not
+    a runtime dependency of this package -- see this module's own docstring
+    and ``requirements.txt``'s optional-dep comment block). Guarded by
+    ``pytest.importorskip`` at each call site, mirroring this suite's
+    existing ``pytest.importorskip("torch")`` convention for other
+    environment-dependent-but-optional test tooling.
+    """
+    tifffile = pytest.importorskip("tifffile")
+    array = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+    array[..., 0], array[..., 1], array[..., 2] = color
+    tifffile.imwrite(path, array, photometric="rgb")
+
+
+def write_16bit_rgb_tiff(
+    path: Path, fractions: tuple[float, float, float] = (0.4, 0.6, 0.8), size=(8, 8)
+) -> None:
+    """A 16-bit-per-channel RGB TIFF (real multi-sample layout, not a
+    numpy-round-tripped one) -- Pillow's libtiff-backed reader downsamples
+    this to 8-bit ``"RGB"`` itself on open (verified empirically; see
+    ``cpsb/raster_io.py``'s module docstring), so no raster_io-side scaling
+    is needed for THIS case, unlike 16-bit grayscale below.
+    """
+    tifffile = pytest.importorskip("tifffile")
+    array = np.zeros((size[1], size[0], 3), dtype=np.uint16)
+    for channel, fraction in enumerate(fractions):
+        array[..., channel] = round(fraction * 65535)
+    tifffile.imwrite(path, array, photometric="rgb")
+
+
+def write_16bit_grayscale_tiff(path: Path, fraction: float = 0.3, size=(8, 8)) -> None:
+    """A 16-bit single-channel (grayscale) TIFF -- opens as Pillow mode
+    ``"I;16"`` with the raw sample untouched (verified empirically: unlike
+    16-bit RGB, Pillow does NOT auto-downsample this case), exercising
+    :func:`cpsb.raster_io._scale_16bit_grayscale_to_l8`.
+    """
+    tifffile = pytest.importorskip("tifffile")
+    array = np.full((size[1], size[0]), round(fraction * 65535), dtype=np.uint16)
+    tifffile.imwrite(path, array, photometric="minisblack")
+
+
+def write_grayscale_tiff(path: Path, value: int = 77, size=(8, 8)) -> None:
+    """A plain 8-bit grayscale TIFF (no bit-depth complication)."""
+    tifffile = pytest.importorskip("tifffile")
+    array = np.full((size[1], size[0]), value, dtype=np.uint8)
+    tifffile.imwrite(path, array, photometric="minisblack")
+
+
+def write_cmyk_tiff(
+    path: Path, standard_cmyk: tuple[int, int, int, int] = (0, 127, 255, 0), size=(8, 8)
+) -> None:
+    """An 8-bit CMYK TIFF (``PhotometricInterpretation = Separated``) built
+    to the TIFF baseline spec's plain ink-direct convention (0 = no ink) --
+    UNLIKE the PSD fixtures above, this is NOT pre-inverted: verified
+    empirically that Pillow's TIFF reader does not itself invert
+    ``"CMYK"``-mode samples on read the way ``psd-tools`` does for PSD (see
+    ``cpsb/raster_io.py``'s module docstring for the full "not verified
+    against a real Photoshop TIFF" caveat this fixture's convention rests
+    on).
+    """
+    tifffile = pytest.importorskip("tifffile")
+    array = np.zeros((size[1], size[0], 4), dtype=np.uint8)
+    array[..., 0], array[..., 1], array[..., 2], array[..., 3] = standard_cmyk
+    tifffile.imwrite(path, array, photometric="separated")
+
+
+def write_rgba_tiff(
+    path: Path, rgba: tuple[int, int, int, int] = (200, 100, 50, 128), size=(8, 8)
+) -> None:
+    """An 8-bit RGBA TIFF with a real (unassociated) alpha channel."""
+    tifffile = pytest.importorskip("tifffile")
+    array = np.zeros((size[1], size[0], 4), dtype=np.uint8)
+    array[..., 0], array[..., 1], array[..., 2], array[..., 3] = rgba
+    tifffile.imwrite(path, array, photometric="rgb", extrasamples=["unassalpha"])
+
+
+def write_multipage_tiff(path: Path, page_colors: list[tuple[int, int, int]], size=(4, 4)) -> None:
+    """A multi-page TIFF -- each page a solid color, so "first page only"
+    is unambiguous to assert on.
+    """
+    tifffile = pytest.importorskip("tifffile")
+    with tifffile.TiffWriter(path) as writer:
+        for color in page_colors:
+            array = np.zeros((size[1], size[0], 3), dtype=np.uint8)
+            array[..., 0], array[..., 1], array[..., 2] = color
+            writer.write(array, photometric="rgb")
+
+
+def minimal_solid_color_pdf_bytes(
+    width_pt: int, height_pt: int, rgb_fraction: tuple[float, float, float]
+) -> bytes:
+    """A hand-built, minimal single-page PDF filling the page with a solid
+    color -- stands in for an ``.ai`` file's embedded PDF stream (modern
+    ``.ai`` files ARE a PDF with Illustrator-private extensions layered on
+    top; a reader that only cares about the PDF content, like ``pypdfium2``,
+    doesn't need those extensions at all). Built directly rather than via
+    ``pypdfium2``'s own (page-object-level, more involved) writer API --
+    both are the "build a tiny PDF... or a committed minimal fixture" options
+    this task's own test-plan called out; this is simpler and has no
+    dependency on pypdfium2's own correctness to construct the fixture
+    itself, which matters since pypdfium2 is also what's under test.
+    """
+    r, g, b = rgb_fraction
+    content = f"{r:.3f} {g:.3f} {b:.3f} rg 0 0 {width_pt} {height_pt} re f".encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {width_pt} {height_pt}] "
+        f"/Contents 4 0 R /Resources << >> >>".encode(),
+        f"<< /Length {len(content)} >>\nstream\n".encode() + content + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{index} 0 obj\n".encode() + obj + b"\nendobj\n"
+    xref_offset = len(out)
+    count = len(objects) + 1
+    out += f"xref\n0 {count}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {count} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode()
+    return bytes(out)
+
+
+def write_synthetic_bayer_dng(path: Path, size: tuple[int, int] = (32, 32)) -> None:
+    """A minimal, synthesized single-plane RGGB Bayer-pattern DNG.
+
+    Not a genuine camera file -- there was no real ``.dng`` sample available
+    to test against in this environment, and downloading one from the
+    internet was out of bounds -- but a real, LibRaw-decodable raw file
+    built from first principles: a baseline-TIFF container carrying the DNG
+    tags LibRaw's DNG path actually requires (``DNGVersion``,
+    ``PhotometricInterpretation = CFA``, ``CFARepeatPatternDim``/
+    ``CFAPattern``, ``BlackLevel``/``WhiteLevel``), verified end-to-end
+    against the real installed ``rawpy``/LibRaw (0.27.0 / LibRaw 0.22.1):
+    ``rawpy.imread(...).postprocess()`` demosaics it into a sane, non-
+    degenerate RGB image with the expected red > green > blue channel
+    ordering (this fixture's raw Bayer samples are 30000/20000/10000 for
+    R/G/B respectively). This is the strongest verification practical here
+    short of a genuine camera file; it does not prove every real-world
+    ``.dng`` variant (compressed, linear-raw, multi-tile, etc.) decodes
+    correctly, only that this package's dispatch-to-``rawpy`` path does.
+    """
+    from PIL import TiffImagePlugin
+
+    data = np.zeros((size[1], size[0]), dtype=np.uint16)
+    data[0::2, 0::2] = 30000  # R
+    data[0::2, 1::2] = 20000  # G
+    data[1::2, 0::2] = 20000  # G
+    data[1::2, 1::2] = 10000  # B
+    image = Image.fromarray(data)
+
+    ifd = TiffImagePlugin.ImageFileDirectory_v2()
+
+    def set_tag(tag: int, tifftype: int, values) -> None:
+        ifd.tagtype[tag] = tifftype
+        ifd[tag] = values
+
+    set_tag(50706, 1, bytes([1, 4, 0, 0]))  # DNGVersion (BYTE x4)
+    set_tag(50707, 1, bytes([1, 1, 0, 0]))  # DNGBackwardVersion
+    set_tag(50708, 2, "TestCam")  # UniqueCameraModel (ASCII)
+    set_tag(33421, 3, (2, 2))  # CFARepeatPatternDim (SHORT x2)
+    set_tag(33422, 1, bytes([0, 1, 1, 2]))  # CFAPattern RGGB (BYTE x4)
+    set_tag(262, 3, (32803,))  # PhotometricInterpretation = CFA
+    set_tag(50714, 3, (0,))  # BlackLevel
+    set_tag(50717, 4, (65535,))  # WhiteLevel
+
+    image.save(path, format="TIFF", tiffinfo=ifd)
+
+
+class TestDecodeTiff:
+    """TIFF via Pillow -- no optional dependency (:data:`raster_io.TIFF_EXTENSIONS`)."""
+
+    def test_rgb_tiff_decodes_correctly(self, tmp_path):
+        path = tmp_path / "rgb.tif"
+        write_rgb_tiff(path, color=(10, 20, 30), size=(16, 16))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGB"
+        assert image.size == (16, 16)
+        assert image.getpixel((0, 0)) == (10, 20, 30)
+
+    def test_16bit_rgb_tiff_decodes_to_correct_rgb8(self, tmp_path):
+        path = tmp_path / "rgb16.tif"
+        write_16bit_rgb_tiff(path, fractions=(0.4, 0.6, 0.8), size=(8, 8))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGB"
+        assert image.getpixel((0, 0)) == (102, 153, 204)  # (0.4, 0.6, 0.8) * 255
+
+    def test_16bit_grayscale_tiff_decodes_to_correct_rgb8(self, tmp_path):
+        """Regression coverage for the near-white-instead-of-gray bug a
+        plain ``.convert("RGB")`` on mode ``"I;16"`` produces (see
+        ``cpsb/raster_io.py``'s module docstring).
+        """
+        path = tmp_path / "gray16.tif"
+        write_16bit_grayscale_tiff(path, fraction=0.3, size=(8, 8))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGB"
+        assert image.getpixel((0, 0)) == (76, 76, 76)  # matches the PSD 16-bit-gray test
+
+    def test_grayscale_tiff_decodes_to_rgb(self, tmp_path):
+        path = tmp_path / "gray8.tif"
+        write_grayscale_tiff(path, value=77, size=(8, 8))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGB"
+        assert image.getpixel((0, 0)) == (77, 77, 77)
+
+    def test_cmyk_tiff_decodes_to_correct_rgb(self, tmp_path):
+        path = tmp_path / "cmyk.tif"
+        write_cmyk_tiff(path, standard_cmyk=(0, 127, 255, 0), size=(8, 8))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGB"
+        red, green, blue = image.getpixel((0, 0))
+        assert red == 255
+        assert 120 <= green <= 135
+        assert blue == 0
+
+    def test_rgba_tiff_preserves_alpha(self, tmp_path):
+        path = tmp_path / "rgba.tif"
+        write_rgba_tiff(path, rgba=(200, 100, 50, 128), size=(8, 8))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGBA"
+        assert image.getpixel((0, 0)) == (200, 100, 50, 128)
+
+    def test_multipage_tiff_uses_first_page_only(self, tmp_path):
+        path = tmp_path / "multi.tif"
+        write_multipage_tiff(path, [(111, 0, 0), (222, 0, 0)], size=(4, 4))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGB"
+        assert image.size == (4, 4)
+        assert image.getpixel((0, 0)) == (111, 0, 0)
+
+    def test_uppercase_extension_dispatches_to_tiff(self, tmp_path):
+        path = tmp_path / "shout.TIFF"
+        write_rgb_tiff(path, color=(1, 2, 3), size=(4, 4))
+        image = raster_io.decode_to_rgb8(path)
+        assert image.getpixel((0, 0)) == (1, 2, 3)
+
+
+class TestDecodeAi:
+    """``.ai`` via the optional ``pypdfium2`` (:data:`raster_io.AI_EXTENSIONS`)."""
+
+    def test_ai_pdf_stream_renders_correct_color(self, tmp_path):
+        pytest.importorskip("pypdfium2")
+        path = tmp_path / "art.ai"
+        path.write_bytes(minimal_solid_color_pdf_bytes(64, 48, (1.0, 0.4, 0.0)))
+
+        image = raster_io.decode_to_rgb8(path)
+
+        assert image.mode in ("RGB", "RGBA")
+        center = image.getpixel((image.size[0] // 2, image.size[1] // 2))
+        assert center[:3] == (255, 102, 0)
+
+    def test_ai_missing_dependency_raises_actionable_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(raster_io, "_optional_module", lambda name: None)
+        path = tmp_path / "art.ai"
+        path.write_bytes(minimal_solid_color_pdf_bytes(8, 8, (1.0, 1.0, 1.0)))
+
+        with pytest.raises(RuntimeError, match="pypdfium2"):
+            raster_io.decode_to_rgb8(path)
+
+
+class TestDecodeRaw:
+    """Camera raw (``.dng`` etc.) via the optional ``rawpy`` (:data:`raster_io.RAW_EXTENSIONS`)."""
+
+    def test_dng_decodes_to_sane_non_degenerate_rgb(self, tmp_path):
+        pytest.importorskip("rawpy")
+        path = tmp_path / "shot.dng"
+        write_synthetic_bayer_dng(path, size=(32, 32))
+
+        image = raster_io.decode_to_rgb8(path)
+
+        assert image.mode in ("RGB", "RGBA")
+        array = np.asarray(image.convert("RGB"), dtype=np.float64)
+        assert array.mean() > 10.0  # not solid black/degenerate
+        # Fixture's raw Bayer samples are R=30000 > G=20000 > B=10000.
+        assert array[..., 0].mean() > array[..., 1].mean() > array[..., 2].mean()
+
+    def test_dng_missing_dependency_raises_actionable_error(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(raster_io, "_optional_module", lambda name: None)
+        path = tmp_path / "shot.dng"
+        path.write_bytes(b"not a real dng")
+
+        with pytest.raises(RuntimeError, match="rawpy"):
+            raster_io.decode_to_rgb8(path)
+
+    def test_other_raw_extension_missing_dependency_names_its_own_extension(
+        self, tmp_path, monkeypatch
+    ):
+        """The error names whichever extension the user actually selected,
+        not a hardcoded ``.dng``.
+        """
+        monkeypatch.setattr(raster_io, "_optional_module", lambda name: None)
+        path = tmp_path / "shot.CR2"
+        path.write_bytes(b"not a real cr2")
+
+        with pytest.raises(RuntimeError, match=r"\.cr2"):
+            raster_io.decode_to_rgb8(path)
+
+
+class TestDecodeToRgb8Dispatch:
+    def test_unsupported_extension_raises_value_error(self, tmp_path):
+        path = tmp_path / "photo.bmp"
+        path.write_bytes(b"not decodable")
+        with pytest.raises(ValueError, match=r"\.bmp"):
+            raster_io.decode_to_rgb8(path)
+
+
+class TestAvailableExtensions:
+    def test_tiff_always_available(self):
+        assert set(raster_io.TIFF_EXTENSIONS) <= set(raster_io.available_extensions())
+
+    def test_excludes_ai_and_raw_when_optional_deps_absent(self, monkeypatch):
+        monkeypatch.setattr(raster_io, "_optional_module", lambda name: None)
+        extensions = set(raster_io.available_extensions())
+        assert not set(raster_io.AI_EXTENSIONS) & extensions
+        assert not set(raster_io.RAW_EXTENSIONS) & extensions
+        assert raster_io.pypdfium2_available() is False
+        assert raster_io.rawpy_available() is False
+
+    def test_includes_ai_and_raw_when_optional_deps_present(self, monkeypatch):
+        monkeypatch.setattr(raster_io, "_optional_module", lambda name: object())
+        extensions = set(raster_io.available_extensions())
+        assert set(raster_io.AI_EXTENSIONS) <= extensions
+        assert set(raster_io.RAW_EXTENSIONS) <= extensions
+
+    def test_edit_in_place_capable_extensions_is_tiff_only(self):
+        """PROTOCOL.md §6b ``edit_original`` policy decision (documented in
+        full in ``cpsb/raster_io.py``): only TIFF can plausibly round-trip
+        through "edit the original file in place" -- Photoshop can save a
+        ``.tif`` but not a flattened raster back into ``.ai``, and no raw
+        format is a valid Photoshop save target at all.
+        """
+        assert raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS == raster_io.TIFF_EXTENSIONS
