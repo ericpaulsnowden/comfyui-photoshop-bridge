@@ -23,12 +23,13 @@ import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from PIL import Image
+from PIL import Image, ImageDraw
 from psd_tools import PSDImage
 
+import cpsb.annotate as annotate_module
 import cpsb.routes as routes_module
 from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
-from cpsb.handoff import HandoffManager, WaitOutcome, compute_source_hash
+from cpsb.handoff import HandoffManager, SourceRef, WaitOutcome, compute_source_hash
 from cpsb.launcher import LaunchResult, Tier1Status
 from cpsb.psd_io import write_psd
 from cpsb.version import __version__ as CPSB_VERSION
@@ -55,6 +56,40 @@ def psd_bytes(
     """Real, minimal PSD bytes via `write_psd` (a scratch file, read back and discarded)."""
     scratch = tmp_path / f"scratch_{hashlib.sha1(repr((color, size)).encode()).hexdigest()}.psd"
     write_psd(scratch, Image.new("RGB", size, color))
+    return scratch.read_bytes()
+
+
+def layered_psd_bytes(
+    tmp_path: Path,
+    base_color: tuple[int, int, int] = (9, 9, 9),
+    size: tuple[int, int] = (16, 16),
+    paint_box: tuple[int, int, int, int] | None = (2, 2, 6, 6),
+) -> bytes:
+    """A LAYERED PSD (a base pixel layer + a painted "Instructions" layer),
+    as bytes -- the remote-upload analogue of `psd_bytes` above (PROTOCOL.md
+    §6d, remote Tier-2 layered annotate).
+
+    Built directly with psd-tools' own construction API (mirrors
+    `tests/test_annotate.py`'s `make_layered_psd` fixture helper, and the
+    SAME API `cpsb.annotate._write_instructions_psd` itself uses), not by
+    calling that node function -- an independent stand-in for "what
+    Photoshop saved and the plugin uploaded," not a round trip through this
+    project's own write path.
+    """
+    key = hashlib.sha1(repr((base_color, size, paint_box)).encode()).hexdigest()
+    scratch = tmp_path / f"layered_{key}.psd"
+    width, height = size
+    psd = PSDImage.new(mode="RGB", size=(width, height), depth=8)
+    psd.create_pixel_layer(
+        Image.new("RGB", size, base_color), name="Image", top=0, left=0, opacity=255
+    )
+    instructions = Image.new("RGBA", size, (0, 0, 0, 0))
+    if paint_box is not None:
+        ImageDraw.Draw(instructions).rectangle(paint_box, fill=(255, 255, 255, 255))
+    psd.create_pixel_layer(
+        instructions, name=annotate_module.INSTRUCTIONS_LAYER_NAME, top=0, left=0, opacity=255
+    )
+    psd.save(scratch)
     return scratch.read_bytes()
 
 
@@ -1996,6 +2031,52 @@ class TestPluginWebsocket:
             # Connection survives all three.
             await wait_until(lambda: routes_module.tier2_connected(client.app))
 
+    async def test_open_handoff_command_carries_wants_layered_psd_flag(
+        self, client, manager, context, source_image, launches
+    ):
+        """PROTOCOL.md §6d (remote Tier-2 layered annotate): `open_handoff`
+        echoes `HandoffMeta.wants_layered_psd` verbatim -- the signal a
+        REMOTE-mode plugin uses (`handoffs.js`) to pick the layered-PSD
+        upload transport over the flat-PNG one at save time. `False` (the
+        default) for an ordinary handoff opened the normal way; `True` for
+        one created the way `cpsb.annotate._create_handoff` does.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            # Ordinary handoff: defaults to False.
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            command = await ws.receive_json(timeout=5)
+            assert command["type"] == "open_handoff"
+            assert command["handoff_id"] == data["handoff_id"]
+            assert command["wants_layered_psd"] is False
+
+            # An annotate-style handoff, created the way
+            # cpsb.annotate._create_handoff does (wants_layered_psd=True),
+            # then opened through the same tier-selecting seam.
+            meta = manager.create(
+                origin_node_id="9",
+                origin_kind="bridge_node",
+                workflow_name="",
+                source=SourceRef(filename="annotate_9.png", subfolder="", type="temp"),
+                original_image=Image.new("RGB", (8, 8), (1, 2, 3)),
+                wants_layered_psd=True,
+            )
+            assert manager.get(meta.handoff_id).wants_layered_psd is True
+            psd_path = manager.psd_path(meta)
+            write_psd(psd_path, Image.new("RGB", (8, 8), (1, 2, 3)))
+            manager.note_source_written(meta.handoff_id)
+
+            attempt = await routes_module.open_in_photoshop(
+                client.app, context, manager, meta, psd_path
+            )
+            assert attempt.ok is True
+            command = await ws.receive_json(timeout=5)
+            assert command["type"] == "open_handoff"
+            assert command["handoff_id"] == meta.handoff_id
+            assert command["wants_layered_psd"] is True
+
 
 class TestPluginWebsocketFileTransfer:
     """PROTOCOL.md §3 REMOTE-mode file transfer: `request_file`/`file_chunk`/
@@ -2245,3 +2326,232 @@ class TestPluginWebsocketFileTransfer:
             meta = manager.get(handoff_id)
             assert meta.status != "edited"
             assert meta.edits == []
+
+    async def test_upload_edit_unknown_kind_gets_upload_error(
+        self, client, context, manager, launches
+    ):
+        """An unrecognized `kind` (neither `"png"` nor `"psd"`) is treated the
+        same as any other malformed chunk -- rejected outright, never
+        silently guessed at.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": "deadbeef",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(b"whatever").decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "xml",
+                }
+            )
+            msg = await ws.receive_json(timeout=5)
+            assert msg == {
+                "type": "upload_error",
+                "handoff_id": "deadbeef",
+                "error": "Malformed upload_edit chunk",
+                "reason": "malformed",
+            }
+
+    async def test_upload_edit_explicit_png_kind_still_decodes_as_image(
+        self, client, context, manager, source_image, launches
+    ):
+        """`kind` defaults to (and, sent explicitly, still means) the
+        original flat-PNG transport -- a non-annotate handoff's remote
+        upload is byte-for-byte unchanged by the new `kind` field's mere
+        existence.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            payload = png_bytes((77, 88, 99))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "png",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+
+            meta = manager.get(handoff_id)
+            assert meta.status == "edited"
+            edit_path = context.cpsb_input_dir / handoff_id / meta.edits[0].filename
+            with Image.open(edit_path) as edited:
+                assert edited.getpixel((0, 0))[:3] == (77, 88, 99)
+
+    async def test_upload_edit_psd_kind_writes_layered_copy_and_ingests(
+        self, client, context, manager, launches, tmp_path
+    ):
+        """The layered-PSD remote-upload transport (PROTOCOL.md §6d): a
+        `kind: "psd"` `upload_edit` writes the reassembled bytes to the
+        handoff's own managed PSD copy path -- the SAME path
+        `cpsb.annotate._read_ps_saved_psd` re-reads once `meta.edits` is
+        non-empty -- rather than decoding them as a flat PNG, so the real
+        "Instructions" layer (and whatever the user painted on it) survives
+        the round trip.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            meta = manager.create(
+                origin_node_id="41",
+                origin_kind="bridge_node",
+                workflow_name="",
+                source=SourceRef(filename="annotate_41.png", subfolder="", type="temp"),
+                original_image=Image.new("RGB", (16, 16), (9, 9, 9)),
+                wants_layered_psd=True,
+            )
+            handoff_id = meta.handoff_id
+
+            payload = layered_psd_bytes(tmp_path, base_color=(9, 9, 9))
+            # A tiny chunk_chars forces a genuine multi-frame transfer.
+            chunks = b64_chunks(payload, chunk_chars=64)
+            assert len(chunks) > 1
+            total = len(chunks)
+            for seq, chunk in enumerate(chunks):
+                await ws.send_json(
+                    {
+                        "type": "upload_edit",
+                        "handoff_id": handoff_id,
+                        "seq": seq,
+                        "total": total,
+                        "data_b64": chunk,
+                        "fidelity": "plugin",
+                        "kind": "psd",
+                    }
+                )
+
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+
+            refreshed = manager.get(handoff_id)
+            assert refreshed.status == "edited"
+            assert len(refreshed.edits) == 1
+            assert refreshed.edits[0].fidelity in ("composite", "recomposite")
+
+            # The managed copy on disk is now the REAL layered upload, byte
+            # for byte -- not a flattened re-encoding of it.
+            psd_path = manager.psd_path(refreshed)
+            assert psd_path.read_bytes() == payload
+
+            # And the annotate read path finds the real Instructions layer.
+            image, mask, _combined = annotate_module._read_ps_saved_psd(psd_path)
+            assert mask is not None
+            assert mask[3:6, 3:6].min() > 0.9  # the painted region
+            assert mask[0, 0] == 0  # untouched corner
+            assert image.size == (16, 16)
+
+    async def test_upload_edit_malformed_psd_kind_gets_upload_error_and_recovers(
+        self, client, context, manager, launches, tmp_path
+    ):
+        """Malformed `kind: "psd"` bytes must not crash the plugin
+        websocket's message loop (a genuinely corrupt or truncated transfer
+        is possible on a real cross-machine link), and must never touch the
+        handoff's managed copy on disk -- `_ingest_psd_upload` validates
+        BEFORE writing anything, so a follow-up GOOD upload for the same
+        handoff still succeeds normally afterward.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            meta = manager.create(
+                origin_node_id="42",
+                origin_kind="bridge_node",
+                workflow_name="",
+                source=SourceRef(filename="annotate_42.png", subfolder="", type="temp"),
+                original_image=Image.new("RGB", (8, 8), (1, 1, 1)),
+                wants_layered_psd=True,
+            )
+            handoff_id = meta.handoff_id
+
+            garbage = b"not a real psd at all, just garbage bytes"
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(garbage).decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "psd",
+                }
+            )
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "upload_error"
+            assert msg["handoff_id"] == handoff_id
+            assert msg["reason"] == "invalid_image"
+            refreshed = manager.get(handoff_id)
+            assert refreshed.status != "edited"
+            assert refreshed.edits == []
+            assert not manager.psd_path(meta).is_file()  # never touched
+
+            # The connection survives, and a good upload right after works.
+            good_payload = layered_psd_bytes(tmp_path, base_color=(1, 1, 1))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(good_payload).decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "psd",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+            assert manager.get(handoff_id).status == "edited"
+
+    async def test_upload_edit_psd_kind_for_non_annotate_handoff_falls_back_to_flatten(
+        self, client, context, manager, source_image, launches, tmp_path
+    ):
+        """Defensive graceful-fallback case: a `kind: "psd"` upload for a
+        handoff that never asked for layered treatment
+        (`wants_layered_psd=False`) still ingests cleanly -- write it,
+        flatten it, record the flattened composite as the edit -- rather
+        than erroring out, since the write+flatten step in
+        `_ingest_psd_upload` never actually inspects that flag.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+            assert manager.get(handoff_id).wants_layered_psd is False
+
+            payload = layered_psd_bytes(tmp_path, base_color=(4, 5, 6), paint_box=None)
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "psd",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+            refreshed = manager.get(handoff_id)
+            assert refreshed.status == "edited"
+            assert len(refreshed.edits) == 1

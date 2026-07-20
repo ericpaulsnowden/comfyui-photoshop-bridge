@@ -310,6 +310,24 @@ class HandoffMeta:
     -- for any legacy ``meta.json`` recorded before this field existed, so
     every handoff already on disk keeps resolving to the exact file it was
     written as, untouched.
+
+    ``wants_layered_psd`` (remote Tier-2 layered annotate, PROTOCOL.md §6d)
+    is ``True`` only for a handoff whose managed PSD copy was written
+    LAYERED (:func:`cpsb.annotate._write_instructions_psd` -- a base pixel
+    layer plus a paintable "Instructions" layer) rather than the ordinary
+    flat :func:`cpsb.psd_io.write_psd`. Set once at creation
+    (:meth:`HandoffManager.create`) by the one caller that writes that kind
+    of copy (:func:`cpsb.annotate._create_handoff`) -- NOT derivable from
+    ``origin_kind`` alone, since the plain Photoshop Bridge node
+    (:mod:`cpsb.nodes`) also creates ``"bridge_node"``-origin handoffs, just
+    with a flat managed copy. Echoed verbatim in the plugin's
+    ``open_handoff`` command (:func:`cpsb.routes.open_in_photoshop`) so a
+    REMOTE-mode plugin knows, per handoff, whether to upload its save as
+    flat PNG bytes (the existing transport, unchanged) or as the document's
+    own raw, layered PSD bytes (the new one) -- see
+    :mod:`cpsb.routes`' ``_ingest_psd_upload``. Defaults ``False`` for every
+    other handoff and for any legacy ``meta.json`` recorded before this
+    field existed (both must keep taking the flat-PNG path, unchanged).
     """
 
     handoff_id: str
@@ -327,6 +345,7 @@ class HandoffMeta:
     original_path: str | None = None
     trigger_policy: TriggerPolicy = DEFAULT_TRIGGER_POLICY
     psd_filename: str = DEFAULT_PSD_FILENAME
+    wants_layered_psd: bool = False
     edits: list[EditRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -342,6 +361,7 @@ class HandoffMeta:
             "original_path": self.original_path,
             "trigger_policy": self.trigger_policy,
             "psd_filename": self.psd_filename,
+            "wants_layered_psd": self.wants_layered_psd,
             "created_ts": self.created_ts,
             "updated_ts": self.updated_ts,
             "status": self.status,
@@ -379,6 +399,10 @@ class HandoffMeta:
             # actually written as -- never re-derived from `source` (which
             # would rename a file that's already sitting on disk).
             psd_filename=data.get("psd_filename") or DEFAULT_PSD_FILENAME,
+            # Missing key (every meta.json written before this field
+            # existed) defaults to False -- the flat-PNG remote-upload path
+            # every such handoff has always taken, unchanged.
+            wants_layered_psd=bool(data.get("wants_layered_psd", False)),
             edits=[EditRecord.from_dict(edit) for edit in data.get("edits", [])],
         )
 
@@ -549,6 +573,7 @@ class HandoffManager:
         edit_in_place: bool = False,
         original_path: str | None = None,
         trigger_policy: TriggerPolicy = DEFAULT_TRIGGER_POLICY,
+        wants_layered_psd: bool = False,
     ) -> HandoffMeta:
         """Allocate a new handoff: id, folder, ``orig_thumb.png``, ``meta.json``.
 
@@ -600,6 +625,11 @@ class HandoffManager:
                 auto-queue on it too. Defaults to
                 :data:`DEFAULT_TRIGGER_POLICY` (today's only pre-existing
                 behavior) for every caller that omits it.
+            wants_layered_psd: :attr:`HandoffMeta.wants_layered_psd` (remote
+                Tier-2 layered annotate, PROTOCOL.md §6d) -- ``True`` only
+                when the caller is about to write this handoff's managed PSD
+                copy LAYERED (:func:`cpsb.annotate._write_instructions_psd`)
+                rather than flat. Defaults ``False`` for every other caller.
         """
         now = time.time()
         with self._lock:
@@ -623,6 +653,7 @@ class HandoffManager:
                 original_path=original_path,
                 trigger_policy=trigger_policy,
                 psd_filename=_derive_psd_filename(source.filename),
+                wants_layered_psd=wants_layered_psd,
             )
             self._handoffs[handoff_id] = meta
             self._write_meta_locked(meta)

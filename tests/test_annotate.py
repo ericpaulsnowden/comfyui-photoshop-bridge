@@ -242,6 +242,44 @@ def make_handoff_with_layered_edit(
     return meta.handoff_id
 
 
+def make_handoff_via_remote_psd_upload(
+    manager: HandoffManager,
+    node_id: str,
+    source: Image.Image,
+    saved_base: Image.Image,
+    instructions_image: Image.Image | None,
+    tmp_path: Path,
+    instructions_layer_name: str = INSTRUCTIONS_LAYER_NAME,
+) -> str:
+    """The REMOTE Tier-2 upload analogue of :func:`make_handoff_with_layered_edit`
+    (PROTOCOL.md §6d): instead of writing the layered PSD straight to the
+    handoff's managed copy path (as a LOCAL save would), this builds it as
+    independent BYTES -- what a REMOTE-mode plugin would have uploaded over
+    the websocket -- and feeds them through
+    ``cpsb.routes._ingest_psd_upload``, the actual server-side entry point
+    a `kind: "psd"` `upload_edit` chunk resolves to
+    (:func:`cpsb.routes._handle_upload_edit_chunk`). This proves the full
+    remote round trip -- upload -> write managed copy -> ingest -> node
+    consumption -- produces IDENTICAL results to the local-mode fixture,
+    not just that the write function works in isolation.
+    """
+    meta = manager.create(
+        origin_node_id=node_id,
+        origin_kind="bridge_node",
+        workflow_name="",
+        source=SourceRef(filename=f"annotate_{node_id}.png", subfolder="", type="temp"),
+        original_image=source,
+        wants_layered_psd=True,
+    )
+    scratch = tmp_path / f"remote_upload_{node_id}.psd"
+    make_layered_psd(scratch, saved_base, instructions_image, instructions_layer_name)
+    raw_bytes = scratch.read_bytes()
+    edit, error, reason = routes_module._ingest_psd_upload(manager, meta, raw_bytes)
+    assert error is None, (error, reason)
+    assert edit is not None
+    return meta.handoff_id
+
+
 def raises_interrupt():
     """The interrupt this test environment surfaces as (no real ComfyUI installed).
 
@@ -476,6 +514,32 @@ class TestWriteLayeredHandoff:
         expected = manager.psd_path(active)
         assert launches == [str(expected)]
 
+    def test_created_handoff_is_flagged_wants_layered_psd(self, node, manager, launches):
+        """Remote Tier-2 layered annotate (PROTOCOL.md §6d): every handoff
+        this node creates must record ``wants_layered_psd=True`` -- the
+        signal ``cpsb.routes.open_in_photoshop`` echoes into the plugin's
+        `open_handoff` command so a REMOTE-mode plugin knows to upload its
+        save as raw PSD bytes instead of a flattened PNG. NOT derivable from
+        ``origin_kind`` alone: the plain Photoshop Bridge node
+        (``cpsb.nodes``) also creates ``"bridge_node"``-origin handoffs, with
+        a flat (unflagged) managed copy.
+        """
+        node_id = "123"
+        with raises_interrupt():
+            node.execute(
+                image=make_tensor(RED),
+                instruction="",
+                mode=AnnotateMode.WAIT_FIRST_SAVE,
+                box_composite=False,
+                timeout_seconds=_SHORT_TIMEOUT,
+                unique_id=node_id,
+                mask=None,
+            )
+
+        active = manager.find_active_for_node(node_id)
+        assert active.origin_kind == "bridge_node"
+        assert active.wants_layered_psd is True
+
 
 class TestReadFoundInstructionsLayer:
     """product-owner spec: a saved PSD with a top-level "Instructions" layer
@@ -606,6 +670,107 @@ class TestReadFoundInstructionsLayer:
         annotated_np = image_tensor_to_uint8_array(annotated_out)
         assert tuple(annotated_np[10, 10]) == RED  # top-left border pixel of the box
         assert tuple(annotated_np[25, 30]) == (0, 0, 0)  # deep interior: untouched (unfilled box)
+
+
+class TestRemoteLayeredPsdUpload:
+    """PROTOCOL.md §6d, remote Tier-2 layered annotate: a REMOTE-mode
+    plugin upload of the document's own raw, layered PSD bytes
+    (`cpsb.routes._ingest_psd_upload`, reached via a `kind: "psd"`
+    `upload_edit` chunk) must produce the SAME mask/image results as a
+    LOCAL save landing directly on the managed copy. Every test here is the
+    direct remote-upload counterpart of one in
+    :class:`TestReadFoundInstructionsLayer` above -- same scenario, same
+    assertions, only :func:`make_handoff_with_layered_edit` swapped for
+    :func:`make_handoff_via_remote_psd_upload` -- so a divergence between
+    the two paths shows up as a mismatched test, not just a passing new one.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_painted_instructions_layer_mask_matches_painted_region(
+        self, node, manager, tmp_path
+    ):
+        node_id = "140"
+        width, height = 24, 16
+        source = Image.new("RGB", (width, height), RED)
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).rectangle((5, 3, 10, 8), fill=(255, 255, 255, 255))
+        make_handoff_via_remote_psd_upload(manager, node_id, source, source, instructions, tmp_path)
+
+        image_out, mask_out, _, _ = node.execute(
+            image=tensor_from_image(source),
+            instruction="",
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id=node_id,
+            mask=None,
+        )
+
+        mask_np = mask_out[0].numpy()
+        assert mask_np[3:9, 5:11].min() > 0.9  # painted region: opaque
+        assert mask_np[0, 0] == 0  # untouched region: fully zero
+        assert mask_np[15, 23] == 0  # opposite corner: fully zero
+
+        image_np = image_tensor_to_uint8_array(image_out)
+        assert np.array_equal(image_np, np.array(source))
+
+    def test_edited_base_layer_bakes_into_image_output(self, node, manager, tmp_path):
+        node_id = "141"
+        width, height = 20, 14
+        source = Image.new("RGB", (width, height), RED)
+        saved_base = source.copy()
+        ImageDraw.Draw(saved_base).rectangle((2, 2, 6, 6), fill=BLUE)
+        blank_instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        make_handoff_via_remote_psd_upload(
+            manager, node_id, source, saved_base, blank_instructions, tmp_path
+        )
+
+        image_out, mask_out, _, _ = node.execute(
+            image=tensor_from_image(source),
+            instruction="",
+            mode=AnnotateMode.WAIT_FIRST_SAVE,
+            box_composite=False,
+            timeout_seconds=60,
+            unique_id=node_id,
+            mask=None,
+        )
+
+        image_np = image_tensor_to_uint8_array(image_out)
+        assert np.array_equal(image_np, np.array(saved_base))  # edit baked in
+        assert tuple(image_np[4, 4]) == BLUE
+        assert tuple(image_np[0, 0]) == RED
+
+        import torch
+
+        assert torch.count_nonzero(mask_out).item() == 0  # Instructions left blank
+
+    def test_rerun_every_save_mode_also_consumes_the_remote_upload(self, node, manager, tmp_path):
+        """The non-blocking mode (`RERUN_EVERY_SAVE`) shares the identical
+        consume-without-reopening path -- confirm the remote-upload fixture
+        works for it too, not just `WAIT_FIRST_SAVE`.
+        """
+        node_id = "142"
+        width, height = 18, 18
+        source = Image.new("RGB", (width, height), RED)
+        instructions = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ImageDraw.Draw(instructions).rectangle((1, 1, 4, 4), fill=(255, 255, 255, 255))
+        make_handoff_via_remote_psd_upload(manager, node_id, source, source, instructions, tmp_path)
+
+        result = node.execute(
+            image=tensor_from_image(source),
+            instruction="",
+            mode=AnnotateMode.RERUN_EVERY_SAVE,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            mask=None,
+        )
+        mask_np = result[1][0].numpy()
+        assert mask_np[1:5, 1:5].min() > 0.9
+        assert mask_np[10, 10] == 0
 
 
 class TestReadMissingInstructionsLayer:

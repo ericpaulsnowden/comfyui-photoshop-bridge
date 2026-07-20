@@ -440,6 +440,14 @@ def _create_handoff(
         source=SourceRef(filename=f"annotate_{node_id}.png", subfolder="", type="temp"),
         original_image=pil_image,
         source_hash=source_hash,
+        # PROTOCOL.md §6d, remote Tier-2 layered annotate: this handoff's
+        # managed copy is about to be written LAYERED (below), unlike the
+        # plain bridge node's flat one -- recording that here is what lets a
+        # REMOTE-mode plugin's `open_handoff` command (cpsb.routes) tell it
+        # to upload its save as raw PSD bytes instead of a flattened PNG, so
+        # the "Instructions" layer this node depends on survives the round
+        # trip cross-machine, not just on a shared filesystem.
+        wants_layered_psd=True,
     )
     psd_path = state.manager.psd_path(meta)
     _write_instructions_psd(psd_path, pil_image)

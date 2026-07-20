@@ -23,7 +23,7 @@ const { localFileSystem, formats } = uxp.storage
 const { connection, pathToFileUrl } = require('./connection.js')
 const { logInfo, logWarn, logError, describeError } = require('./log.js')
 const { runExport } = require('./exporter.js')
-const { uploadEdit } = require('./uploader.js')
+const { uploadEdit, uploadLayeredPsd } = require('./uploader.js')
 
 /**
  * @typedef {'editing' | 'exporting' | 'sent' | 'export_failed' | 'upload_failed'} CpsbLocalHandoffStatus
@@ -41,6 +41,21 @@ const { uploadEdit } = require('./uploader.js')
  * soon as `open_handoff` succeeds, in both modes.
  * @property {string} docTitle
  * @property {CpsbLocalHandoffStatus} status
+ * @property {boolean} wantsLayeredPsd - Mirrors `open_handoff.wants_layered_psd`
+ * (docs/PROTOCOL.md §3, §6d) — `true` for a Photoshop Annotate node handoff,
+ * whose managed PSD copy carries a paintable "Instructions" layer.
+ * Consulted by `deliverEdit` ONLY in `'remote'` mode: `true` there means the
+ * save pipeline uploads `sandboxFile`'s own raw PSD bytes (`kind: "psd"`)
+ * instead of running the flat-PNG export. Meaningless in `'local'` mode —
+ * the shared filesystem already gives the server this handoff's real,
+ * layered save with no upload at all.
+ * @property {import('uxp').storage.File | null} sandboxFile - The REMOTE-mode
+ * sandbox copy `openRemote` downloaded into — the same file Photoshop's own
+ * Cmd/Ctrl+S overwrites in place on every save — re-read directly for the
+ * layered-PSD upload path (no export/flatten needed: Photoshop already
+ * wrote the real, current, layered document there). `null` in `'local'`
+ * mode (nothing was downloaded; `path` points at the real, shared-
+ * filesystem file instead).
  */
 
 /** @type {Map<string, CpsbHandoffRecord>} handoffId -> record */
@@ -97,8 +112,11 @@ function getHandoffsSandboxFolder() {
 /**
  * Handles a server `open_handoff` command: opens the PSD directly (local
  * mode, shared filesystem) or downloads it into the plugin's sandbox first
- * (remote mode), records the document<->handoff mapping, and replies
- * `opened` / `open_failed` (docs/PROTOCOL.md §3).
+ * (remote mode), records the document<->handoff mapping (including
+ * `msg.wants_layered_psd` and, in remote mode, the sandbox `File` entry
+ * `deliverEdit` later re-reads for the layered-PSD upload path — docs/
+ * PROTOCOL.md §6d), and replies `opened` / `open_failed` (docs/PROTOCOL.md
+ * §3).
  * @param {import('./connection.js').CpsbOpenHandoffMessage} msg
  * @returns {Promise<void>}
  */
@@ -106,7 +124,10 @@ async function openHandoff(msg) {
   const handoffId = msg.handoff_id
   try {
     const isLocal = connection.getState().localMode === true
-    const doc = isLocal ? await openLocal(msg.psd_path) : await openRemote(handoffId, msg.psd_path)
+    const opened = isLocal
+      ? { doc: await openLocal(msg.psd_path), file: null }
+      : await openRemote(handoffId, msg.psd_path)
+    const doc = opened.doc
     /** @type {CpsbHandoffRecord} */
     const record = {
       handoffId,
@@ -114,7 +135,9 @@ async function openHandoff(msg) {
       path: isLocal ? normalizePath(msg.psd_path) : null,
       documentId: doc.id,
       docTitle: doc.title,
-      status: 'editing'
+      status: 'editing',
+      wantsLayeredPsd: Boolean(msg.wants_layered_psd),
+      sandboxFile: opened.file
     }
     byHandoffId.set(handoffId, record)
     if (record.path) byPath.set(record.path, record)
@@ -202,10 +225,17 @@ async function getOrCreateSubfolder(parent, name) {
  * control `ws://` connection to a remote ComfyUI works fine, but an HTTP
  * `fetch()` to that same remote host does not), so the download now rides
  * the identical, already-open websocket instead of a second HTTP call.
+ *
+ * Returns the sandbox `File` entry alongside the opened `Document` (not just
+ * the document) so `openHandoff` can stash it on the handoff's record —
+ * `deliverEdit`'s layered-PSD upload path (docs/PROTOCOL.md §6d) re-reads
+ * this SAME file after a save, since a plain Cmd/Ctrl+S in Photoshop
+ * overwrites it in place with the real, current, layered document; no
+ * separate export step is needed the way the flat-PNG path needs one.
  * @param {string} handoffId
  * @param {string} [psdPath] - The server-side `psd_path` from `open_handoff`,
  * used only to recover its basename (see above).
- * @returns {Promise<import('photoshop').Document>}
+ * @returns {Promise<{doc: import('photoshop').Document, file: import('uxp').storage.File}>}
  */
 async function openRemote(handoffId, psdPath) {
   const bytes = await connection.requestFile(handoffId)
@@ -214,7 +244,8 @@ async function openRemote(handoffId, psdPath) {
   const basename = basenameOfServerPath(psdPath) || `${handoffId}.psd`
   const file = await handoffFolder.createFile(basename, { overwrite: true })
   await file.write(bytes.buffer, { format: formats.binary })
-  return core.executeAsModal(() => app.open(file), { commandName: 'ComfyUI: open handoff' })
+  const doc = await core.executeAsModal(() => app.open(file), { commandName: 'ComfyUI: open handoff' })
+  return { doc, file }
 }
 
 /**
@@ -325,13 +356,39 @@ function findOpenDocument(record) {
 }
 
 /**
+ * Reads the current on-disk bytes of a REMOTE-mode handoff's sandbox PSD
+ * copy (docs/PROTOCOL.md §6d, remote Tier-2 layered annotate) — the exact
+ * file `openRemote` wrote, which Photoshop's own plain Cmd/Ctrl+S save (the
+ * same one that fires `saveListener.js`'s `save` notification, which runs
+ * AFTER Photoshop confirms the write) has since overwritten in place, still
+ * carrying every layer — including the user's painted "Instructions" layer
+ * — untouched. Unlike `runExport`'s duplicate-flatten-export pipeline, this
+ * never touches Photoshop's DOM at all (plain file I/O against a file
+ * that's already fully written), so no `core.executeAsModal` wrapper is
+ * needed.
+ * @param {import('uxp').storage.File} file
+ * @returns {Promise<Uint8Array>}
+ */
+async function readSandboxPsdBytes(file) {
+  const contents = await file.read({ format: formats.binary })
+  return new Uint8Array(/** @type {ArrayBuffer} */ (contents))
+}
+
+/**
  * Runs the full "send this document's current state back to ComfyUI"
  * pipeline for a tracked handoff: an immediate `save_detected` notification
- * (informational — docs/PROTOCOL.md §3), then the export pipeline
- * (exporter.js) and the multipart upload (uploader.js). Shared by the save
- * listener (automatic, on a real Photoshop save) and both "Send"
- * entry points (the plugin command and the panel's per-document button) —
- * neither of those callers needs to know this sequence exists.
+ * (informational — docs/PROTOCOL.md §3), then either the flat-PNG export
+ * pipeline (exporter.js) + upload, or — for a REMOTE-mode handoff whose
+ * `open_handoff` carried `wants_layered_psd: true` (docs/PROTOCOL.md §6d) —
+ * the sandbox document's own raw PSD bytes, read directly and uploaded as
+ * `kind: "psd"` instead (`uploader.js`'s `uploadLayeredPsd`). LOCAL mode
+ * always takes the flat-PNG path regardless of `wantsLayeredPsd`: the
+ * shared filesystem already gives the server this handoff's real, layered
+ * save with no upload at all, so there is nothing for the layered-PSD
+ * transport to do there. Shared by the save listener (automatic, on a real
+ * Photoshop save) and both "Send" entry points (the plugin command and the
+ * panel's per-document button) — neither of those callers needs to know
+ * this sequence exists.
  * @param {string} handoffId
  * @returns {Promise<void>}
  */
@@ -352,8 +409,14 @@ async function deliverEdit(handoffId) {
   record.status = 'exporting'
   notifyChanged()
   try {
-    const pngBytes = await runExport(doc)
-    const uploaded = await uploadEdit(handoffId, pngBytes)
+    let uploaded
+    if (record.mode === 'remote' && record.wantsLayeredPsd && record.sandboxFile) {
+      const psdBytes = await readSandboxPsdBytes(record.sandboxFile)
+      uploaded = await uploadLayeredPsd(handoffId, psdBytes)
+    } else {
+      const pngBytes = await runExport(doc)
+      uploaded = await uploadEdit(handoffId, pngBytes)
+    }
     record.status = uploaded ? 'sent' : 'upload_failed'
     if (uploaded) {
       logInfo(`sent edit for handoff ${handoffId} ("${record.docTitle}")`)

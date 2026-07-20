@@ -33,11 +33,13 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 from PIL import Image
+from psd_tools import PSDImage
 
 from .context import CpsbContext
 from .handoff import (
     ACTIVE_STATUSES,
     DEFAULT_TRIGGER_POLICY,
+    EditRecord,
     HandoffManager,
     HandoffMeta,
     HandoffNotFoundError,
@@ -90,6 +92,15 @@ _VALID_SOURCE_TYPES = ("input", "output", "temp")
 _VALID_ORIGIN_KINDS = ("load_image", "terminal_output", "bridge_node", "load_psd")
 _VALID_MODES = ("new", "original", "fresh")
 
+#: Valid `kind` values for a plugin websocket `upload_edit` message (remote
+#: Tier-2 layered annotate, PROTOCOL.md §6d): `"png"` is the original
+#: flat-PNG transport (also the default when a plugin omits the field
+#: entirely, for backward compatibility with a plugin build that predates
+#: this feature); `"psd"` is the new layered-PSD transport
+#: (:func:`_ingest_psd_upload`), sent only when `open_handoff` told the
+#: plugin this handoff `wants_layered_psd` AND the connection is REMOTE.
+_VALID_UPLOAD_KINDS = ("png", "psd")
+
 #: Valid `trigger_policy` values for the optional `POST /cpsb/open` field
 #: (product-owner requirement 2026-07-18, PROTOCOL.md §6b `on_save`). Kept
 #: in sync BY HAND with `cpsb.load_psd.OnSaveMode`'s three widget-combo
@@ -120,6 +131,20 @@ def _error(status: int, message: str, **extra: Any) -> web.Response:
 
 
 @dataclass
+class _PendingUpload:
+    """In-progress `upload_edit` reassembly state for ONE handoff (PROTOCOL.md §3).
+
+    `kind` is captured from the FIRST chunk of this upload (see
+    :data:`_VALID_UPLOAD_KINDS`) and never re-validated against later
+    chunks -- mirrors `total`, which is likewise only ever read fresh off
+    each incoming message, not cross-checked chunk to chunk.
+    """
+
+    kind: str
+    chunks: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PluginConnection:
     """State for the single active UXP plugin websocket connection (PROTOCOL.md §3)."""
 
@@ -131,13 +156,12 @@ class PluginConnection:
     ready: bool = False
     last_pong: float = field(default_factory=time.monotonic)
     #: In-progress `upload_edit` reassembly buffers (PROTOCOL.md §3), keyed
-    #: by `handoff_id` -- the ordered list of `data_b64` chunk strings
-    #: received so far for that handoff's in-flight upload. A brand-new
-    #: connection (a fresh `PluginConnection`, one per websocket) always
-    #: starts with an empty dict, so a reconnect mid-upload never resumes a
-    #: half-finished buffer from a previous socket -- the plugin simply
-    #: restarts that upload's chunks from seq 0 over the new connection.
-    pending_uploads: dict[str, list[str]] = field(default_factory=dict)
+    #: by `handoff_id`. A brand-new connection (a fresh `PluginConnection`,
+    #: one per websocket) always starts with an empty dict, so a reconnect
+    #: mid-upload never resumes a half-finished buffer from a previous
+    #: socket -- the plugin simply restarts that upload's chunks from seq 0
+    #: over the new connection.
+    pending_uploads: dict[str, _PendingUpload] = field(default_factory=dict)
 
 
 class _PluginSlot:
@@ -728,6 +752,15 @@ async def open_in_photoshop(
                 "handoff_id": meta.handoff_id,
                 "psd_path": str(psd_path.resolve()),
                 "file_url": f"/cpsb/file/{meta.handoff_id}",
+                # Remote Tier-2 layered annotate (PROTOCOL.md §6d): echoes
+                # HandoffMeta.wants_layered_psd verbatim so a REMOTE-mode
+                # plugin knows, per handoff, to upload its save as raw PSD
+                # bytes (kind: "psd") rather than a flattened PNG -- see
+                # `_ingest_psd_upload`. Ignored by a LOCAL-mode plugin (the
+                # shared filesystem already gives the server the real
+                # layered save with no upload at all) and by any plugin
+                # build that predates this field.
+                "wants_layered_psd": meta.wants_layered_psd,
             }
         )
         return OpenAttempt(tier=2, ok=True)
@@ -1542,6 +1575,107 @@ async def _send_requested_file(
         )
 
 
+def _ingest_psd_upload(
+    manager: HandoffManager, meta: HandoffMeta, raw_bytes: bytes
+) -> tuple[EditRecord | None, str | None, str | None]:
+    """Write *raw_bytes* as *meta*'s managed PSD copy and ingest its flattened composite.
+
+    The REMOTE-mode counterpart to the Tier 1 watcher's own settled-save
+    path (`cpsb.watcher.CpsbWatcher._ingest_settled`): writes the just-
+    uploaded bytes to the EXACT path a local Photoshop save would have
+    overwritten in place (`HandoffManager.psd_path`), then reads a flat
+    composite off that same on-disk file the identical way the watcher does
+    (`cpsb.psd_io.read_edited_psd`) -- purely for `ingest_edit`'s own
+    bookkeeping (edit history, dedup hash, unblocking a waiter, the
+    `cpsb.updated` event).
+
+    Deliberately origin-agnostic -- it never inspects `meta.origin_kind` or
+    `meta.wants_layered_psd` -- so a mismatched/stale `wants_layered_psd`
+    flag, or a non-annotate handoff a client tagged `kind: "psd"` anyway,
+    still degrades gracefully to "write it, flatten it, ingest the flat
+    composite" rather than a special error path.
+
+    The Instructions-layer-aware MASK derivation itself is NOT done here:
+    `cpsb.annotate._resolve_wait_for_save_edit` / `_resolve_rerun_edit`
+    re-open this SAME managed copy with psd-tools once `ingest_edit` has
+    made `meta.edits` non-empty (`cpsb.annotate._read_ps_saved_psd`) --
+    writing the real layered bytes here, at the exact path that function
+    already re-reads, is the entire fix. No other module needs to change
+    for annotate's mask math to work remotely.
+
+    Never raises: an unparseable/corrupt upload is reported back as an
+    ``(None, message, "invalid_image")`` result -- retryable, mirroring the
+    flat-PNG path's identical "Invalid image data" handling -- rather than
+    letting a malformed transfer crash the plugin websocket's message loop.
+    Validates BEFORE touching the on-disk managed copy at all, so a
+    malformed upload never clobbers the last-known-good layered PSD (with
+    the user's actual Instructions layer) already sitting there from this
+    handoff's creation or a previous successful save.
+
+    Args:
+        manager: The handoff manager.
+        meta: The (already validated ACTIVE) handoff this upload is for.
+        raw_bytes: The fully reassembled, base64-decoded PSD file bytes.
+
+    Returns:
+        ``(edit, error, reason)``: on success, ``edit`` is
+        `HandoffManager.ingest_edit`'s own return (possibly ``None`` for a
+        duplicate/inactive-race no-op -- the caller resolves that the same
+        way the flat-PNG path does) and ``error``/``reason`` are both
+        ``None``. On failure, ``edit`` is ``None`` and ``error``/``reason``
+        describe an `upload_error` to send back.
+    """
+    try:
+        PSDImage.open(io.BytesIO(raw_bytes))
+    except Exception as exc:  # any parse failure just means "not a PSD"
+        return None, f"Invalid PSD data: {exc}", "invalid_image"
+
+    psd_path = manager.psd_path(meta)
+    try:
+        psd_path.parent.mkdir(parents=True, exist_ok=True)
+        psd_path.write_bytes(raw_bytes)
+        image, fidelity = read_edited_psd(psd_path)
+    except Exception as exc:  # mirrors the watcher's own broad catch
+        return None, f"Could not read uploaded PSD: {exc}", "invalid_image"
+
+    logger.info("Ingesting plugin-sourced websocket PSD upload for handoff %s", meta.handoff_id)
+    edit = manager.ingest_edit(meta.handoff_id, image, fidelity)
+    return edit, None, None
+
+
+async def _finish_upload_edit_ack(
+    connection: PluginConnection, manager: HandoffManager, handoff_id: str, edit: EditRecord | None
+) -> bool:
+    """Sends the final `upload_ok`/`upload_error` for a completed ingest attempt.
+
+    Shared tail for both the flat-PNG and layered-PSD branches of
+    `_handle_upload_edit_chunk`: `ingest_edit` returning ``None`` is either a
+    duplicate of the most recent edit (idempotent -- the watchdog and the
+    plugin can both report the same save) or a handoff that went inactive
+    between the earlier status check and now; both are safe to ack as
+    "already delivered" via the latest recorded edit, mirroring
+    `upload_route`'s own idempotent HTTP-path handling.
+
+    Returns:
+        ``True`` if `upload_ok` was sent; ``False`` if an `upload_error` was
+        sent instead (both already written to the socket either way).
+    """
+    if edit is None:
+        latest = manager.get(handoff_id)
+        if latest is None or not latest.edits:
+            await connection.ws.send_json(
+                {
+                    "type": "upload_error",
+                    "handoff_id": handoff_id,
+                    "error": "Handoff is no longer active",
+                    "reason": "inactive",
+                }
+            )
+            return False
+    await connection.ws.send_json({"type": "upload_ok", "handoff_id": handoff_id})
+    return True
+
+
 async def _handle_upload_edit_chunk(
     connection: PluginConnection, manager: HandoffManager, msg: dict[str, Any]
 ) -> None:
@@ -1549,23 +1683,35 @@ async def _handle_upload_edit_chunk(
 
     Buffers `data_b64` strings on *connection* keyed by `handoff_id` (see
     `PluginConnection.pending_uploads`) until *seq* reaches *total* - 1, then
-    base64-decodes the full concatenated string ONCE, decodes it as an
-    image, and ingests it exactly like `POST /cpsb/upload` (`upload_route`)
-    does -- both converge on the same `HandoffManager.ingest_edit`. Replies
-    `upload_ok` on success, or `upload_error` (with a `reason` mirroring
-    `upload_route`'s HTTP status codes -- `unknown_handoff`/`inactive` are
-    the 404/409 equivalents an uploader should never retry; `invalid_image`/
-    `malformed` are retryable, matching the HTTP path's own behavior of
-    still retrying on a 400) otherwise.
+    base64-decodes the full concatenated string ONCE and ingests it one of
+    two ways, per the message's `kind` (:data:`_VALID_UPLOAD_KINDS`,
+    defaulting to `"png"` for a plugin build that predates this field):
+    `"png"` decodes the bytes as an image and ingests it exactly like
+    `POST /cpsb/upload` (`upload_route`) does -- both converge on the same
+    `HandoffManager.ingest_edit`; `"psd"` (remote Tier-2 layered annotate,
+    PROTOCOL.md §6d) writes the bytes as the handoff's managed PSD copy and
+    ingests a flattened composite of THAT (:func:`_ingest_psd_upload`).
+    Replies `upload_ok` on success, or `upload_error` (with a `reason`
+    mirroring `upload_route`'s HTTP status codes -- `unknown_handoff`/
+    `inactive` are the 404/409 equivalents an uploader should never retry;
+    `invalid_image`/`malformed` are retryable, matching the HTTP path's own
+    behavior of still retrying on a 400) otherwise.
     """
     handoff_id = msg.get("handoff_id")
     seq = msg.get("seq")
     total = msg.get("total")
     data_b64 = msg.get("data_b64")
+    kind = msg.get("kind") or "png"
     if not handoff_id:
         logger.warning("cpsb plugin sent upload_edit with no handoff_id, ignoring")
         return
-    if not isinstance(seq, int) or not isinstance(total, int) or total < 1 or data_b64 is None:
+    if (
+        not isinstance(seq, int)
+        or not isinstance(total, int)
+        or total < 1
+        or data_b64 is None
+        or kind not in _VALID_UPLOAD_KINDS
+    ):
         logger.warning(
             "cpsb plugin sent a malformed upload_edit chunk for %s, ignoring", handoff_id
         )
@@ -1580,16 +1726,16 @@ async def _handle_upload_edit_chunk(
         )
         return
 
-    buffer = connection.pending_uploads.setdefault(handoff_id, [])
-    buffer.append(data_b64)
-    if len(buffer) < total:
+    pending = connection.pending_uploads.setdefault(handoff_id, _PendingUpload(kind=kind))
+    pending.chunks.append(data_b64)
+    if len(pending.chunks) < total:
         return  # More chunks still to come.
 
     # Reassembly complete -- pop so a later, unrelated upload for the same
     # handoff_id starts from a clean buffer.
-    ordered_chunks = connection.pending_uploads.pop(handoff_id)
+    pending = connection.pending_uploads.pop(handoff_id)
     try:
-        raw_bytes = base64.b64decode("".join(ordered_chunks), validate=True)
+        raw_bytes = base64.b64decode("".join(pending.chunks), validate=True)
     except (ValueError, binascii.Error) as exc:
         await connection.ws.send_json(
             {
@@ -1639,43 +1785,40 @@ async def _handle_upload_edit_chunk(
         await connection.ws.send_json({"type": "upload_ok", "handoff_id": handoff_id})
         return
 
-    try:
-        image = Image.open(io.BytesIO(raw_bytes))
-        image.load()
-    except (OSError, ValueError) as exc:
-        await connection.ws.send_json(
-            {
-                "type": "upload_error",
-                "handoff_id": handoff_id,
-                "error": f"Invalid image data: {exc}",
-                "reason": "invalid_image",
-            }
-        )
-        return
-
-    logger.info("Ingesting plugin-sourced websocket upload for handoff %s", handoff_id)
-    # Both the HTTP and websocket upload paths deliver final, already-
-    # flattened pixels with no PSD (re)compositing on our side, so both map
-    # to fidelity "plugin" -- see upload_route's identical comment.
-    edit = manager.ingest_edit(handoff_id, image, "plugin")
-    if edit is None:
-        # Either a duplicate of the most recent edit (idempotent -- the
-        # watchdog and the plugin can both report the same save) or the
-        # handoff went inactive between the check above and here; both are
-        # safe to ack as "already delivered" rather than an error, mirroring
-        # upload_route's own idempotent handling.
-        latest = manager.get(handoff_id)
-        if latest is None or not latest.edits:
+    if pending.kind == "psd":
+        edit, error_message, reason = _ingest_psd_upload(manager, meta, raw_bytes)
+        if error_message is not None:
             await connection.ws.send_json(
                 {
                     "type": "upload_error",
                     "handoff_id": handoff_id,
-                    "error": "Handoff is no longer active",
-                    "reason": "inactive",
+                    "error": error_message,
+                    "reason": reason,
                 }
             )
             return
-    await connection.ws.send_json({"type": "upload_ok", "handoff_id": handoff_id})
+    else:
+        try:
+            image = Image.open(io.BytesIO(raw_bytes))
+            image.load()
+        except (OSError, ValueError) as exc:
+            await connection.ws.send_json(
+                {
+                    "type": "upload_error",
+                    "handoff_id": handoff_id,
+                    "error": f"Invalid image data: {exc}",
+                    "reason": "invalid_image",
+                }
+            )
+            return
+
+        logger.info("Ingesting plugin-sourced websocket upload for handoff %s", handoff_id)
+        # Both the HTTP and websocket upload paths deliver final, already-
+        # flattened pixels with no PSD (re)compositing on our side, so both
+        # map to fidelity "plugin" -- see upload_route's identical comment.
+        edit = manager.ingest_edit(handoff_id, image, "plugin")
+
+    await _finish_upload_edit_ack(connection, manager, handoff_id, edit)
 
 
 async def _handle_plugin_message(

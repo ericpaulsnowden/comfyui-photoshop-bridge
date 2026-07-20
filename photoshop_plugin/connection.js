@@ -198,6 +198,15 @@ function splitIntoChunks(data) {
  * filesystem) but still basenames it to name the locally-downloaded copy
  * the same thing (`handoffs.js`'s `openRemote`).
  * @property {string} file_url - e.g. `/cpsb/file/<id>` (remote mode).
+ * @property {boolean} [wants_layered_psd] - Remote Tier-2 layered annotate
+ * (docs/PROTOCOL.md §6d): mirrors the handoff's own
+ * `HandoffMeta.wants_layered_psd`. `true` only for a Photoshop Annotate
+ * node handoff, whose managed PSD copy carries a paintable "Instructions"
+ * layer -- `handoffs.js`'s save pipeline uses this, together with the
+ * connection's own REMOTE/LOCAL mode, to decide whether to upload the
+ * document's own raw PSD bytes (`uploader.js`'s `uploadLayeredPsd`) instead
+ * of the ordinary flattened PNG. Absent or `false` (including from a server
+ * build that predates this field) means "flat PNG, as always."
  */
 
 /**
@@ -239,6 +248,11 @@ function splitIntoChunks(data) {
  * @property {string} data_b64 - Same full-encode-then-slice scheme as
  * {@link CpsbFileChunkMessage}, in the opposite direction.
  * @property {'plugin'} fidelity
+ * @property {'png' | 'psd'} kind - Remote Tier-2 layered annotate
+ * (docs/PROTOCOL.md §6d): `"png"` is the original flat-PNG transport;
+ * `"psd"` is the document's own raw PSD bytes, sent only for a handoff
+ * whose `open_handoff` carried `wants_layered_psd: true`. A server build
+ * that predates this field treats a missing `kind` as `"png"`.
  */
 
 /**
@@ -1009,12 +1023,16 @@ class ConnectionManager extends EventTarget {
   }
 
   /**
-   * Uploads `pngBytes` for `handoffId` over this websocket, split into
+   * Uploads `bytes` for `handoffId` over this websocket, split into
    * {@link WS_TRANSFER_CHUNK_CHARS}-character base64 `upload_edit` chunks
    * (docs/PROTOCOL.md §3), resolving once the server acks `upload_ok`. Used
    * by `uploader.js` in REMOTE mode in place of a plain HTTP `fetch` POST
    * (the same UXP cleartext-to-remote-host restriction {@link requestFile}
-   * exists for).
+   * exists for) — for both the original flat-PNG upload and the newer
+   * layered-PSD one (`kind`, remote Tier-2 layered annotate,
+   * docs/PROTOCOL.md §6d): the chunking/reassembly scheme is identical
+   * either way, only the server-side interpretation of the reassembled
+   * bytes differs.
    *
    * Rejects immediately (no messages sent) if the socket isn't currently
    * open, on `upload_error` from the server (the rejected `Error` carries a
@@ -1022,10 +1040,12 @@ class ConnectionManager extends EventTarget {
    * no ack arrives within {@link TRANSFER_TIMEOUT_MS}, or if the connection
    * closes/resets mid-upload.
    * @param {string} handoffId
-   * @param {Uint8Array} pngBytes
+   * @param {Uint8Array} bytes
+   * @param {'png' | 'psd'} [kind] - Defaults to `'png'`, the original
+   * transport.
    * @returns {Promise<void>}
    */
-  uploadEditOverWs(handoffId, pngBytes) {
+  uploadEditOverWs(handoffId, bytes, kind = 'png') {
     if (!this._socket || this._socket.readyState !== WS_READY_STATE_OPEN) {
       return Promise.reject(new Error('Not connected to the ComfyUI server'))
     }
@@ -1036,7 +1056,7 @@ class ConnectionManager extends EventTarget {
       }, TRANSFER_TIMEOUT_MS)
       this._pendingUploads.set(handoffId, { resolve, reject, timer })
 
-      const chunks = splitIntoChunks(base64Encode(pngBytes))
+      const chunks = splitIntoChunks(base64Encode(bytes))
       const total = chunks.length
       for (let seq = 0; seq < total; seq++) {
         this.send(
@@ -1046,7 +1066,8 @@ class ConnectionManager extends EventTarget {
             seq,
             total,
             data_b64: chunks[seq],
-            fidelity: 'plugin'
+            fidelity: 'plugin',
+            kind
           })
         )
       }

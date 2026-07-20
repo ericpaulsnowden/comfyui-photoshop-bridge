@@ -837,9 +837,22 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     exactly why the original test suite missed the bug.
   - **renamed/deleted** → treated as a plain image: IMAGE = full composite, MASK = None →
     falls through to the mask precedence below.
-  - NB: REMOTE Tier 2 degrades to the empty-`Instructions` case (the plugin uploads a flat
-    PNG and never overwrites the server-side layered `source.psd`) until layered upload
-    lands.
+  - **REMOTE Tier 2 now preserves the Instructions layer** (v0.5.34 — was a documented
+    limitation: the remote plugin used to upload a flat PNG, so the server-side layered PSD
+    was never overwritten and the read above degraded to the empty-`Instructions` case).
+    An annotate handoff carries `HandoffMeta.wants_layered_psd=True` (set in
+    `_create_handoff`; the ONLY signal distinguishing it from a plain `bridge_node` handoff,
+    which shares the origin_kind but writes a flat PSD), echoed to the plugin in
+    `open_handoff`. On save in remote mode, a `wants_layered_psd` handoff re-reads the
+    sandbox PSD Photoshop's own Cmd/Ctrl+S just wrote (no export/flatten) and uploads those
+    BYTES over the existing chunked `upload_edit` WS transport tagged `kind:"psd"` (vs the
+    default `kind:"png"`); the server's `_ingest_psd_upload` validates they parse, writes
+    them to `manager.psd_path(meta)` — the exact path a local save would overwrite — and
+    ingests via the same path the Tier-1 watcher uses, so the layered read above then runs
+    identically to local mode. Malformed bytes error (`upload_error reason:invalid_image`)
+    before touching disk. Non-annotate handoffs and local mode are byte-for-byte unchanged
+    (flat PNG). NB: the actual UXP file-read-after-save, and real multi-MB PSD transfer
+    timing, are only provable on Eric's two machines.
 - MASK resolution precedence: (1) the PS-mode `Instructions`-layer mask above; (2) else
   the `mask` input socket (ComfyUI-only tier: MaskEditor or any mask source upstream);
   (3) else zeros.
