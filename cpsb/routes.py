@@ -826,6 +826,46 @@ async def _fallback_to_tier1(
         manager.mark_error(handoff_id, result.error or "Failed to launch Photoshop")
 
 
+async def send_run_action(
+    app: web.Application, handoff_id: str, action_name: str, action_set: str
+) -> bool:
+    """Ask the connected Tier 2 plugin to play a saved Photoshop Action (the
+    ``PhotoshopAction`` node, ``cpsb/actions.py`` -- not yet in PROTOCOL.md
+    §3, see that module's own docstring).
+
+    Mirrors :func:`open_in_photoshop`'s plugin-send shape: takes the aiohttp
+    ``Application`` directly (not a ``web.Request``) since the calling node
+    has no HTTP request to hand in, and is always called from
+    :meth:`cpsb.actions.PhotoshopAction._send_run_action`'s own
+    cross-thread-bounded wrapper, never awaited directly from a worker
+    thread. Unlike ``open_handoff``, this node REQUIRES Tier 2 -- its caller
+    already confirmed :func:`tier2_connected` before opening at all -- so a
+    ``False`` return here only means the plugin disconnected in the narrow
+    window between that check and this send, not an expected/handled branch
+    the way Tier 1 fallback is for a plain open.
+
+    Returns:
+        ``True`` once the message is handed to the websocket (matching
+        ``open_in_photoshop``'s own "sent, not confirmed" semantics -- the
+        plugin's own ``action_ok``/``action_error`` reply, handled by
+        :func:`_handle_plugin_message`, is what settles the outcome);
+        ``False`` if no ready plugin connection exists to send it on.
+    """
+    slot = app.get(_APP_KEY_PLUGIN)
+    plugin = slot.connection if slot is not None else None
+    if plugin is None or not plugin.ready:
+        return False
+    await plugin.ws.send_json(
+        {
+            "type": "run_action",
+            "handoff_id": handoff_id,
+            "action_name": action_name,
+            "action_set": action_set,
+        }
+    )
+    return True
+
+
 # -- POST /cpsb/upload --------------------------------------------------------
 
 
@@ -1894,6 +1934,28 @@ async def _handle_plugin_message(
             await _send_requested_file(connection, manager, handoff_id)
     elif msg_type == "upload_edit":
         await _handle_upload_edit_chunk(connection, manager, msg)
+    elif msg_type == "action_ok":
+        # The PhotoshopAction node (cpsb/actions.py, not yet in PROTOCOL.md
+        # §3) -- informational only, exactly like "opened"/"save_detected"
+        # above: the actual unblock signal is the edit that already landed
+        # via the ordinary upload path (POST /cpsb/upload or a chunked
+        # `upload_edit`), which `deliverEdit` (runAction.js) always runs
+        # BEFORE sending this. Logged so a successful run is visible without
+        # cross-referencing the upload log line.
+        logger.info("cpsb: plugin action_ok for handoff %s", msg.get("handoff_id"))
+    elif msg_type == "action_error":
+        # The PhotoshopAction node's Action failed to play (bad name/set) OR
+        # played but its export+upload failed -- either way there is no
+        # edit coming for this handoff, so unblock any waiting node NOW
+        # instead of letting it spin for the full timeout_seconds. Mirrors
+        # the "opened"/"open_failed" pair's own mark_error handling above.
+        handoff_id = msg.get("handoff_id")
+        error_text = str(msg.get("error") or "Photoshop Action failed")
+        if handoff_id:
+            try:
+                manager.mark_error(handoff_id, error_text)
+            except HandoffNotFoundError:
+                logger.warning("Plugin reported action_error for unknown handoff %s", handoff_id)
     elif msg_type == "pong":
         connection.last_pong = time.monotonic()
     else:

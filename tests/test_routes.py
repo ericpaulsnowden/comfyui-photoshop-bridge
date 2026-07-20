@@ -1915,6 +1915,113 @@ class TestPluginWebsocket:
             # No server-side launch — a remote plugin's failure stays an error.
             assert launches.calls == []
 
+    def _make_bare_handoff(self, manager: HandoffManager, node_id: str) -> str:
+        """A bare ``bridge_node`` handoff (no PSD on disk) -- enough for the
+        `run_action`/`action_ok`/`action_error` tests below, which never
+        reach `open_in_photoshop` (that's `cpsb.actions.PhotoshopAction`'s
+        own job, covered in ``tests/test_actions.py``) -- only the raw
+        websocket message plumbing ``cpsb.routes`` itself owns.
+        """
+        meta = manager.create(
+            origin_node_id=node_id,
+            origin_kind="bridge_node",
+            workflow_name="",
+            source=SourceRef(filename=f"action_{node_id}.png", subfolder="", type="temp"),
+            original_image=Image.new("RGB", (8, 8), (1, 2, 3)),
+        )
+        return meta.handoff_id
+
+    async def test_send_run_action_dispatches_over_websocket(
+        self, client, manager, context, launches
+    ):
+        """``cpsb.actions.PhotoshopAction``'s new server->plugin message (not
+        yet in PROTOCOL.md §3 -- see ``cpsb/actions.py``'s own docstring).
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            handoff_id = self._make_bare_handoff(manager, "9")
+            sent = await routes_module.send_run_action(
+                client.app, handoff_id, "My Action", "My Set"
+            )
+            assert sent is True
+
+            command = await ws.receive_json(timeout=5)
+            assert command == {
+                "type": "run_action",
+                "handoff_id": handoff_id,
+                "action_name": "My Action",
+                "action_set": "My Set",
+            }
+
+    async def test_send_run_action_false_when_no_plugin_connected(self, client, manager):
+        sent = await routes_module.send_run_action(client.app, "deadbeef", "Action", "Set")
+        assert sent is False
+
+    async def test_action_error_marks_handoff_error_and_unblocks_wait(
+        self, client, manager, context, launches
+    ):
+        """A bad Action/Set name (or a delivery failure after a successful
+        play, ``photoshop_plugin/runAction.js``) surfaces as `action_error`
+        -- the SAME `manager.mark_error` transition `open_failed` uses, so a
+        blocking ``wait_for_edit`` unblocks with ERROR immediately instead of
+        spinning for the full timeout.
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            handoff_id = self._make_bare_handoff(manager, "9")
+            manager.mark_editing(handoff_id)
+
+            waiter = asyncio.ensure_future(
+                asyncio.to_thread(manager.wait_for_edit, handoff_id, 5.0)
+            )
+            await wait_until(lambda: handoff_id in manager._waiters)
+
+            await ws.send_json(
+                {
+                    "type": "action_error",
+                    "handoff_id": handoff_id,
+                    "error": 'Action "Bogus" not found in set "Bogus Set"',
+                }
+            )
+
+            outcome = await waiter
+            assert outcome == WaitOutcome.ERROR
+            refreshed = manager.get(handoff_id)
+            assert refreshed.status == "error"
+            assert refreshed.error == 'Action "Bogus" not found in set "Bogus Set"'
+
+    async def test_action_error_for_unknown_handoff_does_not_crash(self, client, context, launches):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "action_error", "handoff_id": "deadbeef", "error": "boom"})
+            # No crash / connection stays alive -- proven by a further round trip.
+            await ws.send_json({"type": "pong"})
+            await asyncio.sleep(0.05)
+            assert routes_module.tier2_connected(client.app)
+
+    async def test_action_ok_is_informational_only(self, client, manager, context, launches):
+        """`action_ok` never touches handoff state on its own -- the actual
+        unblock signal is the edit that lands via the ordinary upload path,
+        which `runAction.js`'s `deliverEdit` always runs BEFORE sending this
+        (``cpsb/actions.py``'s own docstring).
+        """
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            handoff_id = self._make_bare_handoff(manager, "9")
+            await ws.send_json({"type": "action_ok", "handoff_id": handoff_id})
+            await ws.send_json({"type": "pong"})
+            await asyncio.sleep(0.05)
+            assert routes_module.tier2_connected(client.app)
+            assert manager.get(handoff_id).status == "pending"
+
     async def test_cancel_notifies_plugin(self, client, manager, context, source_image, launches):
         async with client.ws_connect("/cpsb/ws") as ws:
             await self.handshake(ws, context)

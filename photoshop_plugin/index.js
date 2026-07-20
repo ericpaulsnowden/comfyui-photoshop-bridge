@@ -79,6 +79,11 @@ function bootstrap() {
   // Requiring handoffs.js at load time (not lazily) matters: its module body
   // registers the connection's open_handoff/handoff_cancelled listener.
   const { findByDocumentId, findByPath, deliverEdit } = require('./handoffs.js')
+  // Same reason: runAction.js's module body registers the connection's
+  // run_action listener (the PhotoshopAction node, "the capstone") -- it is
+  // never otherwise referenced from this file, so without this require it
+  // would never load at all.
+  require('./runAction.js')
   const { startSaveListener } = require('./saveListener.js')
   const { initPanel } = require('./panel.js')
   const { logError, describeError } = require('./log.js')

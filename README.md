@@ -16,7 +16,7 @@ Neither tier syncs individual Photoshop layers back into the ComfyUI graph — a
 
 ## Nodes and features
 
-Right-clicking an image and choosing **Open in Photoshop** is the core action, and it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds four nodes (category `image/photoshop`):
+Right-clicking an image and choosing **Open in Photoshop** is the core action, and it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds five nodes (category `image/photoshop`):
 
 - **Edit in Photoshop** — a node that opens its input in Photoshop and, in the default "Wait for first save" mode, *blocks* the workflow until you save, then continues with your edit. Also offers "Re-run on every save" and "Open only" modes, a timeout, and a cancel.
 - **Load PSD** — start a workflow from a `.psd`/`.psb` — or a **`.tif`/`.tiff`**, and (with an optional decoder installed) an Illustrator **`.ai`** or a camera **raw/`.dng`** — in ComfyUI's input folder, with an on-node **preview** (rendered server-side, no Photoshop needed) and an optional "edit the original in place" mode. Outputs IMAGE + MASK. An **`on_save`** widget controls what a save in Photoshop actually does — *Re-run workflow* (default), *Update only* (take the edit, don't re-run), or *Ignore* (saving does nothing). Set it to Ignore when you want to open a PSD, shuffle layers, push one back and close, without the graph firing every time you hit save. It's enforced on the server, so it governs the plugin's **Send** button too, not just automatic saves.
@@ -28,6 +28,7 @@ Right-clicking an image and choosing **Open in Photoshop** is the core action, a
   - `instruction` — your text, verbatim.
 
   Rename or delete the Instructions layer and it's just treated as a plain edited image. A **`mode`** widget matches the other nodes — *Wait for first save* (block until you save) or *Re-run on every save* (keep the doc open and re-run with your new mask each save, to iterate on the drawing), plus *Pass through*. A **Re-open in Photoshop** button on the node gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
+- **Run Photoshop Action** — give it an image and the name of a **saved Photoshop Action** (plus its set), and it opens the image, plays that Action, and returns the processed result to your workflow — no manual step. This one **requires the Tier-2 plugin** (there's no way to trigger a Photoshop Action without it), and it says so clearly if the plugin isn't connected. Heads-up: an Action that pops an interactive dialog mid-run can stall Photoshop — use Actions that run start-to-finish unattended.
 
 Handoffs opened in Photoshop are **named after the file they came from** — `Eric-Headshot.jpg` opens as `Eric-Headshot.psd`, not an anonymous `source.psd` — so document tabs and file dropdowns stay tellable-apart.
 

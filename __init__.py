@@ -12,6 +12,7 @@ tested) without ComfyUI -- see ``cpsb/context.py``.
 import logging
 
 try:
+    from .cpsb import actions as _cpsb_actions
     from .cpsb import annotate as _cpsb_annotate
     from .cpsb import compose_psd as _cpsb_compose_psd
     from .cpsb import load_psd as _cpsb_load_psd
@@ -20,6 +21,7 @@ except ImportError:
     # Imported without package context (e.g. pytest's rootdir Package setup,
     # or tooling that loads node-pack entry files flat). ComfyUI itself always
     # loads this file as a package, taking the relative-import branch above.
+    from cpsb import actions as _cpsb_actions
     from cpsb import annotate as _cpsb_annotate
     from cpsb import compose_psd as _cpsb_compose_psd
     from cpsb import load_psd as _cpsb_load_psd
@@ -38,12 +40,14 @@ NODE_CLASS_MAPPINGS = {
     "PhotoshopLoadPSD": _cpsb_load_psd.PhotoshopLoadPSD,
     "PhotoshopComposePSD": _cpsb_compose_psd.PhotoshopComposePSD,
     "PhotoshopAnnotate": _cpsb_annotate.PhotoshopAnnotate,
+    "PhotoshopAction": _cpsb_actions.PhotoshopAction,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopBridge": "Edit in Photoshop",
     "PhotoshopLoadPSD": "Load PSD",
     "PhotoshopComposePSD": "Compose Layers to PSD",
     "PhotoshopAnnotate": "Annotate for Edit",
+    "PhotoshopAction": "Run Photoshop Action",
 }
 
 # ComfyUI checks os.path.isdir() on this itself (nodes.py load_custom_node),

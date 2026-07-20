@@ -885,6 +885,36 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   an info toast, not an error. The open logs a `cpsb annotate:` trail so a "didn't open"
   report is diagnosable.
 
+### 6e. Run Photoshop Action node (v0.5.35)
+
+- Class `PhotoshopAction`, display "Run Photoshop Action", category `image/photoshop`
+  (`cpsb/actions.py`; registered as the pack's 5th node). Inputs: `image` (IMAGE); widgets
+  `action_name` (STRING) + `action_set` (STRING, default "") — plain strings, NOT a dropdown,
+  because UXP cannot enumerate Actions at node-def time; `timeout_seconds` (INT, default
+  1800); hidden `unique_id`. Outputs `(IMAGE, MASK)`.
+- **Tier-2-plugin-REQUIRED** — the pack's ethos exception (there is no ComfyUI-only or Tier-1
+  way to run a saved Photoshop Action). `execute()` calls `routes.tier2_connected` BEFORE
+  creating any handoff; with no plugin it raises `InterruptProcessingException` with a clear
+  message (install/connect the plugin), never a silent no-op or a Tier-1 fallback that opens
+  Photoshop with nothing to run.
+- Flow: mirrors the bridge/annotate blocking-consume pattern — create handoff, open via the
+  shared `PhotoshopBridge._open_in_photoshop` seam, then `routes.send_run_action` sends the
+  new WS message and the node BLOCKS in `wait_for_edit` until the plugin plays the Action,
+  exports, and uploads (reusing the existing `deliverEdit` export+upload). Re-queue consumes.
+- **Play mechanism** (`photoshop_plugin/runAction.js`): UXP's TYPED action API, not a raw
+  batchPlay guess — `app.actionTree` (ActionSet[]) → find the set by name → find the action
+  by name → `action.play()`, inside `core.executeAsModal` with `app.activeDocument` set to the
+  handoff doc. Confirmed against Adobe's `@adobe-uxp-types/photoshop` declarations + live forum
+  usage. **Known risk (the spike):** an Action whose steps include an interactive dialog can
+  FREEZE inside `executeAsModal` (PS 23.1+) with no client-side recovery — the node's
+  `timeout_seconds` is the only backstop (stops the workflow, can't un-stick Photoshop). Use
+  unattended Actions. The actual play + the open/run_action ordering race need live validation.
+- **New WS messages**: `run_action` (server→plugin) `{handoff_id, action_name, action_set}`;
+  `action_ok` (plugin→server, informational); `action_error` (plugin→server)
+  `{handoff_id, error}` → server `manager.mark_error()` (same transition as `open_failed`),
+  unblocking the waiter with `WaitOutcome.ERROR` rather than spinning to timeout. The plugin's
+  existing generic dispatch forwards these; `connection.js` needed no change.
+
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 
 Order: settings `photoshop_path` override → platform discovery → error.
