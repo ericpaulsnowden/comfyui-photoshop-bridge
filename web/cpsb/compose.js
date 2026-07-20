@@ -11,23 +11,21 @@
  *    this module is purely a display concern layered on top — hiding every
  *    disconnected socket except one, and revealing the next as the user
  *    connects — so a freshly-added node doesn't show 20 empty sockets at once.
- * 2. Append-target widgets (product owner, verbatim: "When append to
- *    existing is false can the two existing fields below that be
- *    disabled"): `existing_psd`/`existing_psd_path` (the `append_to_existing`
- *    BOOLEAN's target-selection widgets, `cpsb/compose_psd.py`'s
- *    `INPUT_TYPES`, added v0.5.20) are greyed out and click-blocked whenever
- *    `append_to_existing` is `false`, and restored live the instant it's
- *    toggled back to `true` — cosmetic only, the backend always reads
- *    whatever values they hold regardless. See this file's "Append-target
- *    widgets" section below for the `widget.disabled` mechanism and why it
- *    was chosen over `widget.hidden`. That same section also creates a
- *    "Browse..." button widget directly after `existing_psd_path` (a later
- *    user report, verbatim: "For existing psd path we need a path picker...
- *    so a user can choose a path by navigating through it vs typing or
- *    pasting a path"), enabled/disabled in the same lockstep as the other
- *    two widgets; its click handler opens `browse.js`'s server-backed
- *    directory-browser dialog (`GET /cpsb/browse`, `cpsb/routes.py`) rather
- *    than requiring a typed/pasted server-side path.
+ * 2. The "Browse..." button (a user report, verbatim: "For existing psd
+ *    path we need a path picker... so a user can choose a path by
+ *    navigating through it vs typing or pasting a path"): created directly
+ *    after `existing_psd_path` (`cpsb/compose_psd.py`'s `INPUT_TYPES`) --
+ *    its click handler opens `browse.js`'s server-backed directory-browser
+ *    dialog (`GET /cpsb/browse`, `cpsb/routes.py`) rather than requiring a
+ *    typed/pasted server-side path. v0.5.28 removed the `append_to_existing`
+ *    BOOLEAN and `existing_psd` COMBO this button used to sit alongside
+ *    (product owner, verbatim: "Remove the append_to_existing checkbox and
+ *    always make that on. Also remove the existing_psd selector. Just have
+ *    the browse capability.") — `existing_psd_path` alone now drives the
+ *    backend's "append to existing document" feature (empty = fresh file,
+ *    non-empty = append into that target), so the button is ALWAYS enabled;
+ *    there is no longer a toggle to track or grey out against. See this
+ *    file's "Existing-PSD-path Browse button" section below.
  * 3. "Written: &lt;filename&gt;" display (product owner gap, verbatim: "And
  *    for 'don't open' how do I later find and open the file?"): the backend
  *    now emits a `cpsb.compose_written` event (`cpsb/compose_psd.py`
@@ -276,74 +274,30 @@ function scheduleStabilize(node) {
 }
 
 // -----------------------------------------------------------------------
-// Append-target widgets (this file's header, section 2; product owner,
-// verbatim: "When append to existing is false can the two existing fields
-// below that be disabled"): `existing_psd`/`existing_psd_path`
-// (`cpsb/compose_psd.py`'s `INPUT_TYPES`, added v0.5.20, the last three
-// required inputs — `append_to_existing` BOOLEAN, `existing_psd` COMBO,
-// `existing_psd_path` STRING) only matter when `append_to_existing` is
-// `true`; when it's `false` this section greys the other two out and blocks
-// clicks on them, purely cosmetic — the backend's own `execute()` still
-// receives whatever values they currently hold either way (it simply
-// ignores them when `append_to_existing` is falsy, same as before this
-// section existed).
+// Existing-PSD-path Browse button (this file's header, section 2; a user
+// report, verbatim: "For existing psd path we need a path picker... so a
+// user can choose a path by navigating through it vs typing or pasting a
+// path"): creates a "Browse..." button widget directly after
+// `existing_psd_path` (`cpsb/compose_psd.py`'s `INPUT_TYPES`) whose click
+// handler opens `browse.js`'s server-backed directory-browser dialog
+// (`GET /cpsb/browse`, `cpsb/routes.py`) and writes the chosen path back
+// onto `existing_psd_path`.
 //
-// Mechanism decision — `widget.disabled`, NOT `widget.hidden` (+ a manual
-// node-size recompute, this file's OWN fallback pattern for `image_N`
-// SOCKETS above): verified against the CURRENT `Comfy-Org/ComfyUI_frontend`
-// source, the same established methodology this file's header already uses
-// for every other litegraph API claim here (cloned into a scratch checkout
-// rather than coded from memory):
-// - `BaseWidget` (`src/lib/litegraph/src/widgets/BaseWidget.ts` ~line
-//   101-106) has a real, current, first-class `disabled` getter/setter
-//   backed by `_state.disabled`. Every widget `cpsb/compose_psd.py`'s
-//   `INPUT_TYPES` declares (BOOLEAN/COMBO/STRING) is constructed as a real
-//   `BaseWidget` subclass instance by ComfyUI's own node-construction path
-//   (`BooleanWidget`/`ComboWidget`/`TextWidget`, `widgetMap.ts`), so setting
-//   `.disabled` on one of THIS node's own widgets needs no monkey-patching —
-//   it's the same property the class already has.
-// - `LGraphNode.drawWidgets` (`LGraphNode.ts` ~line 3956-3961: `widget.
-//   computedDisabled = widget.disabled || this.getSlotFromWidget(widget)?.
-//   link != null`) recomputes `computedDisabled` from `.disabled` on EVERY
-//   draw pass, and (~line 3990) halves `ctx.globalAlpha` for any
-//   `computedDisabled` widget — visually greyed out automatically, with no
-//   manual per-frame bookkeeping from this module: set `.disabled` once,
-//   request one redraw (`setDirtyCanvas`), done.
-// - `LGraphCanvas`'s own pointer-down handler (`LGraphCanvas.ts` ~line
-//   2877: `node.getWidgetOnPos(x, y)`, the exact call that decides which
-//   widget receives `processWidgetClick`) uses `getWidgetOnPos`'s default
-//   `includeDisabled = false` (`LGraphNode.ts` ~line 2259-2277: skips any
-//   `(widget.computedDisabled && !includeDisabled)` widget entirely) — so a
-//   disabled COMBO/STRING widget's dropdown/text-edit box never opens; the
-//   click never reaches the widget at all. This is real click-blocking, not
-//   just a visual dimming.
-// `hidden` was rejected for THIS case (unlike the `image_N` sockets above,
-// where litegraph SLOTS genuinely have no visibility flag at all, forcing
-// remove/re-add): litegraph WIDGETS already have this first-class
-// enable/disable flag that does exactly what was asked ("disabled", not
-// "gone" — the product owner's own word), so reaching for `hidden` (a
-// different visual effect — the row vanishes and the node resizes) plus a
-// manual size recompute would be solving a problem `disabled` doesn't have.
-//
-// Toggle-timing: `append_to_existing`'s widget `callback` only fires for an
-// INTERACTIVE toggle (a real pointer click, via `BaseWidget.setValue`) —
-// {@link updateAppendTargetWidgetsEnabled} is chained onto it (never
-// clobbering whatever callback, if any, ComfyUI's own construction path
-// already assigned) for the "reacts immediately" requirement. A WORKFLOW
-// LOAD instead assigns the saved value directly (`LGraphNode.configure`:
-// `widget.value = info.widgets_values[i++]`, no `callback` invoked) — so
-// {@link scheduleAppendTargetSync} exists for exactly that path, the same
-// defer-until-`app.configuringGraph`-settles idiom
-// {@link scheduleStabilize}/{@link scheduleRestoreWrittenDisplay} already
-// establish elsewhere in this file (see this file's header for the timing
-// argument itself, which applies identically here: at the `nodeCreated`
-// moment this node's OWN `configure()` hasn't run yet, so `append_to_
-// existing`'s widget still holds its just-constructed DEFAULT value, not
-// whatever a saved workflow restores moments later).
+// v0.5.28 simplification (product owner, verbatim: "Remove the
+// append_to_existing checkbox and always make that on. Also remove the
+// existing_psd selector. Just have the browse capability. Users can use
+// that to either select any existing file, or make a new one."): this used
+// to be gated on an `append_to_existing` BOOLEAN widget -- greyed out and
+// click-blocked while it was `false`, re-enabled the instant it was toggled
+// `true` (`widget.disabled`, per the now-removed "Append-target widgets"
+// design this section replaces). That toggle -- and the `existing_psd`
+// COMBO beside it -- are GONE from the backend's `INPUT_TYPES` entirely;
+// `existing_psd_path` alone now drives everything (empty = fresh file,
+// non-empty = append into that target). With no toggle left to gate on,
+// this button is simply ALWAYS enabled: there is nothing to grey out, and
+// no `.disabled`/enable-sync bookkeeping is needed any more.
 // -----------------------------------------------------------------------
 
-const APPEND_TO_EXISTING_WIDGET_NAME = 'append_to_existing'
-const EXISTING_PSD_WIDGET_NAME = 'existing_psd'
 const EXISTING_PSD_PATH_WIDGET_NAME = 'existing_psd_path'
 
 /**
@@ -363,32 +317,6 @@ const BROWSE_BUTTON_WIDGET_NAME = 'cpsb_existing_psd_browse'
  */
 function findWidgetByName(node, name) {
   return node.widgets?.find((w) => w.name === name)
-}
-
-/**
- * Applies the node's current `append_to_existing` value to the `.disabled`
- * flag of `existing_psd`/`existing_psd_path` (this section's header): both
- * disabled when `append_to_existing` is falsy, both re-enabled the instant
- * it's truthy. Also applies the same `.disabled` flag to the "Browse..."
- * button ({@link BROWSE_BUTTON_WIDGET_NAME}) in lockstep -- there is no
- * point offering a path picker for a target the backend isn't even reading
- * right now. A no-op if `append_to_existing` itself isn't present (an
- * impossible case for a node built from the current `INPUT_TYPES`, but
- * cheap to guard) — leaves whichever of the other widgets DOES exist
- * untouched rather than assuming all of them always do.
- * @param {import('../../../scripts/app.js').LGraphNode} node
- */
-function updateAppendTargetWidgetsEnabled(node) {
-  const toggle = findWidgetByName(node, APPEND_TO_EXISTING_WIDGET_NAME)
-  if (!toggle) return
-  const enabled = toggle.value === true
-  const existingPsd = findWidgetByName(node, EXISTING_PSD_WIDGET_NAME)
-  const existingPsdPath = findWidgetByName(node, EXISTING_PSD_PATH_WIDGET_NAME)
-  const browseButton = findWidgetByName(node, BROWSE_BUTTON_WIDGET_NAME)
-  if (existingPsd) existingPsd.disabled = !enabled
-  if (existingPsdPath) existingPsdPath.disabled = !enabled
-  if (browseButton) browseButton.disabled = !enabled
-  node.graph?.setDirtyCanvas(true, false)
 }
 
 /**
@@ -424,7 +352,8 @@ function insertWidgetAfter(node, widget, afterWidget) {
  * (`cpsb_written`/`cpsb_written_copy_path` below) — never written into
  * `widgets_values`, so it can never collide positionally with a real
  * backend-declared widget. Idempotent: a pre-existing button (found by name)
- * is returned as-is rather than duplicated.
+ * is returned as-is rather than duplicated. ALWAYS enabled (this section's
+ * header) -- no `.disabled` is ever set on it.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @param {import('../../../scripts/app.js').IBaseWidget} existingPsdPathWidget
  * @returns {import('../../../scripts/app.js').IBaseWidget}
@@ -441,38 +370,22 @@ function findOrCreateBrowseButton(node, existingPsdPathWidget) {
   )
   browseButton.label = 'Browse...'
   browseButton.tooltip =
-    'Navigate the ComfyUI machine’s filesystem to pick (or name a new) .psd/.psb target.'
+    'Navigate the ComfyUI machine’s filesystem to pick (or name a new) .psd/.psb target. ' +
+    'Leave existing_psd_path empty to write a fresh, auto-numbered file instead.'
   insertWidgetAfter(node, browseButton, existingPsdPathWidget)
   return browseButton
 }
 
 /**
- * Deferred, `configuringGraph`-safe initial sync of the append-target
- * widgets' `.disabled` flag — see this section's header ("Toggle-timing")
- * for why a deferred pass, separate from the live `callback` chain, is the
- * only place a just-loaded workflow's `append_to_existing` value ever gets
- * applied to `existing_psd`/`existing_psd_path`.
- * @param {import('../../../scripts/app.js').LGraphNode} node
- */
-function scheduleAppendTargetSync(node) {
-  if (node.__cpsbAppendTargetSyncTimer) return
-  node.__cpsbAppendTargetSyncTimer = setTimeout(() => {
-    node.__cpsbAppendTargetSyncTimer = null
-    if (!node.graph) return // removed from the graph since being scheduled
-    if (app.configuringGraph) {
-      scheduleAppendTargetSync(node) // workflow still loading -- retry once it settles
-      return
-    }
-    updateAppendTargetWidgetsEnabled(node)
-  }, STABILIZE_DEBOUNCE_MS)
-}
-
-/**
- * Installs the append-target enable/disable behavior on one
- * `PhotoshopComposePSD` node instance (this section's header). Exported —
- * matching every other `attach*` in this file being its own clean,
- * independently-callable entry point — but ALSO invoked directly from
- * {@link attachAutoGrowInputs} below, since THIS change's scope is
+ * Installs the "Browse..." button on one `PhotoshopComposePSD` node
+ * instance (this section's header). NAME KEPT as `attachAppendTargetWidgets`
+ * (not renamed to something Browse-button-specific) even though it now only
+ * does ONE thing: `web/cpsb.js`'s `nodeCreated` hook (out of scope for this
+ * change) calls `compose.attachAppendTargetWidgets(node)` by this exact
+ * name, so renaming the export here would silently break that call site.
+ * Exported — matching every other `attach*` in this file being its own
+ * clean, independently-callable entry point — but ALSO invoked directly
+ * from {@link attachAutoGrowInputs} below, since THIS change's scope is
  * `compose.js` only and `web/cpsb.js`'s own `nodeCreated` wiring (where
  * every other `attach*` here is actually invoked) is out of bounds for it;
  * idempotent per node instance (the guard immediately below), so a future
@@ -485,36 +398,10 @@ export function attachAppendTargetWidgets(node) {
   if (node.__cpsbAppendTargetAttached) return
   node.__cpsbAppendTargetAttached = true
 
-  const toggle = findWidgetByName(node, APPEND_TO_EXISTING_WIDGET_NAME)
-  if (toggle) {
-    const originalCallback = toggle.callback
-    toggle.callback = function (value, ...rest) {
-      const result = originalCallback?.call(this, value, ...rest)
-      updateAppendTargetWidgetsEnabled(node)
-      return result
-    }
-  }
-
-  // "Browse..." button (this file's header, section 2) -- created here,
-  // directly after existing_psd_path, rather than in a separate attach*
-  // function, so its enable/disable state is trivially kept in lockstep by
-  // the SAME updateAppendTargetWidgetsEnabled() calls that already handle
-  // existing_psd/existing_psd_path (see that function's own doc comment).
   const existingPsdPathWidget = findWidgetByName(node, EXISTING_PSD_PATH_WIDGET_NAME)
   if (existingPsdPathWidget) {
     findOrCreateBrowseButton(node, existingPsdPathWidget)
   }
-
-  const originalOnRemoved = node.onRemoved
-  node.onRemoved = function () {
-    if (node.__cpsbAppendTargetSyncTimer) {
-      clearTimeout(node.__cpsbAppendTargetSyncTimer)
-      node.__cpsbAppendTargetSyncTimer = null
-    }
-    return originalOnRemoved?.call(this)
-  }
-
-  scheduleAppendTargetSync(node)
 }
 
 // -----------------------------------------------------------------------
@@ -558,19 +445,24 @@ export function attachAppendTargetWidgets(node) {
 // copy the full path not just the file name"):
 //   - A plain, non-clickable TEXT ROW ({@link WRITTEN_TEXT_WIDGET_NAME}) —
 //     "Written: <filename> (on ComfyUI machine)". Non-interactive widget
-//     type chosen: a `button`-type widget PERMANENTLY `.disabled = true` —
-//     the exact same `widget.disabled` mechanism this file's "Append-target
-//     widgets" section verifies against the current `Comfy-Org/
-//     ComfyUI_frontend` source in detail (see that section's header for the
-//     full citation trail: `BaseWidget`'s real `disabled` property,
-//     `LGraphNode.drawWidgets`' automatic 50%-alpha dimming, `getWidgetOnPos`
-//     excluding `computedDisabled` widgets from ever receiving a click).
-//     Reused here rather than researching a second mechanism, because it is
-//     litegraph's own answer to exactly this: "greyed out and inert, but
-//     still occupying its row" — no genuine dedicated read-only/label
-//     widget type exists in this frontend (mirrors `settings.js`'s own
-//     documented finding for the ComfyUI-settings-panel case, a different
-//     surface with the same absence).
+//     type chosen: a `button`-type widget PERMANENTLY `.disabled = true`.
+//     Verified against the current `Comfy-Org/ComfyUI_frontend` source
+//     (this project's established methodology, cloned into a scratch
+//     checkout rather than coded from memory): `BaseWidget`
+//     (`src/lib/litegraph/src/widgets/BaseWidget.ts` ~line 101-106) has a
+//     real, current, first-class `disabled` getter/setter; `LGraphNode.
+//     drawWidgets` (`LGraphNode.ts` ~line 3956-3961) recomputes
+//     `computedDisabled` from `.disabled` on every draw pass and halves
+//     `ctx.globalAlpha` for it (visually greyed out, no manual per-frame
+//     bookkeeping needed); `LGraphCanvas`'s own pointer-down handler
+//     (`getWidgetOnPos`'s default `includeDisabled = false`, `LGraphNode.ts`
+//     ~line 2259-2277) skips any `computedDisabled` widget entirely, so a
+//     disabled widget's click never reaches it -- real click-blocking, not
+//     just a visual dimming. This is litegraph's own answer to "greyed out
+//     and inert, but still occupying its row" — no genuine dedicated
+//     read-only/label widget type exists in this frontend (mirrors
+//     `settings.js`'s own documented finding for the ComfyUI-settings-panel
+//     case, a different surface with the same absence).
 //   - A separate "Copy Path" BUTTON ({@link WRITTEN_COPY_PATH_WIDGET_NAME})
 //     that copies the FULL, absolute, server-side path
 //     ({@link api.CpsbComposeWrittenEvent}'s `path` field, added alongside
@@ -935,9 +827,9 @@ export function init() {
  * `nodeCreated`. Idempotent per node instance (the same convention
  * `badges.installBadgeHook`/`loadpsd.attachUploadWidget` already use) and a
  * no-op for any other node type. ALSO installs
- * {@link attachAppendTargetWidgets} — see that function's own doc comment
- * for why it's invoked from here rather than from `web/cpsb.js`'s
- * `nodeCreated` directly.
+ * {@link attachAppendTargetWidgets} (the "Browse..." button) — see that
+ * function's own doc comment for why it's invoked from here rather than
+ * from `web/cpsb.js`'s `nodeCreated` directly.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 export function attachAutoGrowInputs(node) {

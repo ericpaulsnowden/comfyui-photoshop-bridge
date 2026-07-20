@@ -14,4 +14,4 @@ so that script's regex can find and replace it reliably.
 
 from __future__ import annotations
 
-__version__ = "0.5.28"
+__version__ = "0.5.29"

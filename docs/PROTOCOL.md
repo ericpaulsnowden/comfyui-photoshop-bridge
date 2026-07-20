@@ -543,6 +543,15 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 - Frontend: the node type is allowlisted in `captureImageUploadType`'s detection (its
   hand-rolled widget bypasses the stock `image_upload` spec flag), and its context-menu
   origin_kind derives as `load_psd`.
+- **CMYK loads correctly** (fixed v0.5.28 — user report: "a black square"): psd-tools
+  1.17.4 already un-inverts Photoshop's on-disk CMYK convention in its own
+  `pil_io.post_process` (verified in its source), so `normalize_to_rgb8` must NOT invert
+  again — the old double inversion produced full-ink black. Both the node's IMAGE output
+  and `/cpsb/psd_preview` share the one healed helper. Test-fixture trap, documented in
+  `cpsb/psd_io.py`'s docstring: `PSDImage.frompil()`-built CMYK fixtures do NOT match
+  Photoshop's on-disk bytes (no write-side inversion), so they validate the bug — real
+  fixtures must pre-invert (`byte = 255*(1-ink)`). No-ICC conversion is naive/preview-
+  grade by design; embedded profiles get psd-tools' own ICC transform.
 - **Preview** (no Photoshop plugin required): the node shows a canvas preview of the
   selected PSD, like LoadImage does for a PNG. `GET /cpsb/psd_preview?filename=&subfolder=&type=`
   (defaults `subfolder=""`, `type="input"`; params mirror `/view` but default to the
@@ -656,6 +665,21 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     folder, and `PhotoshopLoadPSD`'s `psd` combo lists `input/*.psd` — so pointing a Load
     PSD node at the composed file works today. (Exception: an `existing_psd_path` override
     can point outside `input/`, where it won't appear in that combo.)
+- **Append target is browse-only** (v0.5.29 — user simplification request: "Remove the
+  append_to_existing checkbox and always make that on. Also remove the existing_psd
+  selector. Just have the browse capability."). The `append_to_existing` BOOLEAN and
+  `existing_psd` COMBO are REMOVED; behavior is driven purely by `existing_psd_path`
+  (STRING + the Browse… dialog): EMPTY (default) → the classic fresh auto-numbered
+  `compose_%05d.psd` per run; NON-EMPTY → append into that path (create if missing).
+  Identity/IS_CHANGED fold the stripped path (empty string = fresh mode), so switching
+  empty↔path supersedes the active handoff exactly as toggling used to. The path is used
+  VERBATIM (suffix-validated only) — the deliberate power-user trust model the override
+  branch always had; Browse is how ordinary users produce it. **Widget-position breaking
+  change**: ComfyUI restores saved widget values by POSITION, so a pre-v0.5.29 workflow
+  that configured append needs its compose widgets re-checked once after loading (repo
+  precedent: the v0.5.12 filename_prefix removal — deliberate, no shim, pre-1.0). Final
+  required order: group_name, layer_name, mode, timeout_seconds, max_layers,
+  existing_psd_path.
 - **Append into an existing document** (v0.5.20). Widgets, all appended at the END of
   `required` (ComfyUI matches saved widget values BY POSITION, so anywhere else silently
   shifts every existing workflow's values): `append_to_existing` (BOOLEAN, default False),

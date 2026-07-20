@@ -5,10 +5,15 @@ safety, and the three ``mode`` behaviors -- "Don't open (composite only)"
 (old always-flat), "Re-run on every save" (non-blocking open + passthrough),
 and "Wait for first save" (blocking open-then-wait) -- with their
 ``bridge_node`` handoff creation. Also covers the "append to existing
-document" feature (``append_to_existing``/``existing_psd``/
-``existing_psd_path``): target resolution, run-numbered grouping across
-successive appends, the missing-target/non-RGB/canvas-mismatch guards, the
-atomic-write crash guarantee, and the duplicate-append caching semantics.
+document" feature, driven purely by ``existing_psd_path`` (v0.5.28 removed
+the earlier ``append_to_existing`` BOOLEAN and ``existing_psd`` COMBO --
+see ``cpsb/compose_psd.py``'s class docstring "WIDGET-POSITION BREAKING
+CHANGE" note): EMPTY means the old fresh-auto-numbered-file behavior,
+byte-identical; NON-EMPTY means target resolution, run-numbered grouping
+across successive appends, the missing-target/non-RGB/canvas-mismatch
+guards, the atomic-write crash guarantee, and the duplicate-append caching
+semantics (including switching between empty and a path superseding an
+active handoff).
 """
 
 from __future__ import annotations
@@ -1143,8 +1148,7 @@ class TestLayersOutput:
             timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED, size=(8, 8)),
-            append_to_existing=True,
-            existing_psd="accumulate.psd",
+            existing_psd_path=str(target),
         )
         arr = (layers.numpy() * 255.0).round().astype("uint8")
         assert arr.shape == (1, 30, 40, 3)  # the TARGET's canvas, not 8x8
@@ -1312,7 +1316,6 @@ class TestComposeWrittenEvent:
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="4",
-            append_to_existing=True,
             existing_psd_path=str(target),
             image_1=make_tensor(GREEN, size=(10, 10)),
         )
@@ -1332,7 +1335,6 @@ class TestComposeWrittenEvent:
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="5",
-            append_to_existing=True,
             existing_psd_path=str(target),
             image_1=make_tensor(RED, size=(8, 8)),
         )
@@ -1361,7 +1363,6 @@ class TestComposeWrittenEvent:
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=tensor,
             )
@@ -1374,7 +1375,6 @@ class TestComposeWrittenEvent:
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=tensor,
             )
@@ -2097,8 +2097,8 @@ class TestHandoffIdentityReuseAndSupersede:
 
 def _write_target(path: Path, images, group_name: str, layer_name: str = "Layer") -> None:
     """Test helper: build a grouped PSD (:func:`compose_module._build_group_psd`)
-    and save it directly to *path* -- used to set up a pre-existing
-    ``append_to_existing`` target the way a prior run (or a hand-authored
+    and save it directly to *path* -- used to set up a pre-existing append
+    target (``existing_psd_path``) the way a prior run (or a hand-authored
     review document) would have left one.
     """
     psd, _w, _h, _placements = compose_module._build_group_psd(images, group_name, layer_name)
@@ -2106,93 +2106,73 @@ def _write_target(path: Path, images, group_name: str, layer_name: str = "Layer"
 
 
 class TestAppendWidgetsShape:
-    """INPUT_TYPES shape for the three new "append to existing document"
-    widgets -- appended at the END of ``required`` (widget-value-by-position
-    means anywhere else would corrupt every saved workflow's existing
-    values).
+    """INPUT_TYPES shape for the "append to existing document" feature --
+    just ``existing_psd_path`` now (v0.5.28 removed the ``append_to_existing``
+    BOOLEAN and ``existing_psd`` COMBO that used to sit alongside it, product
+    owner request: "Remove the append_to_existing checkbox and always make
+    that on. Also remove the existing_psd selector. Just have the browse
+    capability."), appended at the END of ``required`` (widget-value-by-
+    position means anywhere else would corrupt every saved workflow's
+    existing values).
     """
 
     def test_widgets_appended_at_the_end_in_order(self):
         required = ComposePSD.INPUT_TYPES()["required"]
         keys = list(required.keys())
-        assert keys[-3:] == ["append_to_existing", "existing_psd", "existing_psd_path"]
+        assert keys[-1] == "existing_psd_path"
+        # The full required-keys list, in order -- pins the exact shape:
+        # only ONE trailing append-related widget now, not three.
+        assert keys == [
+            "group_name",
+            "layer_name",
+            "mode",
+            "timeout_seconds",
+            "max_layers",
+            "existing_psd_path",
+        ]
 
     def test_defaults(self):
         required = ComposePSD.INPUT_TYPES()["required"]
-        assert required["append_to_existing"] == ("BOOLEAN", {"default": False})
         assert required["existing_psd_path"] == ("STRING", {"default": ""})
-        assert required["existing_psd"] == ([],)  # unconfigured backend: no crash, empty combo
-
-    def test_existing_psd_combo_lists_psd_files_when_configured(self, context, manager, configured):
-        (context.input_dir / "a.psd").write_bytes(b"x")
-        (context.input_dir / "b.psb").write_bytes(b"x")
-        (context.input_dir / "not_a_psd.png").write_bytes(b"x")
-        (options,) = ComposePSD.INPUT_TYPES()["required"]["existing_psd"]
-        assert options == ["a.psd", "b.psb"]
-
-
-class TestListPsdFiles:
-    def test_lists_psd_and_psb_sorted(self, tmp_path):
-        (tmp_path / "z.psd").write_bytes(b"x")
-        (tmp_path / "a.psb").write_bytes(b"x")
-        (tmp_path / "ignored.txt").write_bytes(b"x")
-        assert compose_module._list_psd_files(tmp_path) == ["a.psb", "z.psd"]
-
-    def test_missing_dir_is_empty(self, tmp_path):
-        assert compose_module._list_psd_files(tmp_path / "does_not_exist") == []
-
-    def test_non_recursive(self, tmp_path):
-        (tmp_path / "sub").mkdir()
-        (tmp_path / "sub" / "nested.psd").write_bytes(b"x")
-        assert compose_module._list_psd_files(tmp_path) == []
+        assert "append_to_existing" not in required  # removed widget
+        assert "existing_psd" not in required  # removed widget
 
 
 class TestAppendTargetKey:
-    def test_override_wins_when_non_empty(self):
-        assert compose_module._append_target_key("combo.psd", "  /abs/override.psd  ") == (
-            "/abs/override.psd"
-        )
+    def test_non_empty_is_stripped(self):
+        assert compose_module._append_target_key("  /abs/target.psd  ") == "/abs/target.psd"
 
-    def test_falls_back_to_combo(self):
-        assert compose_module._append_target_key("combo.psd", "") == "combo.psd"
+    def test_empty_is_empty(self):
+        assert compose_module._append_target_key("") == ""
 
-    def test_both_empty_is_empty(self):
-        assert compose_module._append_target_key("", "") == ""
+    def test_whitespace_only_is_empty(self):
+        assert compose_module._append_target_key("   ") == ""
 
 
 class TestResolveAppendTarget:
-    def test_override_used_verbatim(self, context):
-        result = compose_module._resolve_append_target(context, "", "/somewhere/else/target.psd")
+    def test_used_verbatim(self):
+        result = compose_module._resolve_append_target("/somewhere/else/target.psd")
         assert result == Path("/somewhere/else/target.psd")
 
-    def test_override_with_bad_suffix_raises(self, context):
+    def test_bad_suffix_raises(self):
         with pytest.raises(ValueError, match=r"existing_psd_path must be a \.psd/\.psb"):
-            compose_module._resolve_append_target(context, "", "/somewhere/else/target.png")
-
-    def test_combo_resolves_relative_to_input_dir(self, context):
-        (context.input_dir / "review.psd").write_bytes(b"x")
-        result = compose_module._resolve_append_target(context, "review.psd", "")
-        assert result == (context.input_dir / "review.psd").resolve()
-
-    def test_combo_with_bad_suffix_raises(self, context):
-        with pytest.raises(ValueError, match=r"existing_psd must be a \.psd/\.psb"):
-            compose_module._resolve_append_target(context, "review.png", "")
-
-    def test_empty_combo_and_empty_override_raises(self, context):
-        with pytest.raises(ValueError, match="no existing_psd file is selected"):
-            compose_module._resolve_append_target(context, "", "")
-
-    def test_path_traversal_in_combo_is_rejected(self, context):
-        with pytest.raises(ValueError, match="escapes the input directory"):
-            compose_module._resolve_append_target(context, "../outside.psd", "")
+            compose_module._resolve_append_target("/somewhere/else/target.png")
 
     def test_missing_target_is_still_a_valid_resolution(self, context):
         # Resolution succeeds even though nothing exists at the path yet --
         # "point at a file that isn't there yet" is a first-run convenience,
         # not a resolution-time error (execute() creates it fresh).
-        result = compose_module._resolve_append_target(context, "not_yet_created.psd", "")
-        assert result == (context.input_dir / "not_yet_created.psd").resolve()
+        target = context.input_dir / "not_yet_created.psd"
+        result = compose_module._resolve_append_target(str(target))
+        assert result == target
         assert not result.exists()
+
+    def test_relative_path_is_not_resolved_against_input_dir(self):
+        # No input-dir-relative resolution any more (the combo that used to
+        # do that is gone) -- a relative value is returned exactly as given,
+        # never joined to any input directory.
+        result = compose_module._resolve_append_target("review.psd")
+        assert result == Path("review.psd")
 
 
 class TestNextRunGroupName:
@@ -2279,7 +2259,7 @@ class TestAtomicSave:
 
 
 class TestAppendExecute:
-    """``append_to_existing=True`` end-to-end, via :meth:`ComposePSD.execute`
+    """A non-empty ``existing_psd_path`` end-to-end, via :meth:`ComposePSD.execute`
     (mode="Don't open (composite only)" unless a test specifically needs the
     handoff/Photoshop-open machinery).
     """
@@ -2309,7 +2289,6 @@ class TestAppendExecute:
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
-            append_to_existing=True,
             existing_psd_path=str(target),
             image_1=make_tensor(GREEN, size=(10, 10)),
         )
@@ -2346,7 +2325,6 @@ class TestAppendExecute:
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=make_tensor(color, size=(8, 8)),
             )
@@ -2367,7 +2345,6 @@ class TestAppendExecute:
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
-            append_to_existing=True,
             existing_psd_path=str(target),
             image_1=make_tensor(RED, size=(8, 8)),
         )
@@ -2375,6 +2352,40 @@ class TestAppendExecute:
         assert filename_out == "not_yet_created.psd"
         reopened = PSDImage.open(target)
         assert [c.name for c in reopened] == ["Review 1"]  # first run: numbered from 1
+
+    def test_empty_path_is_the_old_fresh_auto_numbered_behavior_byte_identical(
+        self, context, manager, configured
+    ):
+        """The new (v0.5.28) default -- ``existing_psd_path=""`` -- must
+        reproduce the pre-v0.5.28 non-append behavior exactly: a fresh,
+        auto-numbered ``compose_%05d.psd`` in the input dir, structurally
+        identical to what :func:`compose_module._build_group_psd` alone
+        would write.
+        """
+        node = ComposePSD()
+        image_out, mask_out, filename_out, _layers_out = node.execute(
+            filename_prefix="compose",
+            group_name="My Layers",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            existing_psd_path="",  # explicit, but this is also the default
+            image_1=make_tensor(RED, size=(10, 6)),
+            image_2=make_tensor(BLUE, size=(6, 10)),
+        )
+        written = context.input_dir / filename_out
+        assert filename_out == "compose_00001.psd"
+        assert written.is_file()
+
+        reopened = PSDImage.open(written)
+        assert reopened.size == (10, 10)
+        group = reopened[0]
+        assert group.kind == "group"
+        assert group.name == "My Layers"  # NOT run-numbered -- a plain fresh file
+        assert [layer.name for layer in group] == ["Layer 1", "Layer 2"]
+        array = (image_out[0].numpy() * 255.0).round().astype("uint8")
+        assert array.shape == (10, 10, 3)
+        assert mask_out.shape == (1, 10, 10)
 
     def test_non_rgb_target_is_refused_with_clear_error(self, context, manager, configured):
         target = context.input_dir / "cmyk.psd"
@@ -2389,7 +2400,6 @@ class TestAppendExecute:
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=make_tensor(RED, size=(8, 8)),
             )
@@ -2409,7 +2419,6 @@ class TestAppendExecute:
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=make_tensor(GREEN, size=(20, 20)),  # bigger than the 6x6 canvas
             )
@@ -2421,42 +2430,6 @@ class TestAppendExecute:
         reopened = PSDImage.open(target)
         assert reopened.size == (6, 6)
         assert [c.name for c in reopened] == ["Review 1", "Review 2"]
-
-    def test_existing_psd_path_override_wins_over_combo(self, context, manager, configured):
-        combo_target = context.input_dir / "combo_target.psd"
-        override_target = context.input_dir / "override_target.psd"
-        _write_target(combo_target, [Image.new("RGB", (4, 4), RED)], "Review 1")
-        # No pre-existing file at the override path -- created fresh, proving
-        # the override (not the combo) is what actually got used.
-
-        node = ComposePSD()
-        node.execute(
-            group_name="Review",
-            layer_name="Layer",
-            mode=DONT_OPEN,
-            timeout_seconds=1800,
-            unique_id="1",
-            append_to_existing=True,
-            existing_psd="combo_target.psd",
-            existing_psd_path=str(override_target),
-            image_1=make_tensor(GREEN, size=(4, 4)),
-        )
-        assert override_target.is_file()
-        assert PSDImage.open(combo_target).__len__() == 1  # combo target untouched
-
-    def test_path_traversal_in_existing_psd_combo_is_rejected(self, context, manager, configured):
-        node = ComposePSD()
-        with pytest.raises(ValueError, match="escapes the input directory"):
-            node.execute(
-                group_name="Review",
-                layer_name="Layer",
-                mode=DONT_OPEN,
-                timeout_seconds=1800,
-                unique_id="1",
-                append_to_existing=True,
-                existing_psd="../outside.psd",
-                image_1=make_tensor(RED, size=(4, 4)),
-            )
 
     def test_atomic_write_crash_leaves_original_file_intact(
         self, context, manager, configured, monkeypatch
@@ -2483,7 +2456,6 @@ class TestAppendExecute:
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=make_tensor(GREEN, size=(8, 8)),
             )
@@ -2513,7 +2485,6 @@ class TestAppendExecute:
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
-            append_to_existing=True,
             existing_psd_path=str(target),
             image_1=make_tensor(GREEN, size=(8, 8)),
         )
@@ -2522,32 +2493,59 @@ class TestAppendExecute:
 
 
 class TestAppendIsChanged:
-    """``append_to_existing``/target folded into IS_CHANGED (build brief
-    item 7: "toggling target/flag with unchanged upstream images will [now]
-    re-execute").
+    """``existing_psd_path`` folded into IS_CHANGED: switching between empty
+    and a path, or between two different paths, with unchanged upstream
+    images must still force re-execution (the v0.5.28 replacement for the
+    old ``append_to_existing`` BOOLEAN's own equivalent coverage).
     """
 
-    def test_toggling_append_flag_changes_hash(self, configured):
+    def test_empty_to_path_changes_hash(self, configured):
         tensor = make_tensor(RED)
-        base = ComposePSD.IS_CHANGED(
+        empty = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
+            existing_psd_path="",
         )
-        toggled = ComposePSD.IS_CHANGED(
+        non_empty = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
-            append_to_existing=True,
             existing_psd_path="/tmp/x.psd",
         )
-        assert base != toggled
+        assert empty != non_empty
+
+    def test_path_to_empty_changes_hash(self, configured):
+        """Symmetric to the above: going back to empty must also change the
+        hash, not just leaving it (a stale identity would otherwise never
+        supersede).
+        """
+        tensor = make_tensor(RED)
+        non_empty = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=tensor,
+            existing_psd_path="/tmp/x.psd",
+        )
+        empty = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=tensor,
+            existing_psd_path="",
+        )
+        assert non_empty != empty
 
     def test_changing_target_changes_hash(self, configured):
         tensor = make_tensor(RED)
@@ -2558,7 +2556,6 @@ class TestAppendIsChanged:
             timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
-            append_to_existing=True,
             existing_psd_path="/tmp/a.psd",
         )
         b = ComposePSD.IS_CHANGED(
@@ -2568,37 +2565,123 @@ class TestAppendIsChanged:
             timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
-            append_to_existing=True,
             existing_psd_path="/tmp/b.psd",
         )
         assert a != b
 
-    def test_target_irrelevant_when_append_is_off(self, configured):
-        """A different existing_psd_path with append_to_existing=False must
-        NOT change the hash -- the target is irrelevant when not appending.
+    def test_whitespace_only_path_hashes_the_same_as_empty(self, configured):
+        """``_append_target_key`` strips whitespace-only input down to "" --
+        IS_CHANGED must treat the two identically, not as a "changed target".
         """
         tensor = make_tensor(RED)
-        a = ComposePSD.IS_CHANGED(
+        empty = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
-            append_to_existing=False,
-            existing_psd_path="/tmp/a.psd",
+            existing_psd_path="",
         )
-        b = ComposePSD.IS_CHANGED(
+        whitespace = ComposePSD.IS_CHANGED(
             filename_prefix="compose",
             group_name="Group",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
             image_1=tensor,
-            append_to_existing=False,
-            existing_psd_path="/tmp/b.psd",
+            existing_psd_path="   ",
         )
-        assert a == b
+        assert empty == whitespace
+
+
+class TestAppendTargetSwitchSupersedes:
+    """Switching ``existing_psd_path`` between empty and a path -- either
+    direction -- must supersede an active handoff and open a genuinely new
+    one, exactly like a changed connected image would (the class docstring's
+    "duplicate-append avoidance" section, and the old ``append_to_existing``
+    toggle's own equivalent behavior before v0.5.28 removed it).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_empty_to_path_supersedes_the_active_handoff(
+        self, context, manager, configured_with_app, launches
+    ):
+        node_id = "800"
+        tensor = make_tensor(RED, size=(8, 8))
+        node = ComposePSD()
+
+        # First run: existing_psd_path empty -- the old fresh-file behavior,
+        # opened via the non-blocking "Re-run on every save" mode.
+        node.execute(
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=tensor,
+            existing_psd_path="",
+        )
+        old_active = manager.find_active_for_node(node_id)
+        assert old_active is not None
+
+        # Same pixels, but now pointed at a real append target.
+        target = context.input_dir / "review.psd"
+        node.execute(
+            group_name="Review",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=tensor,
+            existing_psd_path=str(target),
+        )
+        assert manager.get(old_active.handoff_id).status == "superseded"
+        new_active = manager.find_active_for_node(node_id)
+        assert new_active is not None
+        assert new_active.handoff_id != old_active.handoff_id
+        # The switch performed a REAL append (not skipped) -- the target
+        # exists with the first run-numbered group.
+        assert [c.name for c in PSDImage.open(target)] == ["Review 1"]
+
+    def test_path_to_empty_supersedes_the_active_handoff(
+        self, context, manager, configured_with_app, launches
+    ):
+        node_id = "801"
+        tensor = make_tensor(RED, size=(8, 8))
+        target = context.input_dir / "review.psd"
+        node = ComposePSD()
+
+        node.execute(
+            group_name="Review",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=tensor,
+            existing_psd_path=str(target),
+        )
+        old_active = manager.find_active_for_node(node_id)
+        assert old_active is not None
+
+        # Same pixels, but now cleared back to empty -- a fresh auto-numbered
+        # file, not another append into `target`.
+        node.execute(
+            group_name="Group",
+            mode=RERUN,
+            timeout_seconds=1800,
+            unique_id=node_id,
+            image_1=tensor,
+            existing_psd_path="",
+        )
+        assert manager.get(old_active.handoff_id).status == "superseded"
+        new_active = manager.find_active_for_node(node_id)
+        assert new_active is not None
+        assert new_active.handoff_id != old_active.handoff_id
+        # `target` was never touched a second time -- still just its first group.
+        assert [c.name for c in PSDImage.open(target)] == ["Review 1"]
+        # A fresh, separate auto-numbered file was written for the empty-path run.
+        assert (context.input_dir / "compose_00001.psd").is_file()
 
 
 class TestAppendDuplicateGuard:
@@ -2627,7 +2710,6 @@ class TestAppendDuplicateGuard:
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=tensor,
             )
@@ -2643,7 +2725,6 @@ class TestAppendDuplicateGuard:
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=tensor,
             )
@@ -2674,7 +2755,6 @@ class TestAppendDuplicateGuard:
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=make_tensor(RED, size=(8, 8)),
             )
@@ -2687,7 +2767,6 @@ class TestAppendDuplicateGuard:
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
-                append_to_existing=True,
                 existing_psd_path=str(target),
                 image_1=make_tensor(GREEN, size=(8, 8)),  # genuinely different pixels
             )

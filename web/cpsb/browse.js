@@ -15,8 +15,9 @@
  *
  * Wired from `compose.js`'s `attachAppendTargetWidgets`: the "Browse..."
  * button widget that function creates (directly after `existing_psd_path`,
- * enabled/disabled in lockstep with `existing_psd`/`existing_psd_path`
- * themselves) calls {@link openBrowseDialog} with the node and that widget.
+ * ALWAYS enabled -- v0.5.28 removed the `append_to_existing` BOOLEAN/
+ * `existing_psd` COMBO this button used to be gated on, see `compose.js`'s
+ * own header) calls {@link openBrowseDialog} with the node and that widget.
  *
  * Remote-machine honesty (this project's established convention — compare
  * `compose.js`'s "Written: ... (on ComfyUI machine)" display and `open.js`'s
