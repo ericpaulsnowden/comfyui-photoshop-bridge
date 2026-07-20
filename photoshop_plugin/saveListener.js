@@ -39,9 +39,10 @@ function isDebounced(documentId) {
 /**
  * Resolves which document a `save` notification's descriptor refers to.
  *
- * `// VERIFY(spike-7):` whether the `save` event descriptor reliably
- * carries a `documentID` field is not confirmed by any Adobe reference page
- * found during implementation — the official event-listener examples cover
+ * `RESOLVED (spike 7 — PASS live on PS 27.8.0, 2026-07-17, and validated in`
+ * `production through v0.5.30):` at implementation time, whether the `save`
+ * event descriptor reliably carries a `documentID` field was not confirmed
+ * by any Adobe reference page — the official event-listener examples cover
  * `open`/`select`/etc. generically, and the one first-party sample that
  * reads `descriptor.documentID` after a notification (the `vanilla-js-sample`
  * plugin, AdobeDocs/uxp-photoshop-plugin-samples) does so for

@@ -11,8 +11,8 @@
  * 1. Primary — duplicate + flatten + a `batchPlay` "save as PNG" descriptor
  *    with `dialogOptions: "dontDisplay"`, writing to a temp file this
  *    plugin then reads and deletes. Research flagged this as historically
- *    fiddly (undocumented descriptor shape) — see the `VERIFY(spike-6)`
- *    comment below for exactly how the descriptor here was sourced.
+ *    fiddly (undocumented descriptor shape) — see the sourcing note below
+ *    for how the descriptor was assembled (spike 6: PASS live on PS 27.8.0).
  * 2. Fallback — `imaging.getPixels()` on the same flattened duplicate,
  *    hand-encoded to PNG (see the encoder section below for why encoding is
  *    hand-rolled at all). Used whenever the primary path fails for any
@@ -63,10 +63,11 @@ async function runExport(doc) {
  * Primary export path: a `batchPlay` "save as PNG" descriptor targeting a
  * temp file in this plugin's own sandbox, with no dialog.
  *
- * `// VERIFY(spike-6):` the descriptor below is assembled from two
+ * `RESOLVED (spike 6 — PASS live on PS 27.8.0, 2026-07-17, and validated in`
+ * `production through v0.5.30):` the descriptor below was assembled from two
  * independently-confirmed but non-identical sources, not one authoritative
  * example — Adobe's own reference docs describe `batchPlay`'s general shape
- * and publish no save/export descriptor at all. (`_options.dialogOptions`
+ * and publish no save/export descriptor at all — and then proven live. (`_options.dialogOptions`
  * itself IS first-class documented — the batchPlay reference enumerates
  * "silent" (default) / "dontDisplay" / "display" — so the spike's remaining
  * uncertainty is the save-descriptor SHAPE, not the dialog suppression.)

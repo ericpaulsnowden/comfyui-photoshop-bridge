@@ -2,11 +2,11 @@
 
 Before locking in the M1 implementation, we're validating eight assumptions the whole design leans on. Each one is small, throwaway, and answerable in isolation — pick one, follow its procedure, fill in its Results section, and check it off below.
 
-**Status as of 2026-07-17:** three of the eight spikes are proven live on Photoshop 27.8.0, and the full Tier-2 round trip works end to end — spike 2 (UXP localhost WebSocket permission, previously the #1 project risk), spike 6 (silent `batchPlay` PNG export), and spike 7 (save-event listener + document identity) all PASS. See the **LIVE RESULTS** section at the bottom of this file. Spikes 1, 3, 4, 5, and 8 remain open.
+**Status as of 2026-07-20:** these M0 spikes have been overtaken by production. The pack shipped through **v0.5.30** — four nodes, the Tier-1 and Tier-2 round trips, and cross-machine (Mac Photoshop ↔ PC ComfyUI) editing — and Eric has personally validated the whole feature set on his own machines (50/50 manual-test items). Spikes 2, 6, 7 were proven live on Photoshop 27.8.0 (2026-07-17; see **LIVE RESULTS** at the bottom). Spikes **1, 3, 4, 5 are now confirmed in production** — the right-click menu, psd-tools PSD write fidelity, the save-detection watcher (Windows on Eric's PC + macOS in dev), and paste-back + auto-queue all ship and are validated by real use, not a throwaway spike. The one genuinely open item is **spike 8 (programmatic Maximize Compatibility)** — in progress as an auto-set-on-connect feature, pending live validation.
 
 The rule: **M1 design isn't final until every spike below has a written yes/no/workaround answer.**
 
-This project is pre-release — see the status note at the top of the [main README](../README.md). With Tier 2's core path now proven, the most valuable contribution available is running one of the five still-open spikes (1, 3, 4, 5, 8) and reporting real results.
+This project is pre-release — see the status note at the top of the [main README](../README.md). The design assumptions these spikes were written to de-risk are now settled by the shipped, user-validated v0.5.30 feature set; only spike 8 (Maximize Compatibility) is still being proven live.
 
 ## Prerequisites
 
@@ -17,14 +17,14 @@ This project is pre-release — see the status note at the top of the [main READ
 
 ## Checklist
 
-- [ ] 1. Image-widget right-click menu hook
+- [x] 1. Image-widget right-click menu hook — **CONFIRMED IN PRODUCTION** (the right-click "Open in Photoshop" menu ships and is validated; PROTOCOL.md §8)
 - [x] 2. UXP localhost WebSocket on target Photoshop versions — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
-- [ ] 3. PSD write fidelity via `psd-tools` `frompil`
-- [ ] 4. Watchdog event pattern for Photoshop saves (macOS + Windows)
-- [ ] 5. Clipspace-style paste-back + auto-queue
+- [x] 3. PSD write fidelity via `psd-tools` `frompil` — **CONFIRMED IN PRODUCTION** (compose/load/annotate all write PSDs that round-trip; validated live)
+- [x] 4. Watchdog event pattern for Photoshop saves — **CONFIRMED IN PRODUCTION** (Tier-1 save detection validated on Eric's Windows PC + macOS in dev)
+- [x] 5. Clipspace-style paste-back + auto-queue — **CONFIRMED IN PRODUCTION** (edits paste back to the origin node; auto-queue-on-save validated, incl. annotate re-run mode)
 - [x] 6. Silent PNG export via `batchPlay` — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
 - [x] 7. Save-event listener + document identity — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
-- [ ] 8. Programmatic Maximize Compatibility preference
+- [ ] 8. Programmatic Maximize Compatibility preference — **IN PROGRESS** (auto-set-on-connect feature; pending live validation on Eric's Photoshop)
 
 ---
 
@@ -54,7 +54,7 @@ This project is pre-release — see the status note at the top of the [main READ
 8. Note the exact ComfyUI frontend version tested (visible in the About panel) — this is an area of recent upstream churn.
 
 **Status:**
-- [ ] Not started
+- [x] **CONFIRMED IN PRODUCTION** — the "Open in Photoshop" right-click menu shipped and is validated in live use (see `web/cpsb/menu.js`, PROTOCOL.md §8). A dedicated throwaway spike was never needed once the real menu landed.
 
 ### Results
 _Date, frontend version tested, findings, and the decision (single image-scoped item vs. node-body-scoped fallback) go here._
@@ -99,7 +99,7 @@ _Date, frontend version tested, findings, and the decision (single image-scoped 
 6. For any failure (corruption, visible color shift), note the exact failure and try one alternative write path (e.g. a different library, or hand-writing a minimal valid PSD) to see if it resolves the issue.
 
 **Status:**
-- [ ] Not started
+- [x] **CONFIRMED IN PRODUCTION** — psd-tools `frompil`/`create_pixel_layer` writes drive compose, load, and annotate; round trips are validated live (incl. the v0.5.28 CMYK fidelity fix).
 
 ### Results
 _Per-test-image outcome, any color/corruption issues, and the sufficiency verdict on `psd-tools` go here._
@@ -121,7 +121,7 @@ _Per-test-image outcome, any color/corruption issues, and the sufficiency verdic
 6. From the logs, determine: does Photoshop write in place or via temp-file-then-rename, per OS? What debounce window covers the slowest observed case with reasonable margin?
 
 **Status:**
-- [ ] Not started
+- [x] **CONFIRMED IN PRODUCTION** — the Tier-1 watchdog save-detection ships and is validated on Eric's Windows PC and in macOS dev; the lock-ordering fix in v0.5.26 hardened it further.
 
 ### Results
 _Per-OS event pattern, measured timings, and the resulting debounce window go here._
@@ -144,7 +144,7 @@ _Per-OS event pattern, measured timings, and the resulting debounce window go he
 7. Note the ComfyUI frontend version tested.
 
 **Status:**
-- [ ] Not started
+- [x] **CONFIRMED IN PRODUCTION** — paste-back to the origin node and auto-queue-on-save both ship and are validated (including the annotate "Re-run on every save" loop in v0.5.30).
 
 ### Results
 _Confirmed call sequence (including any extra calls needed) and queuePrompt behavior go here._
@@ -208,7 +208,7 @@ _Confirmed call sequence (including any extra calls needed) and queuePrompt beha
 5. Confirm this doesn't require any permission beyond the plugin's existing manifest, and that the change persists across a Photoshop restart.
 
 **Status:**
-- [ ] Not started
+- [ ] **IN PROGRESS** — being implemented as an auto-set-Maximize-Compatibility-on-connect plugin feature; the batchPlay descriptor still needs live validation on Eric's Photoshop.
 
 ### Results
 _Whether get/set worked, the exact descriptors used, and the final yes/no on automatic preference-setting go here._
