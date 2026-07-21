@@ -32,7 +32,7 @@ Right-clicking an image and choosing **Open in Photoshop** is the core action, a
 
 Handoffs opened in Photoshop are **named after the file they came from** — `Eric-Headshot.jpg` opens as `Eric-Headshot.psd`, not an anonymous `source.psd` — so document tabs and file dropdowns stay tellable-apart.
 
-A **"Photoshop Edits" sidebar gallery** tracks every round trip for the workflow: re-open an edit, add it as a node, reveal the file, or remove an entry from the list. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
+A **"Photoshop Edits" sidebar gallery** tracks every round trip for the workflow, as a list or a grid (toggle in the gallery header, remembered across sessions): re-open an edit, add it as a node, reveal the file, or remove an entry from the list. Each card leads with the latest edit — **click and hold the thumbnail to compare it against the original**. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
 
 <!-- demo.gif -->
 *(Right-click an image → Open in Photoshop → edit → Cmd/Ctrl+S → the node updates. Demo GIF coming.)*

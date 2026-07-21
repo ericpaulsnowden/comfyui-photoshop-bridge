@@ -101,6 +101,16 @@ export function warn(...args) {
  * @property {string} workflow_name
  * @property {CpsbImageRef} source
  * @property {string | null} [source_hash]
+ * @property {string} [psd_filename] - The managed PSD copy's own on-disk
+ * filename, DERIVED from the origin filename's stem (PROTOCOL.md §1, v0.5.26
+ * — `Eric-Headshot.jpg` → `Eric-Headshot.psd`), not the literal `source.psd`
+ * every handoff used before that change. Absent only on a `meta.json`
+ * written before this field existed, which the backend itself reads back as
+ * `source.psd` (`HandoffManager`'s own fallback) — so treat a missing value
+ * here the same way. This frontend doesn't currently address the managed
+ * PSD by name (thumbnails/edits go through {@link thumbUrl}/{@link viewUrl},
+ * neither of which needs it), so the field is documented here for
+ * completeness with `meta.json` rather than consumed anywhere yet.
  * @property {string | null} [managed_dir] - The `managed_folder_name`
  * (PROTOCOL.md §1/§2) in effect when this handoff was created — the actual
  * folder under `input/` its files live in, which is `null` only for a

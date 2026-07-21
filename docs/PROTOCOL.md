@@ -981,7 +981,14 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
 - Batch nodes (`node.imgs.length > 1`): open the **currently displayed** image
   (`node.imageIndex ?? 0`); an "Open all N in Photoshop" item appears for N ≤ 8.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
-  `cpsb.showUpgradeBanner` (bool, default true).
+  `cpsb.showUpgradeBanner` (bool, default true), `cpsb.galleryGridLayout` (bool, default
+  false — List/Grid layout for the sidebar gallery; the gallery header's own List/Grid
+  buttons write the same setting, so the two controls always agree).
+- Gallery card thumbnail (v0.5.36): each card leads with ONE larger thumbnail — the
+  latest edit, or the original when no edit exists yet. When an edit exists,
+  click-and-hold (Pointer Events; mouse and touch) reveals the original while held and
+  snaps back on release/cancel. Purely a display affordance: no new route, no new
+  websocket message, no change to the card action surface.
 
 ---
 

@@ -27,6 +27,10 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  /* The List/Grid toggle joined the pill + version label in this row; wrap
+     rather than clip/overflow at narrow sidebar widths. */
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 
 .cpsb-gallery-header-right {
@@ -34,6 +38,41 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex-wrap: wrap;
+}
+
+/* List/Grid layout toggle (gallery.js buildLayoutToggle) — a segmented pair
+   of buttons rather than a checkbox, so the current choice is always
+   visible at a glance, not just inferrable from a toggle's on/off state. */
+
+.cpsb-layout-toggle {
+  display: inline-flex;
+  border-radius: 6px;
+  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.cpsb-layout-toggle-button {
+  padding: 3px 9px;
+  border: none;
+  background: var(--comfy-input-bg, #262626);
+  color: var(--muted-foreground, #888);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.cpsb-layout-toggle-button + .cpsb-layout-toggle-button {
+  border-left: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
+}
+
+.cpsb-layout-toggle-button:hover {
+  background: var(--content-hover-bg, #333);
+}
+
+.cpsb-layout-toggle-button-active {
+  color: var(--fg-color, #e6e6e6);
+  background: rgba(91, 155, 213, 0.2);
 }
 
 /* Generic "Ps" text lettermark (gallery header identity; the tab-strip
@@ -121,6 +160,48 @@
   min-width: 0;
 }
 
+/* Grid layout (gallery.js rebuild(): `.cpsb-gallery-grid` is added ALONGSIDE
+   `.cpsb-gallery-list`, never in place of it, when the persisted
+   cpsb.galleryGridLayout setting/header toggle is on). Every rule below is
+   an ADDITIVE override scoped under this class, so List's own rules above
+   stay exactly as they were — Grid can't drift List's layout by accident. */
+
+.cpsb-gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 10px;
+}
+
+.cpsb-gallery-grid .cpsb-card {
+  gap: 6px;
+  padding: 8px;
+}
+
+.cpsb-gallery-grid .cpsb-card-header {
+  flex-wrap: wrap;
+}
+
+.cpsb-gallery-grid .cpsb-card-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cpsb-gallery-grid .cpsb-card-actions {
+  gap: 4px;
+}
+
+.cpsb-gallery-grid .cpsb-card-action {
+  padding: 3px 6px;
+  font-size: 10px;
+}
+
+.cpsb-gallery-grid .cpsb-card-thumb-frame {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1 / 1;
+}
+
 /* Connection pill */
 
 .cpsb-pill {
@@ -189,25 +270,117 @@
   background: rgba(91, 155, 213, 0.12);
 }
 
-.cpsb-card-thumbs {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* Card thumbnail (gallery.js buildCardThumb): a single larger AFTER-led
+   image — the latest edit, or the original when no edit exists yet —
+   replacing the old fixed-64px before/after PAIR shown side by side with a
+   "→" between them (.cpsb-card-thumbs/.cpsb-card-thumb-arrow, both removed:
+   nothing builds either anymore). List's frame is a fixed larger square
+   below; Grid's own sizing lives with the rest of "Grid layout" above
+   (.cpsb-gallery-grid .cpsb-card-thumb-frame) since it depends on the
+   card's grid track width, not a constant. */
+
+.cpsb-card-thumb-frame {
+  position: relative;
+  overflow: hidden;
+  border-radius: 6px;
+  flex-shrink: 0;
+  background: var(--comfy-input-bg, #111);
+  width: 128px;
+  height: 128px;
+  /* No native "save image" long-press callout or text-selection highlight —
+     a long-press on this frame already means something (hold-to-compare). */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
-.cpsb-card-thumb {
-  width: 64px;
-  height: 64px;
+.cpsb-card-thumb-frame .cpsb-card-thumb {
+  width: 100%;
+  height: 100%;
+  /* cover, not the default fill: the frame is a fixed square (List) or a
+     grid-track square (Grid) while the handoff image can be any aspect —
+     fill would visibly stretch it. This lived on the old base
+     .cpsb-card-thumb rule and must survive its removal. */
   object-fit: cover;
-  border-radius: 6px;
-  background: var(--comfy-input-bg, #111);
-  flex-shrink: 0;
+  display: block;
+  /* Hold-to-compare makes press-and-drift ON the image a normal gesture;
+     without this, that same gesture is exactly how a native image drag
+     starts (ghost image, pointercancel mid-hold). */
+  -webkit-user-drag: none;
+  border-radius: 0; /* the frame itself clips + rounds; a second radius on
+    the image inside it would double up at the corners */
+}
+
+/* When an edit exists, AFTER and BEFORE are stacked (both absolutely
+   positioned, filling the frame) and crossfaded via opacity — see
+   attachHoldToCompare in gallery.js for what toggles .cpsb-card-thumb-holding
+   on the frame; this is purely the CSS side of that. With no edit, buildCardThumb
+   emits neither modifier and this pair of rules simply doesn't apply. */
+
+.cpsb-card-thumb-after,
+.cpsb-card-thumb-before {
+  position: absolute;
+  inset: 0;
+}
+
+.cpsb-card-thumb-before {
+  opacity: 0;
+  transition: opacity 100ms ease;
+}
+
+.cpsb-card-thumb-frame.cpsb-card-thumb-holding .cpsb-card-thumb-before {
+  opacity: 1;
+}
+
+.cpsb-card-thumb-frame.cpsb-card-thumb-holding .cpsb-card-thumb-after {
+  opacity: 0;
+}
+
+/* Discoverability affordance for the hold-to-compare gesture — both always
+   visible rather than hover-revealed, since touch has no hover state to
+   reveal them with. The badge's text is swapped between "After"/"Before" by
+   attachHoldToCompare; the hint just fades out once a hold is already in
+   progress, when it would otherwise sit on top of the BEFORE image. */
+
+.cpsb-card-thumb-badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  pointer-events: none; /* never steals the pointerdown from the frame */
+}
+
+.cpsb-card-thumb-hint {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 3px 6px;
+  font-size: 9px;
+  text-align: center;
+  color: #fff;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.55), transparent);
+  pointer-events: none;
+  transition: opacity 100ms ease;
+}
+
+.cpsb-card-thumb-frame.cpsb-card-thumb-holding .cpsb-card-thumb-hint {
+  opacity: 0;
 }
 
 /* Placeholder shown in place of a thumbnail whose file is gone (purged
-   handoff folder, deleted input) — same footprint as .cpsb-card-thumb so
-   the card layout doesn't shift, but a labeled box instead of the
-   browser's broken-image glyph. */
+   handoff folder, deleted input) — buildThumb carries over whatever
+   size/role class (e.g. cpsb-card-thumb-after/-before) the image it
+   replaces had, so this keeps the SAME footprint and stacking position
+   the real thumbnail had, not just a fixed size — a labeled box instead of
+   the browser's broken-image glyph. */
 
 .cpsb-card-thumb-missing {
   display: inline-flex;
@@ -220,11 +393,6 @@
   font-size: 10px;
   line-height: 1.3;
   border: 1px dashed var(--border-default, rgba(255, 255, 255, 0.18));
-}
-
-.cpsb-card-thumb-arrow {
-  color: var(--muted-foreground, #888);
-  flex-shrink: 0;
 }
 
 .cpsb-card-header {
@@ -663,13 +831,16 @@
 @media (prefers-reduced-motion: reduce) {
   .cpsb-toast,
   .cpsb-dialog-backdrop,
-  .cpsb-card {
+  .cpsb-card,
+  .cpsb-card-thumb-before,
+  .cpsb-card-thumb-hint {
     transition: none;
   }
 }
 
 @media (prefers-color-scheme: light) {
-  .cpsb-card-thumb {
+  .cpsb-card-thumb,
+  .cpsb-card-thumb-frame {
     background: #eee;
   }
 }

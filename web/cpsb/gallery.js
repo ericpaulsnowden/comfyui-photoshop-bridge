@@ -6,6 +6,24 @@
  * manual import. Refreshes only from `state.js`'s change notifications
  * (themselves driven by the `cpsb.*` websocket events) — no polling.
  *
+ * Each card leads with ONE larger thumbnail — the AFTER image (the latest
+ * edit; the ORIGINAL when no edit has arrived yet) — replacing the old
+ * fixed-size before/after PAIR shown side by side with a "→" between them.
+ * When an edit exists, the original is layered underneath and a
+ * click-and-hold ({@link attachHoldToCompare}, Pointer Events — mouse and
+ * touch alike, no separate handlers for either) reveals it for as long as
+ * the pointer is held, snapping back to AFTER on release, an interrupted
+ * gesture, or the pointer leaving the thumbnail. A corner badge and a
+ * "Hold to compare" hint are always visible (never hover-only — touch has
+ * no hover to reveal them) so the gesture is discoverable; no edit yet
+ * means nothing to compare, so none of that — wiring, badge, or hint — is
+ * attached at all. A List/Grid toggle in the header switches the SAME
+ * cards (the card-building functions below are layout-agnostic) between
+ * this single-column flow and a responsive multi-column grid, persisted
+ * via `settings.js`'s `cpsb.galleryGridLayout` — the identical
+ * `app.extensionManager.setting` mechanism every other `cpsb.*` frontend
+ * preference already uses, so it survives a reload the same way they do.
+ *
  * Card actions are STATUS-SCOPED via one explicit table
  * ({@link cardCapabilities}) rather than ad-hoc conditions — the first
  * field round exposed exactly the failure class that invites: Re-open
@@ -446,19 +464,31 @@ function buildStatusChip(meta) {
  * the swap is reliable.
  * @param {string} src
  * @param {string} alt
+ * @param {string} [extraClassName] - Extra class(es) appended to the base
+ * `cpsb-card-thumb` (e.g. the AFTER/BEFORE role modifier {@link
+ * buildCardThumb} adds). Carried onto the broken-image placeholder too, so
+ * a 404'd AFTER/BEFORE image degrades to a placeholder of the SAME
+ * footprint and position instead of snapping back to the bare default size
+ * and shifting (or, inside the stacked compare frame, misplacing) the
+ * layout.
  * @returns {HTMLElement}
  */
-function buildThumb(src, alt) {
+function buildThumb(src, alt, extraClassName = '') {
+  const className = extraClassName ? `cpsb-card-thumb ${extraClassName}` : 'cpsb-card-thumb'
   const img = ui.el('img', {
-    className: 'cpsb-card-thumb',
-    attrs: { src, alt, loading: 'lazy' }
+    className,
+    // draggable=false: hold-to-compare makes press-and-drift on a thumbnail
+    // a first-class gesture, and on an <img> that exact motion is also how a
+    // native HTML5 image drag starts (ghost image + pointercancel killing
+    // the hold). cpsb.css pairs this with -webkit-user-drag: none.
+    attrs: { src, alt, loading: 'lazy', draggable: 'false' }
   })
   img.addEventListener(
     'error',
     () => {
       img.replaceWith(
         ui.el('div', {
-          className: 'cpsb-card-thumb cpsb-card-thumb-missing',
+          className: `${className} cpsb-card-thumb-missing`,
           text: 'No preview',
           attrs: { title: 'The image file is no longer on the server.' }
         })
@@ -467,6 +497,117 @@ function buildThumb(src, alt) {
     { once: true }
   )
   return img
+}
+
+/**
+ * The card's single leading thumbnail (replaces the old side-by-side
+ * before/after pair): the AFTER image — *latestEdit* when one exists, else
+ * the ORIGINAL — at a larger size. When *latestEdit* exists, the original
+ * is layered underneath (absolute-positioned; `cpsb.css` crossfades it via
+ * opacity) and {@link attachHoldToCompare} wires the click-and-hold reveal
+ * plus its corner badge/hint; with no edit yet there is nothing to compare,
+ * so this returns a single plain image with none of that attached.
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ * @param {import('./api.js').CpsbEdit | undefined} latestEdit
+ * @returns {HTMLElement}
+ */
+function buildCardThumb(meta, latestEdit) {
+  if (!latestEdit) {
+    return ui.el('div', {
+      className: 'cpsb-card-thumb-frame',
+      children: [buildThumb(api.thumbUrl(meta.handoff_id), 'Original')]
+    })
+  }
+
+  const after = buildThumb(
+    api.viewUrl({
+      filename: latestEdit.filename,
+      subfolder: api.editSubfolder(meta),
+      type: 'input'
+    }),
+    'Latest edit',
+    'cpsb-card-thumb-after'
+  )
+  const before = buildThumb(api.thumbUrl(meta.handoff_id), 'Original', 'cpsb-card-thumb-before')
+  const badge = ui.el('span', { className: 'cpsb-card-thumb-badge', text: 'After' })
+  const hint = ui.el('span', { className: 'cpsb-card-thumb-hint', text: 'Hold to compare' })
+
+  const frame = ui.el('div', {
+    className: 'cpsb-card-thumb-frame',
+    children: [after, before, badge, hint]
+  })
+  attachHoldToCompare(frame, badge)
+  return frame
+}
+
+/**
+ * Wires the click-and-hold before/after reveal on *frame* via Pointer
+ * Events — one code path for mouse AND touch, no `mousedown`/`touchstart`
+ * pair to keep in sync (this is the plain-DOM browser sidebar; the
+ * UXP/litegraph pointer quirks noted elsewhere in this pack don't apply
+ * here). Holding adds `cpsb-card-thumb-holding` to *frame*, which is all
+ * `cpsb.css` needs to crossfade the layered before/after images and hide
+ * the hint; releasing — `pointerup`, `pointercancel`, or `pointerleave` —
+ * always removes it, so the gesture can never get stuck showing BEFORE.
+ *
+ * `setPointerCapture` redirects the rest of this gesture's events to
+ * *frame* regardless of where the pointer physically ends up, which a bare
+ * `pointerup` listener cannot do on its own (it only fires on whatever
+ * element happens to be under the pointer at release) — without it, a
+ * press that drifts slightly off the thumbnail before releasing would
+ * leave BEFORE showing with no `pointerup` on *frame* to clear it. If an
+ * older/partial Pointer Events implementation throws, the gesture still
+ * works for the common press-and-release-in-place case; only the
+ * drifted-off-the-thumb edge case degrades, which isn't worth failing the
+ * whole card over.
+ *
+ * The thumbnail has no click action today and this deliberately keeps it
+ * that way — a quick tap/click just flashes BEFORE and back, never
+ * triggers anything destructive or navigational.
+ * @param {HTMLElement} frame
+ * @param {HTMLElement} badge - The corner label swapped between "After" and
+ * "Before" while held.
+ */
+function attachHoldToCompare(frame, badge) {
+  let activePointerId = /** @type {number | null} */ (null)
+
+  const showBefore = () => {
+    frame.classList.add('cpsb-card-thumb-holding')
+    badge.textContent = 'Before'
+  }
+  const showAfter = () => {
+    frame.classList.remove('cpsb-card-thumb-holding')
+    badge.textContent = 'After'
+  }
+
+  frame.addEventListener('pointerdown', (event) => {
+    // A right-click or an auxiliary mouse button must not trigger this —
+    // only the primary mouse button, or any touch/pen contact (which has
+    // no "button" concept and reports 0 by convention).
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    activePointerId = event.pointerId
+    try {
+      frame.setPointerCapture(event.pointerId)
+    } catch {
+      // See doc comment above: degrade to the common case rather than
+      // break the card over a nicety.
+    }
+    showBefore()
+  })
+
+  const release = (/** @type {PointerEvent} */ event) => {
+    if (activePointerId === null || event.pointerId !== activePointerId) return
+    activePointerId = null
+    showAfter()
+  }
+  frame.addEventListener('pointerup', release)
+  frame.addEventListener('pointercancel', release)
+  // Belt-and-braces per this pack's pointer-handling convention: while
+  // capture is active, boundary events normally don't fire for the
+  // capturing element (the capture already guarantees pointerup/cancel
+  // land here), so this mainly backstops the setPointerCapture-threw
+  // fallback path above.
+  frame.addEventListener('pointerleave', release)
 }
 
 /**
@@ -485,21 +626,7 @@ function buildCard(meta) {
   // open re-evaluates it — visibility is never cached across renders.
   const originNodePresent = !!pasteback.getNodeByIdFlexible(meta.origin_node_id)
 
-  const thumbs = ui.el('div', { className: 'cpsb-card-thumbs' })
-  thumbs.appendChild(buildThumb(api.thumbUrl(meta.handoff_id), 'Original'))
-  if (latestEdit) {
-    thumbs.appendChild(ui.el('span', { className: 'cpsb-card-thumb-arrow', text: '→' }))
-    thumbs.appendChild(
-      buildThumb(
-        api.viewUrl({
-          filename: latestEdit.filename,
-          subfolder: api.editSubfolder(meta),
-          type: 'input'
-        }),
-        'Latest edit'
-      )
-    )
-  }
+  const thumb = buildCardThumb(meta, latestEdit)
 
   const header = ui.el('div', {
     className: 'cpsb-card-header',
@@ -587,9 +714,60 @@ function buildCard(meta) {
     actions.appendChild(removeButton)
   }
 
-  const card = ui.el('div', { className: 'cpsb-card', children: [thumbs, header, metaLine, actions] })
+  const card = ui.el('div', { className: 'cpsb-card', children: [thumb, header, metaLine, actions] })
   if (capabilities.dropImport) attachDropHandlers(card, meta)
   return card
+}
+
+/**
+ * List/Grid toggle for the gallery header — two buttons (not a checkbox or
+ * combo: this is a persistent, always-visible 2-way switch a user sets once
+ * and forgets, so a segmented pair of buttons — the same visual language
+ * `.cpsb-card-action` already establishes elsewhere in this file — reads
+ * clearer than a single control whose current state you have to infer).
+ * Writes straight through {@link settings.setGalleryGridLayout} and calls
+ * {@link rebuild} immediately after: a settings-panel change and this
+ * header control both persist through the identical
+ * `app.extensionManager.setting` mechanism, but neither one raises a
+ * `state.js` change event (only `cpsb.*` websocket traffic does), so
+ * without the explicit `rebuild()` call here the panel would silently keep
+ * showing the OLD layout until some unrelated handoff event happened to
+ * repaint it.
+ * @param {"list" | "grid"} layout - This render's already-resolved value
+ * (read once per {@link rebuild}, not re-read here) so the two buttons'
+ * active state can never disagree with what's actually on screen.
+ * @returns {HTMLElement}
+ */
+function buildLayoutToggle(layout) {
+  /**
+   * @param {"list" | "grid"} value
+   * @param {string} label
+   */
+  const button = (value, label) =>
+    ui.el('button', {
+      className: `cpsb-layout-toggle-button${
+        layout === value ? ' cpsb-layout-toggle-button-active' : ''
+      }`,
+      text: label,
+      attrs: {
+        type: 'button',
+        title: `Show edits as a ${value}`,
+        'aria-pressed': String(layout === value)
+      },
+      on: {
+        click: () => {
+          if (layout === value) return
+          settings.setGalleryGridLayout(value === 'grid')
+          rebuild()
+        }
+      }
+    })
+
+  return ui.el('div', {
+    className: 'cpsb-layout-toggle',
+    attrs: { role: 'group', 'aria-label': 'Gallery layout' },
+    children: [button('list', 'List'), button('grid', 'Grid')]
+  })
 }
 
 /**
@@ -705,6 +883,9 @@ function rebuild() {
   if (!rootEl) return
   try {
     rootEl.replaceChildren()
+    // Resolved once per render so the header toggle and the list container
+    // below can never disagree about which layout is current.
+    const layout = settings.getGalleryGridLayout() ? 'grid' : 'list'
 
     rootEl.appendChild(
       ui.el('div', {
@@ -713,7 +894,7 @@ function rebuild() {
           buildBrandMark(),
           ui.el('div', {
             className: 'cpsb-gallery-header-right',
-            children: [buildConnectionPill(), buildVersionLabel()]
+            children: [buildLayoutToggle(layout), buildConnectionPill(), buildVersionLabel()]
           })
         ]
       })
@@ -746,7 +927,14 @@ function rebuild() {
       return
     }
 
-    const list = ui.el('div', { className: 'cpsb-gallery-list' })
+    // Grid is a pure CSS overlay on top of the same list/card markup
+    // (`.cpsb-gallery-grid` in cpsb.css) — buildCard/buildCardThumb are
+    // layout-agnostic, so every existing card behavior (status chip, every
+    // cardCapabilities action, drag-drop import, the missing-thumb
+    // fallback) keeps working unchanged in either layout.
+    const list = ui.el('div', {
+      className: layout === 'grid' ? 'cpsb-gallery-list cpsb-gallery-grid' : 'cpsb-gallery-list'
+    })
     for (const meta of handoffs) {
       // Per-card guard: one malformed meta (e.g. from a hand-edited or
       // truncated meta.json the backend recovered) must degrade to one
