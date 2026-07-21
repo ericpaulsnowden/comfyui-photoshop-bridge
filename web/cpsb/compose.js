@@ -1,7 +1,7 @@
 /**
- * @file Three independent per-node display concerns for the "Compose Layers
- * to PSD" node (`PhotoshopComposePSD`, PROTOCOL.md §6c), all owned here
- * because this is where the rest of this package already does
+ * @file Four independent per-node display/interaction concerns for the
+ * "Compose Layers to PSD" node (`PhotoshopComposePSD`, PROTOCOL.md §6c), all
+ * owned here because this is where the rest of this package already does
  * compose-node-specific widget/socket manipulation:
  *
  * 1. Auto-growing `image_N` inputs: "connecting one reveals the next empty
@@ -44,6 +44,23 @@
  *    {@link getWrittenFileRef}/{@link hasWrittenFile} let `menu.js` also
  *    offer "Open in Photoshop" for a Compose node with no `node.imgs` at all
  *    (build brief item 4).
+ * 4. Renamable `image_N` INPUT SLOTS (product owner, verbatim: "you should
+ *    be able to change the names of the input nodes by double clicking on
+ *    them. The name of the node should become the layer names. Remove the
+ *    separate layer name textbox."): double-clicking an `image_N` slot opens
+ *    a rename prompt exactly like `comfyui-epsnodes`' `EPSSwitcher`
+ *    (`eps_image/switcher.js`, FORMAT.md §6.4 "Renamable rows") -- the same
+ *    `onDblClick`/`onInputDblClick` dual-hook shape, the same
+ *    `LGraphCanvas.prompt`-with-`window.prompt`-fallback dialog, and the same
+ *    "set `input.label`, never `input.name`" display-only contract (clean-
+ *    room reimplementation here, not a copy — see this file's "Renamable
+ *    image_N inputs" section for the citations). Every slot's current label
+ *    is kept serialized into the backend's hidden `layer_names` STRING
+ *    widget (`cpsb/compose_psd.py`'s `INPUT_TYPES`) as a JSON object, which
+ *    is what turns a renamed slot into that layer's actual name in the
+ *    written PSD (`cpsb/compose_psd.py`'s `_resolve_layer_names`) -- the
+ *    former separate `layer_name` STRING widget this replaces is gone
+ *    entirely, per the product owner's own ask above.
  *
  * See this file's "Written-file display" section below for the full design
  * (including what does and does not survive a browser reload).
@@ -164,6 +181,28 @@ const STABILIZE_DEBOUNCE_MS = 64
 const IMAGE_INPUT_NAME_RE = /^image_(\d+)$/
 
 /**
+ * Name of the backend-declared hidden STRING widget (`cpsb/compose_psd.py`'s
+ * `INPUT_TYPES`) this file publishes every `image_N` slot's custom label
+ * into, as a JSON object (`_parse_layer_names`'s own contract:
+ * `{"image_N": "label"}`, absent key == no custom name -- see the "Renamable
+ * image_N inputs" section below). A REAL required widget (unlike the
+ * `serialize: false` buttons elsewhere in this file), so it round-trips with
+ * the saved workflow like any other backend-declared value; this file only
+ * ever hides its on-canvas row (`.hidden = true`), never its serialization.
+ */
+const LAYER_NAMES_WIDGET_NAME = 'layer_names'
+
+/**
+ * Half-height of the Y band (around a row's `getConnectionPos`) that counts
+ * as "this row" for double-click rename hit-testing (the "Renamable image_N
+ * inputs" section below) -- mirrors comfyui-epsnodes' `eps_image/
+ * switcher.js` `ROW_HIT_HALF_HEIGHT`: rows are ~20px apart (litegraph's
+ * default slot height), and 9 leaves a small deadzone between adjacent rows
+ * rather than an ambiguous overlap.
+ */
+const ROW_HIT_HALF_HEIGHT = 9
+
+/**
  * @param {import('../../../scripts/app.js').LGraphNode} node
  * @returns {boolean}
  */
@@ -186,6 +225,24 @@ function imageInputIndex(name) {
  */
 function getImageInputs(node) {
   return (node.inputs ?? []).filter((input) => imageInputIndex(input.name) !== null)
+}
+
+/**
+ * Like {@link getImageInputs}, but paired with each input's own index into
+ * `node.inputs` -- needed by the rename hit-testing below
+ * ({@link imageInputAtLocalY}), which must call `node.getConnectionPos(true,
+ * idx)` with the REAL slot index, not its position among just the image_N
+ * inputs.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {{idx: number, input: import('../../../scripts/app.js').IBaseWidget}[]}
+ */
+function imageInputEntries(node) {
+  const entries = []
+  const inputs = node.inputs ?? []
+  for (let idx = 0; idx < inputs.length; idx++) {
+    if (imageInputIndex(inputs[idx].name) !== null) entries.push({ idx, input: inputs[idx] })
+  }
+  return entries
 }
 
 /**
@@ -228,6 +285,15 @@ function addImageInput(node, index) {
  *    to what currently exists, is connected), reveal the next missing index
  *    (bounded by {@link MAX_IMAGE_INPUTS}) so there is always exactly one
  *    empty socket available to connect into next.
+ *
+ * Also re-publishes {@link LAYER_NAMES_WIDGET_NAME} ({@link publishLayerNames})
+ * once the above settles -- this is what satisfies "on configure/load" for
+ * the rename feature (the "Renamable image_N inputs" section below): this
+ * function's own `app.configuringGraph` guard already defers its real work
+ * until a workflow restore's sockets/labels are fully in place, and it also
+ * runs once on every ordinary connect/disconnect, so publishing here (rather
+ * than adding a SEPARATE `configure()` hook) reuses that already-proven
+ * timing instead of re-deriving it.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 function stabilizeImageInputs(node) {
@@ -257,6 +323,7 @@ function stabilizeImageInputs(node) {
     }
   }
 
+  publishLayerNames(node)
   node.graph?.setDirtyCanvas?.(true, true)
 }
 
@@ -273,6 +340,281 @@ function scheduleStabilize(node) {
     node.__cpsbComposeStabilizeTimer = null
     stabilizeImageInputs(node)
   }, STABILIZE_DEBOUNCE_MS)
+}
+
+// -----------------------------------------------------------------------
+// Renamable image_N inputs (this file's header, section 4; product owner
+// verbatim: "you should be able to change the names of the input nodes by
+// double clicking on them. The name of the node should become the layer
+// names. Remove the separate layer name textbox.").
+//
+// This is a clean-room reimplementation of the PROVEN pattern already
+// shipped in `comfyui-epsnodes`' `eps_image/switcher.js` (FORMAT.md §6.4
+// "Renamable rows") -- not a copy (different repo, this file's own style),
+// but the same load-bearing techniques, cited here rather than re-derived:
+//   - `LGraphCanvas.prompt(title, value, callback, event)` when this fork
+//     has it (confirmed present there against a local ComfyUI_frontend
+//     checkout), else a plain `window.prompt` fallback -- see
+//     {@link promptForImageInputLabel}.
+//   - Setting `input.label` ONLY -- `input.name` (the backend kwargs
+//     contract `cpsb/compose_psd.py`'s `execute(self, ..., **kwargs)` keys
+//     on) and every existing link are left completely untouched, so a saved
+//     workflow's `image_7` link is always restored onto a real `image_7`
+//     socket exactly as before this feature existed (this file's header,
+//     "FORK NOTICE" paragraph, already establishes that invariant for the
+//     auto-grow machinery; renaming does not change it). An empty/whitespace
+//     label DELETES the `.label` property (not `= ""`), so litegraph's own
+//     `label || name` draw-time fallback shows the plain socket name again
+//     immediately -- see {@link setInputLabel}.
+//   - Two double-click hooks, not one, because litegraph dispatches a
+//     double-click differently depending on where it lands:
+//     `onInputDblClick(index, e)` fires for a click within litegraph's OWN
+//     input hit-region (the socket dot and its name/label text --
+//     `LGraphCanvas.ts`'s inputs loop registers this and `return`s before
+//     reaching anything else); `onDblClick(e, pos, canvas)` fires for a
+//     click anywhere ELSE in the node body (this node draws no per-row
+//     toggle box the way `EPSSwitcher` does, so that is simply blank row
+//     space here). `pos[1] < 0` excludes the title bar (litegraph's own
+//     signal for "this was the title"). See {@link wireImageInputRename}.
+//   - Persistence: `switcher.js`'s own file header documents a live,
+//     verified round trip (rename a row, reload the page, re-read
+//     `node.inputs[i].label`) coming back unchanged, backed by
+//     `node/slotUtils.ts`'s `inputAsSerialisable` explicitly destructuring
+//     `label` into the serialized POJO -- the same litegraph fork this
+//     package targets (this file's own header cites the identical
+//     `Comfy-Org/ComfyUI_frontend` source convention). That is why this file
+//     trusts plain `input.label` too, with no node-property fallback map:
+//     the round-trip guarantee comes from the SAME underlying mechanism,
+//     already proven elsewhere in this monorepo, not re-derived here.
+//
+// **The `layer_names` bridge to the backend** (mirrors `switcher.js`'s own
+// `toggles` widget -- see that file's module docstring "toggles is the
+// enabled-set bridge to the backend"): `cpsb/compose_psd.py`'s `INPUT_TYPES`
+// declares a REQUIRED `layer_names` STRING widget (default `""`) at the
+// exact position the removed `layer_name` STRING widget used to occupy.
+// {@link hideLayerNamesWidget} hides its on-canvas row once, at attach time
+// (`.hidden = true` only -- it stays a real, serialized widget, so it still
+// round-trips with the saved workflow); {@link publishLayerNames} keeps its
+// value in lockstep with every `image_N` slot's current `.label` as a JSON
+// object (`{"image_1": "Sky", ...}`, absent key == no custom name --
+// `cpsb/compose_psd.py`'s `_parse_layer_names`), called from
+// {@link setInputLabel} on every rename commit AND from
+// {@link stabilizeImageInputs}'s own already-`configuringGraph`-safe tail
+// (covering the "on configure/load" case without a second, separately-timed
+// hook).
+// -----------------------------------------------------------------------
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
+ */
+function getLayerNamesWidget(node) {
+  return findWidgetByName(node, LAYER_NAMES_WIDGET_NAME)
+}
+
+/**
+ * Hides the backend-declared `layer_names` widget's on-canvas row (this
+ * section's header) -- called once, at attach time. Mirrors
+ * `eps_image/switcher.js`'s own `hideTogglesWidget`: `.hidden = true` is
+ * enough to stop it drawing (`badges.js`'s own widget-layout pass in this
+ * same package already filters on `!w.hidden`) without stopping it from
+ * serializing, since `serialize` itself is untouched. A missing widget
+ * (defensive only -- `cpsb/compose_psd.py`'s `INPUT_TYPES` always declares
+ * it) just warns; renaming would then have nothing to write into, but
+ * nothing else on the node breaks.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function hideLayerNamesWidget(node) {
+  const widget = getLayerNamesWidget(node)
+  if (!widget) {
+    api.warn(
+      'PhotoshopComposePSD node is missing its `layer_names` widget; ' +
+        'renaming image_N inputs will not reach the backend'
+    )
+    return
+  }
+  widget.hidden = true
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @returns {Record<string, string>} `{"image_N": "label"}` for every
+ * `image_N` input that currently carries a non-blank `.label` -- an input
+ * with no label (never renamed, or reset back to blank) is simply absent,
+ * matching `cpsb/compose_psd.py`'s `_parse_layer_names` "absence means no
+ * custom name" contract.
+ */
+function collectImageInputLabels(node) {
+  const labels = {}
+  for (const input of getImageInputs(node)) {
+    const label = typeof input.label === 'string' ? input.label.trim() : ''
+    if (label) labels[input.name] = label
+  }
+  return labels
+}
+
+/**
+ * Writes {@link collectImageInputLabels}'s current snapshot into the hidden
+ * `layer_names` widget (this section's header). A no-op if that widget is
+ * missing (already warned once by {@link hideLayerNamesWidget}). Safe and
+ * cheap to call often -- every call recomputes the full snapshot from the
+ * inputs themselves (the authoritative source), so it can never drift from
+ * what is actually drawn on the node.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function publishLayerNames(node) {
+  const widget = getLayerNamesWidget(node)
+  if (!widget) return
+  widget.value = JSON.stringify(collectImageInputLabels(node))
+}
+
+/**
+ * The text litegraph actually draws for *input* -- `label || name`, matching
+ * `measureSlots.ts`'s own precedence (`eps_image/switcher.js`'s identical
+ * `displayText` helper, cited here for the same reasoning).
+ * @param {object} input
+ * @returns {string}
+ */
+function displayText(input) {
+  return (input && (input.label || input.name)) || ''
+}
+
+/**
+ * Sets or clears *input*'s display label -- `input.name` and every existing
+ * link are NEVER touched (this section's header). An empty/whitespace
+ * *label* deletes the `.label` property entirely (rather than setting
+ * `""`), so {@link displayText}/litegraph's own `label || name` fallback
+ * shows the plain socket name again immediately. Re-publishes
+ * `layer_names` right away so the very next queue already sees the rename
+ * (`cpsb/compose_psd.py`'s `IS_CHANGED` hashes that widget's value, so this
+ * also correctly invalidates any cached/consumable result for this node).
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {object} input
+ * @param {string} label
+ */
+function setInputLabel(node, input, label) {
+  const trimmed = (label ?? '').trim()
+  if (trimmed) input.label = trimmed
+  else delete input.label
+  publishLayerNames(node)
+  node.graph?.setDirtyCanvas(true, true)
+}
+
+/**
+ * Best-effort active `LGraphCanvas` for callbacks that don't receive one
+ * directly ({@link wireImageInputRename}'s `onInputDblClick` branch) -- the
+ * same `app.canvas` access pattern this package already uses elsewhere
+ * (e.g. `pasteback.js`).
+ * @returns {object|null}
+ */
+function activeCanvas() {
+  return app?.canvas ?? null
+}
+
+/**
+ * Opens the rename editor for *input* (this section's header): `LGraphCanvas
+ * .prompt` when this fork has it, else a plain `window.prompt` fallback.
+ * `window.prompt` returns `null` on Cancel but `""` on an intentional
+ * OK-with-empty-field -- `commit` only skips the `null` case, so clearing
+ * the field still resets the label via {@link setInputLabel}.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {object} input
+ * @param {object|null} canvas
+ * @param {Event} event
+ */
+function promptForImageInputLabel(node, input, canvas, event) {
+  const commit = (value) => {
+    if (value == null) return
+    setInputLabel(node, input, value)
+  }
+  if (canvas && typeof canvas.prompt === 'function') {
+    canvas.prompt('Layer name', displayText(input), commit, event)
+  } else {
+    commit(window.prompt('Layer name', displayText(input)))
+  }
+}
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {number} localY node-local Y (graph Y minus `node.pos[1]`)
+ * @returns {object|null} the `image_N` input at *localY* -- connected or the
+ * trailing spare -- or `null` if no row is close enough. Mirrors
+ * `eps_image/switcher.js`'s own `rowAtLocalY`.
+ */
+function imageInputAtLocalY(node, localY) {
+  if (typeof node.getConnectionPos !== 'function') return null
+  for (const { idx, input } of imageInputEntries(node)) {
+    let pos
+    try {
+      pos = node.getConnectionPos(true, idx)
+    } catch (error) {
+      continue
+    }
+    if (Math.abs(localY - (pos[1] - node.pos[1])) <= ROW_HIT_HALF_HEIGHT) return input
+  }
+  return null
+}
+
+/**
+ * Wraps `onInputDblClick` and `onDblClick` so double-clicking an `image_N`
+ * input -- connected or the trailing spare -- opens the rename prompt (this
+ * section's header explains why both hooks are needed). Idempotent-safe to
+ * call once per node (guarded by its caller, {@link attachLayerRenaming}).
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function wireImageInputRename(node) {
+  const originalOnInputDblClick = node.onInputDblClick
+  node.onInputDblClick = function (index, e) {
+    let result
+    if (typeof originalOnInputDblClick === 'function') {
+      result = originalOnInputDblClick.apply(this, arguments)
+    }
+    try {
+      const input = this.inputs?.[index]
+      if (input && imageInputIndex(input.name) !== null) {
+        promptForImageInputLabel(this, input, activeCanvas(), e)
+      }
+    } catch (error) {
+      api.warn('onInputDblClick rename failed', error)
+    }
+    return result
+  }
+
+  const originalOnDblClick = node.onDblClick
+  node.onDblClick = function (e, pos, canvas) {
+    let result
+    if (typeof originalOnDblClick === 'function') {
+      result = originalOnDblClick.apply(this, arguments)
+    }
+    try {
+      if (Array.isArray(pos) && pos[1] >= 0) {
+        const input = imageInputAtLocalY(this, pos[1])
+        if (input) promptForImageInputLabel(this, input, canvas || activeCanvas(), e)
+      }
+    } catch (error) {
+      api.warn('onDblClick rename failed', error)
+    }
+    return result
+  }
+}
+
+/**
+ * Installs the renamable-`image_N`-inputs feature on one
+ * `PhotoshopComposePSD` node instance (this section's header). Call from
+ * `nodeCreated` -- invoked directly from {@link attachAutoGrowInputs} below,
+ * the same reason {@link attachAppendTargetWidgets} is (this change's scope
+ * is `compose.js` only; `web/cpsb.js`'s own `nodeCreated` wiring is out of
+ * bounds for it). Idempotent per node instance and a no-op for any other
+ * node type.
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+export function attachLayerRenaming(node) {
+  if (!isComposePsdNode(node)) return
+  if (node.__cpsbLayerRenamingAttached) return
+  node.__cpsbLayerRenamingAttached = true
+
+  hideLayerNamesWidget(node)
+  wireImageInputRename(node)
 }
 
 // -----------------------------------------------------------------------
@@ -830,14 +1172,16 @@ export function init() {
  * `nodeCreated`. Idempotent per node instance (the same convention
  * `badges.installBadgeHook`/`loadpsd.attachUploadWidget` already use) and a
  * no-op for any other node type. ALSO installs
- * {@link attachAppendTargetWidgets} (the "Browse..." button) — see that
- * function's own doc comment for why it's invoked from here rather than
- * from `web/cpsb.js`'s `nodeCreated` directly.
+ * {@link attachAppendTargetWidgets} (the "Browse..." button) and
+ * {@link attachLayerRenaming} (double-click-to-rename an `image_N` slot) —
+ * see those functions' own doc comments for why they're invoked from here
+ * rather than from `web/cpsb.js`'s `nodeCreated` directly.
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 export function attachAutoGrowInputs(node) {
   if (!isComposePsdNode(node)) return
   attachAppendTargetWidgets(node)
+  attachLayerRenaming(node)
   if (node.__cpsbComposeInputsAttached) return
   node.__cpsbComposeInputsAttached = true
 
@@ -858,11 +1202,12 @@ export function attachAutoGrowInputs(node) {
   }
 
   // The initial "hide all but the first empty socket" pass (PROTOCOL.md
-  // §6c). Always deferred, never run synchronously here: this correctly
-  // covers both the interactive "drag a fresh node onto the canvas" case
-  // (configuringGraph is already false, so the deferred call runs on the
-  // very next tick) and a workflow-load case (deferred until configuration
-  // settles) with the exact same code path -- see stabilizeImageInputs's
-  // own docstring and this file's header.
+  // §6c) -- and, via stabilizeImageInputs's own tail, the first
+  // publishLayerNames() call for this node. Always deferred, never run
+  // synchronously here: this correctly covers both the interactive "drag a
+  // fresh node onto the canvas" case (configuringGraph is already false, so
+  // the deferred call runs on the very next tick) and a workflow-load case
+  // (deferred until configuration settles) with the exact same code path --
+  // see stabilizeImageInputs's own docstring and this file's header.
   scheduleStabilize(node)
 }

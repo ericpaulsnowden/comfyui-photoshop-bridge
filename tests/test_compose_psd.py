@@ -202,7 +202,11 @@ class TestContractShape:
         spec = ComposePSD.INPUT_TYPES()
         assert "filename_prefix" not in spec["required"]  # removed widget
         assert spec["required"]["group_name"] == ("STRING", {"default": "ComfyUI Layers"})
-        assert spec["required"]["layer_name"] == ("STRING", {"default": "Layer"})
+        # `layer_name` (a single base-name textbox) is REMOVED (product owner:
+        # "Remove the separate layer name textbox") -- `layer_names` (hidden,
+        # per-slot JSON) replaces it at the same required position.
+        assert "layer_name" not in spec["required"]
+        assert spec["required"]["layer_names"] == ("STRING", {"default": ""})
         assert spec["hidden"] == {"unique_id": "UNIQUE_ID"}
 
     def test_mode_combo_is_the_three_protocol_strings(self):
@@ -259,16 +263,20 @@ class TestSanitizeFilenamePrefix:
 
 
 class TestCollectConnectedImages:
+    """Returns ``(index, tensor)`` pairs (not bare tensors) so a disconnected
+    MIDDLE gap never shifts a later socket's own index -- needed for
+    per-slot custom-name lookup (:class:`TestResolveLayerNames`)."""
+
     def test_only_connected_indices_in_order(self):
         kwargs = {"image_3": "c", "image_1": "a", "image_20": "t"}
-        assert compose_module._collect_connected_images(kwargs) == ["a", "c", "t"]
+        assert compose_module._collect_connected_images(kwargs) == [(1, "a"), (3, "c"), (20, "t")]
 
     def test_empty_when_none_connected(self):
         assert compose_module._collect_connected_images({}) == []
 
     def test_ignores_indices_beyond_max(self):
         kwargs = {f"image_{compose_module.MAX_IMAGE_INPUTS + 1}": "ignored", "image_1": "a"}
-        assert compose_module._collect_connected_images(kwargs) == ["a"]
+        assert compose_module._collect_connected_images(kwargs) == [(1, "a")]
 
 
 class TestCenteredOffset:
@@ -311,15 +319,27 @@ class TestBuildGroupPsd:
         assert len(group) == 3
         assert [layer.name for layer in group] == ["Layer 1", "Layer 2", "Layer 3"]
 
-    def test_custom_layer_name_increments(self, tmp_path):
-        """The `layer_name` widget names layers `<name> 1..N` (replaces the
-        removed `filename_prefix`)."""
+    def test_explicit_layer_names_used_verbatim(self, tmp_path):
+        """An explicit ``layer_names`` list (what ``execute()`` passes, already
+        resolved via ``_resolve_layer_names``) is used verbatim, one per image,
+        in order."""
         images = [Image.new("RGB", (4, 4), RED), Image.new("RGB", (4, 4), GREEN)]
-        psd, _, _, _ = compose_module._build_group_psd(images, "G", "Frame")
+        psd, _, _, _ = compose_module._build_group_psd(images, "G", ["Frame 1", "Frame 2"])
         out = tmp_path / "named.psd"
         psd.save(out)
         group = PSDImage.open(out)[0]
         assert [layer.name for layer in group] == ["Frame 1", "Frame 2"]
+
+    def test_omitted_layer_names_falls_back_to_default_numbering(self, tmp_path):
+        """``layer_names=None`` (the default) falls back to the long-standing
+        ``"Layer 1".."Layer N"`` scheme -- unchanged pre-rename behavior for a
+        direct/low-level caller that has nothing to say about naming."""
+        images = [Image.new("RGB", (4, 4), RED), Image.new("RGB", (4, 4), GREEN)]
+        psd, _, _, _ = compose_module._build_group_psd(images, "G")
+        out = tmp_path / "default_named.psd"
+        psd.save(out)
+        group = PSDImage.open(out)[0]
+        assert [layer.name for layer in group] == ["Layer 1", "Layer 2"]
 
     def test_odd_size_centering_reopens_at_expected_bbox(self, tmp_path):
         images = [Image.new("RGB", (7, 9), RED), Image.new("RGB", (4, 4), BLUE)]
@@ -538,9 +558,61 @@ class TestComputeInputsHash:
         assert a != c
         assert b != c
 
+    def test_changes_with_layer_names(self):
+        """Renaming an ``image_N`` slot (the ``layer_names`` hidden widget's
+        raw JSON) must change the hash -- PROTOCOL.md §6c: a rename has to
+        correctly invalidate any cached/consumable result for this node."""
+        images = [Image.new("RGB", (4, 4), RED)]
+        a = compose_module._compute_inputs_hash(images, "compose", "Group", DONT_OPEN)
+        b = compose_module._compute_inputs_hash(
+            images, "compose", "Group", DONT_OPEN, layer_names='{"image_1": "Sky"}'
+        )
+        assert a != b
+
+    def test_stable_when_layer_names_unchanged(self):
+        images = [Image.new("RGB", (4, 4), RED)]
+        a = compose_module._compute_inputs_hash(
+            images, "compose", "Group", DONT_OPEN, layer_names='{"image_1": "Sky"}'
+        )
+        b = compose_module._compute_inputs_hash(
+            images, "compose", "Group", DONT_OPEN, layer_names='{"image_1": "Sky"}'
+        )
+        assert a == b
+
+
+class TestComputeIdentityHash:
+    """:func:`compose_module._compute_identity_hash` directly -- the
+    mode/prefix-FREE value a ``bridge_node`` handoff's ``source_hash`` is
+    recorded as (see the many indirect exercises of it via ``TestIsChanged``/
+    ``TestExecuteConsumePath`` for the reuse/supersede behavior this feeds).
+    """
+
+    def test_changes_with_layer_names(self):
+        images = [Image.new("RGB", (4, 4), RED)]
+        a = compose_module._compute_identity_hash(images, "Group")
+        b = compose_module._compute_identity_hash(images, "Group", layer_names='{"image_1": "Sky"}')
+        assert a != b
+
+    def test_stable_when_layer_names_unchanged(self):
+        images = [Image.new("RGB", (4, 4), RED)]
+        a = compose_module._compute_identity_hash(images, "Group", layer_names='{"image_1": "Sky"}')
+        b = compose_module._compute_identity_hash(images, "Group", layer_names='{"image_1": "Sky"}')
+        assert a == b
+
+    def test_different_names_change_the_hash(self):
+        images = [Image.new("RGB", (4, 4), RED)]
+        a = compose_module._compute_identity_hash(images, "Group", layer_names='{"image_1": "Sky"}')
+        b = compose_module._compute_identity_hash(
+            images, "Group", layer_names='{"image_1": "Ground"}'
+        )
+        assert a != b
+
 
 class TestCollectLayerImages:
-    """Batch expansion + the max_layers cap (multi-image IMAGE input -> layers)."""
+    """Batch expansion + the max_layers cap (multi-image IMAGE input -> layers),
+    plus the ``origins`` list (:func:`compose_module._resolve_layer_names`'s
+    own input) each layer's ``(slot_index, frame_index, frames_in_slot)``.
+    """
 
     def test_frames_to_pils_expands_batch(self):
         pils = compose_module._tensor_frames_to_pils(make_batch([RED, GREEN]))
@@ -548,33 +620,175 @@ class TestCollectLayerImages:
 
     def test_single_socket_batch_expands_to_layers(self):
         kwargs = {"image_1": make_batch([RED, GREEN, BLUE])}
-        pils, total = compose_module._collect_layer_images(kwargs, max_layers=64)
+        pils, total, origins = compose_module._collect_layer_images(kwargs, max_layers=64)
         assert total == 3
         assert [p.getpixel((0, 0)) for p in pils] == [RED, GREEN, BLUE]
+        assert origins == [(1, 1, 3), (1, 2, 3), (1, 3, 3)]
 
     def test_multiple_sockets_concatenate_index_then_batch_order(self):
         kwargs = {"image_1": make_batch([RED, GREEN]), "image_2": make_batch([BLUE])}
-        pils, total = compose_module._collect_layer_images(kwargs, max_layers=64)
+        pils, total, origins = compose_module._collect_layer_images(kwargs, max_layers=64)
         assert total == 3
         assert [p.getpixel((0, 0)) for p in pils] == [RED, GREEN, BLUE]
+        assert origins == [(1, 1, 2), (1, 2, 2), (2, 1, 1)]
 
     def test_cap_truncates_and_reports_total(self):
         kwargs = {"image_1": make_batch([RED] * 10)}
-        pils, total = compose_module._collect_layer_images(kwargs, max_layers=4)
+        pils, total, origins = compose_module._collect_layer_images(kwargs, max_layers=4)
         assert total == 10
         assert len(pils) == 4
+        assert origins == [(1, 1, 4), (1, 2, 4), (1, 3, 4), (1, 4, 4)]
 
     def test_cap_spans_sockets(self):
         kwargs = {"image_1": make_batch([RED] * 3), "image_2": make_batch([BLUE] * 3)}
-        pils, total = compose_module._collect_layer_images(kwargs, max_layers=4)
+        pils, total, origins = compose_module._collect_layer_images(kwargs, max_layers=4)
         assert total == 6
         # 3 from image_1 (bottom), then 1 from image_2 -- cap hit mid-socket.
         assert [p.getpixel((0, 0)) for p in pils] == [RED, RED, RED, BLUE]
+        assert origins == [(1, 1, 3), (1, 2, 3), (1, 3, 3), (2, 1, 1)]
+
+    def test_gap_preserves_true_slot_index(self):
+        """A disconnected MIDDLE slot (``image_2`` never connected) must not
+        shift ``image_3``'s origin down to slot 2 -- origins track the REAL
+        ``image_N``, not a compacted position (this is what lets a rename on
+        ``image_3`` still resolve correctly with a gap at ``image_2``)."""
+        kwargs = {"image_1": make_batch([RED]), "image_3": make_batch([BLUE])}
+        pils, total, origins = compose_module._collect_layer_images(kwargs, max_layers=64)
+        assert total == 2
+        assert len(pils) == 2
+        assert origins == [(1, 1, 1), (3, 1, 1)]
 
     def test_no_sockets_is_empty(self):
-        pils, total = compose_module._collect_layer_images({}, max_layers=64)
+        pils, total, origins = compose_module._collect_layer_images({}, max_layers=64)
         assert pils == []
         assert total == 0
+        assert origins == []
+
+
+class TestParseLayerNames:
+    """The hidden ``layer_names`` widget's JSON contract (PROTOCOL.md §6c):
+    a JSON object mapping a renamed ``image_N`` slot to its label. Must never
+    raise -- a malformed/foreign/pre-rename-stale value degrades to "no
+    custom names" instead.
+    """
+
+    def test_empty_string_is_no_custom_names(self):
+        assert compose_module._parse_layer_names("") == {}
+
+    def test_whitespace_only_is_no_custom_names(self):
+        assert compose_module._parse_layer_names("   ") == {}
+
+    def test_valid_object_parses(self):
+        assert compose_module._parse_layer_names('{"image_1": "Sky"}') == {"image_1": "Sky"}
+
+    def test_multiple_entries_parse(self):
+        raw = '{"image_1": "Sky", "image_3": "Foreground"}'
+        assert compose_module._parse_layer_names(raw) == {
+            "image_1": "Sky",
+            "image_3": "Foreground",
+        }
+
+    def test_malformed_json_falls_back_to_empty(self):
+        assert compose_module._parse_layer_names("{not valid json") == {}
+
+    def test_bare_word_falls_back_to_empty(self):
+        """BACKWARD-COMPAT: a pre-rename workflow's stale ``layer_name`` STRING
+        value (e.g. the literal text ``Layer``, no quotes) is not valid JSON
+        at all -- it must degrade gracefully, not raise."""
+        assert compose_module._parse_layer_names("Layer") == {}
+
+    def test_non_object_json_falls_back_to_empty(self):
+        assert compose_module._parse_layer_names("[1, 2, 3]") == {}
+        assert compose_module._parse_layer_names('"just a string"') == {}
+        assert compose_module._parse_layer_names("42") == {}
+        assert compose_module._parse_layer_names("null") == {}
+
+    def test_non_string_values_are_dropped(self):
+        raw = '{"image_1": 5, "image_2": "OK", "image_3": null}'
+        assert compose_module._parse_layer_names(raw) == {"image_2": "OK"}
+
+    def test_non_string_keys_are_dropped(self):
+        # JSON object keys are always strings once parsed, but a numeric-looking
+        # key is still just a string key ("1") -- not a special case, included
+        # here to document that _parse_layer_names does not coerce it.
+        assert compose_module._parse_layer_names('{"1": "Sky"}') == {"1": "Sky"}
+
+    def test_blank_value_is_dropped(self):
+        assert compose_module._parse_layer_names('{"image_1": "   "}') == {}
+
+    def test_values_are_trimmed(self):
+        assert compose_module._parse_layer_names('{"image_1": "  Sky  "}') == {"image_1": "Sky"}
+
+    def test_logs_a_warning_on_malformed_json(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="cpsb"):
+            compose_module._parse_layer_names("{not valid json")
+        assert "layer_names" in caplog.text
+
+    def test_logs_a_warning_on_non_object_json(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="cpsb"):
+            compose_module._parse_layer_names("[1, 2, 3]")
+        assert "layer_names" in caplog.text
+
+
+class TestDefaultLayerNames:
+    def test_generates_numbered_sequence(self):
+        assert compose_module._default_layer_names(3) == ["Layer 1", "Layer 2", "Layer 3"]
+
+    def test_zero_is_empty(self):
+        assert compose_module._default_layer_names(0) == []
+
+
+class TestResolveLayerNames:
+    """``(origins, custom_names) -> per-layer names`` (PROTOCOL.md §6c) --
+    the core of "renaming an ``image_N`` slot makes that its layer's name".
+    """
+
+    def test_no_custom_names_uses_default_numbered_scheme(self):
+        origins = [(1, 1, 1), (2, 1, 1), (3, 1, 1)]
+        assert compose_module._resolve_layer_names(origins, {}) == [
+            "Layer 1",
+            "Layer 2",
+            "Layer 3",
+        ]
+
+    def test_custom_name_used_verbatim_for_single_frame_slot(self):
+        """A renamed slot's label becomes the layer's name EXACTLY -- not
+        suffixed with a number -- when that slot contributed one layer."""
+        origins = [(1, 1, 1), (2, 1, 1)]
+        names = compose_module._resolve_layer_names(origins, {"image_1": "Sky"})
+        assert names == ["Sky", "Layer 2"]
+
+    def test_only_the_renamed_slot_is_affected(self):
+        """Per-slot resolution: naming one slot must not change another
+        slot's own (default) name."""
+        origins = [(1, 1, 1), (2, 1, 1), (3, 1, 1)]
+        names = compose_module._resolve_layer_names(origins, {"image_2": "Midground"})
+        assert names == ["Layer 1", "Midground", "Layer 3"]
+
+    def test_multi_frame_slot_suffixes_the_custom_name(self):
+        """A renamed slot whose own IMAGE batch produced more than one layer
+        gets its custom name suffixed per frame, so the layers stay
+        distinguishable rather than colliding on one identical name."""
+        origins = [(1, 1, 3), (1, 2, 3), (1, 3, 3)]
+        names = compose_module._resolve_layer_names(origins, {"image_1": "Sky"})
+        assert names == ["Sky 1", "Sky 2", "Sky 3"]
+
+    def test_gap_slot_number_used_for_lookup_not_flat_position(self):
+        """``image_2`` is a disconnected gap; ``image_3`` keeps ITS OWN slot
+        number for custom-name lookup, not a compacted index."""
+        origins = [(1, 1, 1), (3, 1, 1)]
+        names = compose_module._resolve_layer_names(origins, {"image_3": "Foreground"})
+        assert names == ["Layer 1", "Foreground"]
+
+    def test_blank_custom_name_falls_back_to_default(self):
+        """Defensive: even if a caller passed an entry with a blank value
+        (``_parse_layer_names`` itself never would), a falsy custom name
+        falls back to the default rather than emitting a blank layer name."""
+        origins = [(1, 1, 1)]
+        assert compose_module._resolve_layer_names(origins, {"image_1": ""}) == ["Layer 1"]
+
+    def test_empty_origins_is_empty(self):
+        assert compose_module._resolve_layer_names([], {"image_1": "Sky"}) == []
 
 
 class TestChannelAwareConversion:
@@ -871,6 +1085,56 @@ class TestIsChanged:
             timeout_seconds=1800,
             unique_id="1",
             image_1=make_tensor(RED),
+        )
+        assert len(value) == 64
+
+    def test_changes_when_layer_names_change(self, configured):
+        """PROTOCOL.md §6c: renaming an ``image_N`` slot must re-execute this
+        node even with pixel-identical inputs, so a stale (pre-rename)
+        composite is never served after the rename."""
+        before = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED),
+        )
+        after = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED),
+            layer_names='{"image_1": "Sky"}',
+        )
+        assert before != after
+
+    def test_stable_when_layer_names_unchanged(self, configured):
+        kwargs = dict(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED),
+            layer_names='{"image_1": "Sky"}',
+        )
+        assert ComposePSD.IS_CHANGED(**kwargs) == ComposePSD.IS_CHANGED(**kwargs)
+
+    def test_malformed_layer_names_does_not_raise(self, configured):
+        """A malformed ``layer_names`` value must never crash IS_CHANGED --
+        ComfyUI calls this on every graph submission, including one with a
+        currently-invalid widget value the user hasn't fixed yet."""
+        value = ComposePSD.IS_CHANGED(
+            filename_prefix="compose",
+            group_name="Group",
+            mode=WAIT,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED),
+            layer_names="{not valid json",
         )
         assert len(value) == 64
 
@@ -1189,6 +1453,176 @@ class TestLayersOutput:
         assert tuple(arr[0, 4, 4]) == RED  # `layers` = what was written
 
 
+class TestCustomLayerNaming:
+    """End-to-end, via :meth:`ComposePSD.execute`: renaming an ``image_N``
+    slot (the hidden ``layer_names`` widget's JSON, filled by
+    ``web/cpsb/compose.js``'s double-click prompt) becomes that slot's
+    layer's actual name in the written PSD (PROTOCOL.md §6c, product owner
+    verbatim: "The name of the node should become the layer names").
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_custom_slot_name_becomes_the_layer_name(self, context, manager, configured):
+        node = ComposePSD()
+        _, _, filename_out, _layers_out = node.execute(
+            filename_prefix="compose",
+            group_name="G",
+            layer_names='{"image_1": "Sky", "image_2": "Foreground"}',
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+            image_2=make_tensor(BLUE, size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Sky", "Foreground"]
+
+    def test_unnamed_slot_falls_back_to_default_among_named_ones(
+        self, context, manager, configured
+    ):
+        """Per-slot resolution: naming ONE slot must not affect another,
+        un-renamed slot's own default name."""
+        node = ComposePSD()
+        _, _, filename_out, _layers_out = node.execute(
+            filename_prefix="compose",
+            group_name="G",
+            layer_names='{"image_1": "Sky"}',  # image_2 deliberately left unnamed
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+            image_2=make_tensor(BLUE, size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Sky", "Layer 2"]
+
+    def test_renamed_gap_slot_resolves_correctly(self, context, manager, configured):
+        """A rename on a slot AFTER a disconnected gap (``image_2`` never
+        connected) must still resolve against its own real slot number."""
+        node = ComposePSD()
+        _, _, filename_out, _layers_out = node.execute(
+            filename_prefix="compose",
+            group_name="G",
+            layer_names='{"image_3": "Foreground"}',
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+            image_3=make_tensor(BLUE, size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Layer 1", "Foreground"]
+
+    def test_malformed_layer_names_json_falls_back_to_default(
+        self, context, manager, configured, caplog
+    ):
+        node = ComposePSD()
+        with caplog.at_level(logging.WARNING, logger="cpsb"):
+            _, _, filename_out, _layers_out = node.execute(
+                filename_prefix="compose",
+                group_name="G",
+                layer_names="{not valid json",
+                mode=DONT_OPEN,
+                timeout_seconds=1800,
+                unique_id="1",
+                image_1=make_tensor(RED, size=(8, 8)),
+            )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Layer 1"]
+        assert "layer_names" in caplog.text
+
+    def test_empty_layer_names_is_the_ordinary_default(self, context, manager, configured):
+        """The default (``layer_names=""``) must be byte-identical to the
+        pre-rename output -- a workflow that never renames anything sees no
+        change at all."""
+        node = ComposePSD()
+        _, _, filename_out, _layers_out = node.execute(
+            filename_prefix="compose",
+            group_name="G",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+            image_2=make_tensor(BLUE, size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Layer 1", "Layer 2"]
+
+    def test_multi_frame_batch_under_custom_name_gets_distinct_suffixes(
+        self, context, manager, configured
+    ):
+        """A renamed slot whose own batch produced multiple layers keeps
+        them distinguishable rather than colliding on one identical name."""
+        node = ComposePSD()
+        _, _, filename_out, _layers_out = node.execute(
+            filename_prefix="compose",
+            group_name="G",
+            layer_names='{"image_1": "Sky"}',
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_batch([RED, GREEN, BLUE], size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Sky 1", "Sky 2", "Sky 3"]
+
+    def test_backward_compat_stale_layer_name_value_is_ignored(
+        self, context, manager, configured
+    ):
+        """BACKWARD-COMPAT: a workflow saved before this feature existed may
+        still deliver its old plain-string ``layer_name`` widget value here
+        (not valid JSON) -- it must load and compose cleanly, falling back
+        to the exact same default ``Layer N`` naming that workflow always
+        produced, never raising."""
+        node = ComposePSD()
+        _, _, filename_out, _layers_out = node.execute(
+            filename_prefix="compose",
+            group_name="G",
+            layer_names="Layer",  # the stale pre-rename value, not JSON
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=make_tensor(RED, size=(8, 8)),
+        )
+        group = PSDImage.open(context.input_dir / filename_out)[0]
+        assert [layer.name for layer in group] == ["Layer 1"]
+
+    def test_rename_changes_output_on_requeue(self, context, manager, configured):
+        """A rename (unchanged pixels) must produce a NEW write with the new
+        name -- IS_CHANGED/identity-hash sensitivity to `layer_names`
+        (:class:`TestIsChanged`/:class:`TestComputeIdentityHash`) exercised
+        end-to-end through two real executions."""
+        node = ComposePSD()
+        tensor = make_tensor(RED, size=(8, 8))
+
+        _, _, first_filename, _ = node.execute(
+            filename_prefix="rename",
+            group_name="G",
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=tensor,
+        )
+        first_group = PSDImage.open(context.input_dir / first_filename)[0]
+        assert [layer.name for layer in first_group] == ["Layer 1"]
+
+        _, _, second_filename, _ = node.execute(
+            filename_prefix="rename",
+            group_name="G",
+            layer_names='{"image_1": "Sky"}',
+            mode=DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            image_1=tensor,  # same pixels -- only the name changed
+        )
+        assert second_filename != first_filename  # genuinely re-composed, not reused
+        second_group = PSDImage.open(context.input_dir / second_filename)[0]
+        assert [layer.name for layer in second_group] == ["Sky"]
+
+
 class TestComposeWrittenEvent:
     """``cpsb.compose_written`` (product owner gap: "for 'don't open' how do
     I later find and open the file?"): a NEW, minimal, non-handoff event
@@ -1312,7 +1746,6 @@ class TestComposeWrittenEvent:
         node = ComposePSD()
         node.execute(
             group_name="Review",
-            layer_name="Layer",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="4",
@@ -1331,7 +1764,6 @@ class TestComposeWrittenEvent:
         node = ComposePSD()
         node.execute(
             group_name="Review",
-            layer_name="Layer",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="5",
@@ -1359,7 +1791,6 @@ class TestComposeWrittenEvent:
         with raises_interrupt():
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -1371,7 +1802,6 @@ class TestComposeWrittenEvent:
         with raises_interrupt():
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -2106,9 +2536,13 @@ def _write_target(path: Path, images, group_name: str, layer_name: str = "Layer"
     """Test helper: build a grouped PSD (:func:`compose_module._build_group_psd`)
     and save it directly to *path* -- used to set up a pre-existing append
     target (``existing_psd_path``) the way a prior run (or a hand-authored
-    review document) would have left one.
+    review document) would have left one. *layer_name* is a convenience base
+    name (this helper's own contract, unrelated to the backend's per-slot
+    ``layer_names`` JSON) -- expanded to the numbered ``_build_group_psd``
+    list callers actually take now.
     """
-    psd, _w, _h, _placements = compose_module._build_group_psd(images, group_name, layer_name)
+    layer_names = [f"{layer_name} {i}" for i in range(1, len(images) + 1)]
+    psd, _w, _h, _placements = compose_module._build_group_psd(images, group_name, layer_names)
     psd.save(path)
 
 
@@ -2131,7 +2565,7 @@ class TestAppendWidgetsShape:
         # only ONE trailing append-related widget now, not three.
         assert keys == [
             "group_name",
-            "layer_name",
+            "layer_names",
             "mode",
             "timeout_seconds",
             "max_layers",
@@ -2189,7 +2623,7 @@ class TestNextRunGroupName:
     def test_increments_past_highest_existing_run(self, tmp_path):
         images = [Image.new("RGB", (4, 4), RED)]
         psd, _, _, _placements = compose_module._build_group_psd(images, "Review 1")
-        compose_module._append_run_into_psd(psd, images, "Review 2", "Layer")
+        compose_module._append_run_into_psd(psd, images, "Review 2")  # default numbered naming
         out = tmp_path / "t.psd"
         psd.save(out)
         reopened = PSDImage.open(out)
@@ -2292,7 +2726,6 @@ class TestAppendExecute:
         node = ComposePSD()
         node.execute(
             group_name="Review",
-            layer_name="Layer",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
@@ -2328,7 +2761,6 @@ class TestAppendExecute:
         for color in colors:
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
@@ -2348,7 +2780,6 @@ class TestAppendExecute:
         node = ComposePSD()
         _, _, filename_out, _layers_out = node.execute(
             group_name="Review",
-            layer_name="Layer",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
@@ -2403,7 +2834,6 @@ class TestAppendExecute:
         with pytest.raises(ValueError, match="CMYK"):
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
@@ -2422,7 +2852,6 @@ class TestAppendExecute:
         with caplog.at_level(logging.WARNING, logger="cpsb"):
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
@@ -2459,7 +2888,6 @@ class TestAppendExecute:
         with pytest.raises(RuntimeError, match="simulated crash"):
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=DONT_OPEN,
                 timeout_seconds=1800,
                 unique_id="1",
@@ -2488,7 +2916,6 @@ class TestAppendExecute:
         node = ComposePSD()
         image_out, _mask_out, _filename, _layers_out = node.execute(
             group_name="Review",
-            layer_name="Layer",
             mode=DONT_OPEN,
             timeout_seconds=1800,
             unique_id="1",
@@ -2713,7 +3140,6 @@ class TestAppendDuplicateGuard:
         with raises_interrupt():
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -2728,7 +3154,6 @@ class TestAppendDuplicateGuard:
         with raises_interrupt():
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -2758,7 +3183,6 @@ class TestAppendDuplicateGuard:
         with raises_interrupt():
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,
@@ -2770,7 +3194,6 @@ class TestAppendDuplicateGuard:
         with raises_interrupt():
             node.execute(
                 group_name="Review",
-                layer_name="Layer",
                 mode=WAIT,
                 timeout_seconds=_SHORT_TIMEOUT,
                 unique_id=node_id,

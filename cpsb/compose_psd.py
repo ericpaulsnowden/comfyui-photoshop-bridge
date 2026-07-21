@@ -49,6 +49,7 @@ MASK output is derived from the overall composite's alpha instead (see
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -77,10 +78,14 @@ MAX_IMAGE_INPUTS = 20
 DEFAULT_FILENAME_PREFIX = "compose"
 DEFAULT_GROUP_NAME = "ComfyUI Layers"
 
-#: Base name for the pixel layers; each layer is ``"<layer_name> <index>"`` with
-#: index counting 1..N bottom-to-top. Replaces the removed ``filename_prefix``
-#: widget (which only named an intermediate file the user never saw — Photoshop
-#: opens a managed PSD copy, not that file).
+#: Fallback base name for a layer whose ``image_N`` slot carries no (or a
+#: blank) custom name (:func:`_resolve_layer_names`): such a layer is named
+#: ``"<DEFAULT_LAYER_NAME> <index>"``, *index* counting 1..N bottom-to-top
+#: across every connected layer -- unchanged from the pre-rename build, where
+#: this was simply the removed ``layer_name`` STRING widget's own default.
+#: That widget is gone (PROTOCOL.md §6c: double-clicking an ``image_N`` INPUT
+#: SLOT renames it, and that name becomes the layer's name); this constant now
+#: only ever feeds the "slot was never renamed" fallback branch.
 DEFAULT_LAYER_NAME = "Layer"
 
 #: The Compose-node-specific third ``mode`` string (PROTOCOL.md §6c). The
@@ -109,8 +114,17 @@ _LAYER_OPACITY = 255
 _PSD_EXTENSIONS: tuple[str, ...] = (".psd", ".psb")
 
 
-def _collect_connected_images(kwargs: dict[str, Any]) -> list[Any]:
-    """The connected ``image_N`` tensors from *kwargs*, in index order.
+def _collect_connected_images(kwargs: dict[str, Any]) -> list[tuple[int, Any]]:
+    """The connected ``image_N`` tensors from *kwargs*, paired with their slot
+    index ``N``, in ascending ``N`` order.
+
+    The index travels alongside each tensor (not a bare tensor list) so a
+    caller can attribute a layer back to the exact ``image_N`` socket -- and
+    therefore to that socket's own custom name (PROTOCOL.md §6c) -- it came
+    from, even across a disconnected MIDDLE gap: if ``image_2`` is not
+    connected while ``image_1`` and ``image_3`` are, the returned pairs are
+    ``[(1, ...), (3, ...)]``, never compacted so ``image_3``'s tensor reads as
+    though it were index 2. :func:`_collect_layer_images` relies on this.
 
     Args:
         kwargs: The node call's keyword arguments -- everything beyond the
@@ -118,15 +132,15 @@ def _collect_connected_images(kwargs: dict[str, Any]) -> list[Any]:
             optional sockets ComfyUI actually connected for this execution.
 
     Returns:
-        Tensors in ascending ``N`` order (``image_1`` first). Only indices
-        ``1..MAX_IMAGE_INPUTS`` are ever considered, matching what
-        :meth:`PhotoshopComposePSD.INPUT_TYPES` declares.
+        ``(index, tensor)`` pairs in ascending ``index`` order (``image_1``
+        first). Only indices ``1..MAX_IMAGE_INPUTS`` are ever considered,
+        matching what :meth:`PhotoshopComposePSD.INPUT_TYPES` declares.
     """
     images = []
     for index in range(1, MAX_IMAGE_INPUTS + 1):
         image = kwargs.get(f"image_{index}")
         if image is not None:
-            images.append(image)
+            images.append((index, image))
     return images
 
 
@@ -135,6 +149,124 @@ def _collect_connected_images(kwargs: dict[str, Any]) -> list[Any]:
 #: a few separate sockets) never truncate, while still bounding a runaway batch
 #: (e.g. a long video decode) so it can't silently produce a thousand-layer PSD.
 DEFAULT_MAX_LAYERS = 64
+
+
+def _parse_layer_names(raw: str) -> dict[str, str]:
+    """Best-effort JSON parse of the hidden ``layer_names`` widget's value.
+
+    PROTOCOL.md §6c: double-clicking an ``image_N`` INPUT SLOT
+    (``web/cpsb/compose.js``) renames it, and the frontend serializes every
+    slot's current label into this one hidden STRING widget as a JSON
+    OBJECT mapping each renamed slot's name (``"image_N"``) to its label,
+    e.g. ``{"image_1": "Sky", "image_3": "Foreground"}``. A slot with no
+    entry (never renamed, or reset back to blank) is absent from the object
+    entirely -- absence, not an explicit empty string, is what
+    :func:`_resolve_layer_names` treats as "use the default name".
+
+    Never raises: this widget's value can be empty (a fresh node, or one
+    predating this feature entirely), or -- the BACKWARD-COMPAT case -- still
+    carry a pre-rename workflow's stale ``layer_name`` STRING value (a bare
+    base name like ``"Layer"``, not valid JSON at all, landing here purely
+    because ComfyUI restores saved widget values by POSITION and this widget
+    occupies the slot that STRING widget used to). Any of these -- blank,
+    malformed JSON, or well-formed JSON that isn't an object -- degrades to
+    "no custom names recorded" (a warning is logged, except for the common
+    blank case) rather than failing the queue; mirrors
+    ``eps_image/nodes_switcher.py``'s ``_parse_toggles`` in the sibling
+    comfyui-epsnodes pack, reimplemented locally rather than imported (a
+    different repo, and this shape -- string labels, not booleans -- is
+    different enough not to share code).
+
+    Args:
+        raw: The ``layer_names`` widget's current value, verbatim.
+
+    Returns:
+        A ``{"image_N": "label"}`` map. Keys that were not both a string key
+        and a non-blank string value in the parsed JSON are dropped (a
+        foreign/hand-edited value might carry a number, ``null``, or an
+        empty/whitespace-only label -- none of those are usable labels); every
+        surviving label is stripped of leading/trailing whitespace, matching
+        the frontend's own ``setInputLabel`` trim (``web/cpsb/compose.js``).
+    """
+    if not raw or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "cpsb compose_psd: malformed `layer_names` value (%s); using default layer names",
+            exc,
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "cpsb compose_psd: `layer_names` was not a JSON object (got %s); using default "
+            "layer names",
+            type(parsed).__name__,
+        )
+        return {}
+    names: dict[str, str] = {}
+    for key, value in parsed.items():
+        if isinstance(key, str) and isinstance(value, str):
+            trimmed = value.strip()
+            if trimmed:
+                names[key] = trimmed
+    return names
+
+
+def _default_layer_names(count: int) -> list[str]:
+    """``["Layer 1", "Layer 2", ...]`` -- the long-standing numbered scheme.
+
+    Used verbatim by :func:`_resolve_layer_names` for a slot that carries no
+    custom name, and as the fallback *layer_names* for a low-level caller
+    (:func:`_build_group_psd`/:func:`_append_run_into_psd`) that doesn't pass
+    one at all -- so a direct/test caller with nothing to say about naming
+    gets exactly the pre-rename behavior.
+    """
+    return [f"{DEFAULT_LAYER_NAME} {index}" for index in range(1, count + 1)]
+
+
+def _resolve_layer_names(
+    origins: list[tuple[int, int, int]], custom_names: dict[str, str]
+) -> list[str]:
+    """Per-layer names, parallel to *origins* (:func:`_collect_layer_images`'s
+    third return value), in the same bottom-to-top order.
+
+    A slot with a non-blank custom name (``custom_names[f"image_{slot_index}"]``,
+    :func:`_parse_layer_names`) uses that name VERBATIM when its own batch
+    contributed exactly one layer (*frames_in_slot* == 1) -- so double-clicking
+    an ``image_N`` slot and typing "Sky" makes the written layer's name
+    exactly ``"Sky"`` (PROTOCOL.md §6c), not ``"Sky 1"``. When that slot's
+    batch contributed MORE than one layer (a multi-image ``IMAGE`` batch on one
+    socket, :func:`_tensor_frames_to_pils`), the custom name is suffixed with
+    *frame_index* (``"Sky 1"``, ``"Sky 2"``, ...) so the batch's layers stay
+    distinguishable rather than colliding on one identical name.
+
+    A slot with NO custom name (absent from *custom_names*, or present but
+    blank -- :func:`_parse_layer_names` already drops blanks) falls back to
+    the long-standing ``f"{DEFAULT_LAYER_NAME} {flat_index}"`` scheme,
+    *flat_index* counting 1..N across EVERY layer bottom-to-top (not just
+    within that slot) -- byte-identical to this node's pre-rename output, so
+    a workflow that never renamed anything sees no change at all.
+
+    Args:
+        origins: ``(slot_index, frame_index, frames_in_slot)`` per layer, in
+            bottom-to-top order.
+        custom_names: ``{"image_N": "label"}``, e.g. from :func:`_parse_layer_names`.
+
+    Returns:
+        One name per entry of *origins*, same order, same length -- ready to
+        pass straight to :func:`_create_layers_in_psd` (via
+        :func:`_build_group_psd`/:func:`_append_run_into_psd`).
+    """
+    names: list[str] = []
+    for flat_index, (slot_index, frame_index, frames_in_slot) in enumerate(origins, start=1):
+        custom = custom_names.get(f"image_{slot_index}")
+        if custom:
+            names.append(custom if frames_in_slot == 1 else f"{custom} {frame_index}")
+        else:
+            names.append(f"{DEFAULT_LAYER_NAME} {flat_index}")
+    return names
 
 
 def _array_to_pil(array: Any) -> Image.Image:
@@ -205,7 +337,7 @@ def _tensor_frames_to_pils(image: Any) -> list[Image.Image]:
 
 def _collect_layer_images(
     kwargs: dict[str, Any], max_layers: int
-) -> tuple[list[Image.Image], int]:
+) -> tuple[list[Image.Image], int, list[tuple[int, int, int]]]:
     """Expand every connected ``image_N`` socket's batch into layer images.
 
     Order is ``image_1``..``image_N`` (bottom-to-top), and within each socket
@@ -214,18 +346,38 @@ def _collect_layer_images(
     but never decoded (a huge batch is sliced before conversion, so it can't
     blow up memory just to be dropped).
 
-    Returns ``(pil_images, total_available)`` where *total_available* is how many
-    images existed across all sockets before the cap, so the caller can tell the
-    user when it truncated.
+    Returns:
+        ``(pil_images, total_available, origins)``:
+
+        * *total_available* is how many images existed across all sockets
+          before the cap, so the caller can tell the user when it truncated.
+        * *origins* is ``(slot_index, frame_index, frames_in_slot)`` per entry
+          of *pil_images*, parallel to it and in the same order --
+          *slot_index* is the ``image_N`` socket's ``N`` this layer came from
+          (:func:`_collect_connected_images`'s own index, so a disconnected
+          middle gap never shifts a later socket's index), *frame_index* is
+          this layer's 1-based position within that socket's own batch, and
+          *frames_in_slot* is how many layers that socket contributed in
+          total (after any *max_layers* truncation). :func:`_resolve_layer_names`
+          uses these three to attribute each layer back to its slot's own
+          custom name (PROTOCOL.md §6c) and to disambiguate multiple layers
+          sharing one renamed slot.
     """
     pil_images: list[Image.Image] = []
+    origins: list[tuple[int, int, int]] = []
     total_available = 0
-    for tensor in _collect_connected_images(kwargs):
+    for slot_index, tensor in _collect_connected_images(kwargs):
         total_available += len(tensor)
         remaining = max_layers - len(pil_images)
         if remaining > 0:
-            pil_images.extend(_tensor_frames_to_pils(tensor[:remaining]))
-    return pil_images, total_available
+            frames = _tensor_frames_to_pils(tensor[:remaining])
+            pil_images.extend(frames)
+            frames_in_slot = len(frames)
+            origins.extend(
+                (slot_index, frame_index, frames_in_slot)
+                for frame_index in range(1, frames_in_slot + 1)
+            )
+    return pil_images, total_available, origins
 
 
 def _sanitize_filename_prefix(raw: str) -> str:
@@ -258,7 +410,7 @@ def _sanitize_filename_prefix(raw: str) -> str:
 def _compute_identity_hash(
     pil_images: list[Image.Image],
     group_name: str,
-    layer_name: str = DEFAULT_LAYER_NAME,
+    layer_names: str = "",
     append_target: str = "",
 ) -> str:
     """The handoff's source IDENTITY -- deliberately mode/prefix-FREE.
@@ -278,7 +430,7 @@ def _compute_identity_hash(
     second live Photoshop document -- got created and the first was left
     dangling (the confirmed "spins forever" / "slew of new documents" bug).
     Hashing only the pixels + the structural params that actually change the
-    written PSD's own content (``group_name``, ``layer_name``,
+    written PSD's own content (``group_name``, ``layer_names``,
     ``append_target``) keeps a mode flip, or a filename-prefix edit, from
     stranding an in-progress edit.
 
@@ -298,8 +450,16 @@ def _compute_identity_hash(
             ``image_1..image_N`` order.
         group_name: The ``group_name`` widget value (changes the written
             PSD's group name, so it is part of the document's identity).
-        layer_name: The ``layer_name`` widget value (changes every layer's
-            name for the same reason).
+        layer_names: The hidden ``layer_names`` widget's raw, still-serialized
+            value (PROTOCOL.md §6c: a JSON object mapping a renamed
+            ``image_N`` slot to its label, :func:`_parse_layer_names`) --
+            hashed VERBATIM here, not the per-layer names it resolves to
+            (:func:`_resolve_layer_names`). Any edit to any slot's label
+            changes this string, which is sufficient on its own to change the
+            identity -- and hashing the raw value avoids resolving it against
+            *pil_images* just to hash the result. Renaming a slot therefore
+            changes the document's identity for the same reason changing the
+            old, removed ``layer_name`` STRING widget's value used to.
         append_target: :func:`_append_target_key` of the current
             ``existing_psd_path`` widget value -- ``""`` when it is blank
             (this run writes a fresh auto-numbered file; the old, unchanged
@@ -313,7 +473,7 @@ def _compute_identity_hash(
         hasher.update(compute_source_hash(image).encode("ascii"))
     hasher.update(group_name.encode("utf-8"))
     hasher.update(b"\x00")
-    hasher.update(layer_name.encode("utf-8"))
+    hasher.update(layer_names.encode("utf-8"))
     hasher.update(b"\x00")
     hasher.update(append_target.encode("utf-8"))
     return hasher.hexdigest()
@@ -324,14 +484,14 @@ def _compute_inputs_hash(
     filename_prefix: str,
     group_name: str,
     mode: str,
-    layer_name: str = DEFAULT_LAYER_NAME,
+    layer_names: str = "",
     append_target: str = "",
 ) -> str:
     """A deterministic sha256 identity for "these inputs, these params, this mode".
 
     Used ONLY by :meth:`PhotoshopComposePSD.IS_CHANGED` as the base value
     that forces ComfyUI to re-execute this node when ANYTHING relevant
-    changes -- pixels, ``filename_prefix``, ``group_name``, ``layer_name``,
+    changes -- pixels, ``filename_prefix``, ``group_name``, ``layer_names``,
     ``mode``, or the append target (switching any of these genuinely
     changes what ``execute()`` does even for pixel-identical inputs, so each
     must be folded in HERE). This is deliberately a DIFFERENT value from
@@ -339,9 +499,9 @@ def _compute_inputs_hash(
     a handoff's recorded ``source_hash`` must NOT include ``mode``/
     ``filename_prefix`` while this ``IS_CHANGED`` value still needs to.
 
-    Built on top of :func:`_compute_identity_hash` (same pixel/group/layer/
-    append hashing) rather than duplicating it, with ``filename_prefix`` and
-    ``mode`` folded in afterward.
+    Built on top of :func:`_compute_identity_hash` (same pixel/group/
+    layer_names/append hashing) rather than duplicating it, with
+    ``filename_prefix`` and ``mode`` folded in afterward.
 
     Note this is NOT literally "sha256 of the PSD bytes that would be
     written" -- computing that would require re-serializing a full PSD on
@@ -359,14 +519,16 @@ def _compute_inputs_hash(
         mode: The ``mode`` widget value (one of :data:`MODE_DONT_OPEN`,
             :attr:`cpsb.nodes.BridgeMode.WAIT_FIRST_SAVE`, or
             :attr:`cpsb.nodes.BridgeMode.RERUN_EVERY_SAVE`).
-        layer_name: The ``layer_name`` widget value.
+        layer_names: The hidden ``layer_names`` widget's raw, still-serialized
+            value (see :func:`_compute_identity_hash`'s docstring -- hashed
+            verbatim, same rationale).
         append_target: :func:`_append_target_key` of the current
             ``existing_psd_path`` widget value.
 
     Returns:
         A 64-char lowercase hex sha256 digest.
     """
-    identity_hash = _compute_identity_hash(pil_images, group_name, layer_name, append_target)
+    identity_hash = _compute_identity_hash(pil_images, group_name, layer_names, append_target)
     hasher = hashlib.sha256()
     hasher.update(identity_hash.encode("ascii"))
     hasher.update(b"\x00")
@@ -539,7 +701,7 @@ def _layers_batch_tensor(
 def _create_layers_in_psd(
     psd: PSDImage,
     pil_images: list[Image.Image],
-    layer_name: str,
+    layer_names: list[str],
     canvas_width: int,
     canvas_height: int,
 ) -> tuple[list[Any], list[tuple[Image.Image, int, int]]]:
@@ -559,8 +721,11 @@ def _create_layers_in_psd(
         psd: The (already-created or already-opened) document to add layers
             to. Not saved by this function.
         pil_images: Decoded inputs, in ``image_1..image_N`` order.
-        layer_name: Base name; layers are named ``"<layer_name> <index>"``,
-            1-indexed.
+        layer_names: The name for each layer, PARALLEL to *pil_images* (same
+            order, same length -- callers resolve this via
+            :func:`_resolve_layer_names` or :func:`_default_layer_names`
+            before calling here; this function itself does no naming logic,
+            just uses each name verbatim).
         canvas_width: Canvas width to center against.
         canvas_height: Canvas height to center against.
 
@@ -575,16 +740,18 @@ def _create_layers_in_psd(
     """
     placements = _compute_placements(pil_images, canvas_width, canvas_height)
     layers = []
-    for index, (layer_image, left, top) in enumerate(placements, start=1):
+    for name, (layer_image, left, top) in zip(layer_names, placements, strict=True):
         layer = psd.create_pixel_layer(
-            layer_image, name=f"{layer_name} {index}", top=top, left=left, opacity=_LAYER_OPACITY
+            layer_image, name=name, top=top, left=left, opacity=_LAYER_OPACITY
         )
         layers.append(layer)
     return layers, placements
 
 
 def _build_group_psd(
-    pil_images: list[Image.Image], group_name: str, layer_name: str = DEFAULT_LAYER_NAME
+    pil_images: list[Image.Image],
+    group_name: str,
+    layer_names: list[str] | None = None,
 ) -> tuple[PSDImage, int, int, list[tuple[Image.Image, int, int]]]:
     """Build the in-memory grouped PSD document (PROTOCOL.md §6c).
 
@@ -599,6 +766,13 @@ def _build_group_psd(
         pil_images: Decoded inputs, in ``image_1..image_N`` order. Must be
             non-empty.
         group_name: Name for the single group every layer is placed inside.
+        layer_names: The name for each layer, parallel to *pil_images* (same
+            order, same length) -- :meth:`PhotoshopComposePSD.execute` passes
+            the already-:func:`_resolve_layer_names`'d list here. ``None``
+            (the default) falls back to :func:`_default_layer_names`'s plain
+            ``"Layer 1".."Layer N"`` numbering, for a low-level/direct caller
+            (this module's own structural tests) with nothing to say about
+            naming.
 
     Returns:
         ``(psd, canvas_width, canvas_height, placements)`` -- *psd* is the
@@ -617,15 +791,21 @@ def _build_group_psd(
     # yields a transparent layer, verified empirically against psd-tools 1.17.4),
     # so this is NOT a place alpha would be flattened away.
     psd = PSDImage.new(mode="RGB", size=(canvas_width, canvas_height), depth=8)
+    resolved_names = (
+        layer_names if layer_names is not None else _default_layer_names(len(pil_images))
+    )
     layers, placements = _create_layers_in_psd(
-        psd, pil_images, layer_name, canvas_width, canvas_height
+        psd, pil_images, resolved_names, canvas_width, canvas_height
     )
     psd.create_group(layer_list=layers, name=group_name)
     return psd, canvas_width, canvas_height, placements
 
 
 def _append_run_into_psd(
-    psd: PSDImage, pil_images: list[Image.Image], run_group_name: str, layer_name: str
+    psd: PSDImage,
+    pil_images: list[Image.Image],
+    run_group_name: str,
+    layer_names: list[str] | None = None,
 ) -> tuple[list[tuple[Image.Image, int, int]], int, int]:
     """Add *pil_images* as a NEW top-level group onto *psd* -- the "append to
     existing document" feature's own write step (build brief items 1/6).
@@ -651,7 +831,10 @@ def _append_run_into_psd(
         pil_images: This run's decoded inputs, in ``image_1..image_N`` order.
         run_group_name: This run's own group name (already run-numbered by
             :func:`_next_run_group_name`).
-        layer_name: Base layer name for this run's own layers.
+        layer_names: The name for each of this run's own layers, parallel to
+            *pil_images*. ``None`` (the default) falls back to
+            :func:`_default_layer_names` -- see :func:`_build_group_psd`'s
+            identical parameter for the full rationale.
 
     Returns:
         ``(placements, canvas_width, canvas_height)`` -- *placements* covers
@@ -661,8 +844,11 @@ def _append_run_into_psd(
         dims are *psd*'s existing, unchanged size.
     """
     canvas_width, canvas_height = psd.width, psd.height
+    resolved_names = (
+        layer_names if layer_names is not None else _default_layer_names(len(pil_images))
+    )
     layers, placements = _create_layers_in_psd(
-        psd, pil_images, layer_name, canvas_width, canvas_height
+        psd, pil_images, resolved_names, canvas_width, canvas_height
     )
     psd.create_group(layer_list=layers, name=run_group_name)
     return placements, canvas_width, canvas_height
@@ -1079,6 +1265,25 @@ class PhotoshopComposePSD:
     own docstring) to ``input/<filename_prefix>_%05d.psd``
     (:func:`_allocate_output_path`).
 
+    **A layer's name comes from renaming its own ``image_N`` INPUT SLOT**
+    (PROTOCOL.md §6c, product owner verbatim: "you should be able to change
+    the names of the input nodes by double clicking on them. The name of the
+    node should become the layer names."). There is no longer a separate
+    ``layer_name`` STRING widget for this (removed) -- double-clicking an
+    ``image_N`` slot in ``web/cpsb/compose.js`` opens a rename prompt exactly
+    like ``comfyui-epsnodes``' ``EPSSwitcher`` (``eps_image/switcher.js``,
+    FORMAT.md §6.4 "Renamable rows"), and the frontend serializes every
+    slot's current label into the hidden ``layer_names`` STRING widget as a
+    JSON object (:func:`_parse_layer_names`). :func:`_resolve_layer_names`
+    then turns that, plus which ``image_N`` slot each decoded layer actually
+    came from (:func:`_collect_layer_images`'s ``origins``), into one name per
+    layer: a renamed slot's label is used VERBATIM when it contributed a
+    single layer (suffixed with a per-frame number only when its own IMAGE
+    batch produced more than one), and an un-renamed slot falls back to the
+    original ``"Layer <N>"`` numbering (:data:`DEFAULT_LAYER_NAME`) -- so a
+    workflow that never renames anything looks exactly like the pre-rename
+    build.
+
     Outputs: ``(IMAGE, MASK, STRING)``. IMAGE is the deterministic flattened
     composite of exactly what was written (:func:`_flatten_placements`, not
     a re-read of the saved file); MASK is ``1 - alpha`` of that composite
@@ -1137,7 +1342,7 @@ class PhotoshopComposePSD:
     managed PSD copy) rather than minting a second one, so a re-queue against a
     handoff that is open in Photoshop but not yet saved never orphans it with
     a duplicate. Only when the identity no longer matches (the actual
-    connected images, ``group_name``, or ``layer_name`` changed) is the old
+    connected images, ``group_name``, or ``layer_names`` changed) is the old
     handoff superseded and a genuinely new one created. The consume check
     runs first for EVERY mode, so an already-saved edit is served without
     re-opening Photoshop regardless of which mode is selected; the reuse
@@ -1210,7 +1415,7 @@ class PhotoshopComposePSD:
     against the target's already-current canvas), but nothing more is
     written to the target, so re-queuing an unedited, still-pending run can
     never duplicate its group. Only a genuinely new identity (different
-    pixels, ``group_name``, ``layer_name``, or ``existing_psd_path``) ever
+    pixels, ``group_name``, ``layer_names``, or ``existing_psd_path``) ever
     performs another real append.
 
     **WIDGET-POSITION BREAKING CHANGE (v0.5.29)**: the ``append_to_existing``
@@ -1254,6 +1459,23 @@ class PhotoshopComposePSD:
         declared range here only needs to be generous enough to never run
         out.
 
+        ``layer_names`` (STRING, default ``""``) occupies the exact
+        ``required`` position the now-removed ``layer_name`` STRING widget
+        used to (immediately after ``group_name``) -- DELIBERATELY, not an
+        oversight: every widget after it (``mode``/``timeout_seconds``/
+        ``max_layers``/``existing_psd_path``) keeps the same positional slot
+        a pre-rename saved workflow already expects (ComfyUI matches saved
+        ``widgets_values`` to widgets purely by POSITION), so this node's
+        rename feature (class docstring) needed no
+        "WIDGET-POSITION BREAKING CHANGE" note the way v0.5.29's append
+        widget removal did. The frontend (``web/cpsb/compose.js``) hides this
+        widget's on-canvas row (it never shows a textbox for it -- the
+        product owner's "Remove the separate layer name textbox" ask) and
+        instead keeps it in lockstep with every ``image_N`` slot's own
+        double-click-renamed label; see :func:`_parse_layer_names` for the
+        JSON shape and :meth:`execute`'s BACKWARD-COMPAT handling of a
+        pre-rename workflow whose stale ``layer_name`` value now lands here.
+
         The final ``required`` entry is the "append to existing document"
         feature (the class docstring's own section): the ``existing_psd_path``
         STRING (default ``""``). Appended at the very END of ``required``
@@ -1269,7 +1491,13 @@ class PhotoshopComposePSD:
         return {
             "required": {
                 "group_name": ("STRING", {"default": DEFAULT_GROUP_NAME}),
-                "layer_name": ("STRING", {"default": DEFAULT_LAYER_NAME}),
+                # Hidden on-canvas by the frontend (web/cpsb/compose.js) --
+                # NOT a textbox the user edits directly (that removed
+                # `layer_name` widget's replacement, per the product owner's
+                # "Remove the separate layer name textbox" ask). Filled by
+                # double-clicking an image_N INPUT SLOT to rename it; see the
+                # class docstring's rename paragraph and _parse_layer_names.
+                "layer_names": ("STRING", {"default": ""}),
                 "mode": (
                     [
                         nodes.BridgeMode.WAIT_FIRST_SAVE,
@@ -1301,7 +1529,7 @@ class PhotoshopComposePSD:
         timeout_seconds: int,
         unique_id: str,
         max_layers: int = DEFAULT_MAX_LAYERS,
-        layer_name: str = DEFAULT_LAYER_NAME,
+        layer_names: str = "",
         filename_prefix: str = DEFAULT_FILENAME_PREFIX,
         existing_psd_path: str = "",
         **kwargs: Any,
@@ -1333,13 +1561,17 @@ class PhotoshopComposePSD:
         from empty to a path, from a path back to empty, or switching between
         two different paths must re-execute this node even with
         pixel-identical upstream images (the class docstring's "append to an
-        existing document" section).
+        existing document" section). *layer_names* -- the hidden widget's raw
+        JSON, PROTOCOL.md §6c -- is folded in the same way and for the same
+        reason: renaming an ``image_N`` slot must re-execute this node even
+        with pixel-identical inputs, so a stale composite (with the OLD
+        layer names) is never served after a rename.
         """
-        pil_images, _ = _collect_layer_images(kwargs, max_layers)
+        pil_images, _, _ = _collect_layer_images(kwargs, max_layers)
         prefix = _sanitize_filename_prefix(filename_prefix)
         append_target = _append_target_key(existing_psd_path)
         inputs_hash = _compute_inputs_hash(
-            pil_images, prefix, group_name, mode, layer_name, append_target
+            pil_images, prefix, group_name, mode, layer_names, append_target
         )
 
         state = nodes._state_if_configured()
@@ -1350,7 +1582,7 @@ class PhotoshopComposePSD:
         # that function's docstring), not the mode-sensitive inputs_hash
         # above (which stays mode-sensitive here only so a mode/prefix change
         # alone still forces THIS node to re-execute).
-        identity_hash = _compute_identity_hash(pil_images, group_name, layer_name, append_target)
+        identity_hash = _compute_identity_hash(pil_images, group_name, layer_names, append_target)
         active = _find_matching_active_handoff(state.manager, str(unique_id), identity_hash)
         if active is not None:
             edit_hash = state.manager.latest_edit_hash(active.handoff_id)
@@ -1365,7 +1597,7 @@ class PhotoshopComposePSD:
         timeout_seconds: int,
         unique_id: str,
         max_layers: int = DEFAULT_MAX_LAYERS,
-        layer_name: str = DEFAULT_LAYER_NAME,
+        layer_names: str = "",
         filename_prefix: str = DEFAULT_FILENAME_PREFIX,
         existing_psd_path: str = "",
         **kwargs: Any,
@@ -1424,6 +1656,18 @@ class PhotoshopComposePSD:
                 taking priority over nothing (the old ``existing_psd`` combo
                 this widget used to defer to is gone; see the class
                 docstring's "WIDGET-POSITION BREAKING CHANGE" note).
+            layer_names: The hidden widget the frontend fills with every
+                renamed ``image_N`` slot's label as a JSON object
+                (:func:`_parse_layer_names`; class docstring's rename
+                paragraph) -- resolved here, per layer, via
+                :func:`_resolve_layer_names`. BACKWARD-COMPAT: this occupies
+                the exact ``required`` position the removed ``layer_name``
+                STRING widget used to (:meth:`INPUT_TYPES`'s own note), so a
+                workflow saved before this feature existed may still deliver
+                that widget's old plain-string value here (e.g. ``"Layer"``)
+                -- not valid JSON, so :func:`_parse_layer_names` drops it and
+                every layer just gets the default ``"Layer <N>"`` name,
+                exactly as that old workflow always produced; it never raises.
             **kwargs: The connected ``image_N`` tensors (each possibly a
                 multi-image batch), whichever subset ComfyUI passed.
 
@@ -1446,7 +1690,7 @@ class PhotoshopComposePSD:
         manager = state.manager
         node_id = str(unique_id)
 
-        pil_images, total_available = _collect_layer_images(kwargs, max_layers)
+        pil_images, total_available, origins = _collect_layer_images(kwargs, max_layers)
         if not pil_images:
             raise ValueError("PhotoshopComposePSD needs at least one connected image_N input")
         if total_available > len(pil_images):
@@ -1460,6 +1704,17 @@ class PhotoshopComposePSD:
                 max_layers,
                 len(pil_images),
             )
+
+        # Per-layer names (class docstring's rename paragraph): a slot's own
+        # double-click-renamed label, if any, else the default "Layer <N>" --
+        # resolved ONCE here and reused by every write path below
+        # (_build_group_psd/_append_run_into_psd), so the fresh-file and
+        # append branches name layers identically. _parse_layer_names never
+        # raises -- a malformed or pre-rename-stale `layer_names` value just
+        # yields no custom names (BACKWARD-COMPAT, this method's own
+        # docstring), never an error into the user's queue.
+        custom_layer_names = _parse_layer_names(layer_names)
+        resolved_layer_names = _resolve_layer_names(origins, custom_layer_names)
 
         prefix = _sanitize_filename_prefix(filename_prefix)
         # Append target key for the cache-key-consistent identity hash below
@@ -1479,7 +1734,7 @@ class PhotoshopComposePSD:
         # Photoshop document while a second one got created underneath it.
         # append_target IS folded in here, unlike mode -- see
         # _compute_identity_hash's own docstring for why.
-        identity_hash = _compute_identity_hash(pil_images, group_name, layer_name, append_target)
+        identity_hash = _compute_identity_hash(pil_images, group_name, layer_names, append_target)
 
         # -- reuse / supersede (mirrors cpsb.nodes.PhotoshopBridge.execute,
         # cpsb/nodes.py:402-432, and cpsb.annotate's analogous block,
@@ -1494,7 +1749,7 @@ class PhotoshopComposePSD:
             and active.source_hash is not None
             and active.source_hash != identity_hash
         ):
-            # The connected inputs (or group_name/layer_name/append settings)
+            # The connected inputs (or group_name/layer_names/append settings)
             # genuinely changed since this handoff was opened: any edits it
             # holds belong to the OLD identity and must not be served for the
             # new one. Retire it and start fresh -- this is the one case a
@@ -1550,7 +1805,7 @@ class PhotoshopComposePSD:
                 # DUPLICATE-APPEND GUARD (class docstring's "duplicate-append
                 # avoidance" section): `active` here means an already-open,
                 # not-yet-edited handoff for THIS node already matches the
-                # CURRENT identity (pixels/group_name/layer_name/target all
+                # CURRENT identity (pixels/group_name/layer_names/target all
                 # unchanged) -- e.g. a re-queue of "Wait for first save"
                 # before anyone has saved yet. That prior call already
                 # performed the real append into `target_path`; doing it
@@ -1586,7 +1841,7 @@ class PhotoshopComposePSD:
                     mode,
                 )
                 placements, canvas_width, canvas_height = _append_run_into_psd(
-                    psd, pil_images, run_group_name, layer_name
+                    psd, pil_images, run_group_name, resolved_layer_names
                 )
                 _atomic_save(psd, target_path)
                 # Own-write suppression (cpsb.handoff.HandoffManager.
@@ -1618,7 +1873,7 @@ class PhotoshopComposePSD:
                     mode,
                 )
                 psd, canvas_width, canvas_height, placements = _build_group_psd(
-                    pil_images, run_group_name, layer_name
+                    pil_images, run_group_name, resolved_layer_names
                 )
                 _atomic_save(psd, target_path)
                 # Same own-write suppression as the "append into an existing
@@ -1638,7 +1893,7 @@ class PhotoshopComposePSD:
                 mode,
             )
             psd, canvas_width, canvas_height, placements = _build_group_psd(
-                pil_images, group_name, layer_name
+                pil_images, group_name, resolved_layer_names
             )
             output_path = _allocate_output_path(state.context.input_dir, prefix)
             psd.save(output_path)

@@ -629,18 +629,43 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   carries a ComfyUI IMAGE, which may be a multi-image BATCH (e.g. a VAE Decode emitting
   several images) — every image in every batch becomes its own layer (frames expanded in
   batch order within a socket, sockets in `image_1..image_N` order).
+- **Renamable `image_N` INPUT SLOTS name the layers (v0.5.38, product owner verbatim: "you
+  should be able to change the names of the input nodes by double clicking on them. The
+  name of the node should become the layer names. Remove the separate layer name
+  textbox.").** Double-clicking an `image_N` slot (connected or the trailing spare) opens
+  a rename prompt (`LGraphCanvas.prompt`, falling back to `window.prompt`) exactly like
+  `comfyui-epsnodes`' `EPSSwitcher` (FORMAT.md §6.4 "Renamable rows" — the same technique,
+  clean-room reimplemented in `web/cpsb/compose.js`, not copied). Confirming sets that
+  input's `.label` — display-only, `input.name` and every existing link are untouched, so
+  a saved workflow's `image_7` link still restores onto a real `image_7` socket exactly as
+  before. Every slot's current label is kept serialized into the hidden `layer_names`
+  widget (below) as a JSON object; the backend (`_resolve_layer_names`) turns that into
+  each layer's actual written name — a renamed slot's label is used VERBATIM when its own
+  batch contributed one layer, suffixed per-frame (`"<label> 1"`, `"<label> 2"`, …) when it
+  contributed more than one; an un-renamed slot keeps the original `"Layer <N>"` numbering.
+  This REPLACES the former single `layer_name` STRING widget (a global base name for every
+  layer alike) — removed outright, per the product owner's own ask.
 - Widgets: `group_name` (STRING, default "ComfyUI Layers" — the group/folder the layers
-  land in), `layer_name` (STRING, default "Layer" — each layer is named `<layer_name> N`,
-  N counting 1..N bottom-to-top), `mode` (COMBO — the SAME three strings as the Edit in
-  Photoshop node's BridgeMode: "Wait for first save" (default) | "Re-run on every save" |
-  "Don't open (composite only)"). (`mode` replaces the earlier `edit_after` BOOLEAN;
-  `layer_name` replaces the removed `filename_prefix` — both pre-release breaking changes.
-  `filename_prefix` was dropped because it only named an intermediate file the user never
-  sees: Photoshop opens the managed `source.psd` copy, not that file.) `timeout_seconds`
+  land in), a HIDDEN `layer_names` STRING (default `""` — never shown as a textbox; filled
+  purely by the rename gesture above, one JSON object per node:
+  `{"image_1": "Sky", "image_3": "Foreground"}`, absent key = that slot keeps the default
+  numbered name; occupies the exact `required` position the removed `layer_name` widget
+  used to, so every OTHER widget's saved position is unaffected), `mode` (COMBO — the SAME
+  three strings as the Edit in Photoshop node's BridgeMode: "Wait for first save" (default)
+  | "Re-run on every save" | "Don't open (composite only)"). (`mode` replaces the earlier
+  `edit_after` BOOLEAN; the removed `filename_prefix` was dropped because it only named an
+  intermediate file the user never sees: Photoshop opens the managed `source.psd` copy, not
+  that file — both pre-release breaking changes.) `timeout_seconds`
   (INT, default 1800) applies to "Wait for first save".
   `max_layers` (INT, default 64, min 1, max 512) caps the total images turned into layers
   across all sockets, oldest-first; a larger batch is truncated (first N kept) with a
   logged warning — no silent drop.
+- **Backward compatibility**: a workflow saved before v0.5.38 has no `layer_names` value,
+  and — because ComfyUI restores saved widget values by POSITION — may deliver that older
+  build's `layer_name` STRING value into this widget's slot instead (e.g. the literal text
+  `Layer`). That is not valid JSON; `_parse_layer_names` degrades it to "no custom names"
+  (logged once at WARNING, never raised), so the workflow loads and composes cleanly with
+  the exact same default `"Layer <N>"` naming it always produced.
 - Behavior: canvas = max width × max height across inputs; every image (across every
   socket's batch) becomes one pixel layer, CENTERED, never rescaled; `image_1`'s first
   frame is the BOTTOM layer, later frames/indices stack on top; all layers inside ONE
@@ -744,8 +769,9 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   change**: ComfyUI restores saved widget values by POSITION, so a pre-v0.5.29 workflow
   that configured append needs its compose widgets re-checked once after loading (repo
   precedent: the v0.5.12 filename_prefix removal — deliberate, no shim, pre-1.0). Final
-  required order: group_name, layer_name, mode, timeout_seconds, max_layers,
-  existing_psd_path.
+  required order: group_name, layer_names, mode, timeout_seconds, max_layers,
+  existing_psd_path (v0.5.38 renamed the `layer_name` slot to the hidden `layer_names` —
+  see the rename bullet above — without disturbing this order).
 - **Append into an existing document** (v0.5.20). Widgets, all appended at the END of
   `required` (ComfyUI matches saved widget values BY POSITION, so anywhere else silently
   shifts every existing workflow's values): `append_to_existing` (BOOLEAN, default False),
@@ -782,9 +808,12 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 - **Handoff identity is mode-FREE** (fixed v0.5.18 — this node previously had neither
   reuse nor supersede, which is what made "Wait for first save" hang forever and spawned
   a document per run). Two distinct hashes now:
-  - `_compute_identity_hash` (images + `group_name` + `layer_name`) is what a handoff's
-    `source_hash` records and what reuse/supersede is keyed on. Deliberately excludes
-    `mode` and `filename_prefix`, matching `compute_source_hash`'s pixels-only contract.
+  - `_compute_identity_hash` (images + `group_name` + `layer_names`) is what a handoff's
+    `source_hash` records and what reuse/supersede is keyed on. `layer_names` is hashed as
+    its raw serialized JSON (v0.5.38, replacing the removed `layer_name` STRING in this
+    hash) — a rename therefore also supersedes/re-executes exactly like a `group_name` edit
+    always has. Deliberately excludes `mode` and `filename_prefix`, matching
+    `compute_source_hash`'s pixels-only contract.
     Folding `mode` in was the bug: flipping the widget with identical pixels changed the
     recorded identity, so the already-open handoff could never match again — it was
     stranded as a live but unreachable Photoshop document while a second one was created
