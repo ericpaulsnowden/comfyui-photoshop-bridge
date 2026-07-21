@@ -1589,6 +1589,17 @@ class PhotoshopComposePSD:
                     psd, pil_images, run_group_name, layer_name
                 )
                 _atomic_save(psd, target_path)
+                # Own-write suppression (cpsb.handoff.HandoffManager.
+                # record_own_write -- see its docstring for the full
+                # rationale): if a `load_psd` edit_in_place handoff happens
+                # to have THIS exact `existing_psd_path` open in Photoshop
+                # with its own watch on it, this write must never be
+                # mistaken for THAT other handoff's own Photoshop save --
+                # the confirmed compose-writes-into-a-watched-file loop bug.
+                # Recorded on the REAL final path, after _atomic_save's own
+                # os.replace has fully landed (record_own_write's own
+                # "finish the write, then record" contract).
+                manager.record_own_write(target_path)
                 logger.info("cpsb compose_psd: node %s: wrote %s", node_id, target_path)
                 _emit_compose_written(state.context, node_id, target_path)
             else:
@@ -1610,6 +1621,11 @@ class PhotoshopComposePSD:
                     pil_images, run_group_name, layer_name
                 )
                 _atomic_save(psd, target_path)
+                # Same own-write suppression as the "append into an existing
+                # target" branch above -- see that call's comment (this
+                # branch differs only in the target having just been created
+                # fresh rather than already existing).
+                manager.record_own_write(target_path)
                 logger.info("cpsb compose_psd: node %s: wrote %s", node_id, target_path)
                 _emit_compose_written(state.context, node_id, target_path)
             output_path = target_path
@@ -1626,6 +1642,16 @@ class PhotoshopComposePSD:
             )
             output_path = _allocate_output_path(state.context.input_dir, prefix)
             psd.save(output_path)
+            # Own-write suppression (cpsb.handoff.HandoffManager.
+            # record_own_write): _allocate_output_path guarantees this exact
+            # name didn't exist a moment ago, so colliding with an ALREADY-
+            # watched path is unlikely here -- but not impossible (e.g. a
+            # stale edit_in_place watch left over on a since-recreated
+            # filename), and the product owner asked for one consistent
+            # mechanism covering every write this node makes, not just the
+            # higher-probability append-mode case above. Cheap to record
+            # unconditionally.
+            manager.record_own_write(output_path)
             logger.info("cpsb compose_psd: node %s: wrote %s", node_id, output_path)
             _emit_compose_written(state.context, node_id, output_path)
 

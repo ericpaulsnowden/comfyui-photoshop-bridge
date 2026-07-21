@@ -1618,7 +1618,14 @@ class TestModeRerunEverySave:
         assert handoff_psd.is_file()
         # Byte-for-byte copy of the generated file (layers preserved).
         assert handoff_psd.read_bytes() == (context.input_dir / filename_out).read_bytes()
-        assert active.handoff_id in manager._own_source_writes
+        # note_source_written recorded the handoff's own managed copy (PATH-
+        # keyed now, not handoff-id-keyed -- see HandoffManager.
+        # record_own_write's docstring); the fresh compose output itself is
+        # ALSO recorded (a separate path, cpsb/compose_psd.py's own
+        # manager.record_own_write(output_path) call), covered by
+        # tests/test_own_write_suppression.py rather than duplicated here.
+        handoff_stat = handoff_psd.stat()
+        assert manager.is_own_write(handoff_psd, handoff_stat.st_size, handoff_stat.st_mtime_ns)
 
     def test_source_hash_is_mode_free_identity(self, context, manager, configured_with_app):
         """A ``bridge_node`` handoff's ``source_hash`` is the mode/prefix-FREE

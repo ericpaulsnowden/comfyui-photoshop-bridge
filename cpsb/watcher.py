@@ -108,7 +108,7 @@ class CpsbWatcher:
         self._parent_watches: dict[Path, ObservedWatch] = {}
         # (size, mtime_ns) of the original file at the moment watch_original()
         # started watching it -- an edit_in_place handoff's own analogue of
-        # is_own_source_write's "our own write" suppression below, needed for
+        # is_own_write's "our own write" suppression below, needed for
         # a DIFFERENT reason: unlike the managed copy (which THIS package
         # just wrote and knows the exact signature of), an edit_in_place
         # target already exists with the user's own content the moment
@@ -366,8 +366,16 @@ class CpsbWatcher:
             self._schedule(handoff_id, path)
             return
 
-        if self._manager.is_own_source_write(handoff_id, stat.st_size, stat.st_mtime_ns):
-            logger.debug("Ignoring our own managed-copy write for handoff %s", handoff_id)
+        if self._manager.is_own_write(path, stat.st_size, stat.st_mtime_ns):
+            # PATH-keyed, not handoff-id-keyed (cpsb.handoff.HandoffManager.
+            # record_own_write's own docstring has the full rationale): this
+            # is what lets a DIFFERENT handoff's write -- e.g.
+            # PhotoshopComposePSD writing its composed output into a file
+            # this handoff (a `load_psd` edit_in_place original, or another
+            # handoff's own managed copy) happens to be watching -- be
+            # recognized as "not a real Photoshop save" too, not just this
+            # handoff's own managed-copy write.
+            logger.debug("Ignoring our own write to %s (handoff %s)", path, handoff_id)
             return
 
         if self._matches_original_baseline(handoff_id, stat.st_size, stat.st_mtime_ns):

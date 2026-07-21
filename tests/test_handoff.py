@@ -611,20 +611,63 @@ class TestWaitTable:
 
 
 class TestOwnSourceWrites:
-    def test_signature_matches_until_file_changes(self, manager, context):
+    """``note_source_written`` (the handoff-id convenience wrapper) and its
+    underlying primitive, ``record_own_write``/``is_own_write`` (PATH-keyed,
+    not handoff-id-keyed -- see ``HandoffManager.record_own_write``'s own
+    docstring for why: it must suppress a write that lands on a path a
+    DIFFERENT handoff, or no handoff at all, is watching -- not just the
+    same handoff's own managed copy). ``tests/test_own_write_suppression.py``
+    covers the cross-handoff and watcher-integration scenarios this design
+    exists for; this class covers the manager-level API contract itself.
+    """
+
+    def test_note_source_written_still_works_as_a_wrapper(self, manager, context):
         meta = create_handoff(manager)
         psd_path = manager.psd_path(meta)
         psd_path.write_bytes(b"fake psd contents")
         manager.note_source_written(meta.handoff_id)
 
         stat = psd_path.stat()
-        assert manager.is_own_source_write(meta.handoff_id, stat.st_size, stat.st_mtime_ns)
+        assert manager.is_own_write(psd_path, stat.st_size, stat.st_mtime_ns)
 
         psd_path.write_bytes(b"photoshop rewrote this with more bytes")
         new_stat = psd_path.stat()
-        assert not manager.is_own_source_write(
-            meta.handoff_id, new_stat.st_size, new_stat.st_mtime_ns
-        )
+        assert not manager.is_own_write(psd_path, new_stat.st_size, new_stat.st_mtime_ns)
+
+    def test_note_source_written_is_a_noop_for_an_unknown_handoff(self, manager):
+        manager.note_source_written("never-created")  # must not raise
+
+    def test_record_own_write_needs_no_handoff_at_all(self, manager, tmp_path):
+        """The primitive's whole point: a path with no handoff (e.g.
+        PhotoshopComposePSD's fresh/append output before any handoff exists
+        for it) can still be recorded and looked up directly.
+        """
+        path = tmp_path / "compose_00001.psd"
+        path.write_bytes(b"composed layers")
+
+        manager.record_own_write(path)
+
+        stat = path.stat()
+        assert manager.is_own_write(path, stat.st_size, stat.st_mtime_ns)
+        assert not manager.is_own_write(path, stat.st_size + 1, stat.st_mtime_ns)
+
+    def test_record_own_write_is_a_noop_for_a_missing_file(self, manager, tmp_path):
+        """Matches the predecessor's own posture: nothing to stat, so silently skip."""
+        manager.record_own_write(tmp_path / "never-written.psd")  # must not raise
+
+    def test_re_recording_moves_a_path_to_the_end(self, manager, tmp_path):
+        """Re-recording an already-present path must refresh its stat (the
+        file may have changed) rather than being a stale no-op.
+        """
+        path = tmp_path / "target.psd"
+        path.write_bytes(b"run 1")
+        manager.record_own_write(path)
+
+        path.write_bytes(b"run 2, more bytes")
+        manager.record_own_write(path)
+
+        stat = path.stat()
+        assert manager.is_own_write(path, stat.st_size, stat.st_mtime_ns)
 
 
 class TestIdempotentCancel:

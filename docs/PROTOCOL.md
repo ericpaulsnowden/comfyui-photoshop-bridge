@@ -56,6 +56,22 @@ filename lookup widened the window enough to hit reliably). Bookkeeping happens 
 lock (a `None` reservation keeps concurrent callers idempotent); observer calls happen
 outside it.
 
+**Own-write suppression is PATH-keyed, not handoff-id-keyed (v0.5.37).** The watcher
+cannot tell who wrote a file from a raw filesystem event alone, so every write this
+package makes to a path that could be under watch calls
+`HandoffManager.record_own_write(path)` right after the write completes (after an
+atomic write's `os.replace`, never before); `CpsbWatcher._settle` checks
+`HandoffManager.is_own_write(path, size, mtime_ns)` before ever reading a settled
+file. The registry is keyed by the file's own resolved path, bounded to 128 entries
+(oldest-inserted evicted; re-recording refreshes a path's position), **not** by
+handoff id — a handoff-id-keyed predecessor could only suppress a write against that
+same handoff's own managed copy, which missed the case where one node writes into a
+path a *different* handoff is watching (§6c: Compose's `existing_psd_path` landing on
+a Load PSD `edit_in_place` original — an infinite re-run loop under "Re-run on every
+save"). `note_source_written(handoff_id)` still exists as a convenience wrapper over
+`record_own_write` for the common "just created this handoff, wrote its managed copy"
+case; it is not a separate mechanism.
+
 - There is **no separate session manifest file**: on server start, the backend rebuilds
   its in-memory state by scanning `input/<managed>/*/meta.json` (the meta files are the
   source of truth; this supersedes PLAN §3's `session_manifest.json` — one file fewer,
@@ -527,7 +543,11 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   saved PSD directly. On such a handoff, `orig_thumb`/`source.psd`-copy are skipped; the
   edit is read from the original path. Terminal cleanup never deletes the user's file
   (only managed-folder artifacts are ever purged). This is the only path where a bridge
-  handoff points at a file the user owns — guard every delete accordingly.
+  handoff points at a file the user owns — guard every delete accordingly. Any *other*
+  node's write that happens to land on this same original path (e.g. a Compose node's
+  `existing_psd_path` pointed at it — §6c) is suppressed via the shared, path-keyed
+  own-write registry (§1, v0.5.37) — suppression is not specific to the node that
+  opened the original.
 - **Save-trigger policy** (v0.5.21): the node carries a COMBO widget `on_save`, appended
   as the LAST required input (ComfyUI restores a saved workflow's widget values BY
   POSITION — see `LGraphNode`'s `widgets_values` zip — so appending is the only placement
@@ -643,11 +663,23 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   never blocks (first run opens PS, passes the flat composite through; each save
   auto-queues a re-run consuming the latest edit); "Don't open (composite only)" is the
   old always-flat behavior (never opens PS). The handoff uses origin_kind `bridge_node`
-  and edit_in_place on the generated file (ours → safe), so it shares the §6 bridge
-  node's blocking-wait, consume, IS_CHANGED, and frontend auto-queue machinery verbatim
-  (import from cpsb.nodes; do not duplicate). Default "Wait for first save" makes the
-  useful edit-in-Photoshop flow the out-of-box behavior — a flat composite is only ever
-  the output when the user has no edit yet or picked "Don't open".
+  with a MANAGED COPY of the generated file (v1 scope decision, NOT `edit_in_place` —
+  the managed copy is a byte-for-byte copy of the just-written composed PSD, made once
+  at handoff-creation time; corrected v0.5.37, this paragraph previously claimed
+  edit_in_place), so it shares the §6 bridge node's blocking-wait, consume, IS_CHANGED,
+  and frontend auto-queue machinery verbatim (import from cpsb.nodes; do not
+  duplicate). Default "Wait for first save" makes the useful edit-in-Photoshop flow the
+  out-of-box behavior — a flat composite is only ever the output when the user has no
+  edit yet or picked "Don't open".
+- **Own-write suppression (v0.5.37).** Every real write this node makes to disk — the
+  fresh auto-numbered file, and the `existing_psd_path` append target, whether newly
+  created or pre-existing — is registered with the shared, path-keyed own-write
+  registry (§1) right after the write lands (after `os.replace`, for the atomic
+  append-mode write). Without this, pointing `existing_psd_path` at a file another
+  handoff has open (e.g. a Load PSD node's `edit_in_place` original — §6b) would have
+  the watcher misread this node's own write as that OTHER handoff's Photoshop save:
+  under "Re-run on every save" that re-triggers the very node that just wrote it — an
+  infinite loop; under "Wait for first save" it delivers the wrong pixels.
 - Consume semantics: `IS_CHANGED` hashes the input images + params, folded with the
   latest-edit hash when an active matching handoff exists; execute() returns the latest
   edit (flattened) when the active handoff's `source_hash` matches the current inputs'

@@ -186,6 +186,20 @@ TERMINAL_STATUSES: frozenset[str] = frozenset({"cancelled", "discarded", "supers
 
 _SECONDS_PER_DAY = 86400
 
+#: Cap on :attr:`HandoffManager._own_writes` -- the own-write suppression
+#: registry (see that attribute's own comment, and
+#: :meth:`HandoffManager.record_own_write`) is PATH-keyed rather than
+#: handoff-id-keyed precisely so it can protect a write that has no handoff
+#: of its own at all (``PhotoshopComposePSD``'s fresh/append output before
+#: any handoff exists for it) or belongs to a DIFFERENT handoff than the one
+#: whose watch it lands under, so nothing else naturally bounds its size the
+#: way "one entry per known handoff" used to. 128 is generous for any real
+#: session (every write site records once per actual on-disk write, never
+#: continuously) while keeping a long-running server's memory footprint
+#: fixed regardless of how many composes/handoffs accumulate over its
+#: lifetime.
+_OWN_WRITE_REGISTRY_MAX = 128
+
 
 class HandoffNotFoundError(Exception):
     """Raised for any operation on an unknown or already-purged handoff_id."""
@@ -490,10 +504,30 @@ class HandoffManager:
         self._lock = threading.Lock()
         self._handoffs: dict[str, HandoffMeta] = {}
         self._waiters: dict[str, _Waiter] = {}
-        # handoff_id -> (st_size, st_mtime_ns) of a managed PSD copy THIS
-        # package wrote, so the watcher can tell our own initial write apart
-        # from a Photoshop save landing on the same path (see note_source_written).
-        self._own_source_writes: dict[str, tuple[int, int]] = {}
+        # resolved path -> (st_size, st_mtime_ns) of the last write THIS
+        # package itself made to that path, so the watcher can tell "we just
+        # wrote this" apart from "Photoshop just saved this" -- see
+        # record_own_write()/is_own_write() below. Deliberately PATH-keyed,
+        # not handoff-id-keyed (the design this replaced): a handoff-id-keyed
+        # registry only ever protected that ONE handoff's own managed copy,
+        # but this package also writes PSDs at paths a DIFFERENT handoff may
+        # be watching -- most concretely, PhotoshopComposePSD's
+        # `existing_psd_path` append target (or its fresh auto-numbered
+        # output) can be the exact file a `load_psd` `edit_in_place` handoff
+        # has open in Photoshop with its own watch on it
+        # (cpsb.watcher.CpsbWatcher.watch_original). A handoff-id-keyed
+        # lookup can never suppress THAT write, because the watcher would be
+        # consulting a different handoff's own registry entry -- exactly the
+        # confirmed "compose writes into a file Load PSD is watching -> the
+        # watcher ingests it as a Photoshop edit -> a downstream re-run
+        # writes again -> loop" bug (product-owner directive: fix this "in a
+        # consistent sharable way across all of the nodes that use it").
+        # Keying by the resolved PATH instead means ANY call site's
+        # record_own_write() protects that exact path regardless of which
+        # handoff -- if any -- is asking, which is the one shared mechanism
+        # every writer in this package can now rely on. Bounded to
+        # _OWN_WRITE_REGISTRY_MAX entries, oldest-inserted evicted first.
+        self._own_writes: dict[Path, tuple[int, int]] = {}
         self._scan_existing()
         self._cleanup_stale()
 
@@ -764,35 +798,114 @@ class HandoffManager:
 
     # -- own-write suppression (Tier 1 watcher support) ----------------------
 
-    def note_source_written(self, handoff_id: str) -> None:
-        """Record that this package just wrote the managed PSD copy for *handoff_id*.
+    def record_own_write(self, path: Path) -> None:
+        """Record that THIS package itself just wrote *path*.
 
-        The watchdog Observer cannot tell who wrote a file. Without this,
-        the very write that creates the handoff PSD would settle through the
-        debounce window and be ingested as if Photoshop had saved an edit.
-        Callers invoke this immediately after :func:`cpsb.psd_io.write_psd`
-        (or an equivalent verbatim byte-copy write); the watcher then skips
-        any settled event whose stat signature still matches (a real
-        Photoshop save changes size and/or mtime). A no-op if *handoff_id*
-        is unknown (nothing to stat) -- not expected in practice, since
-        every real caller only invokes this right after its own
-        :meth:`create` call for the same id.
+        The primitive behind every "don't ingest our own write as a
+        Photoshop save" check in :class:`cpsb.watcher.CpsbWatcher`. The
+        watchdog Observer cannot tell who wrote a file -- it only sees a
+        filesystem event -- so ANY write this package makes to a path that
+        could ALSO be under watch must call this immediately afterward, so
+        :meth:`is_own_write` can recognize the resulting settled event as
+        "ours" and skip it, rather than ingesting it as if Photoshop had
+        just saved an edit. Left unguarded, that misdetection either
+        re-triggers a "Re-run on every save" workflow against its own just-
+        written output (an infinite loop -- the confirmed bug this method
+        exists to close) or ingests the wrong pixels under "Wait for first
+        save".
+
+        Deliberately keyed by the file's own RESOLVED PATH, not by any
+        handoff id -- see :attr:`_own_writes`'s own comment for why a
+        handoff-id-keyed registry (this method's predecessor,
+        ``note_source_written``/``is_own_source_write``; the former is kept
+        below as a thin, convenience wrapper over this method) cannot
+        protect a write that a DIFFERENT handoff's watch might land under.
+        Every write site in this package that lands on a possibly-watched
+        path -- a handoff's own managed copy (:meth:`psd_path`, via
+        :meth:`note_source_written`), or ``PhotoshopComposePSD``'s composed
+        output (fresh-numbered file or ``existing_psd_path`` append target,
+        :mod:`cpsb.compose_psd`) -- calls this directly or through that
+        wrapper, so :meth:`is_own_write` is the ONE place
+        :class:`~cpsb.watcher.CpsbWatcher` needs to consult.
+
+        Bounded to :data:`_OWN_WRITE_REGISTRY_MAX` entries, oldest-inserted
+        evicted first -- a plain ``dict`` already preserves insertion order,
+        so eviction is just popping its first key. Re-recording an
+        already-present path pops and reinserts it, moving it to the END --
+        the same "most recently used" position a brand-new entry gets --
+        so a path this package keeps writing to repeatedly (e.g. successive
+        appends into the same ``existing_psd_path`` target) is never the one
+        evicted just because it was first recorded long ago.
+
+        Args:
+            path: The just-written file's path. Need not be pre-resolved --
+                this method resolves it itself, matching
+                :meth:`is_own_write`'s own resolution, so a symlinked
+                ``input/`` (or managed folder) can never cause a mismatch
+                between the two sides.
+
+        Note:
+            Silently does nothing if *path* cannot be stat'd (e.g. it was
+            somehow removed between the write and this call) -- there is no
+            stat signature to record, and the watcher will simply treat the
+            next event on that path as a genuine save, same as if this had
+            never been called. Matches this method's predecessor's own
+            posture (also a silent no-op on a missing file). Call this AFTER
+            the write is fully complete -- including, for an atomic
+            write-temp-then-``os.replace`` sequence
+            (:func:`cpsb.compose_psd._atomic_save`), after the replace, on
+            the real final destination path, never the temp path.
+        """
+        resolved = path.resolve()
+        try:
+            stat = resolved.stat()
+        except OSError:
+            return
+        with self._lock:
+            # Pop-then-reinsert (rather than a plain dict assignment) so a
+            # re-recorded path moves to the END of iteration order -- see
+            # this method's own docstring on why that matters for eviction.
+            self._own_writes.pop(resolved, None)
+            self._own_writes[resolved] = (stat.st_size, stat.st_mtime_ns)
+            if len(self._own_writes) > _OWN_WRITE_REGISTRY_MAX:
+                oldest = next(iter(self._own_writes))
+                del self._own_writes[oldest]
+
+    def is_own_write(self, path: Path, size: int, mtime_ns: int) -> bool:
+        """Whether *path*'s current stat still matches our own last recorded write to it.
+
+        Resolves *path* the same way :meth:`record_own_write` resolves its
+        own -- the only caller (:class:`cpsb.watcher.CpsbWatcher`'s
+        ``_settle``) passes whatever ``pathlib.Path`` the raw filesystem
+        event carried, which must resolve identically on both sides for a
+        symlinked managed folder (or ``edit_in_place`` target) to suppress
+        correctly.
+        """
+        resolved = path.resolve()
+        with self._lock:
+            return self._own_writes.get(resolved) == (size, mtime_ns)
+
+    def note_source_written(self, handoff_id: str) -> None:
+        """Record that this package just wrote *handoff_id*'s managed PSD copy.
+
+        A thin wrapper over :meth:`record_own_write` -- kept as its own
+        named method because it is this package's oldest and most common
+        call pattern (5 call sites: every node/route that creates a handoff
+        and immediately writes its managed copy, PROTOCOL.md §3) and because
+        resolving "the path" from just a handoff id (via :meth:`psd_path`)
+        is a genuine convenience those call sites shouldn't each have to
+        repeat. The PRIMITIVE both this method and every other write site in
+        this package now share is :meth:`record_own_write` -- see its own
+        docstring for why the underlying registry is path-keyed rather than
+        handoff-id-keyed. A no-op if *handoff_id* is unknown (nothing to
+        resolve a path from) -- not expected in practice, since every real
+        caller only invokes this right after its own :meth:`create` call for
+        the same id.
         """
         meta = self.get(handoff_id)
         if meta is None:
             return
-        path = self.psd_path(meta)
-        try:
-            stat = path.stat()
-        except OSError:
-            return
-        with self._lock:
-            self._own_source_writes[handoff_id] = (stat.st_size, stat.st_mtime_ns)
-
-    def is_own_source_write(self, handoff_id: str, size: int, mtime_ns: int) -> bool:
-        """Whether the managed PSD copy's current stat still matches our own last write."""
-        with self._lock:
-            return self._own_source_writes.get(handoff_id) == (size, mtime_ns)
+        self.record_own_write(self.psd_path(meta))
 
     # -- state transitions -------------------------------------------------
 
