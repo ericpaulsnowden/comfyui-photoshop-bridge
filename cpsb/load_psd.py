@@ -1,10 +1,11 @@
 """The ``PhotoshopLoadPSD`` ComfyUI node (PROTOCOL.md §6b).
 
-Lets a workflow START from a ``.psd``/``.psb`` file (or, since 2026-07-19,
-TIFF/``.ai``/camera-raw -- Eric's ask: "I asked for file support beyond
-psd... especially dng, tiff and ai", answered by broadening this ONE node's
-accepted formats rather than adding new nodes, per this project's
-reduce-custom-nodes ethos) living in ComfyUI's ``input/`` directory instead
+Lets a workflow START from a ``.psd``/``.psb`` file (or, since 2026-07-19, a
+``.tif``/``.tiff`` -- Eric's ask: "I asked for file support beyond psd...
+especially dng, tiff and ai", answered for TIFF by broadening this ONE node's
+accepted formats; ``.ai``/camera-raw instead open through Photoshop itself via
+a Tier-2 "Open via Photoshop" node, no third-party decoder) living in
+ComfyUI's ``input/`` directory instead
 of a flat raster image: the ``psd`` COMBO input lists those files, mirroring
 ``LoadImage.INPUT_TYPES`` -- verified against ComfyUI's real source
 (``comfyanonymous/ComfyUI``, ``nodes.py``, current ``master``, fetched
@@ -41,12 +42,12 @@ flat rasters with no layers/handoff-round-trip concept -- decoding one is a
 single :func:`cpsb.raster_io.decode_to_rgb8` call rather than
 :func:`cpsb.psd_io.read_edited_psd`'s composite/recomposite machinery (see
 :meth:`PhotoshopLoadPSD.execute`'s dispatch). TIFF ships unconditionally (no
-new dependency: Pillow already reads it); ``.ai``/camera-raw are each gated
-on an OPTIONAL library (``pypdfium2``/``rawpy`` respectively) being
-importable, so this node's combo never offers a format this interpreter
-can't actually decode, and a missing library never surfaces as a raw
-``ImportError`` -- see :mod:`cpsb.raster_io`'s own module docstring for the
-full feasibility assessment and verification notes. The PROTOCOL.md §6b
+new dependency: Pillow already reads it). ``.ai``/camera-raw are NOT decoded
+here -- Photoshop opens them natively, so they moved to a Tier-2 "Open via
+Photoshop" node
+(``docs/roadmap/ps-external-decode.md``) rather than pulling third-party
+decoders (``pypdfium2``/``rawpy``) into this pack -- see
+:mod:`cpsb.raster_io`'s own module docstring. The PROTOCOL.md §6b
 ``edit_original`` option is NOT extended to these formats here: whether
 "edit the original file in place" is even meaningful is a frontend
 (``web/cpsb``) and ``/cpsb/open`` (``cpsb.routes``) decision, both out of
@@ -112,9 +113,9 @@ def _accepted_extensions() -> tuple[str, ...]:
 
     :data:`PSD_EXTENSIONS` (handled via :func:`cpsb.psd_io.read_edited_psd`,
     with the full handoff/round-trip machinery) plus whatever
-    :func:`cpsb.raster_io.available_extensions` can decode on THIS
-    interpreter right now (TIFF unconditionally; ``.ai``/raw only when their
-    optional library actually imports) -- so the combo never lists, and
+    :func:`cpsb.raster_io.available_extensions` can decode (just TIFF -- no
+    optional library; ``.ai``/raw moved to the Tier-2 "Open via Photoshop"
+    node) -- so the combo never lists, and
     ``VALIDATE_INPUTS`` never accepts, a file type that would error on
     selection (PROTOCOL.md-adjacent product requirement, 2026-07-19: "I
     asked for file support beyond psd"). Shared by :func:`_list_psd_files`
@@ -173,10 +174,9 @@ def _list_psd_files(input_dir: Path) -> list[str]:
     Despite the name (kept for minimal diff against this function's
     long-standing PSD-only history -- every call site/test already spells it
     this way), this now lists every extension :func:`_accepted_extensions`
-    covers: PSD-native (``.psd``/``.psb``) plus TIFF/``.ai``/raw, whichever
-    of the latter group's optional dependencies actually import on this
-    interpreter (2026-07-19 product ask: "I asked for file support beyond
-    psd... especially dng, tiff and ai"). Non-recursive, matching
+    covers: PSD-native (``.psd``/``.psb``) plus TIFF (2026-07-19 product ask:
+    "I asked for file support beyond psd... especially dng, tiff and ai" --
+    TIFF here; ``.ai``/raw via the Tier-2 node). Non-recursive, matching
     ``LoadImage.INPUT_TYPES``'s own flat directory listing (see this
     module's docstring) -- a file nested in a subfolder is not offered, the
     same as an image would not be.

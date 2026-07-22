@@ -75,8 +75,15 @@ import * as ui from './ui.js'
  */
 export const LOAD_PSD_NODE_TYPE = 'PhotoshopLoadPSD'
 
-/** Extensions this widget accepts (PROTOCOL.md §6b). */
-const ACCEPTED_EXTENSIONS = ['.psd', '.psb']
+/**
+ * Extensions this widget accepts (PROTOCOL.md §6b). PSD-native plus TIFF --
+ * every format `cpsb.load_psd._accepted_extensions()` can decode with no
+ * optional dependency (TIFF rides Pillow, already a hard dep). Kept in lockstep
+ * with that backend set: `.ai`/raw are deliberately NOT here -- they are not
+ * decoded in-process at all anymore (removed with pypdfium2/rawpy) and instead
+ * belong to the separate Tier-2 "Open via Photoshop" node.
+ */
+const ACCEPTED_EXTENSIONS = ['.psd', '.psb', '.tif', '.tiff']
 
 /** `<input type="file" accept="...">` value, comma-joined per the HTML spec. */
 const ACCEPT_ATTR = ACCEPTED_EXTENSIONS.join(',')
@@ -215,8 +222,8 @@ async function ingestFile(node, psdWidget, uploadWidget, file) {
   if (!hasAcceptedExtension(file.name)) {
     ui.showToast({
       severity: 'error',
-      summary: 'Not a PSD/PSB file',
-      detail: `"${file.name}" — only .psd and .psb files are accepted.`
+      summary: 'Unsupported file type',
+      detail: `"${file.name}" — Load PSD accepts .psd, .psb, .tif, and .tiff files.`
     })
     return
   }
@@ -608,7 +615,7 @@ export function attachUploadWidget(node) {
     // which node-rendering mode (canvas vs. Vue) is active.
     { serialize: false, canvasOnly: true }
   )
-  uploadWidget.label = 'Choose PSD to upload'
+  uploadWidget.label = 'Upload Photoshop File'
 
   installDragAndDrop(node, onFile)
 }

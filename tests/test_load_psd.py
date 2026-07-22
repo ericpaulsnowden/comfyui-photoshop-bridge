@@ -334,14 +334,11 @@ class TestListPsdFiles:
 
 
 class TestBroadenedFormatsListing:
-    """2026-07-19: "I asked for file support beyond psd... especially dng,
-    tiff and ai" -- the combo/``VALIDATE_INPUTS`` accept-list broadens to
-    :func:`load_psd_module._accepted_extensions` (PSD-native plus whatever
-    :func:`cpsb.raster_io.available_extensions` currently covers). ``.ai``/
-    raw availability is monkeypatched deterministically here (rather than
-    relying on whether ``pypdfium2``/``rawpy`` happen to be installed in
-    whatever environment runs this suite) so these tests pass the same way
-    regardless.
+    """The combo/``VALIDATE_INPUTS`` accept-list is PSD-native plus TIFF
+    (:func:`load_psd_module._accepted_extensions` /
+    :func:`cpsb.raster_io.available_extensions`). ``.ai``/raw are NOT here --
+    they moved to the Tier-2 "Open via Photoshop" node, so Load PSD needs no
+    optional decoder and this listing is deterministic with no monkeypatching.
     """
 
     def test_tiff_always_listed_no_dependency_needed(self, tmp_path):
@@ -356,30 +353,6 @@ class TestBroadenedFormatsListing:
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
         assert spec["required"]["psd"] == (["one.psd", "photo.tif"],)
 
-    def test_ai_excluded_when_pypdfium2_unavailable(self, context, configured, monkeypatch):
-        monkeypatch.setattr(load_psd_module.raster_io, "pypdfium2_available", lambda: False)
-        (context.input_dir / "art.ai").write_bytes(b"x")
-        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["psd"] == ([],)
-
-    def test_ai_included_when_pypdfium2_available(self, context, configured, monkeypatch):
-        monkeypatch.setattr(load_psd_module.raster_io, "pypdfium2_available", lambda: True)
-        (context.input_dir / "art.ai").write_bytes(b"x")
-        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["psd"] == (["art.ai"],)
-
-    def test_raw_excluded_when_rawpy_unavailable(self, context, configured, monkeypatch):
-        monkeypatch.setattr(load_psd_module.raster_io, "rawpy_available", lambda: False)
-        (context.input_dir / "shot.dng").write_bytes(b"x")
-        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["psd"] == ([],)
-
-    def test_raw_included_when_rawpy_available(self, context, configured, monkeypatch):
-        monkeypatch.setattr(load_psd_module.raster_io, "rawpy_available", lambda: True)
-        (context.input_dir / "shot.dng").write_bytes(b"x")
-        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["psd"] == (["shot.dng"],)
-
 
 class TestBroadenedFormatsValidateInputs:
     def test_accepts_tiff(self, context, configured):
@@ -391,17 +364,6 @@ class TestBroadenedFormatsValidateInputs:
         result = load_psd_module.PhotoshopLoadPSD.VALIDATE_INPUTS("ok.bmp")
         assert result is not True
         assert isinstance(result, str)
-
-    def test_rejects_ai_when_pypdfium2_unavailable(self, context, configured, monkeypatch):
-        monkeypatch.setattr(load_psd_module.raster_io, "pypdfium2_available", lambda: False)
-        (context.input_dir / "art.ai").write_bytes(b"x")
-        result = load_psd_module.PhotoshopLoadPSD.VALIDATE_INPUTS("art.ai")
-        assert result is not True
-
-    def test_accepts_ai_when_pypdfium2_available(self, context, configured, monkeypatch):
-        monkeypatch.setattr(load_psd_module.raster_io, "pypdfium2_available", lambda: True)
-        (context.input_dir / "art.ai").write_bytes(b"x")
-        assert load_psd_module.PhotoshopLoadPSD.VALIDATE_INPUTS("art.ai") is True
 
 
 class TestResolvePsdPath:
@@ -621,26 +583,6 @@ class TestExecuteBroadenedFormats:
         assert pixels.shape == (8, 12, 3)
         assert tuple(pixels[0, 0]) == (40, 80, 120)
         assert mask_tensor.shape == (1, 8, 12)  # no alpha in a plain RGB TIFF -> zeros mask
-
-    def test_execute_missing_ai_dependency_raises_actionable_error(
-        self, context, manager, configured, monkeypatch
-    ):
-        monkeypatch.setattr(load_psd_module.raster_io, "_optional_module", lambda name: None)
-        (context.input_dir / "art.ai").write_bytes(b"%PDF-1.4\nnot a full pdf")
-
-        node = load_psd_module.PhotoshopLoadPSD()
-        with pytest.raises(RuntimeError, match="pypdfium2"):
-            node.execute(psd="art.ai", unique_id="1")
-
-    def test_execute_missing_raw_dependency_raises_actionable_error(
-        self, context, manager, configured, monkeypatch
-    ):
-        monkeypatch.setattr(load_psd_module.raster_io, "_optional_module", lambda name: None)
-        (context.input_dir / "shot.dng").write_bytes(b"not a real dng")
-
-        node = load_psd_module.PhotoshopLoadPSD()
-        with pytest.raises(RuntimeError, match="rawpy"):
-            node.execute(psd="shot.dng", unique_id="1")
 
 
 class TestExecuteMaskChain:

@@ -4,13 +4,7 @@ psd-tools>=1.9.24
 pillow>=10.3.0
 numpy
 
-# --- Optional, format-specific decoders (cpsb/raster_io.py) ----------------
-# TIFF needs nothing extra (Pillow, above, already reads it). These two are
-# soft-imported: the pack imports and every existing behavior works with
-# both absent. Only needed if a user actually selects that file type in the
-# Load PSD node's combo -- install by hand, per format, as needed. (No
-# pyproject.toml extras group for these: this repo's pyproject.toml is out
-# of scope for the change that added this section.)
-#   pip install pypdfium2   # .ai (Illustrator's embedded PDF stream)
-#   pip install rawpy       # .dng and other camera-raw formats (needs LibRaw;
-#                            # ships as a prebuilt wheel, no system install)
+# No optional decoders: Load PSD reads .psd/.psb/.tif/.tiff with the above
+# alone. Illustrator .ai and camera raw/.dng are opened by Photoshop itself
+# (a Tier-2 "Open via Photoshop" node, no third-party lib) -- see
+# docs/roadmap/ps-external-decode.md.

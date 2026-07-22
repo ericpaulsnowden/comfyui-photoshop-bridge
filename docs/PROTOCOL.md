@@ -581,19 +581,17 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `pasteback.js`'s constants). `tests/test_load_psd.py`'s drift guard asserts all four
   agree, reading the JS as text — rewording one in isolation would otherwise silently stop
   a policy being honored, with no type error anywhere.
-- **Non-PSD formats** (v0.5.32, `cpsb/raster_io.py`): the node's file combo and
-  `VALIDATE_INPUTS` also accept `.tif`/`.tiff` (Pillow, no dependency) and — when the
-  optional decoder is importable — `.ai` (`pypdfium2`, renders the embedded PDF page 0) and
-  `.dng` + camera raw `.cr2/.cr3/.nef/.arw/.orf/.rw2/.raf` (`rawpy`/LibRaw, demosaic). The
-  combo lists a format ONLY if its decoder imports, so a missing optional lib means the
-  format is simply absent, never a broken entry. `execute()` dispatches `.psd`/`.psb` to
-  `read_edited_psd` and everything else to `raster_io.decode_to_rgb8` (returns one PIL
-  image, alpha in the mode — the pack's convention; reuses `psd_io.normalize_to_rgb8` for
+- **Non-PSD formats** (`cpsb/raster_io.py`): the node's file combo and `VALIDATE_INPUTS`
+  also accept `.tif`/`.tiff` (Pillow, no dependency). `execute()` dispatches `.psd`/`.psb`
+  to `read_edited_psd` and TIFF to `raster_io.decode_to_rgb8` (returns one PIL image, alpha
+  in the mode — the pack's convention; reuses `psd_io.normalize_to_rgb8` for
   16-bit/CMYK/grayscale, plus a 16-bit-grayscale scale fix Pillow doesn't do itself).
-  `edit_original` stays PSD/TIFF-only (`raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS`) — you
-  can't round-trip a raw or `.ai` back. NB: the `/cpsb/open` `_PSD_NATIVE_EXTENSIONS` gate
-  is unchanged, so "Open in Photoshop" for a loaded `.tif` is a follow-up (read/decode is
-  wired; the open-native path is not yet).
+  `edit_original` stays PSD/TIFF-only (`raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS`).
+  Illustrator `.ai` and camera raw/`.dng` are NOT decoded in-process (v0.5.40 removed the
+  optional `pypdfium2`/`rawpy` path — the pack bundles no third-party decoders); Photoshop
+  opens them natively, so they belong to a dedicated Tier-2 "Open via Photoshop" node — see
+  `docs/roadmap/ps-external-decode.md`. NB: the `/cpsb/open` `_PSD_NATIVE_EXTENSIONS` gate
+  is unchanged, so "Open in Photoshop" for a loaded `.tif` is still a follow-up.
 - Frontend: the node type is allowlisted in `captureImageUploadType`'s detection (its
   hand-rolled widget bypasses the stock `image_upload` spec flag), and its context-menu
   origin_kind derives as `load_psd`.
