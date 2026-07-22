@@ -1288,6 +1288,31 @@ class TestWaitForFirstSaveBlocking:
             mask=None,
         )
         assert manager.find_active_for_node("93") is None
+
+    def test_unrecognized_mode_passes_through_without_handoff_but_warns(
+        self, node, manager, launches, caplog
+    ):
+        # A stale/garbled mode string (e.g. a workflow saved before the
+        # v0.5.30 annotate_mode->mode rename, whose old value ComfyUI cannot
+        # carry to the new widget so it sits at its PASS_THROUGH default) must
+        # behave like Pass-through -- input returned untouched, no handoff,
+        # Photoshop never opened -- but LOUDLY. The old silent fall-through
+        # read exactly like a broken "Wait for first save that does nothing".
+        tensor = make_tensor(RED)
+        with caplog.at_level(logging.WARNING, logger="cpsb"):
+            result = node.execute(
+                image=tensor,
+                instruction="hello",
+                mode="Open in Photoshop (mask from edits)",  # a genuine pre-v0.5.30 value
+                box_composite=False,
+                timeout_seconds=60,
+                unique_id="94",
+                mask=None,
+            )
+        assert result[0] is tensor  # passed through verbatim, never re-encoded
+        assert result[2] == "hello"
+        assert manager.find_active_for_node("94") is None  # never created/opened a handoff
+        assert any("unrecognized mode" in record.message for record in caplog.records)
         assert len(launches) == 0
 
     def test_open_seam_invoked_with_diagnosable_log_trail(self, node, manager, launches, caplog):
@@ -1739,6 +1764,46 @@ class TestIsChanged:
             unique_id=node_id,
         )
         assert before != after
+
+    def test_unrecognized_mode_does_not_fold_in_edit_hash(self, configured, manager):
+        # Symmetric with execute(): an unrecognized mode string consumes no
+        # edit, so an arriving edit must NOT change IS_CHANGED for it -- it
+        # returns its own base hash, never folding the edit in, exactly like
+        # Pass-through (test_pass_through_never_folds...). The prior
+        # `!= PASS_THROUGH` gate DID fold it, so an unrecognized/stale mode
+        # made the node re-fire on every save yet execute() never surfaced the
+        # edit -- one half of the "workflow never advances" P0.
+        node_id = "109"
+        source = Image.new("RGB", (24, 16), (0, 0, 0))
+        meta = manager.create(
+            origin_node_id=node_id,
+            origin_kind="bridge_node",
+            workflow_name="",
+            source=SourceRef(filename="x.png", subfolder="", type="temp"),
+            original_image=source,
+        )
+        tensor = tensor_from_image(source)
+        mode = "Open in Photoshop (mask from edits)"  # a genuine pre-v0.5.30 value
+        before = annotate_module.PhotoshopAnnotate.IS_CHANGED(
+            image=tensor,
+            instruction="",
+            mode=mode,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+        )
+        edit = source.copy()
+        edit.putpixel((1, 1), (255, 255, 255))
+        manager.ingest_edit(meta.handoff_id, edit, "plugin")
+        after = annotate_module.PhotoshopAnnotate.IS_CHANGED(
+            image=tensor,
+            instruction="",
+            mode=mode,
+            box_composite=False,
+            timeout_seconds=1800,
+            unique_id=node_id,
+        )
+        assert before == after  # never folds the edit, unlike WAIT/RERUN above
 
     def test_unconfigured_raises_in_ps_mode(self):
         assert nodes_module._state is None

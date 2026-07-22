@@ -941,7 +941,14 @@ class PhotoshopAnnotate:
         params_blob = f"{instruction}|{mode}|{bool(box_composite)}|{mask is not None}"
         base = hashlib.sha256(f"{image_hash}:{params_blob}".encode()).hexdigest()
 
-        if mode == AnnotateMode.PASS_THROUGH:
+        # Fold the edit hash ONLY for the two PS-touching modes -- symmetric
+        # with execute(), which consumes an edit only in those two branches
+        # and treats every other value (PASS_THROUGH or an unrecognized/stale
+        # string) as pass-through. Gating on `!= PASS_THROUGH` instead would
+        # make an unrecognized mode fold in an edit hash here that execute()
+        # never actually consumes, so the node would re-fire on every save
+        # yet never surface the edit.
+        if mode not in (AnnotateMode.WAIT_FIRST_SAVE, AnnotateMode.RERUN_EVERY_SAVE):
             return base
 
         manager = nodes._require_state().manager
@@ -1006,6 +1013,23 @@ class PhotoshopAnnotate:
         elif mode == AnnotateMode.RERUN_EVERY_SAVE:
             consumed = _resolve_rerun_edit(state, node_id, pil_image, source_hash)
         else:
+            if mode != AnnotateMode.PASS_THROUGH:
+                # An unrecognized mode string used to fall silently to
+                # pass-through -- no open, no wait, no log -- which reads
+                # exactly like "Wait for first save does nothing". The most
+                # common cause is a workflow saved before the v0.5.30
+                # annotate_mode->mode rename (see the class docstring's
+                # BREAKING CHANGE note): ComfyUI cannot carry the old value
+                # over, so the widget silently sits at its PASS_THROUGH
+                # default. Make that loud instead of mysterious.
+                logger.warning(
+                    "cpsb annotate: node %s: unrecognized mode %r -- treating as %r. "
+                    "Re-select the node's mode widget (a workflow saved before v0.5.30 "
+                    "does not migrate its old mode value).",
+                    node_id,
+                    mode,
+                    AnnotateMode.PASS_THROUGH,
+                )
             consumed = None  # Pass-through: never looks up a handoff at all.
 
         if consumed is None:

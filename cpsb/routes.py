@@ -722,6 +722,50 @@ class OpenAttempt:
     error: str | None = None
 
 
+#: Grace period before :func:`_warn_if_tier2_open_unconfirmed` complains that a
+#: Tier-2 ``open_handoff`` was never confirmed. Deliberately generous: a large
+#: layered PSD, or a REMOTE-mode plugin downloading the bytes over the
+#: websocket first, can legitimately take many seconds to open before the
+#: plugin replies ``opened``. The warning is diagnostic only (never changes
+#: status), so erring long simply avoids a premature, misleading complaint on a
+#: slow-but-healthy open.
+_TIER2_OPEN_CONFIRM_GRACE_SECONDS = 30.0
+
+#: Strong references to fire-and-forget background tasks (the Tier-2 open
+#: watchdog below), so the event loop's own weak references don't let them be
+#: garbage-collected mid-flight (asyncio docs / ruff RUF006). Each task removes
+#: itself on completion.
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+async def _warn_if_tier2_open_unconfirmed(manager: HandoffManager, handoff_id: str) -> None:
+    """Log a WARNING if a Tier-2 ``open_handoff`` never gets an ``opened``/``open_failed`` reply.
+
+    The Tier-2 open is fire-and-forget (:func:`open_in_photoshop`): it returns
+    the instant the command is on the wire, and a blocking node then sits in
+    :meth:`cpsb.handoff.HandoffManager.wait_for_edit` for up to its
+    ``timeout_seconds``. A healthy open moves the handoff to ``editing`` (on the
+    plugin's ``opened`` reply, :func:`_handle_plugin_message`) or to a terminal
+    state (on ``open_failed``); a connected-but-wedged/backgrounded plugin that
+    processes neither leaves it at its creation-time ``pending`` -- an open that
+    is indistinguishable from a healthy in-flight one until the whole timeout
+    elapses. This turns that silent case into a diagnosable console line.
+    Non-destructive: it only reads status, never transitions the handoff, so a
+    late-but-real confirmation still works.
+    """
+    await asyncio.sleep(_TIER2_OPEN_CONFIRM_GRACE_SECONDS)
+    meta = manager.get(handoff_id)
+    if meta is not None and meta.status == "pending":
+        logger.warning(
+            "cpsb: Tier-2 open for handoff %s still unconfirmed after %.0fs -- the "
+            "plugin sent no 'opened'/'open_failed' reply. If Photoshop did not open, "
+            "its UXP plugin may be backgrounded or wedged: bring Photoshop to the "
+            "foreground (or reconnect the ComfyUI Bridge panel), then re-queue.",
+            handoff_id,
+            _TIER2_OPEN_CONFIRM_GRACE_SECONDS,
+        )
+
+
 async def open_in_photoshop(
     app: web.Application,
     context: CpsbContext,
@@ -763,6 +807,23 @@ async def open_in_photoshop(
                 "wants_layered_psd": meta.wants_layered_psd,
             }
         )
+        logger.info(
+            "cpsb: sent open_handoff for handoff %s to the Tier-2 plugin "
+            "(awaiting its 'opened' confirmation)",
+            meta.handoff_id,
+        )
+        # Fire-and-forget open (see this function's own docstring): a
+        # connected-but-wedged/backgrounded plugin can silently never process
+        # this, leaving a blocking node (annotate/action "Wait for first
+        # save") in wait_for_edit for the full timeout with no error and
+        # nothing open. This watchdog makes that case loud in the console;
+        # it never changes the handoff's status, so a merely slow-but-healthy
+        # open still works normally.
+        _watchdog = asyncio.create_task(
+            _warn_if_tier2_open_unconfirmed(manager, meta.handoff_id)
+        )
+        _BACKGROUND_TASKS.add(_watchdog)
+        _watchdog.add_done_callback(_BACKGROUND_TASKS.discard)
         return OpenAttempt(tier=2, ok=True)
 
     # launch_photoshop chains blocking subprocess calls (worst case several
