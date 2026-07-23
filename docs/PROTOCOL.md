@@ -88,7 +88,7 @@ case; it is not a separate mechanism.
 {
   "handoff_id": "a1b2c3d4",
   "origin_node_id": "17",
-  "origin_kind": "load_image" | "terminal_output" | "bridge_node" | "load_psd",
+  "origin_kind": "load_image" | "terminal_output" | "bridge_node" | "load_psd" | "manual_send",
   "workflow_name": "my-workflow",
   "source_hash": "<sha256 hex of the original image's normalized PNG encoding>",
   "source": {"filename": "ComfyUI_00042_.png", "subfolder": "", "type": "output"},
@@ -336,6 +336,23 @@ Plugin → server:
   below for how chunks are produced/reassembled. Server replies `upload_ok` once every
   chunk `0..total-1` has arrived and the reassembled bytes decode and ingest cleanly, or
   `upload_error` otherwise.
+- `{"type": "manual_push", "push_id": "...", "seq": 0, "total": 3, "data_b64": "...",
+  "title": "Background (layer)"}` — "send a layer/document to ComfyUI" (2026-07-23), the
+  reverse of every other round trip: the plugin initiates, with no ComfyUI node or
+  existing handoff behind it at all. Chunking is identical to `upload_edit` (see below),
+  but keyed by a PLUGIN-generated `push_id` instead of a `handoff_id` — none exists yet,
+  since THIS transfer is what creates one. `title` is sent on every chunk (same
+  self-contained-frame convention as `upload_edit`'s `fidelity`) but only read once, from
+  the first chunk; it becomes the new handoff's `source.filename`, which the gallery
+  shows as the card's title (`web/cpsb/gallery.js`) since a pushed card has no workflow.
+  Once reassembled, the server creates a fresh handoff (`origin_kind: "manual_send"`,
+  `origin_node_id` synthesized as `ps-push:<push_id>` — unique, never matches a real
+  ComfyUI node id, so Reveal simply never shows for these cards, same as any other
+  node-less handoff), writes a normal flat managed PSD copy, and ingests the SAME pushed
+  image as the handoff's first edit — it arrives already `edited`, ready for **Add**.
+  Replies `manual_push_ok` (`{"push_id", "handoff_id"}`, the new id) or
+  `manual_push_error` (`{"push_id", "error"}`) — an invalid/malformed transfer never
+  creates a handoff at all.
 - `{"type": "pong"}`
 
 Server → plugin:
@@ -366,8 +383,9 @@ Server → plugin:
 - `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
   the socket (plugin reconnects with backoff).
 
-**File transfer chunking (`request_file`/`file_chunk` and `upload_edit`):** both
-directions use the identical scheme. The sender base64-encodes the ENTIRE file ONCE,
+**File transfer chunking (`request_file`/`file_chunk`, `upload_edit`, and
+`manual_push`):** all three use the identical scheme. The sender base64-encodes the
+ENTIRE file ONCE,
 then slices that single string into fixed-size pieces (~700,000 characters, comfortably
 inside a "~512KB–1MB base64 chunk" target) sent as successive frames carrying the same
 `handoff_id`, an increasing `seq` starting at 0, and a constant `total` (chunk count).
@@ -411,6 +429,43 @@ network, i.e. started with `--listen`.
   batchPlay guess — the typed setter with a documented enum value; worst-case failure is a
   caught exception, never corrupted unrelated prefs. Live-validation on real Photoshop is
   the remaining open part of spike 8.
+
+- **"Send to ComfyUI"** (`photoshop_plugin/manualSend.js`, manifest.json's `sendToComfyUI`
+  command, top-level Plugins menu — owner ask 2026-07-23: "there should be a way to send a
+  layer or send a file to ComfyUI"). The reverse of every other round trip in this doc: the
+  PLUGIN initiates, with no ComfyUI node or existing handoff behind it at all, and no Tier-1
+  equivalent (Tier 2 required — there is nothing for this to fall back to). No native
+  Photoshop layer/document context-menu entry exists to hook (confirmed absent by Adobe
+  staff on the Creative Cloud Developer Forums), so the top-level Plugins menu is the
+  correct trigger surface. Firing the command shows a native `<dialog>`/`uxpShowModal()`
+  picker (confirmed working from a bare command context with no panel open) offering
+  **Active Layer** or **Whole Document**:
+  - Whole document reuses `exporter.js`'s existing `runExport()` VERBATIM (duplicate +
+    flatten + export + close, already spike-6-proven) — no new export code for this branch.
+  - Active layer isolates the topmost of the current selection (`Document.activeLayers[0]`)
+    into a fresh same-size document (`app.createDocument` + `Layer.duplicate(destDoc)`),
+    trims it to its own non-transparent bounds (`Document.trim(constants.TrimType.
+    TRANSPARENT, ...)`), then exports via the SAME batchPlay/Imaging pair as the whole-
+    document path (`exporter.js`'s `exportFlattenedDocument`, factored out of `runExport`
+    for this reuse). **Known, honest, unverified risk needing a live-Photoshop check** (the
+    same spike-gated posture every other genuinely new UXP surface in this pack takes):
+    `Layer.duplicate(destDoc)`'s pixel-offset/position behavior when `destDoc` is a FRESH
+    document is undocumented — Adobe's own reference example only covers duplicating into
+    an ALREADY-OPEN document. Worst case is a cosmetically-shifted-but-still-valid export
+    (Trim still produces a correct crop of whatever pixels actually land), never corruption.
+    **Also known: only the topmost of a multi-layer selection is sent, deliberately no
+    auto-merge** — `Layer.merge()`'s documented multi-selection behavior is reported broken
+    on the Creative Cloud Developer Forums, with no confirmed batchPlay alternative.
+
+  Either way, the exported PNG bytes go over a new chunked `manual_push` websocket message
+  (§3 above) — always over the websocket regardless of LOCAL/REMOTE mode, since (unlike an
+  edit for an existing handoff) there is no pre-arranged shared-filesystem path to write
+  onto. The server creates a fresh handoff (`origin_kind: "manual_send"`, a synthesized
+  `origin_node_id` that never matches a real graph node), writes a normal flat managed PSD
+  copy, and ingests the same pushed image as its first edit — it arrives already `edited`,
+  ready for the gallery's **Add** action. The card's title is the pushed layer/document
+  name (`source.filename`, shown by `web/cpsb/gallery.js` in place of the usual workflow
+  name, which a pushed card has none of).
 
 ---
 

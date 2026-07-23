@@ -469,6 +469,14 @@ class ConnectionManager extends EventTarget {
      * @type {Map<string, {resolve: () => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>}>}
      */
     this._pendingUploads = new Map()
+    /**
+     * In-flight `manual_push` sends awaiting a `manual_push_ok`/
+     * `manual_push_error` ack, keyed by the plugin's own `push_id` (no
+     * `handoff_id` exists until the server creates one) — "send a
+     * layer/document to ComfyUI", 2026-07-23. See {@link pushManualSendOverWs}.
+     * @type {Map<string, {resolve: (handoffId: string) => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>}>}
+     */
+    this._pendingPushes = new Map()
   }
 
   /**
@@ -569,6 +577,11 @@ class ConnectionManager extends EventTarget {
       pending.reject(new Error(reason))
     }
     this._pendingUploads.clear()
+    for (const pending of this._pendingPushes.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error(reason))
+    }
+    this._pendingPushes.clear()
   }
 
   /**
@@ -754,6 +767,16 @@ class ConnectionManager extends EventTarget {
       this._onUploadResult(errorMsg.handoff_id, errorMsg.error || 'Upload rejected', errorMsg.reason)
       return
     }
+    if (msg.type === 'manual_push_ok') {
+      const okMsg = /** @type {{push_id: string, handoff_id: string}} */ (msg)
+      this._onManualPushResult(okMsg.push_id, okMsg.handoff_id, null)
+      return
+    }
+    if (msg.type === 'manual_push_error') {
+      const errorMsg = /** @type {{push_id: string, error: string}} */ (msg)
+      this._onManualPushResult(errorMsg.push_id, null, errorMsg.error || 'Push rejected')
+      return
+    }
     // open_handoff / handoff_cancelled / anything future and unrecognized —
     // not this module's concern. handoffs.js listens for these.
     this.dispatchEvent(new CustomEvent('message', { detail: msg }))
@@ -821,6 +844,29 @@ class ConnectionManager extends EventTarget {
     const error = new Error(errorMessage)
     if (reason) /** @type {any} */ (error).reason = reason
     pending.reject(error)
+  }
+
+  /**
+   * Resolves or rejects the in-flight {@link pushManualSendOverWs} call for
+   * `pushId` (`manual_push_ok` -> resolve with the server's new
+   * `handoffId`, `manual_push_error` -> reject). A result for a `pushId`
+   * with no pending push is ignored — mirrors {@link _onUploadResult}.
+   * @param {string} pushId
+   * @param {string | null} handoffId - The new handoff id on success, `null`
+   * for `manual_push_error`.
+   * @param {string | null} errorMessage - `null` for `manual_push_ok`.
+   * @returns {void}
+   */
+  _onManualPushResult(pushId, handoffId, errorMessage) {
+    const pending = this._pendingPushes.get(pushId)
+    if (!pending) return
+    this._pendingPushes.delete(pushId)
+    clearTimeout(pending.timer)
+    if (errorMessage === null) {
+      pending.resolve(/** @type {string} */ (handoffId))
+      return
+    }
+    pending.reject(new Error(errorMessage))
   }
 
   /**
@@ -1070,6 +1116,53 @@ class ConnectionManager extends EventTarget {
             kind
           })
         )
+      }
+    })
+  }
+
+  /**
+   * Sends *bytes* as a brand-new "send a layer/document to ComfyUI" push
+   * (2026-07-23) — the reverse of every other transfer in this file: there
+   * is no existing `handoff_id` to correlate by, since this transfer is
+   * what CREATES one. Chunked identically to {@link uploadEditOverWs}
+   * (same `WS_TRANSFER_CHUNK_CHARS` split), correlated instead by *pushId*,
+   * a caller-generated id used purely for THIS transfer's own reassembly
+   * bookkeeping (server-side: `cpsb.routes._PendingPush`) — never persisted,
+   * never becomes the real handoff id. Resolves with the server's newly
+   * minted `handoff_id` on `manual_push_ok`; rejects on `manual_push_error`,
+   * timeout, or a mid-transfer disconnect (`_rejectAllPending`), mirroring
+   * every other transfer method's failure posture in this file.
+   * @param {string} pushId - Caller-generated, unique per call (a fresh
+   * random string is enough — nothing here interprets it beyond using it
+   * as a Map key both here and server-side for correlation).
+   * @param {Uint8Array} bytes
+   * @param {string} title - Becomes the new handoff's `source.filename`
+   * (`cpsb/routes.py`'s `_handle_manual_push_chunk`), which the ComfyUI
+   * gallery shows as the card's title.
+   * @returns {Promise<string>} The new `handoff_id`.
+   */
+  pushManualSendOverWs(pushId, bytes, title) {
+    if (!this._socket || this._socket.readyState !== WS_READY_STATE_OPEN) {
+      return Promise.reject(new Error('Not connected to the ComfyUI server'))
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingPushes.delete(pushId)
+        reject(new Error(`manual_push ${pushId} timed out after ${TRANSFER_TIMEOUT_MS}ms`))
+      }, TRANSFER_TIMEOUT_MS)
+      this._pendingPushes.set(pushId, { resolve, reject, timer })
+
+      const chunks = splitIntoChunks(base64Encode(bytes))
+      const total = chunks.length
+      for (let seq = 0; seq < total; seq++) {
+        this.send({
+          type: 'manual_push',
+          push_id: pushId,
+          seq,
+          total,
+          data_b64: chunks[seq],
+          title
+        })
       }
     })
   }

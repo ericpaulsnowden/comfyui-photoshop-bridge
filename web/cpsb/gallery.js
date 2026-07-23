@@ -557,7 +557,20 @@ function buildCard(meta) {
     children: [
       ui.el('span', {
         className: 'cpsb-card-title',
-        text: meta.workflow_name || 'Untitled workflow'
+        // A manual_send card (pushed FROM Photoshop, 2026-07-23) has no
+        // workflow at all -- `source.filename` carries what was actually
+        // sent instead ("Background (layer)"), which reads far better than
+        // the generic "Untitled workflow" fallback. Scoped strictly to
+        // manual_send: bridge_node/annotate/action handoffs ALSO have an
+        // empty workflow_name (their own _create_handoff always passes
+        // workflow_name="", no saved-workflow concept reaches bare node
+        // execution), but their source.filename is an internal placeholder
+        // ("annotate_17.png") that would read WORSE than "Untitled
+        // workflow" if shown here — this must not touch those.
+        text:
+          meta.workflow_name ||
+          (meta.origin_kind === 'manual_send' ? meta.source?.filename : null) ||
+          'Untitled workflow'
       }),
       buildStatusChip(meta)
     ]

@@ -34,6 +34,8 @@ Handoffs opened in Photoshop are **named after the file they came from** — `Er
 
 A **"Photoshop Edits" sidebar gallery** tracks every round trip for the workflow as a grid of cards: **Open** it again in Photoshop, **Add** it as a node, **Reveal** its origin node on the canvas, or **Remove** it from the list. Each card leads with the latest edit — hold the gallery's **"Hold to compare"** button to see every card's original at once. A card still `Editing` whose Tier-2 plugin has confirmed the document is closed shows "Closed without saving" instead of guessing from elapsed time. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
 
+**Send TO ComfyUI, starting from Photoshop.** Everything above starts from a ComfyUI node; **Plugins ▸ Send to ComfyUI** goes the other way — pick **Active Layer** or **Whole Document** in the small dialog that pops up, and it lands as a new, ready-to-use card in the sidebar gallery, no workflow or node required to receive it. Click **Add** on that card to drop it into any workflow as a Load Image node. Requires the Tier-2 plugin (there's no Tier-1 equivalent — this has no ComfyUI node to fall back to). Only the topmost layer of a multi-layer selection is sent; merge manually first if you need more than one.
+
 <!-- demo.gif -->
 *(Right-click an image → Open in Photoshop → edit → Cmd/Ctrl+S → the node updates. Demo GIF coming.)*
 

@@ -54,7 +54,7 @@ export function warn(...args) {
  */
 
 /**
- * @typedef {"load_image" | "terminal_output" | "bridge_node" | "load_psd"} CpsbOriginKind
+ * @typedef {"load_image" | "terminal_output" | "bridge_node" | "load_psd" | "manual_send"} CpsbOriginKind
  */
 
 /**

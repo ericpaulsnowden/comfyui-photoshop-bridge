@@ -2743,3 +2743,172 @@ class TestPluginWebsocketFileTransfer:
             refreshed = manager.get(handoff_id)
             assert refreshed.status == "edited"
             assert len(refreshed.edits) == 1
+
+
+class TestManualPush:
+    """`manual_push` (2026-07-23) -- "send a layer/document to ComfyUI": the
+    reverse of every other round trip, initiated by the plugin with NO
+    ComfyUI node or existing handoff behind it at all. Chunking mirrors
+    `upload_edit` exactly (see TestPluginWebsocketFileTransfer above) but
+    there is no prior `POST /cpsb/open` -- the whole point is this message
+    alone creates a brand-new handoff/gallery card.
+    """
+
+    async def test_creates_a_new_handoff_with_no_prior_open(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            payload = png_bytes((10, 20, 30))
+            chunks = b64_chunks(payload, chunk_chars=16)
+            assert len(chunks) > 1
+            for seq, chunk in enumerate(chunks):
+                await ws.send_json(
+                    {
+                        "type": "manual_push",
+                        "push_id": "push-1",
+                        "seq": seq,
+                        "total": len(chunks),
+                        "data_b64": chunk,
+                        "title": "Background (layer)",
+                    }
+                )
+
+            ack = await ws.receive_json(timeout=5)
+            assert ack["type"] == "manual_push_ok"
+            assert ack["push_id"] == "push-1"
+            handoff_id = ack["handoff_id"]
+            assert handoff_id
+
+            meta = manager.get(handoff_id)
+            assert meta is not None
+            assert meta.origin_kind == "manual_send"
+            assert meta.status == "edited"
+            assert meta.source.filename == "Background (layer)"
+            assert len(meta.edits) == 1
+            edit_path = context.cpsb_input_dir / handoff_id / meta.edits[0].filename
+            with Image.open(edit_path) as edited:
+                assert edited.getpixel((0, 0))[:3] == (10, 20, 30)
+
+    async def test_writes_a_normal_reopenable_managed_psd(self, client, context, manager):
+        """Unlike a bare bridge_node handoff, a push writes a real managed
+        PSD copy -- so Open/Re-open works on a pushed card via the exact
+        same code path every other `edited` handoff already uses, no new
+        gallery capability-gating needed."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            payload = png_bytes((1, 2, 3))
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-2",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "title": "art.psd (whole document)",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            handoff_id = ack["handoff_id"]
+            meta = manager.get(handoff_id)
+            assert manager.psd_path(meta).is_file()
+
+    async def test_origin_node_id_never_matches_a_real_graph_node(self, client, context, manager):
+        """The synthesized origin_node_id must be inert everywhere a real
+        node id is looked up -- find_active_for_node for an unrelated node
+        must not somehow match it."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-3",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((5, 5, 5))).decode("ascii"),
+                    "title": "x",
+                }
+            )
+            await ws.receive_json(timeout=5)
+
+            assert manager.find_active_for_node("17") is None
+            assert manager.find_active_for_node("") is None
+
+    async def test_default_title_when_missing(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-4",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((7, 7, 7))).decode("ascii"),
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            meta = manager.get(ack["handoff_id"])
+            assert meta.source.filename == "Sent from Photoshop"
+
+    async def test_malformed_chunk_gets_manual_push_error(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "manual_push", "push_id": "push-5", "seq": 0})
+            msg = await ws.receive_json(timeout=5)
+            assert msg == {
+                "type": "manual_push_error",
+                "push_id": "push-5",
+                "error": "Malformed manual_push chunk",
+            }
+
+    async def test_invalid_image_gets_manual_push_error_and_no_handoff(
+        self, client, context, manager
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            before = len(manager.list_all())
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-6",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(b"not an image").decode("ascii"),
+                    "title": "x",
+                }
+            )
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "manual_push_error"
+            assert msg["push_id"] == "push-6"
+            assert len(manager.list_all()) == before
+
+    async def test_appears_in_status_route(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-7",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((9, 9, 9))).decode("ascii"),
+                    "title": "pushed.png",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+
+            status = await (await client.get("/cpsb/status")).json()
+            ids = [h["handoff_id"] for h in status["handoffs"]]
+            assert ack["handoff_id"] in ids

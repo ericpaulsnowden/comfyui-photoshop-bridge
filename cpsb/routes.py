@@ -146,6 +146,24 @@ class _PendingUpload:
 
 
 @dataclass
+class _PendingPush:
+    """In-progress `manual_push` reassembly state for ONE Photoshop-initiated
+    send (gallery overhaul, "send a layer/document to ComfyUI", 2026-07-23).
+
+    Keyed by a PLUGIN-generated `push_id`, not a `handoff_id` -- there is no
+    handoff yet; this transfer is what CREATES one, once fully reassembled.
+    `title` is captured from the first chunk (mirrors `_PendingUpload.kind`'s
+    identical "read once, trust it" convention) and becomes the new handoff's
+    `source.filename`, so the gallery card is labeled with whatever the user
+    was sending ("Background (layer)", "MyDocument.psd (whole document)")
+    rather than a generic placeholder.
+    """
+
+    title: str
+    chunks: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PluginConnection:
     """State for the single active UXP plugin websocket connection (PROTOCOL.md §3)."""
 
@@ -163,6 +181,11 @@ class PluginConnection:
     #: socket -- the plugin simply restarts that upload's chunks from seq 0
     #: over the new connection.
     pending_uploads: dict[str, _PendingUpload] = field(default_factory=dict)
+    #: In-progress `manual_push` reassembly buffers, keyed by the plugin's own
+    #: `push_id` (see :class:`_PendingPush`) -- the "send a layer/document to
+    #: ComfyUI" feature, 2026-07-23. Same reconnect-restarts-cleanly posture
+    #: as `pending_uploads`.
+    pending_pushes: dict[str, _PendingPush] = field(default_factory=dict)
 
 
 class _PluginSlot:
@@ -1932,6 +1955,105 @@ async def _handle_upload_edit_chunk(
     await _finish_upload_edit_ack(connection, manager, handoff_id, edit)
 
 
+async def _handle_manual_push_chunk(
+    manager: HandoffManager, connection: PluginConnection, msg: dict[str, Any]
+) -> None:
+    """Handle one `manual_push` chunk -- "send a layer/document to ComfyUI"
+    (2026-07-23), the reverse of every other round trip in this pack: the
+    plugin initiates, with no ComfyUI node or existing handoff behind it at
+    all. Mirrors `_handle_upload_edit_chunk`'s exact chunking/reassembly
+    shape (:class:`_PendingUpload` vs :class:`_PendingPush`, `connection.
+    pending_uploads` vs `connection.pending_pushes`) but keyed by the
+    plugin's own `push_id` instead of a `handoff_id`, since none exists until
+    THIS transfer creates one.
+
+    Once reassembled: decodes the PNG, creates a fresh handoff
+    (`origin_kind="manual_send"`, `origin_node_id` synthesized as
+    `f"ps-push:{push_id}"` -- unique, and never collides with a real
+    ComfyUI node id, so every existing `origin_node_id`-keyed lookup
+    -- `find_active_for_node`, the gallery's Reveal-button-only-if-
+    `getNodeByIdFlexible`-finds-a-real-node gate -- simply never matches it,
+    exactly like a graph-less bridge_node handoff already behaves), writes a
+    normal FLAT managed PSD copy (the pushed image IS both "the original"
+    and, immediately, "the edit" -- there is no separate before/after here),
+    then ingests that same image as the handoff's first edit so the card
+    shows up already `edited` and ready for Add. Writing a real managed PSD
+    (not skipping it) is deliberate: it costs nothing extra and means Open/
+    Re-open also just works on a pushed card, via the exact same code path
+    every other `edited` handoff already uses -- no new capability-gating
+    needed in the gallery.
+
+    Replies `manual_push_ok`/`manual_push_error` (mirroring `upload_ok`/
+    `upload_error`'s shape) keyed by `push_id`, carrying the new
+    `handoff_id` on success so the plugin can log/toast it if useful --
+    the plugin does not need to track it further.
+    """
+    push_id = msg.get("push_id")
+    seq = msg.get("seq")
+    total = msg.get("total")
+    data_b64 = msg.get("data_b64")
+    title = msg.get("title") or "Sent from Photoshop"
+    if not push_id:
+        logger.warning("cpsb plugin sent manual_push with no push_id, ignoring")
+        return
+    if not isinstance(seq, int) or not isinstance(total, int) or total < 1 or data_b64 is None:
+        logger.warning("cpsb plugin sent a malformed manual_push chunk for %s, ignoring", push_id)
+        connection.pending_pushes.pop(push_id, None)
+        await connection.ws.send_json(
+            {
+                "type": "manual_push_error",
+                "push_id": push_id,
+                "error": "Malformed manual_push chunk",
+            }
+        )
+        return
+
+    pending = connection.pending_pushes.setdefault(push_id, _PendingPush(title=title))
+    pending.chunks.append(data_b64)
+    if len(pending.chunks) < total:
+        return  # More chunks still to come.
+
+    pending = connection.pending_pushes.pop(push_id)
+    try:
+        raw_bytes = base64.b64decode("".join(pending.chunks), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        await connection.ws.send_json(
+            {"type": "manual_push_error", "push_id": push_id, "error": f"Invalid base64: {exc}"}
+        )
+        return
+
+    try:
+        image = Image.open(io.BytesIO(raw_bytes))
+        image.load()
+    except (OSError, ValueError) as exc:
+        await connection.ws.send_json(
+            {"type": "manual_push_error", "push_id": push_id, "error": f"Invalid image data: {exc}"}
+        )
+        return
+
+    meta = manager.create(
+        origin_node_id=f"ps-push:{push_id}",
+        origin_kind="manual_send",
+        workflow_name="",
+        source=SourceRef(filename=pending.title, subfolder="", type="temp"),
+        original_image=image,
+    )
+    psd_path = manager.psd_path(meta)
+    write_psd(psd_path, image)
+    manager.note_source_written(meta.handoff_id)
+    manager.ingest_edit(meta.handoff_id, image, "plugin")
+
+    logger.info(
+        "cpsb: created handoff %s from Photoshop-initiated push %r (push_id %s)",
+        meta.handoff_id,
+        pending.title,
+        push_id,
+    )
+    await connection.ws.send_json(
+        {"type": "manual_push_ok", "push_id": push_id, "handoff_id": meta.handoff_id}
+    )
+
+
 async def _handle_plugin_message(
     context: CpsbContext,
     manager: HandoffManager,
@@ -2020,6 +2142,8 @@ async def _handle_plugin_message(
             await _send_requested_file(connection, manager, handoff_id)
     elif msg_type == "upload_edit":
         await _handle_upload_edit_chunk(connection, manager, msg)
+    elif msg_type == "manual_push":
+        await _handle_manual_push_chunk(manager, connection, msg)
     elif msg_type == "action_ok":
         # The PhotoshopAction node (cpsb/actions.py, not yet in PROTOCOL.md
         # §3) -- informational only, exactly like "opened"/"save_detected"

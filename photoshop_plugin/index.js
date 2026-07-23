@@ -87,6 +87,7 @@ function bootstrap() {
   const { startSaveListener } = require('./saveListener.js')
   const { initPanel } = require('./panel.js')
   const { logError, describeError } = require('./log.js')
+  const { sendToComfyUI } = require('./manualSend.js')
 
   /**
    * Implements the "Send" Plugins-menu command: exports and uploads
@@ -153,6 +154,15 @@ function bootstrap() {
             await sendBackNowForActiveDocument()
           } catch (error) {
             logError(`"Send" command failed: ${describeError(error)}`)
+          }
+        }
+      },
+      sendToComfyUI: {
+        async run() {
+          try {
+            await sendToComfyUI()
+          } catch (error) {
+            logError(`"Send to ComfyUI" command failed: ${describeError(error)}`)
           }
         }
       }

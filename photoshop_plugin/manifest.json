@@ -2,7 +2,7 @@
   "manifestVersion": 5,
   "id": "com.cpsb.comfyui-bridge",
   "name": "ComfyUI Bridge",
-  "version": "0.5.42",
+  "version": "0.5.43",
   "main": "panel.html",
   "host": {
     "app": "PS",
@@ -29,6 +29,13 @@
       "id": "sendBackNow",
       "label": {
         "default": "Send"
+      }
+    },
+    {
+      "type": "command",
+      "id": "sendToComfyUI",
+      "label": {
+        "default": "Send to ComfyUI"
       }
     }
   ],

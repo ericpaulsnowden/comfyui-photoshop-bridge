@@ -175,4 +175,39 @@ async function uploadLayeredPsd(handoffId, psdBytes) {
   return uploadEditOverWebsocket(handoffId, psdBytes, 'psd')
 }
 
-module.exports = { uploadEdit, uploadLayeredPsd }
+/**
+ * Sends `bytes` as a brand-new "send a layer/document to ComfyUI" push
+ * (2026-07-23) via {@link connection.pushManualSendOverWs} — always over the
+ * websocket, regardless of LOCAL/REMOTE mode (unlike an edit for an
+ * EXISTING handoff, a push has no pre-arranged shared-filesystem path to
+ * write onto in LOCAL mode either; the server mints the handoff and writes
+ * its managed copy itself either way, so there is nothing for a LOCAL-mode
+ * HTTP variant to gain here). Same retry-with-backoff quality bar as
+ * {@link uploadEditOverWebsocket}, except each attempt generates a FRESH
+ * `push_id` — reusing one across attempts risks the server reassembling a
+ * stale partial buffer from an earlier, abandoned attempt.
+ * @param {string} title
+ * @param {Uint8Array} bytes
+ * @returns {Promise<string | null>} The new `handoff_id` on success, `null`
+ * after every retry is exhausted.
+ */
+async function pushManualSend(title, bytes) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const pushId = `push-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    try {
+      return await connection.pushManualSendOverWs(pushId, bytes, title)
+    } catch (error) {
+      logWarn(
+        `manual_push (title=${title}) failed, attempt ${attempt}/${MAX_ATTEMPTS}: ` +
+          describeError(error)
+      )
+    }
+    if (attempt < MAX_ATTEMPTS) {
+      await delay(RETRY_DELAY_MS * attempt)
+    }
+  }
+  logError(`manual_push (title=${title}) failed after ${MAX_ATTEMPTS} attempts`)
+  return null
+}
+
+module.exports = { uploadEdit, uploadLayeredPsd, pushManualSend }

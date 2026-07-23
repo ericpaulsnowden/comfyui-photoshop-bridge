@@ -39,16 +39,7 @@ async function runExport(doc) {
     async () => {
       const duplicate = await doc.duplicate()
       try {
-        await duplicate.flatten()
-        try {
-          return await exportViaBatchPlay(duplicate)
-        } catch (batchPlayError) {
-          logWarn(
-            `batchPlay PNG export failed, falling back to the Imaging API: ` +
-              describeError(batchPlayError)
-          )
-          return await exportViaImaging(duplicate)
-        }
+        return await exportFlattenedDocument(duplicate)
       } finally {
         // closeWithoutSaving() is documented as returning void (not a
         // Promise) — nothing to await.
@@ -57,6 +48,37 @@ async function runExport(doc) {
     },
     { commandName: 'ComfyUI: export edit' }
   )
+}
+
+/**
+ * Flattens *doc* and exports it to PNG bytes (batchPlay, falling back to the
+ * Imaging API) -- the shared inner logic {@link runExport} wraps with its
+ * own "duplicate the ORIGINAL doc first, close the duplicate after" caller
+ * contract. Factored out (2026-07-23, "send a layer/document to ComfyUI")
+ * so a caller that has already produced its OWN throwaway document by some
+ * other means -- e.g. isolating a single layer into a fresh document, which
+ * has nothing to do with duplicating an existing one -- can reuse the exact
+ * same export path without `runExport`'s redundant extra duplicate. Callers
+ * own *doc*'s lifecycle: this function flattens and reads it, but never
+ * closes it. Must run inside `core.executeAsModal` (mutates *doc* via
+ * `.flatten()`) -- callers already inside one (like `runExport`) call this
+ * directly; a caller starting fresh must wrap its own call.
+ * @param {import('photoshop').Document} doc - A throwaway/isolated document,
+ * safe to flatten destructively.
+ * @returns {Promise<Uint8Array>} PNG-encoded bytes.
+ * @throws {Error} If both the primary and fallback export paths fail.
+ */
+async function exportFlattenedDocument(doc) {
+  await doc.flatten()
+  try {
+    return await exportViaBatchPlay(doc)
+  } catch (batchPlayError) {
+    logWarn(
+      `batchPlay PNG export failed, falling back to the Imaging API: ` +
+        describeError(batchPlayError)
+    )
+    return await exportViaImaging(doc)
+  }
 }
 
 /**
@@ -334,4 +356,4 @@ function encodePNG(pixels, width, height, components) {
   return out
 }
 
-module.exports = { runExport }
+module.exports = { runExport, exportFlattenedDocument }

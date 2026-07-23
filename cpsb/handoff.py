@@ -33,7 +33,7 @@ logger = logging.getLogger("cpsb")
 HandoffStatus = Literal[
     "pending", "editing", "edited", "cancelled", "discarded", "superseded", "error"
 ]
-OriginKind = Literal["load_image", "terminal_output", "bridge_node", "load_psd"]
+OriginKind = Literal["load_image", "terminal_output", "bridge_node", "load_psd", "manual_send"]
 Fidelity = Literal["composite", "recomposite", "plugin"]
 
 #: A handoff's save-trigger policy (product-owner requirement 2026-07-18):
