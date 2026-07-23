@@ -50,6 +50,7 @@ from .handoff import (
 from .launcher import launch_photoshop, tier1_status
 from .locality import is_request_local
 from .psd_io import read_edited_psd, write_psd
+from .raster_io import TIFF_EXTENSIONS, decode_to_rgb8
 from .version import __version__
 from .watcher import CpsbWatcher
 
@@ -1052,7 +1053,7 @@ def _empty_psd_preview_response() -> web.Response:
 
 @routes.get("/cpsb/psd_preview")
 async def psd_preview_route(request: web.Request) -> web.Response:
-    """Flatten a `.psd`/`.psb` into a cached, ComfyUI-addressable preview PNG.
+    """Flatten a `.psd`/`.psb` (or a `.tif`/`.tiff`) into a cached, ComfyUI-addressable preview PNG.
 
     Query params mirror ComfyUI's own ``GET /view``: ``filename`` (required),
     ``subfolder`` (default ``""``), ``type`` (default ``"input"`` -- unlike
@@ -1091,8 +1092,8 @@ async def psd_preview_route(request: web.Request) -> web.Response:
     source_path = _resolve_source_path(context, filename, subfolder, source_type)
     if source_path is None or not source_path.is_file():
         return _error(404, f"PSD not found: {filename}")
-    if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS:
-        return _error(400, f"Not a .psd/.psb file: {filename}")
+    if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS + TIFF_EXTENSIONS:
+        return _error(400, f"Cannot preview (not .psd/.psb/.tif/.tiff): {filename}")
 
     file_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
     png_path = _psd_preview_cache_path(context, file_hash)
@@ -1103,10 +1104,19 @@ async def psd_preview_route(request: web.Request) -> web.Response:
         )
 
     try:
-        image, _fidelity = read_edited_psd(source_path)
+        # TIFF flattens through the SAME raster decoder the Load PSD node's own
+        # execute() uses (raster_io.decode_to_rgb8, incl. its 16-bit/CMYK
+        # normalization); .psd/.psb go through read_edited_psd. Both return a
+        # ready-to-save PIL image, so the cache write below is identical.
+        # Without this branch, selecting a TIFF 400'd here and the on-node
+        # preview silently never refreshed (owner report 2026-07-22).
+        if source_path.suffix.lower() in TIFF_EXTENSIONS:
+            image = decode_to_rgb8(source_path)
+        else:
+            image, _fidelity = read_edited_psd(source_path)
     except Exception:
         # Deliberately broad, mirroring _open_psd_native_source: an
-        # unreadable or exotic PSD must not fail this request, only the
+        # unreadable or exotic file must not fail this request, only the
         # preview it would have produced.
         logger.warning("%s: could not flatten for a preview", source_path, exc_info=True)
         return _empty_psd_preview_response()

@@ -731,6 +731,30 @@ class TestPsdPreview:
             assert preview.size == (24, 12)
             assert preview.getpixel((0, 0))[:3] == (50, 60, 70)
 
+    async def test_tiff_previews_via_raster_decode(self, client, context):
+        """A .tif/.tiff previews too, through raster_io.decode_to_rgb8 -- the
+        SAME decoder the Load PSD node's execute() uses. Owner report
+        2026-07-22: selecting a TIFF used to 400 here, so the on-node preview
+        silently never refreshed (a downstream Preview node still worked).
+        """
+        Image.new("RGB", (20, 10), (12, 34, 56)).save(
+            context.input_dir / "photo.tif", format="TIFF"
+        )
+
+        response = await client.get(
+            "/cpsb/psd_preview", params={"filename": "photo.tif", "type": "input"}
+        )
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["type"] == "temp"
+        assert data["filename"].startswith("psdpreview_")
+        png_path = context.temp_dir / "cpsb" / data["filename"]
+        with Image.open(png_path) as preview:
+            preview.load()
+            assert preview.size == (20, 10)
+            assert preview.getpixel((0, 0))[:3] == (12, 34, 56)
+
     async def test_default_subfolder_and_type_are_empty_and_input(self, client, context, tmp_path):
         """``subfolder``/``type`` are optional query params -- default to
         ``""``/``"input"`` (unlike ComfyUI's own ``/view``, which defaults
