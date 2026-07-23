@@ -1,11 +1,13 @@
 /**
  * @file Node overlay badge for an active Photoshop round trip: a small pill
- * reading "Editing in Photoshop…" (animated spinner) while `editing`,
- * briefly "Edited" (checkmark, ~2s) right after an edit lands, and — while
- * `editing` — a hover-revealed ✕ that cancels the handoff directly from the
- * node (PROTOCOL.md §2 `/cpsb/cancel`: "The frontend surfaces it directly on
- * the node's 'Editing in Photoshop…' badge (hover → cancel)").  Driven by
- * `cpsb.status` / `cpsb.updated`.
+ * reading "Editing in Photoshop…" (animated spinner) while `editing`, and —
+ * while `editing` — a hover-revealed ✕ that cancels the handoff directly
+ * from the node (PROTOCOL.md §2 `/cpsb/cancel`: "The frontend surfaces it
+ * directly on the node's 'Editing in Photoshop…' badge (hover → cancel)").
+ * Driven by `cpsb.status`. (A prior version also flashed "Edited" —
+ * checkmark, ~2s — on `cpsb.updated`; removed in the gallery overhaul,
+ * 2026-07-22, owner ask: the gallery's own green "Edited" chip is now the
+ * only completion signal, decluttering the node canvas.)
  *
  * Implemented via chained `node.onDrawForeground` / `onMouseDown` /
  * `onMouseMove` / `onMouseLeave` hooks installed from `nodeCreated`, per the
@@ -93,14 +95,15 @@ import * as ui from './ui.js'
 
 /**
  * @typedef {Object} BadgeState
- * @property {"editing" | "edited"} kind
+ * @property {"editing"} kind - The only kind since the gallery overhaul
+ * (2026-07-22) removed the "edited" checkmark flash; kept as a literal
+ * (rather than dropped) so a future badge kind can be added the same way.
  * @property {number} since
- * @property {string} [handoffId] - From the triggering `cpsb.status` /
- * `cpsb.updated` payload (PROTOCOL.md §5 — both always carry `handoff_id`).
- * Only an `"editing"` badge is cancelable; this is what {@link handleMouseDown}
- * hands to `api.cancelHandoff`.
+ * @property {string} [handoffId] - From the triggering `cpsb.status`
+ * payload (PROTOCOL.md §5). Cancelable; this is what
+ * {@link handleMouseDown} hands to `api.cancelHandoff`.
  * @property {boolean} [hovered] - Whether the pointer is currently over the
- * pill, which reveals the ✕ (only meaningful while `kind === "editing"`).
+ * pill, which reveals the ✕.
  * @property {BadgeRect} [pillRect] - Node-local bounds of the whole pill,
  * recomputed every draw. Hovering anywhere inside it sets `hovered`.
  * @property {BadgeRect} [closeRect] - Node-local hit-rect for the ✕ itself,
@@ -111,7 +114,6 @@ import * as ui from './ui.js'
 /** @type {Map<string, BadgeState>} */
 const badgesByNode = new Map()
 
-const EDITED_BADGE_MS = 2000
 const SPIN_PERIOD_MS = 900
 const REPAINT_INTERVAL_MS = 120
 
@@ -156,10 +158,9 @@ const MIN_FALLBACK_HEIGHT = 40
 let animationTimer = /** @type {ReturnType<typeof setInterval> | null} */ (null)
 
 function hasActiveSpinner() {
-  for (const badge of badgesByNode.values()) {
-    if (badge.kind === 'editing') return true
-  }
-  return false
+  // Every tracked badge is kind "editing" now (see BadgeState's own
+  // docstring) — any entry at all means an active spinner.
+  return badgesByNode.size > 0
 }
 
 function ensureAnimationTimer() {
@@ -217,26 +218,6 @@ function drawSpinner(ctx, cx, cy, r) {
   ctx.lineWidth = 2
   ctx.beginPath()
   ctx.arc(cx, cy, r, start, start + Math.PI * 1.3)
-  ctx.stroke()
-  ctx.restore()
-}
-
-/**
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} cx
- * @param {number} cy
- * @param {number} r
- */
-function drawCheckmark(ctx, cx, cy, r) {
-  ctx.save()
-  ctx.strokeStyle = '#4caf50'
-  ctx.lineWidth = 2
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  ctx.beginPath()
-  ctx.moveTo(cx - r * 0.6, cy)
-  ctx.lineTo(cx - r * 0.15, cy + r * 0.5)
-  ctx.lineTo(cx + r * 0.6, cy - r * 0.5)
   ctx.stroke()
   ctx.restore()
 }
@@ -440,8 +421,8 @@ function drawBadge(ctx, node) {
   if (!badge) return // cheap when inactive: one Map lookup, nothing else.
   if (node.flags?.collapsed) return
 
-  const cancelable = badge.kind === 'editing' && !!badge.handoffId
-  const label = badge.kind === 'editing' ? 'Editing in Photoshop…' : 'Edited'
+  const cancelable = !!badge.handoffId
+  const label = 'Editing in Photoshop…'
 
   ctx.save()
   ctx.font = '11px sans-serif'
@@ -480,7 +461,7 @@ function drawBadge(ctx, node) {
   const y = Math.min(Math.max(anchor.y + (anchor.h - PILL_HEIGHT) / 2, 4), maxY)
 
   ctx.fillStyle = 'rgba(20, 20, 24, 0.85)'
-  ctx.strokeStyle = badge.kind === 'editing' ? '#5b9bd5' : '#4caf50'
+  ctx.strokeStyle = '#5b9bd5'
   ctx.lineWidth = 1
   roundRectPath(ctx, x, y, pillWidth, PILL_HEIGHT, PILL_HEIGHT / 2)
   ctx.fill()
@@ -488,11 +469,7 @@ function drawBadge(ctx, node) {
 
   const iconCx = x + PADDING_X + ICON_SIZE / 2
   const iconCy = y + PILL_HEIGHT / 2
-  if (badge.kind === 'editing') {
-    drawSpinner(ctx, iconCx, iconCy, ICON_SIZE / 2)
-  } else {
-    drawCheckmark(ctx, iconCx, iconCy, ICON_SIZE / 2)
-  }
+  drawSpinner(ctx, iconCx, iconCy, ICON_SIZE / 2)
 
   ctx.fillStyle = '#e6e6e6'
   ctx.textAlign = 'left'
@@ -570,7 +547,7 @@ function cancelFromBadge(nodeId, handoffId) {
  */
 function handleMouseDown(node, pos) {
   const badge = badgesByNode.get(String(node.id))
-  if (!badge?.closeRect || badge.kind !== 'editing' || !badge.handoffId) return false
+  if (!badge?.closeRect || !badge.handoffId) return false
   if (!isInRect(pos, badge.closeRect)) return false
   cancelFromBadge(String(node.id), badge.handoffId)
   return true
@@ -582,7 +559,7 @@ function handleMouseDown(node, pos) {
  */
 function updateHover(node, pos) {
   const badge = badgesByNode.get(String(node.id))
-  if (!badge?.pillRect || badge.kind !== 'editing') return // cheap bail: no cancelable badge here.
+  if (!badge?.pillRect) return // cheap bail: no badge here.
   const hovered = isInRect(pos, badge.pillRect)
   if (hovered === !!badge.hovered) return // no visible change, skip the repaint.
   badge.hovered = hovered
@@ -650,16 +627,16 @@ function notifyStatus({ origin_node_id: nodeId, handoff_id: handoffId, status })
     badgesByNode.set(nodeId, { kind: 'editing', since: Date.now(), handoffId })
     ensureAnimationTimer()
   } else {
-    // Every other status (pending / cancelled / discarded / superseded /
-    // error — "edited" is conveyed solely by cpsb.updated, see
-    // notifyEdited: handoff.py's ingest path calls _emit_updated, never
-    // _emit_status, so a cpsb.status "edited" event never actually arrives)
-    // means "this handoff has nothing left to show here". Only clear the
-    // badge if it still belongs to THIS handoff, or predates handoff-id
-    // tracking — a late cancel/error confirmation for a superseded handoff
-    // must not blow away a newer "editing" badge for the same node (e.g.
-    // the user hits Start Fresh immediately after Cancel, racing the old
-    // handoff's server-side confirmation).
+    // Every other status (pending / edited / cancelled / discarded /
+    // superseded / error) means "this handoff has nothing left to show
+    // here" — the gallery's own chip is now the only place "edited" shows at
+    // all (gallery overhaul, 2026-07-22; this file no longer flashes its own
+    // "Edited" checkmark on cpsb.updated). Only clear the badge if it still
+    // belongs to THIS handoff, or predates handoff-id tracking — a late
+    // cancel/error confirmation for a superseded handoff must not blow away
+    // a newer "editing" badge for the same node (e.g. the user hits Start
+    // Fresh immediately after Cancel, racing the old handoff's server-side
+    // confirmation).
     const current = badgesByNode.get(nodeId)
     if (!current || !current.handoffId || current.handoffId === handoffId) {
       badgesByNode.delete(nodeId)
@@ -669,21 +646,7 @@ function notifyStatus({ origin_node_id: nodeId, handoff_id: handoffId, status })
 }
 
 /**
- * @param {import('./api.js').CpsbUpdatedEvent} detail
- */
-function notifyEdited({ origin_node_id: nodeId, handoff_id: handoffId }) {
-  badgesByNode.set(nodeId, { kind: 'edited', since: Date.now(), handoffId })
-  app.graph?.setDirtyCanvas(true, false)
-  setTimeout(() => {
-    const current = badgesByNode.get(nodeId)
-    if (current?.kind === 'edited') badgesByNode.delete(nodeId)
-    app.graph?.setDirtyCanvas(true, false)
-  }, EDITED_BADGE_MS)
-}
-
-/**
- * Subscribes to `cpsb.status` / `cpsb.updated`. Call once from `cpsb.js`'s
- * `setup()`.
+ * Subscribes to `cpsb.status`. Call once from `cpsb.js`'s `setup()`.
  */
 export function init() {
   api.onStatusChanged((detail) => {
@@ -691,13 +654,6 @@ export function init() {
       notifyStatus(detail)
     } catch (error) {
       api.warn('failed to update node badge from cpsb.status', error)
-    }
-  })
-  api.onUpdated((detail) => {
-    try {
-      notifyEdited(detail)
-    } catch (error) {
-      api.warn('failed to update node badge from cpsb.updated', error)
     }
   })
 }

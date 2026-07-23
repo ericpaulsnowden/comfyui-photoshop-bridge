@@ -342,6 +342,25 @@ class HandoffMeta:
     :mod:`cpsb.routes`' ``_ingest_psd_upload``. Defaults ``False`` for every
     other handoff and for any legacy ``meta.json`` recorded before this
     field existed (both must keep taking the flat-PNG path, unchanged).
+
+    ``plugin_doc_open`` (gallery overhaul, 2026-07-22) is the Tier-2 plugin's
+    OWN ground truth for whether this handoff's Photoshop document is still
+    open -- ``True`` on the plugin's ``opened`` reply, ``False`` on its new
+    ``document_closed`` message (:func:`cpsb.routes._handle_plugin_message`;
+    the plugin already tracks this for its own panel list via
+    ``photoshop_plugin/handoffs.js``'s ``findOpenDocument``/
+    ``pruneClosedHandoffs`` -- this just tells the server too), ``None`` when
+    no Tier-2 plugin has ever reported either way (Tier-1-only handoffs, or a
+    handoff created before any plugin connected this session). Replaces the
+    OLD client-only heuristic (``web/cpsb/state.js``'s "``editing`` for over an
+    hour" guess) with a real signal WHEN one is available; ``None`` still
+    means "unknown," never "closed" -- a Tier-1 handoff must keep showing
+    plain ``editing`` forever, not a guessed ``closed``, since there is
+    genuinely no way to know. Deliberately NOT a status (:data:`HandoffStatus`
+    is unaffected) -- this is a side-channel fact ABOUT an ``editing`` handoff,
+    read only by the frontend's display-status derivation
+    (``web/cpsb/state.js``'s ``getDisplayStatus``), never by
+    ``ACTIVE_STATUSES``/``TERMINAL_STATUSES`` or any server-side gate.
     """
 
     handoff_id: str
@@ -360,6 +379,7 @@ class HandoffMeta:
     trigger_policy: TriggerPolicy = DEFAULT_TRIGGER_POLICY
     psd_filename: str = DEFAULT_PSD_FILENAME
     wants_layered_psd: bool = False
+    plugin_doc_open: bool | None = None
     edits: list[EditRecord] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -376,6 +396,7 @@ class HandoffMeta:
             "trigger_policy": self.trigger_policy,
             "psd_filename": self.psd_filename,
             "wants_layered_psd": self.wants_layered_psd,
+            "plugin_doc_open": self.plugin_doc_open,
             "created_ts": self.created_ts,
             "updated_ts": self.updated_ts,
             "status": self.status,
@@ -417,6 +438,11 @@ class HandoffMeta:
             # existed) defaults to False -- the flat-PNG remote-upload path
             # every such handoff has always taken, unchanged.
             wants_layered_psd=bool(data.get("wants_layered_psd", False)),
+            # Missing key (every meta.json written before this field existed,
+            # or a Tier-1-only handoff no plugin ever reported on) defaults to
+            # None -- "unknown," the same safe default a fresh handoff gets --
+            # never coerced to False, which would read as "already closed."
+            plugin_doc_open=data.get("plugin_doc_open"),
             edits=[EditRecord.from_dict(edit) for edit in data.get("edits", [])],
         )
 
@@ -906,6 +932,40 @@ class HandoffManager:
         if meta is None:
             return
         self.record_own_write(self.psd_path(meta))
+
+    def set_plugin_doc_open(self, handoff_id: str, is_open: bool) -> HandoffMeta:
+        """Records the Tier-2 plugin's own report of whether *handoff_id*'s document is open.
+
+        Sets :attr:`HandoffMeta.plugin_doc_open` -- see that field's own
+        docstring for what it means and why it is not a status. Called from
+        :func:`cpsb.routes._handle_plugin_message`'s ``opened`` branch
+        (``is_open=True``, alongside the existing :meth:`mark_editing`) and
+        its new ``document_closed`` branch (``is_open=False``) -- mirrors
+        those handlers' own shape (:meth:`get`, raise
+        :class:`HandoffNotFoundError` on a miss, caught and logged by the
+        route the identical way ``opened``/``open_failed`` already are)
+        rather than going through :meth:`_transition`, which this
+        deliberately does NOT: no ``status``/``error`` field changes, no
+        waiter is unblocked or cancelled, and a terminal handoff (e.g. one
+        the user already discarded in the narrow window before this message
+        arrived) still accepts the update rather than being frozen the way
+        :meth:`mark_cancelled`'s ``noop_if_terminal`` freezes ``cancelled`` --
+        there is nothing for a stray late report to corrupt here, only a
+        fact to record.
+
+        Raises:
+            HandoffNotFoundError: *handoff_id* is not a known handoff.
+        """
+        with self._lock:
+            meta = self._handoffs.get(handoff_id)
+            if meta is None:
+                raise HandoffNotFoundError(handoff_id)
+            meta.plugin_doc_open = is_open
+            meta.updated_ts = time.time()
+            self._write_meta_locked(meta)
+            snapshot = HandoffMeta.from_dict(meta.to_dict())
+        self._emit_status(snapshot)
+        return snapshot
 
     # -- state transitions -------------------------------------------------
 

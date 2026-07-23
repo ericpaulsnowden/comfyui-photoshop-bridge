@@ -9,33 +9,28 @@
  * Each card leads with ONE larger thumbnail — the AFTER image (the latest
  * edit; the ORIGINAL when no edit has arrived yet) — replacing the old
  * fixed-size before/after PAIR shown side by side with a "→" between them.
- * When an edit exists, the original is layered underneath and a
- * click-and-hold ({@link attachHoldToCompare}, Pointer Events — mouse and
- * touch alike, no separate handlers for either) reveals it for as long as
- * the pointer is held, snapping back to AFTER on release, an interrupted
- * gesture, or the pointer leaving the thumbnail. A corner badge and a
- * "Hold to compare" hint are always visible (never hover-only — touch has
- * no hover to reveal them) so the gesture is discoverable; no edit yet
- * means nothing to compare, so none of that — wiring, badge, or hint — is
- * attached at all. A List/Grid toggle in the header switches the SAME
- * cards (the card-building functions below are layout-agnostic) between
- * this single-column flow and a responsive multi-column grid, persisted
- * via `settings.js`'s `cpsb.galleryGridLayout` — the identical
- * `app.extensionManager.setting` mechanism every other `cpsb.*` frontend
- * preference already uses, so it survives a reload the same way they do.
+ * When an edit exists, the original is layered underneath, crossfaded via
+ * CSS opacity; ONE header-level "Hold to compare" button
+ * ({@link buildCompareToggle}, owner ask 2026-07-22 — replaces an earlier
+ * per-thumbnail hold gesture with its own corner badge/hint on every card)
+ * reveals every visible card's original at once for as long as it's held.
+ * Grid is the gallery's only layout (owner ask 2026-07-22 — the List
+ * alternative and its header toggle were removed).
  *
  * Card actions are STATUS-SCOPED via one explicit table
  * ({@link cardCapabilities}) rather than ad-hoc conditions — the first
- * field round exposed exactly the failure class that invites: Re-open
+ * field round exposed exactly the failure class that invites: Open
  * offered on a cancelled card 404s ("No active handoff for this node",
  * `/cpsb/open mode:"original"` requires an ACTIVE handoff, PROTOCOL.md §2),
- * Discard offered on an already-discarded card is a pointless no-op, a drop
- * onto a terminal card 409s ("not accepting uploads"). Every open request
- * goes through `open.js` (shared 428 remote-confirm / 409 chooser / server-
- * message toasts — bypassing that shared flow here is precisely what broke
- * gallery Re-open for remote browsers), and every remaining action is
- * try/catch-wrapped with the server's own error message surfaced
- * (`api.errorMessage`), never a generic failure line.
+ * Remove offered on an already-discarded card is a pointless no-op, a drop
+ * onto a terminal card 409s ("not accepting uploads"). Cancelled/superseded
+ * cards are hidden entirely (alongside discarded — see `HIDDEN_STATUSES`),
+ * so this table's rows for them exist only for switch-exhaustiveness. Every
+ * open request goes through `open.js` (shared 428 remote-confirm / 409
+ * chooser / server-message toasts — bypassing that shared flow here is
+ * precisely what broke gallery Re-open for remote browsers), and every
+ * remaining action is try/catch-wrapped with the server's own error message
+ * surfaced (`api.errorMessage`), never a generic failure line.
  *
  * `registerSidebarTab` shape verified against `Comfy-Org/ComfyUI_frontend`
  * `src/types/extensionTypes.ts` (`CustomSidebarTabExtension`:
@@ -67,7 +62,7 @@ const STATUS_LABELS = {
   editing: 'Editing',
   edited: 'Edited',
   error: 'Error',
-  stale: 'Stale',
+  closed: 'Closed without saving',
   cancelled: 'Cancelled',
   discarded: 'Discarded',
   superseded: 'Superseded'
@@ -110,13 +105,14 @@ let unsubscribeState = /** @type {(() => void) | null} */ (null)
  * PROTOCOL.md §2/§8:
  *
  *  - `mode:"original"` requires an ACTIVE handoff (pending/editing/edited;
- *    "stale" is display-only sugar over `editing`) — offering Re-open on a
- *    terminal card guarantees a 404, the exact field bug this fixes. A
- *    terminal card gets "Open fresh copy" instead (`mode:"new"` from the
- *    recorded source triple; if that file has since been purged the server's
- *    "Source image not found" message is surfaced verbatim).
+ *    "closed" is display-only sugar over `editing` — see `state.js`'s
+ *    `getDisplayStatus`) — offering Re-open on a terminal card guarantees a
+ *    404, the exact field bug this fixes. A terminal card gets "Open fresh
+ *    copy" instead (`mode:"new"` from the recorded source triple; if that
+ *    file has since been purged the server's "Source image not found"
+ *    message is surfaced verbatim).
  *  - `/cpsb/cancel` is the escape hatch for a round trip that hasn't
- *    delivered yet (pending/editing/stale). It's technically idempotent on
+ *    delivered yet (pending/editing/closed). It's technically idempotent on
  *    terminal handoffs, but a button that can only ever no-op is noise — and
  *    on `edited` cards "cancel" is misleading (the edit already landed), so
  *    those offer only Remove.
@@ -131,7 +127,7 @@ let unsubscribeState = /** @type {(() => void) | null} */ (null)
  *    blocking Photoshop Bridge node: `_transition` only unblocks a waiter
  *    (`_cancel_waiter_locked`) when the new status is literally
  *    `"cancelled"`, and only `cancel_route` (never `discard_route`) notifies
- *    the plugin. So `removeCancelsFirst` (pending/editing/stale) makes
+ *    the plugin. So `removeCancelsFirst` (pending/editing/closed) makes
  *    {@link removeFromList} call `/cpsb/cancel` FIRST — same unblock/notify
  *    as the separate Cancel button — and only then `/cpsb/discard`, which
  *    lands the handoff on `discarded`, the one status `rebuild()` filters out
@@ -141,20 +137,20 @@ let unsubscribeState = /** @type {(() => void) | null} */ (null)
  *  - `/cpsb/upload` (drag-drop import) 409s unless the handoff is active —
  *    terminal cards don't register drop handlers at all.
  *
- * Reveal and Add-as-node are NOT status-gated: the origin node and any
- * already-ingested edit files exist (or don't) independently of handoff
- * status, and both actions carry their own guards.
+ * Reveal and Add are NOT status-gated: the origin node and any already-
+ * ingested edit files exist (or don't) independently of handoff status, and
+ * both actions carry their own guards.
  *
  * Kept dependency-free (plain switch on the display status string) so the
  * matrix test can run it outside a browser.
- * @param {import('./api.js').CpsbStatus | "stale"} displayStatus
+ * @param {import('./api.js').CpsbStatus | "closed"} displayStatus
  * @returns {CpsbCardCapabilities}
  */
 function cardCapabilities(displayStatus) {
   switch (displayStatus) {
     case 'pending':
     case 'editing':
-    case 'stale':
+    case 'closed':
       return {
         reopen: true,
         openFresh: false,
@@ -172,8 +168,8 @@ function cardCapabilities(displayStatus) {
         removeCancelsFirst: false,
         dropImport: true
       }
-    case 'cancelled':
-    case 'discarded': // never actually rendered — rebuild() filters it out — kept here so the switch stays exhaustive over every known status.
+    case 'cancelled': // never actually rendered — rebuild() filters it out, alongside superseded/discarded — kept here so the switch stays exhaustive over every known status.
+    case 'discarded':
     case 'superseded':
     case 'error':
       return {
@@ -502,11 +498,13 @@ function buildThumb(src, alt, extraClassName = '') {
 /**
  * The card's single leading thumbnail (replaces the old side-by-side
  * before/after pair): the AFTER image — *latestEdit* when one exists, else
- * the ORIGINAL — at a larger size. When *latestEdit* exists, the original
- * is layered underneath (absolute-positioned; `cpsb.css` crossfades it via
- * opacity) and {@link attachHoldToCompare} wires the click-and-hold reveal
- * plus its corner badge/hint; with no edit yet there is nothing to compare,
- * so this returns a single plain image with none of that attached.
+ * the ORIGINAL — at a larger size. When *latestEdit* exists, the original is
+ * layered underneath (absolute-positioned; `cpsb.css` crossfades it via
+ * opacity) so the ONE header-level {@link buildCompareToggle} can reveal it
+ * for every card at once while held — see that function's own doc for why
+ * this moved off each individual thumbnail. With no edit yet there is
+ * nothing to compare, so this returns a single plain image with no BEFORE
+ * layer at all.
  * @param {import('./api.js').CpsbHandoffMeta} meta
  * @param {import('./api.js').CpsbEdit | undefined} latestEdit
  * @returns {HTMLElement}
@@ -529,85 +527,11 @@ function buildCardThumb(meta, latestEdit) {
     'cpsb-card-thumb-after'
   )
   const before = buildThumb(api.thumbUrl(meta.handoff_id), 'Original', 'cpsb-card-thumb-before')
-  const badge = ui.el('span', { className: 'cpsb-card-thumb-badge', text: 'After' })
-  const hint = ui.el('span', { className: 'cpsb-card-thumb-hint', text: 'Hold to compare' })
 
-  const frame = ui.el('div', {
+  return ui.el('div', {
     className: 'cpsb-card-thumb-frame',
-    children: [after, before, badge, hint]
+    children: [after, before]
   })
-  attachHoldToCompare(frame, badge)
-  return frame
-}
-
-/**
- * Wires the click-and-hold before/after reveal on *frame* via Pointer
- * Events — one code path for mouse AND touch, no `mousedown`/`touchstart`
- * pair to keep in sync (this is the plain-DOM browser sidebar; the
- * UXP/litegraph pointer quirks noted elsewhere in this pack don't apply
- * here). Holding adds `cpsb-card-thumb-holding` to *frame*, which is all
- * `cpsb.css` needs to crossfade the layered before/after images and hide
- * the hint; releasing — `pointerup`, `pointercancel`, or `pointerleave` —
- * always removes it, so the gesture can never get stuck showing BEFORE.
- *
- * `setPointerCapture` redirects the rest of this gesture's events to
- * *frame* regardless of where the pointer physically ends up, which a bare
- * `pointerup` listener cannot do on its own (it only fires on whatever
- * element happens to be under the pointer at release) — without it, a
- * press that drifts slightly off the thumbnail before releasing would
- * leave BEFORE showing with no `pointerup` on *frame* to clear it. If an
- * older/partial Pointer Events implementation throws, the gesture still
- * works for the common press-and-release-in-place case; only the
- * drifted-off-the-thumb edge case degrades, which isn't worth failing the
- * whole card over.
- *
- * The thumbnail has no click action today and this deliberately keeps it
- * that way — a quick tap/click just flashes BEFORE and back, never
- * triggers anything destructive or navigational.
- * @param {HTMLElement} frame
- * @param {HTMLElement} badge - The corner label swapped between "After" and
- * "Before" while held.
- */
-function attachHoldToCompare(frame, badge) {
-  let activePointerId = /** @type {number | null} */ (null)
-
-  const showBefore = () => {
-    frame.classList.add('cpsb-card-thumb-holding')
-    badge.textContent = 'Before'
-  }
-  const showAfter = () => {
-    frame.classList.remove('cpsb-card-thumb-holding')
-    badge.textContent = 'After'
-  }
-
-  frame.addEventListener('pointerdown', (event) => {
-    // A right-click or an auxiliary mouse button must not trigger this —
-    // only the primary mouse button, or any touch/pen contact (which has
-    // no "button" concept and reports 0 by convention).
-    if (event.pointerType === 'mouse' && event.button !== 0) return
-    activePointerId = event.pointerId
-    try {
-      frame.setPointerCapture(event.pointerId)
-    } catch {
-      // See doc comment above: degrade to the common case rather than
-      // break the card over a nicety.
-    }
-    showBefore()
-  })
-
-  const release = (/** @type {PointerEvent} */ event) => {
-    if (activePointerId === null || event.pointerId !== activePointerId) return
-    activePointerId = null
-    showAfter()
-  }
-  frame.addEventListener('pointerup', release)
-  frame.addEventListener('pointercancel', release)
-  // Belt-and-braces per this pack's pointer-handling convention: while
-  // capture is active, boundary events normally don't fire for the
-  // capturing element (the capture already guarantees pointerup/cancel
-  // land here), so this mainly backstops the setPointerCapture-threw
-  // fallback path above.
-  frame.addEventListener('pointerleave', release)
 }
 
 /**
@@ -658,10 +582,13 @@ function buildCard(meta) {
     )
   }
   if (capabilities.reopen) {
+    // Labeled "Open" (renamed from "Re-open", owner ask 2026-07-22, alongside
+    // Reveal/Add/Remove below) — reopen/openFresh are mutually exclusive per
+    // cardCapabilities, so exactly one "Open" button ever renders per card.
     actions.appendChild(
       ui.el('button', {
         className: 'cpsb-card-action',
-        text: 'Re-open',
+        text: 'Open',
         on: { click: () => reopenInPhotoshop(meta) }
       })
     )
@@ -670,7 +597,7 @@ function buildCard(meta) {
     actions.appendChild(
       ui.el('button', {
         className: 'cpsb-card-action',
-        text: 'Open fresh copy',
+        text: 'Open',
         on: { click: () => openFreshCopy(meta) }
       })
     )
@@ -679,7 +606,7 @@ function buildCard(meta) {
     actions.appendChild(
       ui.el('button', {
         className: 'cpsb-card-action',
-        text: 'Add as node',
+        text: 'Add',
         on: { click: () => addAsNode(meta) }
       })
     )
@@ -694,18 +621,17 @@ function buildCard(meta) {
     )
   }
   if (capabilities.remove) {
-    // Labeled "Remove from list", not "Discard" — the user couldn't tell
-    // what Discard did. Now offered on EVERY status (PROTOCOL.md §8): a
-    // prior version only showed this for stale/edited cards ("doesn't
-    // appear for every image", the other half of the field bug this fixes).
-    // On an active card this first cancels the Photoshop edit (see
-    // {@link removeFromList}) before dropping it from the gallery; the
-    // separate Cancel button above (when present) stops the edit without
-    // leaving the gallery. It touches no image or workflow the user cares
-    // about (the tooltip says so, and removeFromList's confirm repeats it).
+    // Labeled "Remove" (renamed from "Remove from list", owner ask
+    // 2026-07-22 — the tooltip below still spells out what it does). Now
+    // offered on EVERY status (PROTOCOL.md §8): a prior version only showed
+    // this for stale/edited cards ("doesn't appear for every image", the
+    // other half of the field bug this fixes). On an active card this first
+    // cancels the Photoshop edit (see {@link removeFromList}) before
+    // dropping it from the gallery; the separate Cancel button above (when
+    // present) stops the edit without leaving the gallery.
     const removeButton = ui.el('button', {
       className: 'cpsb-card-action cpsb-card-action-danger',
-      text: 'Remove from list',
+      text: 'Remove',
       on: { click: () => removeFromList(meta, capabilities) }
     })
     removeButton.title =
@@ -720,54 +646,54 @@ function buildCard(meta) {
 }
 
 /**
- * List/Grid toggle for the gallery header — two buttons (not a checkbox or
- * combo: this is a persistent, always-visible 2-way switch a user sets once
- * and forgets, so a segmented pair of buttons — the same visual language
- * `.cpsb-card-action` already establishes elsewhere in this file — reads
- * clearer than a single control whose current state you have to infer).
- * Writes straight through {@link settings.setGalleryGridLayout} and calls
- * {@link rebuild} immediately after: a settings-panel change and this
- * header control both persist through the identical
- * `app.extensionManager.setting` mechanism, but neither one raises a
- * `state.js` change event (only `cpsb.*` websocket traffic does), so
- * without the explicit `rebuild()` call here the panel would silently keep
- * showing the OLD layout until some unrelated handoff event happened to
- * repaint it.
- * @param {"list" | "grid"} layout - This render's already-resolved value
- * (read once per {@link rebuild}, not re-read here) so the two buttons'
- * active state can never disagree with what's actually on screen.
+ * ONE header-level "Hold to compare" control (owner ask 2026-07-22: the old
+ * per-thumbnail hold gesture — with its own corner badge/hint on every card
+ * — moves to a single spot instead of being repeated on every image).
+ * Holding this button reveals every visible card's ORIGINAL at once by
+ * toggling `cpsb-gallery-comparing` on the gallery root, which `cpsb.css`
+ * uses to crossfade each card's layered before/after thumbnail — the exact
+ * same Pointer Events press pattern the old per-thumbnail version used
+ * (mouse and touch alike via one code path), just wired to one shared class
+ * instead of a per-frame one. List/Grid's toggle used to occupy this same
+ * header slot; grid is now the only layout (owner ask), so nothing else
+ * competes for the space.
  * @returns {HTMLElement}
  */
-function buildLayoutToggle(layout) {
-  /**
-   * @param {"list" | "grid"} value
-   * @param {string} label
-   */
-  const button = (value, label) =>
-    ui.el('button', {
-      className: `cpsb-layout-toggle-button${
-        layout === value ? ' cpsb-layout-toggle-button-active' : ''
-      }`,
-      text: label,
-      attrs: {
-        type: 'button',
-        title: `Show edits as a ${value}`,
-        'aria-pressed': String(layout === value)
-      },
-      on: {
-        click: () => {
-          if (layout === value) return
-          settings.setGalleryGridLayout(value === 'grid')
-          rebuild()
-        }
-      }
-    })
-
-  return ui.el('div', {
-    className: 'cpsb-layout-toggle',
-    attrs: { role: 'group', 'aria-label': 'Gallery layout' },
-    children: [button('list', 'List'), button('grid', 'Grid')]
+function buildCompareToggle() {
+  const button = ui.el('button', {
+    className: 'cpsb-compare-toggle',
+    text: 'Hold to compare',
+    attrs: { type: 'button', title: 'Hold to see the original for every edited card' }
   })
+
+  let activePointerId = /** @type {number | null} */ (null)
+  const showBefore = () => rootEl?.classList.add('cpsb-gallery-comparing')
+  const showAfter = () => rootEl?.classList.remove('cpsb-gallery-comparing')
+
+  button.addEventListener('pointerdown', (event) => {
+    // A right-click or an auxiliary mouse button must not trigger this —
+    // only the primary mouse button, or any touch/pen contact (which has no
+    // "button" concept and reports 0 by convention).
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    activePointerId = event.pointerId
+    try {
+      button.setPointerCapture(event.pointerId)
+    } catch {
+      // Older/partial Pointer Events implementation: degrade to the common
+      // press-and-release-in-place case rather than fail the whole control.
+    }
+    showBefore()
+  })
+
+  const release = (/** @type {PointerEvent} */ event) => {
+    if (activePointerId === null || event.pointerId !== activePointerId) return
+    activePointerId = null
+    showAfter()
+  }
+  button.addEventListener('pointerup', release)
+  button.addEventListener('pointercancel', release)
+  button.addEventListener('pointerleave', release)
+  return button
 }
 
 /**
@@ -879,13 +805,25 @@ function buildBrandMark() {
   })
 }
 
+/**
+ * Statuses hidden from the gallery entirely — every handoff that is
+ * "removed from the list" by definition, not just displayed differently.
+ * `discarded` is what `/cpsb/discard` means (PROTOCOL.md §2/§8); `cancelled`
+ * and `superseded` joined it (owner ask 2026-07-22: cancelled/superseded
+ * cards were pure clutter, indistinguishable from each other in the gallery
+ * and offering nothing beyond what starting a fresh handoff already does).
+ * `error` deliberately stays visible — it's diagnostic (the chip's tooltip
+ * carries the actual failure), not routine bookkeeping. The backend still
+ * returns all of these from `/cpsb/status` until its own cleanup pass, so
+ * this filter is the one place that actually drops them from what the user
+ * sees.
+ */
+const HIDDEN_STATUSES = new Set(['discarded', 'cancelled', 'superseded'])
+
 function rebuild() {
   if (!rootEl) return
   try {
     rootEl.replaceChildren()
-    // Resolved once per render so the header toggle and the list container
-    // below can never disagree about which layout is current.
-    const layout = settings.getGalleryGridLayout() ? 'grid' : 'list'
 
     rootEl.appendChild(
       ui.el('div', {
@@ -894,7 +832,7 @@ function rebuild() {
           buildBrandMark(),
           ui.el('div', {
             className: 'cpsb-gallery-header-right',
-            children: [buildLayoutToggle(layout), buildConnectionPill(), buildVersionLabel()]
+            children: [buildCompareToggle(), buildConnectionPill(), buildVersionLabel()]
           })
         ]
       })
@@ -904,19 +842,11 @@ function rebuild() {
     }
     renderUpgradeBanner(rootEl)
 
-    // A `discarded` handoff is "removed from the list" by definition — that
-    // is what /cpsb/discard means (PROTOCOL.md §2/§8) — but the backend
-    // still returns it from /cpsb/status until cleanup (meta.json only
-    // disappears at the §1 cleanup pass), so this filter is the one place
-    // that actually drops it from what the user sees. Every other status
-    // still renders; without this, "Remove from list" would flip the
-    // handoff's status server-side but leave its card sitting in the
-    // gallery, exactly the "doesn't appear to take something off the list"
-    // field bug this fixes. `state.subscribe(rebuild)` re-runs this on every
-    // `cpsb.status` event (see `mark_discarded` -> `_transition` ->
-    // `_emit_status`, always fired, never a noop), so the card vanishes on
-    // the very next event after the discard call resolves.
-    const handoffs = state.getAllHandoffs().filter((meta) => meta.status !== 'discarded')
+    // See HIDDEN_STATUSES. `state.subscribe(rebuild)` re-runs this on every
+    // `cpsb.status` event (e.g. `mark_discarded`/`mark_cancelled` ->
+    // `_transition` -> `_emit_status`, always fired, never a noop), so a
+    // card vanishes on the very next event after the action that hides it.
+    const handoffs = state.getAllHandoffs().filter((meta) => !HIDDEN_STATUSES.has(meta.status))
     if (handoffs.length === 0) {
       rootEl.appendChild(
         ui.el('div', {
@@ -927,14 +857,11 @@ function rebuild() {
       return
     }
 
-    // Grid is a pure CSS overlay on top of the same list/card markup
-    // (`.cpsb-gallery-grid` in cpsb.css) — buildCard/buildCardThumb are
-    // layout-agnostic, so every existing card behavior (status chip, every
-    // cardCapabilities action, drag-drop import, the missing-thumb
-    // fallback) keeps working unchanged in either layout.
-    const list = ui.el('div', {
-      className: layout === 'grid' ? 'cpsb-gallery-list cpsb-gallery-grid' : 'cpsb-gallery-list'
-    })
+    // Grid is now the only layout (owner ask 2026-07-22 — List removed).
+    // buildCard/buildCardThumb are layout-agnostic, so every card behavior
+    // (status chip, every cardCapabilities action, drag-drop import, the
+    // missing-thumb fallback) is unaffected by this being unconditional now.
+    const list = ui.el('div', { className: 'cpsb-gallery-list cpsb-gallery-grid' })
     for (const meta of handoffs) {
       // Per-card guard: one malformed meta (e.g. from a hand-edited or
       // truncated meta.json the backend recovered) must degrade to one

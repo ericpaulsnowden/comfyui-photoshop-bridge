@@ -127,6 +127,14 @@ export function warn(...args) {
  * than a managed copy. Absent/false on every other handoff.
  * @property {string | null} [original_path] - Absolute path of the user's
  * PSD when `edit_in_place` is true; `null`/absent otherwise.
+ * @property {boolean | null} [plugin_doc_open] - The Tier-2 plugin's own
+ * report of whether this handoff's Photoshop document is still open
+ * (gallery overhaul, 2026-07-22) — `true`/`false` once a plugin has reported
+ * either way, `null`/absent when none ever has (Tier-1-only handoffs, or
+ * before any plugin connected this session). `state.js`'s
+ * `getDisplayStatus` reads this to derive a real "closed without saving"
+ * signal for an `editing` handoff, replacing the old client-only elapsed-
+ * time guess.
  */
 
 /**

@@ -27,7 +27,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  /* The List/Grid toggle joined the pill + version label in this row; wrap
+  /* The compare toggle joins the pill + version label in this row; wrap
      rather than clip/overflow at narrow sidebar widths. */
   flex-wrap: wrap;
   row-gap: 6px;
@@ -41,38 +41,29 @@
   flex-wrap: wrap;
 }
 
-/* List/Grid layout toggle (gallery.js buildLayoutToggle) — a segmented pair
-   of buttons rather than a checkbox, so the current choice is always
-   visible at a glance, not just inferrable from a toggle's on/off state. */
+/* ONE header-level "Hold to compare" button (gallery.js buildCompareToggle,
+   owner ask 2026-07-22) — replaces the old List/Grid segmented toggle that
+   used to occupy this slot (grid is now the gallery's only layout) AND the
+   old per-thumbnail hold gesture (see .cpsb-gallery-comparing below). */
 
-.cpsb-layout-toggle {
-  display: inline-flex;
+.cpsb-compare-toggle {
+  padding: 3px 9px;
   border-radius: 6px;
   border: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
-  overflow: hidden;
-  flex-shrink: 0;
-}
-
-.cpsb-layout-toggle-button {
-  padding: 3px 9px;
-  border: none;
   background: var(--comfy-input-bg, #262626);
   color: var(--muted-foreground, #888);
   font-size: 11px;
   cursor: pointer;
+  flex-shrink: 0;
+  /* No native "save image"/text-selection callout on a press-and-hold. */
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
-.cpsb-layout-toggle-button + .cpsb-layout-toggle-button {
-  border-left: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
-}
-
-.cpsb-layout-toggle-button:hover {
+.cpsb-compare-toggle:hover {
   background: var(--content-hover-bg, #333);
-}
-
-.cpsb-layout-toggle-button-active {
   color: var(--fg-color, #e6e6e6);
-  background: rgba(91, 155, 213, 0.2);
 }
 
 /* Generic "Ps" text lettermark (gallery header identity; the tab-strip
@@ -160,11 +151,12 @@
   min-width: 0;
 }
 
-/* Grid layout (gallery.js rebuild(): `.cpsb-gallery-grid` is added ALONGSIDE
-   `.cpsb-gallery-list`, never in place of it, when the persisted
-   cpsb.galleryGridLayout setting/header toggle is on). Every rule below is
-   an ADDITIVE override scoped under this class, so List's own rules above
-   stay exactly as they were — Grid can't drift List's layout by accident. */
+/* Grid layout (gallery.js rebuild(): `.cpsb-gallery-grid` is now ALWAYS added
+   alongside `.cpsb-gallery-list` — grid is the gallery's only layout, owner
+   ask 2026-07-22; the former List alternative and its header toggle are
+   gone). Every rule below is an ADDITIVE override scoped under this class,
+   kept as a separate class rather than merged into `.cpsb-gallery-list`
+   above so the base rules stay legible on their own. */
 
 .cpsb-gallery-grid {
   display: grid;
@@ -274,10 +266,11 @@
    image — the latest edit, or the original when no edit exists yet —
    replacing the old fixed-64px before/after PAIR shown side by side with a
    "→" between them (.cpsb-card-thumbs/.cpsb-card-thumb-arrow, both removed:
-   nothing builds either anymore). List's frame is a fixed larger square
-   below; Grid's own sizing lives with the rest of "Grid layout" above
+   nothing builds either anymore). This base rule is a fixed larger square;
+   Grid's own sizing lives with the rest of "Grid layout" above
    (.cpsb-gallery-grid .cpsb-card-thumb-frame) since it depends on the
-   card's grid track width, not a constant. */
+   card's grid track width, not a constant, and Grid is the only layout
+   applied (owner ask 2026-07-22), so its override always wins. */
 
 .cpsb-card-thumb-frame {
   position: relative;
@@ -287,8 +280,8 @@
   background: var(--comfy-input-bg, #111);
   width: 128px;
   height: 128px;
-  /* No native "save image" long-press callout or text-selection highlight —
-     a long-press on this frame already means something (hold-to-compare). */
+  /* No native "save image" long-press callout or text-selection highlight on
+     this non-interactive thumbnail. */
   -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
@@ -297,15 +290,13 @@
 .cpsb-card-thumb-frame .cpsb-card-thumb {
   width: 100%;
   height: 100%;
-  /* cover, not the default fill: the frame is a fixed square (List) or a
-     grid-track square (Grid) while the handoff image can be any aspect —
-     fill would visibly stretch it. This lived on the old base
-     .cpsb-card-thumb rule and must survive its removal. */
+  /* cover, not the default fill: the frame is a fixed square while the
+     handoff image can be any aspect — fill would visibly stretch it. This
+     lived on the old base .cpsb-card-thumb rule and must survive its
+     removal. */
   object-fit: cover;
   display: block;
-  /* Hold-to-compare makes press-and-drift ON the image a normal gesture;
-     without this, that same gesture is exactly how a native image drag
-     starts (ghost image, pointercancel mid-hold). */
+  /* No native image-drag ghost/callout on this non-interactive thumbnail. */
   -webkit-user-drag: none;
   border-radius: 0; /* the frame itself clips + rounds; a second radius on
     the image inside it would double up at the corners */
@@ -313,9 +304,10 @@
 
 /* When an edit exists, AFTER and BEFORE are stacked (both absolutely
    positioned, filling the frame) and crossfaded via opacity — see
-   attachHoldToCompare in gallery.js for what toggles .cpsb-card-thumb-holding
-   on the frame; this is purely the CSS side of that. With no edit, buildCardThumb
-   emits neither modifier and this pair of rules simply doesn't apply. */
+   .cpsb-gallery-comparing below for what toggles this (the ONE header-level
+   "Hold to compare" button, not a per-thumbnail gesture). With no edit,
+   buildCardThumb emits neither modifier and this pair of rules simply
+   doesn't apply. */
 
 .cpsb-card-thumb-after,
 .cpsb-card-thumb-before {
@@ -328,50 +320,18 @@
   transition: opacity 100ms ease;
 }
 
-.cpsb-card-thumb-frame.cpsb-card-thumb-holding .cpsb-card-thumb-before {
+/* Held via the ONE header-level "Hold to compare" button (gallery.js
+   buildCompareToggle, owner ask 2026-07-22), which toggles this class on the
+   gallery ROOT — not a per-card class — so holding it crossfades EVERY
+   visible card's before/after layers at once. Replaces a prior per-thumbnail
+   hold gesture (its own corner badge/hint removed along with it — one
+   control now, not one per image). */
+
+.cpsb-gallery-comparing .cpsb-card-thumb-before {
   opacity: 1;
 }
 
-.cpsb-card-thumb-frame.cpsb-card-thumb-holding .cpsb-card-thumb-after {
-  opacity: 0;
-}
-
-/* Discoverability affordance for the hold-to-compare gesture — both always
-   visible rather than hover-revealed, since touch has no hover state to
-   reveal them with. The badge's text is swapped between "After"/"Before" by
-   attachHoldToCompare; the hint just fades out once a hold is already in
-   progress, when it would otherwise sit on top of the BEFORE image. */
-
-.cpsb-card-thumb-badge {
-  position: absolute;
-  top: 5px;
-  right: 5px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  font-size: 9px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  color: #fff;
-  background: rgba(0, 0, 0, 0.55);
-  pointer-events: none; /* never steals the pointerdown from the frame */
-}
-
-.cpsb-card-thumb-hint {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  padding: 3px 6px;
-  font-size: 9px;
-  text-align: center;
-  color: #fff;
-  background: linear-gradient(to top, rgba(0, 0, 0, 0.55), transparent);
-  pointer-events: none;
-  transition: opacity 100ms ease;
-}
-
-.cpsb-card-thumb-frame.cpsb-card-thumb-holding .cpsb-card-thumb-hint {
+.cpsb-gallery-comparing .cpsb-card-thumb-after {
   opacity: 0;
 }
 
@@ -472,7 +432,7 @@
   background: rgba(255, 102, 102, 0.14);
 }
 
-.cpsb-chip-stale {
+.cpsb-chip-closed {
   color: #e0a030;
   background: rgba(224, 160, 48, 0.16);
 }
@@ -832,8 +792,7 @@
   .cpsb-toast,
   .cpsb-dialog-backdrop,
   .cpsb-card,
-  .cpsb-card-thumb-before,
-  .cpsb-card-thumb-hint {
+  .cpsb-card-thumb-before {
     transition: none;
   }
 }

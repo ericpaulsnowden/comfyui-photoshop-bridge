@@ -194,6 +194,48 @@ class TestLifecycle:
         assert manager.ingest_edit("deadbeef", make_image((5, 5, 5)), "plugin") is None
 
 
+class TestPluginDocOpen:
+    """Gallery overhaul (2026-07-22): the Tier-2 plugin's own ground truth
+    for whether a handoff's Photoshop document is still open, replacing the
+    old client-only "editing for over an hour" guess (see
+    HandoffMeta.plugin_doc_open's own docstring)."""
+
+    def test_defaults_to_none_unknown(self, manager):
+        meta = create_handoff(manager)
+        assert manager.get(meta.handoff_id).plugin_doc_open is None
+
+    def test_set_true_then_false(self, manager, events):
+        meta = create_handoff(manager)
+        manager.set_plugin_doc_open(meta.handoff_id, True)
+        assert manager.get(meta.handoff_id).plugin_doc_open is True
+
+        manager.set_plugin_doc_open(meta.handoff_id, False)
+        assert manager.get(meta.handoff_id).plugin_doc_open is False
+
+    def test_does_not_change_status(self, manager):
+        meta = create_handoff(manager)
+        manager.mark_editing(meta.handoff_id)
+        manager.set_plugin_doc_open(meta.handoff_id, False)
+        assert manager.get(meta.handoff_id).status == "editing"
+
+    def test_emits_cpsb_status(self, manager, events):
+        meta = create_handoff(manager)
+        manager.set_plugin_doc_open(meta.handoff_id, True)
+        payloads = events.of_type("cpsb.status")
+        assert payloads[-1]["handoff_id"] == meta.handoff_id
+
+    def test_unknown_handoff_raises(self, manager):
+        with pytest.raises(HandoffNotFoundError):
+            manager.set_plugin_doc_open("deadbeef", False)
+
+    def test_persists_across_reload(self, manager, context):
+        meta = create_handoff(manager)
+        manager.set_plugin_doc_open(meta.handoff_id, False)
+
+        reloaded = HandoffManager(context)
+        assert reloaded.get(meta.handoff_id).plugin_doc_open is False
+
+
 class TestDedup:
     def test_identical_edit_skipped(self, manager, events):
         meta = create_handoff(manager)

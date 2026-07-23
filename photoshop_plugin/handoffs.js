@@ -14,6 +14,13 @@
  * PLAN.md §5's own scoping ("persistence of the map across plugin reloads
  * NOT required") and keeps this module's state as plain in-memory maps with
  * no on-disk format of its own to keep in sync with the backend.
+ *
+ * {@link startDocumentCloseWatcher} (gallery overhaul, 2026-07-22) polls
+ * every {@link DOC_CLOSE_CHECK_MS} whether each tracked document is still
+ * open and tells the server the moment one closes (`document_closed`) — the
+ * ComfyUI-side gallery's real "is this still open?" signal for a Tier-2
+ * handoff, replacing an old client-only elapsed-time guess that had no
+ * plugin involvement at all.
  */
 
 const { app, core } = require('photoshop')
@@ -299,12 +306,18 @@ function findByPath(path) {
  * `documentId` yet (mid-open) is left alone so an in-flight open isn't pruned.
  * Silent — no `notifyChanged()` — so it's safe to call from inside a render
  * (which `getActiveHandoffs` is); the manual clear path notifies explicitly.
+ * @param {(record: CpsbHandoffRecord) => void} [onPruned] - Called for each
+ * pruned record BEFORE it's removed from the registry — see
+ * {@link startDocumentCloseWatcher}, the one other caller, which uses this to
+ * tell the server a document closed without this function needing to know
+ * anything about the connection itself.
  * @returns {number} How many were pruned.
  */
-function pruneClosedHandoffs() {
+function pruneClosedHandoffs(onPruned) {
   let removed = 0
   for (const record of Array.from(byHandoffId.values())) {
     if (record.documentId != null && findOpenDocument(record) == null) {
+      onPruned?.(record)
       byHandoffId.delete(record.handoffId)
       if (record.path) byPath.delete(record.path)
       byDocumentId.delete(record.documentId)
@@ -323,6 +336,38 @@ function getActiveHandoffs() {
   pruneClosedHandoffs()
   return Array.from(byHandoffId.values())
 }
+
+/**
+ * How often {@link startDocumentCloseWatcher} checks whether tracked
+ * handoffs' documents are still open, in milliseconds.
+ */
+const DOC_CLOSE_CHECK_MS = 5000
+
+/**
+ * Periodically tells the server when a tracked handoff's Photoshop document
+ * closes (gallery overhaul, 2026-07-22) — the SAME `app.documents` check
+ * {@link pruneClosedHandoffs} already runs for this plugin's own panel list,
+ * just also reported to the server now, so the ComfyUI-side gallery can show
+ * a REAL "is this still open?" signal for a Tier-2 handoff instead of the
+ * old client-only "editing for over an hour" guess it used to make with no
+ * plugin involved at all (`web/cpsb/state.js`, removed). One source of truth
+ * for "is this handoff's document still open" — this function does not
+ * duplicate {@link findOpenDocument}'s own scan, it just adds a callback onto
+ * the SAME pruning pass. Started once at module load; this module has no
+ * teardown (mirrors `saveListener.js`'s own permanent top-level
+ * registration), so a plain top-level `setInterval` running for the plugin's
+ * whole lifetime is appropriate.
+ */
+function startDocumentCloseWatcher() {
+  setInterval(() => {
+    pruneClosedHandoffs((record) => {
+      connection.send({ type: 'document_closed', handoff_id: record.handoffId })
+      logInfo(`handoff ${record.handoffId}: document "${record.docTitle}" closed`)
+    })
+  }, DOC_CLOSE_CHECK_MS)
+}
+
+startDocumentCloseWatcher()
 
 /**
  * Forgets ALL tracked handoffs (the panel's manual "Clear" button). Local

@@ -111,8 +111,15 @@ Status transitions:
 `opened`) → `edited` (≥1 edit ingested; stays `edited` as further saves append to `edits`).
 `cancelled` (user cancel), `discarded` (gallery discard), `superseded` (replaced by a
 "Start Fresh Edit"), `error` (open/ingest failure, with `error` string) are terminal.
-"Stale" is **not** a status — the frontend derives it (`editing` and `updated_ts` older
-than 1h).
+"Closed" is **not** a status — the frontend derives it (`editing` AND
+`plugin_doc_open === false`, gallery overhaul 2026-07-22, replacing an earlier "editing
+and `updated_ts` older than 1h" client-only guess). `plugin_doc_open` (bool | None) is a
+side-channel fact, not a status: `true` on the plugin's `opened` reply, `false` on its
+`document_closed` message (§3), `None`/absent when no Tier-2 plugin has ever reported
+either way (Tier-1-only, or none connected this session) — `None` still means "unknown,"
+never "closed." Scope: this only detects the document WINDOW closing; a Save-As to a
+different path leaves the document open (so `plugin_doc_open` stays `true`) while
+silently orphaning the watch — see README's Limitations.
 
 `fidelity` records how the edit's pixels were produced: `composite` = embedded
 Maximize-Compatibility composite (Tier 1 best case), `recomposite` = psd-tools re-render
@@ -238,15 +245,17 @@ Marks the handoff `cancelled`, unblocks a waiting bridge node (which then raises
 `cpsb.status` with `cancelled` so the node badge and gallery clear. 200 `{"ok": true}`;
 404 unknown. This is the authoritative way to clear a handoff stuck in `editing` — e.g.
 the user opened Photoshop and closed the document without saving, which produces no file
-event in Tier 1 and so would otherwise sit in `editing` indefinitely. The frontend
-surfaces it directly on the node's "Editing in Photoshop…" badge (hover → cancel) and in
-the gallery; cancelling is always available immediately, not gated on the stale timeout.
-Idempotent: cancelling an already-terminal handoff returns 200 and is a no-op. Any edit
-that arrives after cancellation (a late save landing on a cancelled handoff) is ignored
-by the ingest path (status not in `ACTIVE_STATUSES`).
+event in Tier 1 and so would otherwise sit in `editing` indefinitely (a Tier-2 plugin now
+surfaces this same case proactively and in real time via `document_closed` above — see
+`plugin_doc_open` — but Cancel remains the manual escape hatch either way, always
+available immediately, never gated on any timeout). The frontend surfaces it directly on
+the node's "Editing in Photoshop…" badge (hover → cancel) and in the gallery ("Cancel" on
+a pending/editing/closed card). Idempotent: cancelling an already-terminal handoff
+returns 200 and is a no-op. Any edit that arrives after cancellation (a late save landing
+on a cancelled handoff) is ignored by the ingest path (status not in `ACTIVE_STATUSES`).
 
 ### POST `/cpsb/discard/{handoff_id}`
-Gallery "Discard" for stale handoffs: same as cancel but sets `discarded`. 200/404.
+Gallery "Remove" for any handoff: same as cancel but sets `discarded`. 200/404.
 
 ### GET `/cpsb/status`
 ```json
@@ -297,7 +306,8 @@ Plugin → server:
   `fetch()` calls to a remote ComfyUI simply fail, so both directions ride the control
   websocket that is already open and already proven to work cross-machine.
 - `{"type": "opened", "handoff_id": "...", "document_id": 123}` — document open
-  succeeded; server sets status `editing`.
+  succeeded; server sets status `editing` and records `plugin_doc_open: true`
+  (`HandoffMeta.plugin_doc_open`, gallery overhaul 2026-07-22).
 - `{"type": "open_failed", "handoff_id": "...", "error": "..."}` — server sets status
   `error`. If the plugin is in LOCAL mode (same machine as the server), the server falls
   back to a Tier 1 OS-open if available. For a REMOTE-mode plugin it does **not** fall
@@ -306,6 +316,14 @@ Plugin → server:
   so the real failure is visible.
 - `{"type": "save_detected", "handoff_id": "..."}` — informational (UI badge); pixels
   follow via POST `/cpsb/upload` (LOCAL mode) or `upload_edit` (REMOTE mode).
+- `{"type": "document_closed", "handoff_id": "..."}` — gallery overhaul (2026-07-22): the
+  plugin's own periodic `app.documents` check (`photoshop_plugin/handoffs.js`'s
+  `startDocumentCloseWatcher`/`pruneClosedHandoffs`, every 5s) detected that a tracked
+  handoff's document closed. Server records `plugin_doc_open: false`
+  (`HandoffMeta.plugin_doc_open`) — never touches `status` — so the gallery can show a
+  real "closed without saving" signal for a Tier-2 handoff (`web/cpsb/state.js`'s
+  `getDisplayStatus`), replacing an old client-only "editing for over an hour" guess that
+  had no plugin involvement at all.
 - `{"type": "request_file", "handoff_id": "..."}` — REMOTE-mode PSD download (replaces a
   `fetch` of `GET /cpsb/file/{handoff_id}`, which UXP blocks for a non-localhost host).
   Server replies with one or more `file_chunk`s or a `file_error`, reading the exact same
@@ -1040,14 +1058,23 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
 - Batch nodes (`node.imgs.length > 1`): open the **currently displayed** image
   (`node.imageIndex ?? 0`); an "Open all N in Photoshop" item appears for N ≤ 8.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
-  `cpsb.showUpgradeBanner` (bool, default true), `cpsb.galleryGridLayout` (bool, default
-  false — List/Grid layout for the sidebar gallery; the gallery header's own List/Grid
-  buttons write the same setting, so the two controls always agree).
-- Gallery card thumbnail (v0.5.36): each card leads with ONE larger thumbnail — the
-  latest edit, or the original when no edit exists yet. When an edit exists,
-  click-and-hold (Pointer Events; mouse and touch) reveals the original while held and
-  snaps back on release/cancel. Purely a display affordance: no new route, no new
-  websocket message, no change to the card action surface.
+  `cpsb.showUpgradeBanner` (bool, default true).
+- **Gallery** (v0.5.36; overhauled 2026-07-22): each card leads with ONE larger
+  thumbnail — the latest edit, or the original when no edit exists yet — with the
+  original layered underneath for comparison. Grid is the gallery's ONLY layout (the
+  former List alternative and its header toggle, `cpsb.galleryGridLayout`, were
+  removed); a single header-level "Hold to compare" button (Pointer Events; mouse and
+  touch) reveals every visible card's original at once while held, replacing a prior
+  per-thumbnail hold gesture. Cards whose status is `cancelled`, `discarded`, or
+  `superseded` are hidden from the list entirely (alongside `error`, which stays
+  visible — diagnostic, not routine bookkeeping); an `editing` card whose Tier-2 plugin
+  has reported the document closed (`document_closed` above, `plugin_doc_open`) shows
+  as "Closed without saving" instead of guessing from elapsed time. Card action labels
+  are **Reveal** (center the origin node in the graph), **Open** (Re-open/Open-fresh-
+  copy, mutually exclusive per card), **Add** (add the latest edit as a Load Image
+  node), **Cancel**, and **Remove**. The corresponding per-node canvas badge
+  (`badges.js`) no longer flashes its own "Edited" checkmark on completion — the
+  gallery's chip is the only completion signal now, decluttering the node canvas.
 
 ---
 

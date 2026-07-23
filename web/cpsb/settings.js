@@ -1,6 +1,6 @@
 /**
  * @file Registers the frontend-only `cpsb.*` ComfyUI settings (PROTOCOL.md
- * §8) and provides read/write helpers: three boolean toggles, plus a
+ * §8) and provides read/write helpers: two boolean toggles, plus a
  * read-only version-info row. Distinct from the backend-persisted settings
  * exposed via `GET/POST /cpsb/settings` (`api.getBackendSettings` /
  * `api.updateBackendSettings`), which are not edited from this frontend.
@@ -39,7 +39,7 @@ import { el, injectStyles } from './ui.js'
 
 /**
  * @typedef {Object} CpsbSettingParams
- * Minimal shape of a ComfyUI `SettingParams` entry actually used here: three
+ * Minimal shape of a ComfyUI `SettingParams` entry actually used here: two
  * boolean toggles, plus one purely-informational row whose `type` is a
  * "custom renderer" function instead of a data-type string (see the file
  * header for the verified source references).
@@ -106,19 +106,6 @@ export const SETTINGS = [
       'Show a dismissible banner in the Photoshop Edits sidebar tab ' +
       'suggesting the ComfyUI panel plugin for Photoshop (instant round ' +
       'trips, remote ComfyUI support).'
-  },
-  {
-    id: 'cpsb.galleryGridLayout',
-    name: 'Show Photoshop Edits gallery as a grid',
-    type: 'boolean',
-    defaultValue: false,
-    category: ['Photoshop Bridge', 'General', 'Gallery grid layout'],
-    tooltip:
-      'When on: the Photoshop Edits sidebar tab shows edits as a responsive ' +
-      'multi-column grid of thumbnail-led cards. When off (default): the ' +
-      'existing single-column list. Also toggleable directly from the List/' +
-      'Grid buttons in the gallery header — either place changes the same ' +
-      'setting, so they always agree.'
   },
   {
     id: 'cpsb.versionInfo',
@@ -193,19 +180,3 @@ export function setShowUpgradeBanner(value) {
   writeBooleanSetting('cpsb.showUpgradeBanner', value)
 }
 
-/**
- * @returns {boolean} Current value of `cpsb.galleryGridLayout` (default
- * `false` — the single-column list). Read by `gallery.js`'s `rebuild()` on
- * every render, so a change made from either the settings panel or the
- * gallery header's own List/Grid toggle takes effect immediately.
- */
-export function getGalleryGridLayout() {
-  return readBooleanSetting('cpsb.galleryGridLayout', false)
-}
-
-/**
- * @param {boolean} value
- */
-export function setGalleryGridLayout(value) {
-  writeBooleanSetting('cpsb.galleryGridLayout', value)
-}

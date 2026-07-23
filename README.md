@@ -32,7 +32,7 @@ Right-clicking an image and choosing **Open in Photoshop** is the core action, a
 
 Handoffs opened in Photoshop are **named after the file they came from** — `Eric-Headshot.jpg` opens as `Eric-Headshot.psd`, not an anonymous `source.psd` — so document tabs and file dropdowns stay tellable-apart.
 
-A **"Photoshop Edits" sidebar gallery** tracks every round trip for the workflow, as a list or a grid (toggle in the gallery header, remembered across sessions): re-open an edit, add it as a node, reveal the file, or remove an entry from the list. Each card leads with the latest edit — **click and hold the thumbnail to compare it against the original**. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
+A **"Photoshop Edits" sidebar gallery** tracks every round trip for the workflow as a grid of cards: **Open** it again in Photoshop, **Add** it as a node, **Reveal** its origin node on the canvas, or **Remove** it from the list. Each card leads with the latest edit — hold the gallery's **"Hold to compare"** button to see every card's original at once. A card still `Editing` whose Tier-2 plugin has confirmed the document is closed shows "Closed without saving" instead of guessing from elapsed time. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
 
 <!-- demo.gif -->
 *(Right-click an image → Open in Photoshop → edit → Cmd/Ctrl+S → the node updates. Demo GIF coming.)*
@@ -113,14 +113,14 @@ The round trip, the four nodes, the gallery, and cross-machine editing all work 
 - **Layers don't round-trip into the graph.** A ComfyUI image is flat RGB, so what returns to the node is always a flattened raster. Your layers survive in Photoshop (and on the edit-in-place path, in the file), but aren't exposed as layers in ComfyUI.
 - **16-bit and non-RGB images are converted to RGB8.** CMYK, Grayscale, Lab, or 16-bit sources are converted on the way in — a plain, non-color-managed conversion (a CMYK PSD loads as recognizable RGB, not a colorimetric match). Full-fidelity high-bit-depth or color-managed round-tripping is out of scope. (Compose's *append-to-existing* is stricter: it refuses a non-RGB target outright rather than silently converting your artwork.)
 - **`.tif`/`.tiff` load out of the box** in the Load PSD node (no extra dependency); no third-party image decoders are bundled. Illustrator `.ai` and camera raw/`.dng` open through Photoshop itself, via a dedicated Tier-2 "Open via Photoshop" node (see the roadmap).
-- **Save-As to a different file or format breaks the automatic link.** The watcher only watches the exact managed hand-off path. If you Save As elsewhere, the sidebar gallery marks that hand-off "Stale" and accepts drag-and-drop of any image as a manual import to recover it.
+- **Save-As to a different file or format breaks the automatic link.** The watcher only watches the exact managed hand-off path. If you Save As elsewhere, the document stays open in Photoshop — so it never shows as "Closed without saving" either — but no edit ever arrives at the card, which just sits at "Editing" with nothing to tell you why. Recover with drag-and-drop: drop the saved-elsewhere image onto that card in the sidebar gallery to import it manually.
 - **Remote/headless ComfyUI needs Tier 2.** Tier 1 opens a local file and watches the local filesystem, so it needs Photoshop and ComfyUI on the same machine (with a GUI session). For remote ComfyUI, use the Tier 2 plugin and point it at the server's address.
 
 ## Troubleshooting
 
 **Photoshop asks about Maximize Compatibility on every save.** Set Preferences → File Handling → Maximize PSD Compatibility to **Always** (see Quick Start / [docs/INSTALL.md](docs/INSTALL.md)).
 
-**My edit never comes back into ComfyUI.** Most likely you Save-As'd to a different file or location, which breaks the automatic link (see Limitations) — check the sidebar gallery for a "Stale" chip and drag-and-drop to import it manually. Also confirm you actually saved, and give it a second to settle.
+**My edit never comes back into ComfyUI.** Most likely you Save-As'd to a different file or location, which breaks the automatic link (see Limitations) — the card just sits at "Editing" with no chip to flag it, so drag-and-drop the saved-elsewhere image onto that card in the sidebar gallery to import it manually. Also confirm you actually saved, and give it a second to settle.
 
 **"Open in Photoshop" is missing or disabled.** Your ComfyUI server is probably remote or headless — Tier 1 needs a local Photoshop with a GUI session. Install the Tier 2 plugin, which works over the network.
 

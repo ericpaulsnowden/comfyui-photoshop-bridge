@@ -1939,6 +1939,63 @@ class TestPluginWebsocket:
             # No server-side launch — a remote plugin's failure stays an error.
             assert launches.calls == []
 
+    async def test_opened_sets_plugin_doc_open_true(
+        self, client, manager, context, source_image, launches
+    ):
+        """Gallery overhaul (2026-07-22): `opened` now ALSO records the
+        plugin's own ground truth that the document is open, alongside the
+        existing `status -> editing` transition."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+            assert manager.get(handoff_id).plugin_doc_open is None
+
+            await ws.send_json({"type": "opened", "handoff_id": handoff_id, "document_id": 7})
+            await wait_until(lambda: manager.get(handoff_id).status == "editing")
+            assert manager.get(handoff_id).plugin_doc_open is True
+
+    async def test_document_closed_sets_plugin_doc_open_false(
+        self, client, manager, context, source_image, launches
+    ):
+        """The new `document_closed` message records the document closing
+        WITHOUT touching `status` — the handoff stays `editing` (still
+        reachable by Re-open/Cancel), only the display layer's derived
+        "closed" pseudo-status changes (web/cpsb/state.js)."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+            await ws.send_json({"type": "opened", "handoff_id": handoff_id, "document_id": 7})
+            await wait_until(lambda: manager.get(handoff_id).plugin_doc_open is True)
+
+            await ws.send_json({"type": "document_closed", "handoff_id": handoff_id})
+            await wait_until(lambda: manager.get(handoff_id).plugin_doc_open is False)
+            assert manager.get(handoff_id).status == "editing"  # unchanged
+
+    async def test_document_closed_unknown_handoff_does_not_crash_connection(
+        self, client, manager, context, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self.handshake(ws, context)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "document_closed", "handoff_id": "deadbeef"})
+
+            # The connection/message loop must keep working afterward — a
+            # real subsequent round trip still succeeds.
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+            await ws.send_json({"type": "opened", "handoff_id": handoff_id, "document_id": 7})
+            await wait_until(lambda: manager.get(handoff_id).plugin_doc_open is True)
+
     def _make_bare_handoff(self, manager: HandoffManager, node_id: str) -> str:
         """A bare ``bridge_node`` handoff (no PSD on disk) -- enough for the
         `run_action`/`action_ok`/`action_error` tests below, which never

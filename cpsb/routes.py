@@ -1965,8 +1965,23 @@ async def _handle_plugin_message(
         if handoff_id:
             try:
                 manager.mark_editing(handoff_id)
+                manager.set_plugin_doc_open(handoff_id, True)
             except HandoffNotFoundError:
                 logger.warning("Plugin opened unknown handoff %s", handoff_id)
+    elif msg_type == "document_closed":
+        # Gallery overhaul (2026-07-22): the plugin's OWN ground truth that a
+        # tracked document closed (photoshop_plugin/handoffs.js's
+        # pruneClosedHandoffs, which already ran this exact app.documents
+        # check for its own panel list -- this just relays it here too).
+        # Never touches `status` -- see set_plugin_doc_open's own docstring
+        # -- so this is safe even for a handoff that has since gone terminal
+        # for an unrelated reason.
+        handoff_id = msg.get("handoff_id")
+        if handoff_id:
+            try:
+                manager.set_plugin_doc_open(handoff_id, False)
+            except HandoffNotFoundError:
+                logger.warning("Plugin reported document_closed for unknown handoff %s", handoff_id)
     elif msg_type == "open_failed":
         handoff_id = msg.get("handoff_id")
         error_text = str(msg.get("error") or "Plugin failed to open")

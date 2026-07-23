@@ -20,9 +20,6 @@ import * as api from './api.js'
 /** Handoff statuses that count as "this node has an active round trip". */
 const ACTIVE_STATUSES = new Set(['pending', 'editing', 'edited'])
 
-/** A handoff sitting in `editing` longer than this is considered Stale. */
-const STALE_MS = 60 * 60 * 1000
-
 /** @type {Map<string, import('./api.js').CpsbHandoffMeta>} */
 const handoffsById = new Map()
 
@@ -282,14 +279,22 @@ export function getTierInfo() {
 
 /**
  * Derives the display status for a handoff, materializing the client-only
- * "stale" pseudo-status (PROTOCOL.md §1: `editing` and `updated_ts` older
- * than 1h; never sent by the server).
+ * "closed" pseudo-status (gallery overhaul, 2026-07-22): an `editing`
+ * handoff whose Tier-2 plugin has reported its document CLOSED
+ * (`meta.plugin_doc_open === false` — `cpsb/handoff.py`'s
+ * `HandoffMeta.plugin_doc_open`, set by the plugin's own `document_closed`
+ * message, never guessed). Replaces the old time-based "stale after 1h"
+ * heuristic, which had no plugin involvement and could only ever guess —
+ * with no Tier-2 plugin ever having reported (`plugin_doc_open` stays
+ * `null`/absent, Tier-1-only or no plugin connected this session), an
+ * `editing` handoff still just reads `editing`, honestly, for as long as it
+ * takes: there is genuinely no way to know otherwise.
  * @param {import('./api.js').CpsbHandoffMeta} meta
- * @returns {import('./api.js').CpsbStatus | "stale"}
+ * @returns {import('./api.js').CpsbStatus | "closed"}
  */
 export function getDisplayStatus(meta) {
-  if (meta.status === 'editing' && Date.now() - meta.updated_ts * 1000 > STALE_MS) {
-    return 'stale'
+  if (meta.status === 'editing' && meta.plugin_doc_open === false) {
+    return 'closed'
   }
   return meta.status
 }
