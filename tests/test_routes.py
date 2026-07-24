@@ -3125,3 +3125,130 @@ class TestManualPush:
             status = await (await client.get("/cpsb/status")).json()
             ids = [h["handoff_id"] for h in status["handoffs"]]
             assert ack["handoff_id"] in ids
+
+
+def jpeg_bytes(color: tuple[int, int, int], size: tuple[int, int] = (24, 16)) -> bytes:
+    """A real JPEG payload -- the live-frame wire format (PROTOCOL.md §3)."""
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format="JPEG", quality=90)
+    return buffer.getvalue()
+
+
+class TestLiveFrame:
+    """`live_frame` (realtime drawing M1, docs/roadmap/realtime-drawing.md):
+    the plugin's save-free canvas stream. Keep-latest, fire-and-forget, and
+    EPHEMERAL -- one in-memory slot on the connection, no handoff, no disk,
+    no gallery entry, ever.
+    """
+
+    async def test_frame_stored_and_cpsb_live_emitted(self, client, context, manager, events):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            payload = jpeg_bytes((10, 20, 30))
+            await ws.send_json(
+                {
+                    "type": "live_frame",
+                    "seq": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "doc_title": "sketch.psd",
+                }
+            )
+            await wait_until(lambda: routes_module.get_live_frame(client.app) is not None)
+
+            frame = routes_module.get_live_frame(client.app)
+            assert frame is not None
+            jpeg, seq, title = frame
+            assert jpeg == payload
+            assert seq == 1
+            assert title == "sketch.psd"
+            live_events = events.of_type("cpsb.live")
+            assert live_events and live_events[-1] == {"seq": 1, "doc_title": "sketch.psd"}
+
+    async def test_keep_latest_replaces_and_seq_is_server_side(self, client, context, manager):
+        """The slot holds ONE frame, and seq is the SERVER's monotonic
+        counter -- the plugin's own seq is ignored, so a plugin
+        restart/reconnect can never replay a lower number and stall
+        IS_CHANGED."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            first = jpeg_bytes((1, 1, 1))
+            second = jpeg_bytes((2, 2, 2))
+            for plugin_seq, payload in ((99, first), (1, second)):  # plugin seq goes BACKWARD
+                await ws.send_json(
+                    {
+                        "type": "live_frame",
+                        "seq": plugin_seq,
+                        "data_b64": base64.b64encode(payload).decode("ascii"),
+                        "doc_title": "sketch.psd",
+                    }
+                )
+            await wait_until(
+                lambda: (routes_module.get_live_frame(client.app) or (None, 0, None))[1] == 2
+            )
+            jpeg, seq, _title = routes_module.get_live_frame(client.app)
+            assert jpeg == second  # latest replaced earlier
+            assert seq == 2  # server-side counter, strictly increasing
+
+    async def test_frames_never_touch_disk_or_handoffs(self, client, context, manager):
+        """The roadmap's design commitment, asserted: a live frame creates no
+        handoff and writes nothing under the managed folder."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            before_files = sorted(context.cpsb_input_dir.rglob("*"))
+            await ws.send_json(
+                {
+                    "type": "live_frame",
+                    "seq": 1,
+                    "data_b64": base64.b64encode(jpeg_bytes((5, 5, 5))).decode("ascii"),
+                    "doc_title": "x",
+                }
+            )
+            await wait_until(lambda: routes_module.get_live_frame(client.app) is not None)
+            assert manager.list_all() == []
+            assert sorted(context.cpsb_input_dir.rglob("*")) == before_files
+
+    async def test_invalid_frames_dropped_socket_alive(self, client, context, manager):
+        """Bad base64 / non-JPEG bytes are dropped with a log line -- never an
+        error reply (fire-and-forget protocol), never a socket teardown, and
+        never a slot update."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {"type": "live_frame", "seq": 1, "data_b64": "!!!not-base64!!!", "doc_title": "x"}
+            )
+            await ws.send_json(
+                {
+                    "type": "live_frame",
+                    "seq": 2,
+                    "data_b64": base64.b64encode(b"not a jpeg").decode("ascii"),
+                    "doc_title": "x",
+                }
+            )
+            # Socket still healthy: a valid frame right after lands as seq 1
+            # (the two bad ones never bumped the counter).
+            await ws.send_json(
+                {
+                    "type": "live_frame",
+                    "seq": 3,
+                    "data_b64": base64.b64encode(jpeg_bytes((7, 7, 7))).decode("ascii"),
+                    "doc_title": "x",
+                }
+            )
+            await wait_until(lambda: routes_module.get_live_frame(client.app) is not None)
+            _jpeg, seq, _title = routes_module.get_live_frame(client.app)
+            assert seq == 1
+
+    async def test_get_live_frame_none_without_plugin_or_frame(self, client, context, manager):
+        assert routes_module.get_live_frame(client.app) is None  # no plugin at all
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            assert routes_module.get_live_frame(client.app) is None  # ready, no frame yet

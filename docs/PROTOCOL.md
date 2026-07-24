@@ -367,6 +367,18 @@ Plugin → server:
   Replies `manual_push_ok` (`{"push_id", "handoff_id"}`, the new id) or
   `manual_push_error` (`{"push_id", "error"}`) — an invalid/malformed transfer never
   creates a handoff at all.
+- `{"type": "live_frame", "seq": 12, "data_b64": "<jpeg>", "doc_title": "sketch.psd"}` —
+  realtime drawing (docs/roadmap/realtime-drawing.md M1): one save-free snapshot of the
+  Live-Mode document (JPEG, captured via `imaging.getPixels` downscaled to 768px long
+  side + `encodeImageData`), sent after every detected canvas change (a ~300ms poll of
+  the document's history-state id — `photoshop_plugin/liveMode.js`). NOT chunked (frames
+  are far below the 8 MiB websocket cap), NOT acked (fire-and-forget keep-latest: a bad
+  or dropped frame is simply replaced by the next stroke's), and NEVER a handoff — the
+  server holds exactly ONE frame in memory per connection (`PluginConnection.live_jpeg`),
+  bumps its own server-side counter (the plugin's `seq` is ignored so a reconnect can
+  never go backward), and emits `cpsb.live` (§5). `PhotoshopLiveCanvas` (§6f) serves the
+  newest frame; invalid base64/non-JPEG payloads are dropped with a log line, never an
+  error reply and never a socket teardown.
 - `{"type": "pong"}`
 
 Server → plugin:
@@ -535,6 +547,11 @@ research/research-annotate-node.md retain the design if ever revisited.
   `cpsb.updated` subscription is what clears a Tier-1 badge when the edit arrives).
 - `"cpsb.tier2"` — plugin connection state changed:
   `{"connected": true, "ps_version": "26.5"}`
+- `"cpsb.live"` — a new live-drawing frame landed (realtime drawing M1):
+  `{"seq": 12, "doc_title": "sketch.psd"}`. `seq` is the server-side frame counter
+  (`PhotoshopLiveCanvas.IS_CHANGED`'s cache key). The M2 frontend live loop queues a
+  coalesced re-run on this event; consumers never fetch the frame itself — only the
+  node reads the in-memory slot, at execute time.
 
 **Universal cancel (product-owner requirement 2026-07-17):** ANY node that shows the
 "Editing in Photoshop…" badge (badges.js) MUST expose a working cancel ✕, regardless of
@@ -1068,6 +1085,35 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `{handoff_id, error}` → server `manager.mark_error()` (same transition as `open_failed`),
   unblocking the waiter with `WaitOutcome.ERROR` rather than spinning to timeout. The plugin's
   existing generic dispatch forwards these; `connection.js` needed no change.
+
+### 6f. Photoshop Live Canvas node (realtime drawing M1)
+
+`PhotoshopLiveCanvas` (`cpsb/live.py`; docs/roadmap/realtime-drawing.md) serves the newest
+save-free canvas snapshot the plugin's Live Mode streams (`live_frame`, §3) as
+`(IMAGE, MASK)`. **Tier-2-required** like the Action node, same ethos exception — there is
+no Tier-1 equivalent of save-free capture; it interrupts with an actionable log when no
+plugin is connected or no frame has streamed yet.
+
+- **No handoffs, no disk, no gallery** — the roadmap's ephemerality commitment. The node's
+  entire server-side state is `PluginConnection`'s one keep-latest slot
+  (`routes.get_live_frame`), which dies with the connection. None of the
+  create/supersede/`wait_for_edit` machinery applies.
+- **`IS_CHANGED` = the server-side frame counter** (`frame-<seq>` / `"no-frame"`) — the
+  whole backpressure story on the graph side: a re-queue with no new frame is served from
+  ComfyUI's cache, near-free, so the M2 live loop (or a mashed Queue button) can fire
+  liberally.
+- **`auto_queue` widget (`On`/`Off`)** is read CLIENT-side only (`web/cpsb/live.js`, M2 —
+  the same frontend-reads-the-widget gating as the bridge node's `mode` in `pasteback.js`):
+  `On` auto-queues a coalesced re-run per arriving frame; `Off` still streams, the next
+  manual queue picks up the newest.
+- **MASK is always zeros**: the wire format is JPEG (UXP's `encodeImageData` is
+  documented JPEG-only), which cannot carry alpha; the output exists for wiring parity.
+- Plugin control surface: the panel's **LIVE MODE** section (`Start Live`/`Stop Live`,
+  status line) — one session at a time, watching the document that was active when
+  started; auto-stops when that document closes. Capture cadence: ~300ms history-id poll,
+  768px long-side `targetSize`, `dispose()` after every capture (`liveMode.js`'s doc
+  comment carries the research/spike provenance — the history-id poll's stroke-promptness
+  is spike S-A, owner-verified via the checklist).
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 

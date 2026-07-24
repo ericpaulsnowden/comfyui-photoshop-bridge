@@ -1,0 +1,176 @@
+"""``PhotoshopLiveCanvas`` (realtime drawing M1, docs/roadmap/realtime-drawing.md).
+
+Node-level behavior against a fake connected plugin whose live-frame slot is
+driven directly through :func:`cpsb.routes._handle_live_frame` (a synchronous
+handler -- no websocket needed at this level; the wire path has its own tests
+in ``tests/test_routes.py``'s ``TestLiveFrame``). Fixture shapes mirror
+``tests/test_actions.py`` exactly (the other Tier-2-required node).
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import subprocess
+import sys
+from pathlib import Path
+from typing import cast
+
+import numpy as np
+import pytest
+from aiohttp import web
+from PIL import Image
+
+import cpsb.live as live_module
+import cpsb.nodes as nodes_module
+import cpsb.routes as routes_module
+from cpsb.context import CpsbContext
+from cpsb.handoff import HandoffManager
+
+
+def jpeg_bytes(color: tuple[int, int, int], size: tuple[int, int] = (24, 16)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format="JPEG", quality=95)
+    return buffer.getvalue()
+
+
+def raises_interrupt():
+    """Outside ComfyUI, ``nodes._raise_interrupt`` raises RuntimeError naming
+    ``comfy.model_management`` -- same helper as ``tests/test_actions.py``."""
+    return pytest.raises(RuntimeError, match=r"comfy\.model_management")
+
+
+@pytest.fixture
+def manager(context: CpsbContext) -> HandoffManager:
+    return HandoffManager(context)
+
+
+@pytest.fixture
+def live_app(context: CpsbContext, manager: HandoffManager):
+    """An installed app with a READY fake plugin connection -- the node reads
+    the live slot through ``routes.get_live_frame(state.app)``."""
+    app = web.Application()
+    routes_module.install(app, context, manager)
+    connection = routes_module.PluginConnection(ws=cast("object", None), ready=True)
+    app[routes_module._APP_KEY_PLUGIN].connection = connection
+    nodes_module.configure(context, manager, app, cast("object", None))
+    yield app, connection
+    nodes_module._state = None
+
+
+@pytest.fixture
+def no_plugin_node(context: CpsbContext, manager: HandoffManager):
+    app = web.Application()
+    routes_module.install(app, context, manager)
+    nodes_module.configure(context, manager, app, cast("object", None))
+    yield live_module.PhotoshopLiveCanvas()
+    nodes_module._state = None
+
+
+def push_frame(
+    context: CpsbContext,
+    connection: routes_module.PluginConnection,
+    color: tuple[int, int, int],
+    title: str = "sketch.psd",
+) -> None:
+    routes_module._handle_live_frame(
+        context,
+        connection,
+        {
+            "type": "live_frame",
+            "seq": 1,
+            "data_b64": base64.b64encode(jpeg_bytes(color)).decode("ascii"),
+            "doc_title": title,
+        },
+    )
+
+
+class TestImportability:
+    def test_module_imports_without_torch(self):
+        """Same isolated-subprocess check as every other node module's own."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import cpsb.live as m, sys\n"
+                "assert m.PhotoshopLiveCanvas is not None\n"
+                "print('torch' in sys.modules)",
+            ],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout.strip() == "False", result.stderr
+
+
+class TestIsChanged:
+    def test_no_frame_is_stable(self, live_app):
+        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == "no-frame"
+        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == "no-frame"
+
+    def test_each_frame_changes_the_key(self, context, live_app):
+        _app, connection = live_app
+        push_frame(context, connection, (1, 1, 1))
+        first = live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On")
+        assert first == "frame-1"
+        # No new frame -> stable key -> ComfyUI serves the run from cache.
+        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == first
+        push_frame(context, connection, (2, 2, 2))
+        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == "frame-2"
+
+    def test_auto_queue_not_folded_in(self, context, live_app):
+        _app, connection = live_app
+        push_frame(context, connection, (3, 3, 3))
+        on = live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On")
+        off = live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="Off")
+        assert on == off
+
+
+class TestExecute:
+    def test_requires_tier2(self, no_plugin_node):
+        with raises_interrupt():
+            no_plugin_node.execute(auto_queue="On")
+
+    def test_interrupts_without_a_frame(self, live_app):
+        node = live_module.PhotoshopLiveCanvas()
+        with raises_interrupt():
+            node.execute(auto_queue="On")
+
+    def test_serves_latest_frame_as_tensors(self, context, live_app):
+        _app, connection = live_app
+        push_frame(context, connection, (255, 0, 0))
+        node = live_module.PhotoshopLiveCanvas()
+
+        image_tensor, mask_tensor = node.execute(auto_queue="On")
+
+        assert tuple(image_tensor.shape) == (1, 16, 24, 3)
+        pixels = (image_tensor[0].numpy() * 255.0).round().astype(np.uint8)
+        red, green, blue = pixels[0, 0]
+        assert red > 230 and green < 30 and blue < 30  # JPEG-lossy red
+        # MASK is always zeros: JPEG carries no alpha (module docstring).
+        assert tuple(mask_tensor.shape) == (1, 16, 24)
+        assert float(mask_tensor.max()) == 0.0
+
+    def test_new_frame_replaces_old_pixels(self, context, live_app):
+        _app, connection = live_app
+        node = live_module.PhotoshopLiveCanvas()
+        push_frame(context, connection, (255, 0, 0))
+        node.execute(auto_queue="On")
+
+        push_frame(context, connection, (0, 0, 255))
+        image_tensor, _mask = node.execute(auto_queue="On")
+
+        pixels = (image_tensor[0].numpy() * 255.0).round().astype(np.uint8)
+        red, _green, blue = pixels[0, 0]
+        assert blue > 230 and red < 30  # keep-latest: the newest frame wins
+
+    def test_undecodable_frame_interrupts_not_crashes(self, context, live_app):
+        _app, connection = live_app
+        # Slip a JPEG-SOI-prefixed-but-truncated payload straight into the
+        # slot (the server's cheap sniff would admit it).
+        connection.live_jpeg = b"\xff\xd8truncated-nonsense"
+        connection.live_seq = 7
+        node = live_module.PhotoshopLiveCanvas()
+        with raises_interrupt():
+            node.execute(auto_queue="On")

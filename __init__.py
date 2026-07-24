@@ -15,6 +15,7 @@ try:
     from .cpsb import actions as _cpsb_actions
     from .cpsb import annotate as _cpsb_annotate
     from .cpsb import compose_psd as _cpsb_compose_psd
+    from .cpsb import live as _cpsb_live
     from .cpsb import load_psd as _cpsb_load_psd
     from .cpsb import nodes as _cpsb_nodes
 except ImportError:
@@ -24,6 +25,7 @@ except ImportError:
     from cpsb import actions as _cpsb_actions
     from cpsb import annotate as _cpsb_annotate
     from cpsb import compose_psd as _cpsb_compose_psd
+    from cpsb import live as _cpsb_live
     from cpsb import load_psd as _cpsb_load_psd
     from cpsb import nodes as _cpsb_nodes
 
@@ -41,6 +43,7 @@ NODE_CLASS_MAPPINGS = {
     "PhotoshopComposePSD": _cpsb_compose_psd.PhotoshopComposePSD,
     "PhotoshopAnnotate": _cpsb_annotate.PhotoshopAnnotate,
     "PhotoshopAction": _cpsb_actions.PhotoshopAction,
+    "PhotoshopLiveCanvas": _cpsb_live.PhotoshopLiveCanvas,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopBridge": "Edit in Photoshop",
@@ -48,6 +51,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopComposePSD": "Compose Layers to PSD",
     "PhotoshopAnnotate": "Annotate for Edit",
     "PhotoshopAction": "Run Photoshop Action",
+    "PhotoshopLiveCanvas": "Photoshop Live Canvas",
 }
 
 # ComfyUI checks os.path.isdir() on this itself (nodes.py load_custom_node),

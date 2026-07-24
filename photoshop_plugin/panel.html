@@ -307,6 +307,19 @@
 
       <div class="cpsb-rule"></div>
 
+      <!-- Live Mode (realtime drawing, docs/roadmap/realtime-drawing.md M1):
+           save-free canvas streaming for the ComfyUI "Photoshop Live Canvas"
+           node. One session, for the active document, toggled here. -->
+      <div class="cpsb-section-title">LIVE MODE</div>
+      <div class="cpsb-conn-actions">
+        <sp-button id="cpsb-live-toggle" variant="secondary">Start Live</sp-button>
+      </div>
+      <div id="cpsb-live-status" class="cpsb-muted cpsb-conn-line">
+        Streams the active document to the Photoshop Live Canvas node as you draw.
+      </div>
+
+      <div class="cpsb-rule"></div>
+
       <!-- Plain div + JS click toggle: <details>/<summary> are unsupported
            in UXP (treated as bare divs, so the disclosure never collapses),
            and the `hidden` attribute is documented as unsupported too. The

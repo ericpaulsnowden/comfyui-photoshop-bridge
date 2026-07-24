@@ -214,7 +214,7 @@ class TestRegistration:
         entry = self._load_top_level_init()
         assert entry.NODE_CLASS_MAPPINGS["PhotoshopAction"] is actions_module.PhotoshopAction
         assert entry.NODE_DISPLAY_NAME_MAPPINGS["PhotoshopAction"] == "Run Photoshop Action"
-        # All five nodes present -- the pack still imports cleanly with this
+        # All six nodes present -- the pack still imports cleanly with this
         # one added, not just this node in isolation.
         assert set(entry.NODE_CLASS_MAPPINGS) == {
             "PhotoshopBridge",
@@ -222,6 +222,7 @@ class TestRegistration:
             "PhotoshopComposePSD",
             "PhotoshopAnnotate",
             "PhotoshopAction",
+            "PhotoshopLiveCanvas",
         }
 
 

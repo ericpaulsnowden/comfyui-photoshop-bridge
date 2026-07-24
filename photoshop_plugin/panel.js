@@ -19,6 +19,7 @@ const { connection } = require('./connection.js')
 const { getActiveHandoffs, registryEvents, deliverEdit, clearAllHandoffs } = require('./handoffs.js')
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
 const { isAutoFixEnabled, setAutoFixEnabled } = require('./prefs.js')
+const { toggleLive, getLiveState, liveEvents } = require('./liveMode.js')
 
 // Same version source the `hello` handshake message uses (connection.js):
 // require('uxp').versions.plugin is documented to match manifest.json's
@@ -353,8 +354,38 @@ function initPanel() {
   registryEvents.addEventListener('change', renderHandoffs)
   onLogLine(appendLogLine)
 
+  // Live Mode (realtime drawing M1): toggle + status line, re-rendered on
+  // every liveEvents change (a sent frame, an error, start/stop).
+  const liveToggle = /** @type {HTMLElement} */ (document.getElementById('cpsb-live-toggle'))
+  const liveStatus = /** @type {HTMLElement} */ (document.getElementById('cpsb-live-status'))
+
+  function renderLive() {
+    const live = getLiveState()
+    liveToggle.textContent = live.active ? 'Stop Live' : 'Start Live'
+    if (!live.active) {
+      liveStatus.textContent =
+        live.lastError ||
+        'Streams the active document to the Photoshop Live Canvas node as you draw.'
+      return
+    }
+    const parts = [`Watching "${live.docTitle}"`, `${live.framesSent} frames`]
+    if (live.lastCaptureMs != null) parts.push(`${live.lastCaptureMs}ms capture`)
+    if (live.lastError) parts.push(`last error: ${live.lastError}`)
+    liveStatus.textContent = parts.join(' · ')
+  }
+
+  liveToggle.addEventListener('click', () => {
+    try {
+      toggleLive()
+    } catch (error) {
+      logError(`Live toggle failed: ${describeError(error)}`)
+    }
+  })
+  liveEvents.addEventListener('change', renderLive)
+
   renderConnection()
   renderHandoffs()
+  renderLive()
   for (const line of getLogLines()) appendLogLine(line)
 }
 

@@ -200,6 +200,20 @@ class PluginConnection:
     #: real client mints a fresh `push_id` per attempt, so this stays tiny;
     #: freed with the connection like everything else here.
     rejected_push_ids: set[str] = field(default_factory=set)
+    #: Realtime drawing (docs/roadmap/realtime-drawing.md M1): the single
+    #: keep-latest live-frame slot. `live_jpeg` is the newest JPEG the
+    #: plugin's Live Mode captured (`live_frame` message) -- ONE frame, always
+    #: replaced, NEVER a handoff, never written to disk, never in the
+    #: gallery; it is a transient view of the canvas, and it dies with the
+    #: connection exactly like the transfer buffers above (a reconnect
+    #: simply starts streaming fresh frames). `live_seq` is a SERVER-side
+    #: monotonic counter bumped per accepted frame -- the value
+    #: `PhotoshopLiveCanvas.IS_CHANGED` keys on -- deliberately not the
+    #: plugin's own seq, so a plugin restart/reconnect can never replay a
+    #: lower number and make ComfyUI think nothing changed.
+    live_jpeg: bytes | None = None
+    live_seq: int = 0
+    live_doc_title: str = ""
 
 
 class _PluginSlot:
@@ -2119,6 +2133,68 @@ async def _handle_manual_push_chunk(
     )
 
 
+#: JPEG SOI marker -- the two bytes every JPEG stream starts with. The only
+#: validation a `live_frame` gets server-side: frames are keep-latest and
+#: fire-and-forget (no per-frame ack in the protocol -- a bad frame is
+#: dropped with a log line, and the next stroke replaces it anyway), and the
+#: real decode cost is deferred to `PhotoshopLiveCanvas.execute`, so frames
+#: that arrive between runs are never decoded at all.
+_JPEG_SOI = b"\xff\xd8"
+
+
+def _handle_live_frame(
+    context: CpsbContext, connection: PluginConnection, msg: dict[str, Any]
+) -> None:
+    """Handle one `live_frame` (realtime drawing M1, docs/roadmap/realtime-drawing.md).
+
+    Stores the newest captured canvas JPEG in *connection*'s single
+    keep-latest slot (see the `live_jpeg` field's own comment for the
+    ephemeral-by-design rationale) and emits `cpsb.live` so the frontend's
+    live loop (M2) can queue a re-run. Synchronous and allocation-light on
+    purpose -- this runs on the websocket message loop for every stroke.
+    """
+    data_b64 = msg.get("data_b64")
+    if not isinstance(data_b64, str) or not data_b64:
+        logger.warning("cpsb: live_frame with no data_b64, dropping")
+        return
+    try:
+        jpeg = base64.b64decode(data_b64, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        logger.warning("cpsb: live_frame with invalid base64 (%s), dropping", exc)
+        return
+    if not jpeg.startswith(_JPEG_SOI):
+        logger.warning("cpsb: live_frame is not a JPEG stream, dropping")
+        return
+    connection.live_jpeg = jpeg
+    connection.live_seq += 1
+    connection.live_doc_title = str(msg.get("doc_title") or "")
+    context.send_event(
+        "cpsb.live",
+        {"seq": connection.live_seq, "doc_title": connection.live_doc_title},
+    )
+
+
+def get_live_frame(app: web.Application) -> tuple[bytes, int, str] | None:
+    """The newest live canvas frame, or ``None`` when there is none to serve.
+
+    ``None`` covers every not-ready case identically -- no plugin connected,
+    plugin connected but Live Mode never started, or a fresh reconnect that
+    hasn't streamed a frame yet -- so `PhotoshopLiveCanvas` has exactly one
+    gate to check. Same module-level accessor convention as
+    :func:`tier2_connected` (the node reaches this through
+    ``nodes._require_state().app``, never through a request).
+
+    Returns:
+        ``(jpeg_bytes, seq, doc_title)`` -- *seq* is the server-side
+        monotonic frame counter `IS_CHANGED` keys on.
+    """
+    slot = app.get(_APP_KEY_PLUGIN)
+    connection = slot.connection if slot is not None else None
+    if connection is None or not connection.ready or connection.live_jpeg is None:
+        return None
+    return connection.live_jpeg, connection.live_seq, connection.live_doc_title
+
+
 async def _handle_plugin_message(
     context: CpsbContext,
     manager: HandoffManager,
@@ -2209,6 +2285,8 @@ async def _handle_plugin_message(
         await _handle_upload_edit_chunk(connection, manager, msg)
     elif msg_type == "manual_push":
         await _handle_manual_push_chunk(manager, connection, msg)
+    elif msg_type == "live_frame":
+        _handle_live_frame(context, connection, msg)
     elif msg_type == "action_ok":
         # The PhotoshopAction node (cpsb/actions.py, not yet in PROTOCOL.md
         # §3) -- informational only, exactly like "opened"/"save_detected"
