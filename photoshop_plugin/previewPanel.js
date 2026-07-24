@@ -32,10 +32,13 @@
  * mounts.
  */
 
+const { app } = require('photoshop')
 const { connection } = require('./connection.js')
 const { logInfo, logWarn, describeError } = require('./log.js')
 const { setLivePrompt } = require('./livePrompt.js')
 const { setLiveCreativity } = require('./liveCreativity.js')
+const { liveEvents, getLiveState } = require('./liveMode.js')
+const { makeDocKey, getDocSettings, saveDocSettings } = require('./livePrefs.js')
 
 /**
  * Creativity is a THREE-STEP choice, not a continuous slider (Eric's
@@ -70,6 +73,73 @@ let selectedCreativityKey = null
 /** Last connection status seen, so we re-flush controls only on the
  * transition INTO 'connected' (the reconnect desync fix). */
 let lastConnStatus = /** @type {string | null} */ (null)
+/** The Live-Mode documentId whose settings are currently loaded, so the
+ * per-file restore fires once per session-doc, not on every frame's
+ * liveEvents change. @type {number | null} */
+let loadedLiveDocId = null
+
+/**
+ * The document the panel's controls currently "belong to": the Live-Mode
+ * session's watched document while one is active (edits mid-session must
+ * never land on a different file), else the active document (so a prompt
+ * typed BEFORE starting Live Mode is saved under the doc that's about to be
+ * watched). `null` when neither exists — persistence is skipped, never
+ * guessed (owner ask: tie to the file, no strange cross-file behavior).
+ * @returns {string | null}
+ */
+function resolveDocKey() {
+  const live = getLiveState()
+  if (live.active && live.documentId != null) {
+    for (let i = 0; i < app.documents.length; i++) {
+      if (app.documents[i].id === live.documentId) return makeDocKey(app.documents[i])
+    }
+    return null // watched doc vanished mid-tick — skip rather than misfile
+  }
+  try {
+    return makeDocKey(app.activeDocument)
+  } catch (_error) {
+    return null
+  }
+}
+
+/** Persists the panel's current control values under the owning document. */
+function persistControls() {
+  if (!promptField) return
+  saveDocSettings(resolveDocKey(), {
+    prompt: /** @type {any} */ (promptField).value || '',
+    creativityKey: selectedCreativityKey
+  })
+}
+
+/**
+ * Loads *docKey*'s stored settings into the panel and streams them to the
+ * server, so the graph immediately uses what the panel now shows. No stored
+ * entry → adopt the panel's CURRENT content for this document instead
+ * (covers "typed the prompt, then started Live Mode": the pre-typed text is
+ * saved under the doc rather than clobbered by an empty restore).
+ * @param {string | null} docKey
+ * @returns {void}
+ */
+function applyDocSettings(docKey) {
+  if (!promptField) return
+  const stored = getDocSettings(docKey)
+  if (!stored) {
+    persistControls()
+    return
+  }
+  /** @type {any} */ (promptField).value = stored.prompt
+  selectedCreativityKey = stored.creativityKey
+  refreshCreativityButtons()
+  try {
+    setLivePrompt(stored.prompt)
+    if (stored.creativityKey) {
+      const level = CREATIVITY_LEVELS.find((l) => l.key === stored.creativityKey)
+      if (level) setLiveCreativity(level.value)
+    }
+  } catch (error) {
+    logWarn(`restoring live-control settings failed: ${describeError(error)}`)
+  }
+}
 
 /**
  * Builds the panel DOM once. Plain DOM + inline styles: this document's CSS
@@ -153,6 +223,7 @@ function buildDom() {
     } catch (error) {
       logWarn(`live prompt send failed: ${describeError(error)}`)
     }
+    persistControls() // per-document restore across reloads (livePrefs.js)
   })
 
   const creativityLabel = document.createElement('div')
@@ -207,6 +278,17 @@ function buildDom() {
   rootDiv.appendChild(imageWrap)
   rootDiv.appendChild(controls)
   rootDiv.appendChild(statusEl)
+
+  // First build (plugin just loaded): restore the ACTIVE document's stored
+  // prompt/creativity, so a Photoshop restart doesn't come up blank before
+  // any Live session starts. Read-only when nothing is stored.
+  const startupSettings = getDocSettings(resolveDocKey())
+  if (startupSettings) {
+    /** @type {any} */ (promptField).value = startupSettings.prompt
+    selectedCreativityKey = startupSettings.creativityKey
+    refreshCreativityButtons()
+  }
+
   return rootDiv
 }
 
@@ -252,6 +334,7 @@ function selectCreativity(key) {
   } catch (error) {
     logWarn(`live creativity send failed: ${describeError(error)}`)
   }
+  persistControls() // per-document restore across reloads (livePrefs.js)
 }
 
 /**
@@ -329,6 +412,27 @@ connection.addEventListener('statechange', (event) => {
     flushControls()
   }
   lastConnStatus = status
+})
+
+// Per-file restore on Live-Mode start: when a session begins watching a NEW
+// document, load that document's stored prompt/creativity into the panel and
+// stream them — the controls follow the file being drawn on, never a stale
+// one (owner ask 2026-07-24). liveEvents fires per frame too, so this gates
+// on the documentId transition, not on every event.
+liveEvents.addEventListener('change', (event) => {
+  const state = /** @type {CustomEvent} */ (event).detail
+  if (!state) return
+  if (!state.active) {
+    loadedLiveDocId = null // a restart on the same doc re-loads (harmless)
+    return
+  }
+  if (state.documentId === loadedLiveDocId) return
+  loadedLiveDocId = state.documentId
+  try {
+    applyDocSettings(resolveDocKey())
+  } catch (error) {
+    logWarn(`per-file control restore failed: ${describeError(error)}`)
+  }
 })
 
 module.exports = { mountPreviewPanel }
