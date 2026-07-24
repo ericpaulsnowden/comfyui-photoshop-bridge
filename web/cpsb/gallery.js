@@ -10,12 +10,14 @@
  * edit; the ORIGINAL when no edit has arrived yet) — replacing the old
  * fixed-size before/after PAIR shown side by side with a "→" between them.
  * When an edit exists, the original is layered underneath, crossfaded via
- * CSS opacity; ONE header-level "Hold to compare" button
- * ({@link buildCompareToggle}, owner ask 2026-07-22 — replaces an earlier
- * per-thumbnail hold gesture with its own corner badge/hint on every card)
- * reveals every visible card's original at once for as long as it's held.
- * Grid is the gallery's only layout (owner ask 2026-07-22 — the List
- * alternative and its header toggle were removed).
+ * CSS opacity; press-and-hold ANY card's thumbnail to reveal that card's
+ * original for as long as it's held ({@link attachHoldToCompare}), with a
+ * single header-level description ({@link buildCompareHint}) instead of a
+ * badge on every card (owner asks: 2026-07-22 removed the per-image badges,
+ * 2026-07-24 made the header a plain description and put the hold gesture
+ * back on each individual thumbnail). Grid is the gallery's only layout
+ * (owner ask 2026-07-22 — the List alternative and its header toggle were
+ * removed).
  *
  * Card actions are STATUS-SCOPED via one explicit table
  * ({@link cardCapabilities}) rather than ad-hoc conditions — the first
@@ -500,11 +502,10 @@ function buildThumb(src, alt, extraClassName = '') {
  * before/after pair): the AFTER image — *latestEdit* when one exists, else
  * the ORIGINAL — at a larger size. When *latestEdit* exists, the original is
  * layered underneath (absolute-positioned; `cpsb.css` crossfades it via
- * opacity) so the ONE header-level {@link buildCompareToggle} can reveal it
- * for every card at once while held — see that function's own doc for why
- * this moved off each individual thumbnail. With no edit yet there is
- * nothing to compare, so this returns a single plain image with no BEFORE
- * layer at all.
+ * opacity) and {@link attachHoldToCompare} lets a press-and-hold on this
+ * card's thumbnail reveal it while held. With no edit yet there is nothing to
+ * compare, so this returns a single plain image with no BEFORE layer at all
+ * (and no hold handlers).
  * @param {import('./api.js').CpsbHandoffMeta} meta
  * @param {import('./api.js').CpsbEdit | undefined} latestEdit
  * @returns {HTMLElement}
@@ -528,10 +529,51 @@ function buildCardThumb(meta, latestEdit) {
   )
   const before = buildThumb(api.thumbUrl(meta.handoff_id), 'Original', 'cpsb-card-thumb-before')
 
-  return ui.el('div', {
+  const frame = ui.el('div', {
     className: 'cpsb-card-thumb-frame',
     children: [after, before]
   })
+  attachHoldToCompare(frame)
+  return frame
+}
+
+/**
+ * Wires press-and-hold on ONE card's thumbnail to reveal that card's ORIGINAL
+ * (toggles `cpsb-card-comparing` on the frame; `cpsb.css` crossfades its
+ * before/after layers). Per-card by owner ask (2026-07-24): hold any single
+ * image to compare it — the header now carries the one-line instruction
+ * instead of a badge on every card, and the compare gesture went back onto
+ * each thumbnail (where it was before the 2026-07-22 header consolidation).
+ * Same Pointer Events press pattern the old per-thumbnail gesture used (mouse
+ * primary button, or any touch/pen contact — `button === 0` by convention —
+ * through one code path).
+ * @param {HTMLElement} frame
+ * @returns {void}
+ */
+function attachHoldToCompare(frame) {
+  let activePointerId = /** @type {number | null} */ (null)
+  const showBefore = () => frame.classList.add('cpsb-card-comparing')
+  const showAfter = () => frame.classList.remove('cpsb-card-comparing')
+
+  frame.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'mouse' && event.button !== 0) return
+    activePointerId = event.pointerId
+    try {
+      frame.setPointerCapture(event.pointerId)
+    } catch {
+      // Older/partial Pointer Events: degrade to press-and-release-in-place.
+    }
+    showBefore()
+  })
+
+  const release = (/** @type {PointerEvent} */ event) => {
+    if (activePointerId === null || event.pointerId !== activePointerId) return
+    activePointerId = null
+    showAfter()
+  }
+  frame.addEventListener('pointerup', release)
+  frame.addEventListener('pointercancel', release)
+  frame.addEventListener('pointerleave', release)
 }
 
 /**
@@ -659,54 +701,21 @@ function buildCard(meta) {
 }
 
 /**
- * ONE header-level "Hold to compare" control (owner ask 2026-07-22: the old
- * per-thumbnail hold gesture — with its own corner badge/hint on every card
- * — moves to a single spot instead of being repeated on every image).
- * Holding this button reveals every visible card's ORIGINAL at once by
- * toggling `cpsb-gallery-comparing` on the gallery root, which `cpsb.css`
- * uses to crossfade each card's layered before/after thumbnail — the exact
- * same Pointer Events press pattern the old per-thumbnail version used
- * (mouse and touch alike via one code path), just wired to one shared class
- * instead of a per-frame one. List/Grid's toggle used to occupy this same
- * header slot; grid is now the only layout (owner ask), so nothing else
- * competes for the space.
+ * ONE header-level DESCRIPTION (not a button — owner ask 2026-07-24): a
+ * single line telling the user they can press-and-hold any thumbnail to
+ * compare it with its original. The compare gesture itself lives on each
+ * card's thumbnail ({@link attachHoldToCompare}); this is just the
+ * instruction, so no per-image badge is needed. Replaces the 2026-07-22
+ * "Hold to compare" button, which held-to-compare EVERY card at once — Eric
+ * wanted a plain description plus the original per-image hold behavior back.
  * @returns {HTMLElement}
  */
-function buildCompareToggle() {
-  const button = ui.el('button', {
-    className: 'cpsb-compare-toggle',
-    text: 'Hold to compare',
-    attrs: { type: 'button', title: 'Hold to see the original for every edited card' }
+function buildCompareHint() {
+  return ui.el('span', {
+    className: 'cpsb-compare-hint',
+    text: 'Hold any image to compare',
+    attrs: { title: 'Press and hold a thumbnail to see its original; release to return' }
   })
-
-  let activePointerId = /** @type {number | null} */ (null)
-  const showBefore = () => rootEl?.classList.add('cpsb-gallery-comparing')
-  const showAfter = () => rootEl?.classList.remove('cpsb-gallery-comparing')
-
-  button.addEventListener('pointerdown', (event) => {
-    // A right-click or an auxiliary mouse button must not trigger this —
-    // only the primary mouse button, or any touch/pen contact (which has no
-    // "button" concept and reports 0 by convention).
-    if (event.pointerType === 'mouse' && event.button !== 0) return
-    activePointerId = event.pointerId
-    try {
-      button.setPointerCapture(event.pointerId)
-    } catch {
-      // Older/partial Pointer Events implementation: degrade to the common
-      // press-and-release-in-place case rather than fail the whole control.
-    }
-    showBefore()
-  })
-
-  const release = (/** @type {PointerEvent} */ event) => {
-    if (activePointerId === null || event.pointerId !== activePointerId) return
-    activePointerId = null
-    showAfter()
-  }
-  button.addEventListener('pointerup', release)
-  button.addEventListener('pointercancel', release)
-  button.addEventListener('pointerleave', release)
-  return button
 }
 
 /**
@@ -837,13 +846,11 @@ function rebuild() {
   if (!rootEl) return
   try {
     rootEl.replaceChildren()
-    // Clear any in-progress compare hold. rebuild() fires on EVERY cpsb.*
-    // event, so it can land mid-hold — replaceChildren() just destroyed the
-    // held "Hold to compare" button, and a detached element never receives
-    // the pointerup that would have removed this class. Without this line
-    // the gallery gets stuck showing every card's BEFORE image (chips still
-    // saying "Edited") until the user presses and releases the new button.
-    rootEl.classList.remove('cpsb-gallery-comparing')
+    // No mid-hold cleanup needed anymore: the compare state is a per-card
+    // class (`cpsb-card-comparing`) that lives on each thumbnail frame, and
+    // replaceChildren() destroys those frames — so a rebuild landing mid-hold
+    // simply discards the held card, never leaving a stuck class behind (the
+    // old header button toggled a root class that DID need clearing here).
 
     rootEl.appendChild(
       ui.el('div', {
@@ -852,7 +859,7 @@ function rebuild() {
           buildBrandMark(),
           ui.el('div', {
             className: 'cpsb-gallery-header-right',
-            children: [buildCompareToggle(), buildConnectionPill(), buildVersionLabel()]
+            children: [buildCompareHint(), buildConnectionPill(), buildVersionLabel()]
           })
         ]
       })
@@ -940,10 +947,8 @@ function renderGallery(container) {
 function destroyGallery() {
   unsubscribeState?.()
   unsubscribeState = null
-  // Same mid-hold hygiene as rebuild(): if the tab unmounts while "Hold to
-  // compare" is held, the class must not survive on a container ComfyUI
-  // may reuse for the next mount.
-  rootEl?.classList.remove('cpsb-gallery-comparing')
+  // Per-card compare state lives on the thumbnail frames, which replaceChildren
+  // destroys — nothing to clear off the root anymore (see rebuild()).
   rootEl?.replaceChildren()
   rootEl = null
 }

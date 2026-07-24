@@ -41,29 +41,20 @@
   flex-wrap: wrap;
 }
 
-/* ONE header-level "Hold to compare" button (gallery.js buildCompareToggle,
-   owner ask 2026-07-22) — replaces the old List/Grid segmented toggle that
-   used to occupy this slot (grid is now the gallery's only layout) AND the
-   old per-thumbnail hold gesture (see .cpsb-gallery-comparing below). */
+/* ONE header-level DESCRIPTION (gallery.js buildCompareHint, owner ask
+   2026-07-24) — a plain muted instruction, NOT a button. The compare gesture
+   itself lives on each card's thumbnail (.cpsb-card-comparing below). Occupies
+   the header slot the old List/Grid toggle, then the "Hold to compare" button,
+   used to hold. */
 
-.cpsb-compare-toggle {
-  padding: 3px 9px;
-  border-radius: 6px;
-  border: 1px solid var(--border-default, rgba(255, 255, 255, 0.15));
-  background: var(--comfy-input-bg, #262626);
+.cpsb-compare-hint {
   color: var(--muted-foreground, #888);
   font-size: 11px;
-  cursor: pointer;
-  flex-shrink: 0;
-  /* No native "save image"/text-selection callout on a press-and-hold. */
-  -webkit-touch-callout: none;
-  -webkit-user-select: none;
-  user-select: none;
-}
-
-.cpsb-compare-toggle:hover {
-  background: var(--content-hover-bg, #333);
-  color: var(--fg-color, #e6e6e6);
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Generic "Ps" text lettermark (gallery header identity; the tab-strip
@@ -280,8 +271,9 @@
   background: var(--comfy-input-bg, #111);
   width: 128px;
   height: 128px;
-  /* No native "save image" long-press callout or text-selection highlight on
-     this non-interactive thumbnail. */
+  /* No native "save image" long-press callout or text-selection highlight —
+     press-and-hold on this thumbnail is our compare gesture
+     (gallery.js attachHoldToCompare), not a browser image long-press. */
   -webkit-touch-callout: none;
   -webkit-user-select: none;
   user-select: none;
@@ -304,10 +296,9 @@
 
 /* When an edit exists, AFTER and BEFORE are stacked (both absolutely
    positioned, filling the frame) and crossfaded via opacity — see
-   .cpsb-gallery-comparing below for what toggles this (the ONE header-level
-   "Hold to compare" button, not a per-thumbnail gesture). With no edit,
-   buildCardThumb emits neither modifier and this pair of rules simply
-   doesn't apply. */
+   .cpsb-card-comparing below for what toggles this (a press-and-hold on the
+   card's own thumbnail). With no edit, buildCardThumb emits neither modifier
+   and this pair of rules simply doesn't apply. */
 
 .cpsb-card-thumb-after,
 .cpsb-card-thumb-before {
@@ -320,18 +311,19 @@
   transition: opacity 100ms ease;
 }
 
-/* Held via the ONE header-level "Hold to compare" button (gallery.js
-   buildCompareToggle, owner ask 2026-07-22), which toggles this class on the
-   gallery ROOT — not a per-card class — so holding it crossfades EVERY
-   visible card's before/after layers at once. Replaces a prior per-thumbnail
-   hold gesture (its own corner badge/hint removed along with it — one
-   control now, not one per image). */
+/* Held via a press-and-hold on ONE card's own thumbnail (gallery.js
+   attachHoldToCompare, owner ask 2026-07-24), toggling this class on that
+   card's frame — so holding one image crossfades only THAT card's
+   before/after layers. The header carries a single plain-text instruction
+   (.cpsb-compare-hint) instead of a badge on every card. (2026-07-22 briefly
+   made this a root-level class driven by one header button; 2026-07-24 put
+   the gesture back on each thumbnail per owner feedback.) */
 
-.cpsb-gallery-comparing .cpsb-card-thumb-before {
+.cpsb-card-comparing .cpsb-card-thumb-before {
   opacity: 1;
 }
 
-.cpsb-gallery-comparing .cpsb-card-thumb-after {
+.cpsb-card-comparing .cpsb-card-thumb-after {
   opacity: 0;
 }
 
