@@ -93,10 +93,12 @@ def push_creativity(
     context: CpsbContext,
     connection: routes_module.PluginConnection,
     value: float,
+    band: tuple[float, float] | None = None,
 ) -> None:
-    routes_module._handle_live_creativity(
-        context, connection, {"type": "live_creativity", "value": value}
-    )
+    msg = {"type": "live_creativity", "value": value}
+    if band is not None:
+        msg["min_denoise"], msg["max_denoise"] = band
+    routes_module._handle_live_creativity(context, connection, msg)
 
 
 def push_frame(
@@ -414,6 +416,56 @@ class TestLiveCreativity:
             creativity=0.5, min_denoise=0.4, max_denoise=0.85
         )
         push_creativity(context, connection, 0.7)
+        assert (
+            live_module.PhotoshopLiveCreativity.IS_CHANGED(
+                creativity=0.5, min_denoise=0.4, max_denoise=0.85
+            )
+            != first
+        )
+
+
+class TestCreativityBand:
+    """The panel sends a per-capture-size denoise band with each level (owner
+    report 2026-07-24: the levels behaved very differently at 512/768/1024).
+    When present it WINS over the node widgets; absent, nothing changes."""
+
+    def test_panel_band_overrides_widgets(self, context, live_app):
+        _app, connection = live_app
+        push_creativity(context, connection, 1.0, band=(0.30, 0.60))
+        node = live_module.PhotoshopLiveCreativity()
+        # High creativity over the PANEL band -> its max, not the widgets'.
+        (denoise,) = node.execute(creativity=0.0, min_denoise=0.4, max_denoise=0.85)
+        assert denoise == pytest.approx(0.60)
+
+    def test_widgets_used_when_no_band_sent(self, context, live_app):
+        _app, connection = live_app
+        push_creativity(context, connection, 1.0)  # older plugin: value only
+        node = live_module.PhotoshopLiveCreativity()
+        (denoise,) = node.execute(creativity=0.0, min_denoise=0.4, max_denoise=0.85)
+        assert denoise == pytest.approx(0.85)
+
+    def test_band_is_clamped_and_ordered(self, context, live_app):
+        app, connection = live_app
+        push_creativity(context, connection, 1.0, band=(9.0, -3.0))
+        assert routes_module.get_live_creativity_band(app) == (0.0, 1.0)
+
+    def test_half_band_is_ignored(self, context, live_app):
+        """A malformed (half-sent) band must fall back to the widgets rather
+        than silently mis-mapping every level."""
+        app, connection = live_app
+        routes_module._handle_live_creativity(
+            context, connection, {"type": "live_creativity", "value": 1.0, "min_denoise": 0.3}
+        )
+        assert routes_module.get_live_creativity_band(app) is None
+
+    def test_is_changed_tracks_band_changes(self, context, live_app):
+        _app, connection = live_app
+        push_creativity(context, connection, 0.5, band=(0.4, 0.85))
+        first = live_module.PhotoshopLiveCreativity.IS_CHANGED(
+            creativity=0.5, min_denoise=0.4, max_denoise=0.85
+        )
+        # Same level, DIFFERENT band (a capture-size switch) must re-run.
+        push_creativity(context, connection, 0.5, band=(0.3, 0.6))
         assert (
             live_module.PhotoshopLiveCreativity.IS_CHANGED(
                 creativity=0.5, min_denoise=0.4, max_denoise=0.85

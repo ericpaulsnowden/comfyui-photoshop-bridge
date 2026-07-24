@@ -3339,6 +3339,28 @@ class TestLiveCreativity:
             await ws.send_json({"type": "live_creativity", "value": 0.6})
             await wait_until(lambda: routes_module.get_live_creativity(client.app) == 0.6)
 
+    async def test_band_travels_with_the_value(self, client, context, manager):
+        """The panel's per-capture-size denoise band rides along with each
+        level (owner report 2026-07-24)."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "live_creativity",
+                    "value": 0.5,
+                    "min_denoise": 0.3,
+                    "max_denoise": 0.6,
+                }
+            )
+            await wait_until(
+                lambda: routes_module.get_live_creativity_band(client.app) == (0.3, 0.6)
+            )
+            # A later value WITHOUT a band clears it back to the node widgets.
+            await ws.send_json({"type": "live_creativity", "value": 0.5})
+            await wait_until(lambda: routes_module.get_live_creativity_band(client.app) is None)
+
     async def test_get_live_creativity_none_without_plugin(self, client, context, manager):
         assert routes_module.get_live_creativity(client.app) is None
         async with client.ws_connect("/cpsb/ws") as ws:

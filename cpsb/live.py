@@ -294,17 +294,21 @@ class PhotoshopLiveCreativity:
 
     @classmethod
     def IS_CHANGED(cls, creativity: float, min_denoise: float, max_denoise: float) -> str:
-        """Bust the cache when the PANEL slider changes.
+        """Bust the cache when the PANEL level OR its band changes.
 
         The widget values are diffed natively by ComfyUI, so this only
-        surfaces the panel-streamed value (namespaced ``live:``, like
+        surfaces the panel-streamed state (namespaced ``live:``, like
         :meth:`PhotoshopLivePrompt.IS_CHANGED`, so it can never alias the
-        no-panel sentinel), letting a slider drag re-run the graph while an
-        untouched slider is served from cache.
+        no-panel sentinel), letting a level change -- or a capture-size
+        switch that brings a different band with it -- re-run the graph while
+        an untouched panel is served from cache.
         """
         state = nodes._require_state()
         live = routes.get_live_creativity(state.app)
-        return f"live:{live}" if live is not None else "no-live-creativity"
+        if live is None:
+            return "no-live-creativity"
+        band = routes.get_live_creativity_band(state.app)
+        return f"live:{live}:{band[0]}-{band[1]}" if band else f"live:{live}"
 
     def execute(
         self, creativity: float, min_denoise: float, max_denoise: float
@@ -312,10 +316,24 @@ class PhotoshopLiveCreativity:
         state = nodes._require_state()
         live = routes.get_live_creativity(state.app)
         effective = live if live is not None else creativity
-        denoise = self._denoise(effective, min_denoise, max_denoise)
-        source = "panel slider" if live is not None else "node widget"
+        # The panel's band (a per-capture-size preference) wins when present:
+        # the right denoise range depends on the model+resolution combo, which
+        # the panel tracks per capture size (owner report 2026-07-24). Without
+        # one -- ComfyUI-only, or an older plugin -- the node's own widgets
+        # define the band exactly as before.
+        band = routes.get_live_creativity_band(state.app)
+        lo, hi = band if band is not None else (min_denoise, max_denoise)
+        denoise = self._denoise(effective, lo, hi)
+        source = "panel" if live is not None else "node widget"
+        band_source = "panel band" if band is not None else "node band"
         logger.info(
-            "cpsb live: creativity %.2f from %s -> denoise %.3f", effective, source, denoise
+            "cpsb live: creativity %.2f from %s over %s [%.2f, %.2f] -> denoise %.3f",
+            effective,
+            source,
+            band_source,
+            lo,
+            hi,
+            denoise,
         )
         return (denoise,)
 

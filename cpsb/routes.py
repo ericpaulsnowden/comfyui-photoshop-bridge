@@ -243,6 +243,13 @@ class PluginConnection:
     #: `PhotoshopLiveCreativity` maps it onto a denoise band and falls back to
     #: its own widget when ``None``. Transient, dies with the connection.
     live_creativity: float | None = None
+    #: The denoise band the panel wants that value mapped onto
+    #: ``(min_denoise, max_denoise)``, or ``None`` when the panel didn't send
+    #: one (older plugin) -- then the node uses its own widgets. The band is
+    #: a per-capture-size PANEL preference (owner report 2026-07-24: the
+    #: levels behaved differently at 512/768/1024), so it travels with each
+    #: value rather than living only in the graph.
+    live_creativity_band: tuple[float, float] | None = None
 
 
 class _PluginSlot:
@@ -2299,6 +2306,18 @@ def _handle_live_creativity(
         logger.warning("cpsb: live_creativity with non-numeric value, dropping")
         return
     connection.live_creativity = max(0.0, min(1.0, value))
+    # Optional per-capture-size band (see the field's own comment). Ignored
+    # wholesale unless BOTH bounds parse -- a half-sent band would silently
+    # mis-map every level, which is worse than falling back to the widgets.
+    band = None
+    raw_min, raw_max = msg.get("min_denoise"), msg.get("max_denoise")
+    if raw_min is not None and raw_max is not None:
+        try:
+            lo, hi = sorted((float(raw_min), float(raw_max)))
+            band = (max(0.0, min(1.0, lo)), max(0.0, min(1.0, hi)))
+        except (TypeError, ValueError):
+            logger.warning("cpsb: live_creativity with non-numeric band, using node widgets")
+    connection.live_creativity_band = band
     context.send_event("cpsb.livecreativity", {"creativity": connection.live_creativity})
 
 
@@ -2314,6 +2333,16 @@ def get_live_creativity(app: web.Application) -> float | None:
     if connection is None or not connection.ready:
         return None
     return connection.live_creativity
+
+
+def get_live_creativity_band(app: web.Application) -> tuple[float, float] | None:
+    """The panel's per-capture-size denoise band, or ``None`` to use the
+    node's own ``min_denoise``/``max_denoise`` widgets."""
+    slot = app.get(_APP_KEY_PLUGIN)
+    connection = slot.connection if slot is not None else None
+    if connection is None or not connection.ready:
+        return None
+    return connection.live_creativity_band
 
 
 # --- Refine pass (docs/roadmap/realtime-drawing.md R1/R2) ---------------------

@@ -353,6 +353,15 @@
         sharpest (best for SDXL models). Takes effect immediately.
       </div>
 
+      <!-- Creativity range (owner report 2026-07-24: the Low/Medium/High
+           levels behaved very differently at 512/768/1024 — the right denoise
+           band depends on the model+resolution combo, not the resolution
+           alone). Remembered PER CAPTURE SIZE, so switching size switches the
+           band with it. panel.js re-renders this when capture size changes. -->
+      <div class="cpsb-field-label">CREATIVITY RANGE</div>
+      <div id="cpsb-creativity-range-row" class="cpsb-conn-actions"></div>
+      <div id="cpsb-creativity-range-hint" class="cpsb-muted cpsb-conn-line"></div>
+
       <!-- Refined layer mode (refine pass R1, owner ask 2026-07-24 — in the
            MAIN panel, not the preview panel): how a refined image pushed by
            the "Photoshop Add Layer" node lands in the document. Stack = a

@@ -130,6 +130,74 @@ function setAutoFixEnabled(enabled) {
 /** localStorage key for the refined-layer Stack-vs-Replace mode. */
 const REFINED_LAYER_MODE_KEY = 'cpsb.refinedLayerMode'
 
+/** localStorage key for the per-capture-size creativity-range map. */
+const CREATIVITY_RANGE_KEY = 'cpsb.creativityRanges'
+
+/**
+ * The denoise bands the preview panel's Low/Medium/High creativity levels map
+ * onto. Which band is RIGHT depends on the model + capture-size combo, not on
+ * the capture size alone (SD1.5 at 1024 hallucinates at a denoise SDXL
+ * handles happily), so this is a user choice remembered PER CAPTURE SIZE —
+ * Eric, 2026-07-24: "the creativity slider works VERY differently at
+ * different resolutions. It only really works as expected at 768." Switching
+ * capture size now switches the band with it.
+ * @type {{key: string, label: string, min: number, max: number}[]}
+ */
+const CREATIVITY_RANGES = [
+  { key: 'subtle', label: 'Subtle', min: 0.3, max: 0.6 },
+  { key: 'balanced', label: 'Balanced', min: 0.4, max: 0.85 },
+  { key: 'bold', label: 'Bold', min: 0.55, max: 0.95 }
+]
+
+/** The default band key — the one calibrated at 768 (owner-validated). */
+const DEFAULT_CREATIVITY_RANGE = 'balanced'
+
+/** @returns {Record<string, string>} captureSize -> range key. */
+function readCreativityRangeMap() {
+  try {
+    if (typeof localStorage === 'undefined') return {}
+    const raw = localStorage.getItem(CREATIVITY_RANGE_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch (_error) {
+    return {}
+  }
+}
+
+/**
+ * The creativity band chosen for *captureSize* (defaults to Balanced — the
+ * 768-calibrated band — for any size the user hasn't tuned).
+ * @param {number} captureSize
+ * @returns {{key: string, label: string, min: number, max: number}}
+ */
+function getCreativityRange(captureSize) {
+  const key = readCreativityRangeMap()[String(captureSize)] || DEFAULT_CREATIVITY_RANGE
+  return (
+    CREATIVITY_RANGES.find((r) => r.key === key) ||
+    /** @type {any} */ (CREATIVITY_RANGES.find((r) => r.key === DEFAULT_CREATIVITY_RANGE))
+  )
+}
+
+/**
+ * Persists the creativity band for *captureSize*, best-effort.
+ * @param {number} captureSize
+ * @param {string} rangeKey
+ * @returns {void}
+ */
+function setCreativityRange(captureSize, rangeKey) {
+  try {
+    if (typeof localStorage === 'undefined') return
+    const map = readCreativityRangeMap()
+    map[String(captureSize)] = rangeKey
+    localStorage.setItem(CREATIVITY_RANGE_KEY, JSON.stringify(map))
+  } catch (error) {
+    logWarn(
+      `could not persist the creativity range (${describeError(error)}) — it will reset when Photoshop restarts`
+    )
+  }
+}
+
 /**
  * How a refined image pushed from ComfyUI (`PhotoshopAddLayer` node,
  * refine pass R1) lands in the document: `'stack'` adds a new layer per
@@ -213,5 +281,8 @@ module.exports = {
   setAutoFixEnabled,
   ensureMaximizeCompatibility,
   getRefinedLayerMode,
-  setRefinedLayerMode
+  setRefinedLayerMode,
+  getCreativityRange,
+  setCreativityRange,
+  CREATIVITY_RANGES
 }

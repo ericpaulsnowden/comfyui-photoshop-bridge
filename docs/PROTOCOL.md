@@ -390,8 +390,16 @@ Plugin → server:
   a workflow without a panel prompt still works — clearing the field "hands control back"
   to the graph). Emits `cpsb.liveprompt` (§5). Like `live_frame`: fire-and-forget, never
   a handoff, dies with the connection.
-- `{"type": "live_creativity", "value": 0.75}` — realtime drawing creativity control: the
-  preview panel's Creativity level (Low/Medium/High → `0.0`/`0.5`/`1.0`) (`liveCreativity.js`).
+- `{"type": "live_creativity", "value": 0.75, "min_denoise": 0.4, "max_denoise": 0.85}` —
+  realtime drawing creativity control: the preview panel's Creativity level
+  (Low/Medium/High → `0.0`/`0.5`/`1.0`) (`liveCreativity.js`), plus the denoise BAND that
+  level should map onto. The band is a per-capture-size panel preference (main panel's
+  CREATIVITY RANGE: Subtle 0.30–0.60 / Balanced 0.40–0.85 / Bold 0.55–0.95, remembered per
+  512/768/1024) — the right range depends on the model+resolution combo, not the
+  resolution alone (owner report 2026-07-24: the levels behaved very differently at
+  different capture sizes). Both bounds must parse or the band is ignored wholesale (a
+  half-sent band would mis-map every level); absent entirely — ComfyUI-only or an older
+  plugin — the node's own widgets define the band exactly as before.
   The server clamps it to `0.0..1.0` and holds the newest in ONE keep-latest slot
   (`PluginConnection.live_creativity`); `PhotoshopLiveCreativity` (§6f) maps it onto a
   denoise band, falling back to its own widget when the slider was never touched. A
@@ -1209,7 +1217,9 @@ plugin is connected or no frame has streamed yet.
   maps it onto a denoise band
   (`min_denoise`..`max_denoise` widgets, default 0.40..0.85) so the user tunes how much
   the AI reinterprets the drawing — low = hug the sketch, high = reinterpret — WITHOUT
-  opening ComfyUI. Denoise is the single most effective adherence control at a fixed
+  opening ComfyUI. The panel may send its own band with each level (§3), which WINS over
+  these widgets; `IS_CHANGED` folds the band in, so a capture-size switch that brings a
+  different band re-runs the graph. Denoise is the single most effective adherence control at a fixed
   few-step count (it is the fix for "the render looks 99% like my drawing": effective work
   ≈ steps × denoise). **NOT Tier-2-gated**: falls back to its own `creativity` widget when
   the slider was never touched, so ComfyUI-only works. `IS_CHANGED` surfaces the streamed

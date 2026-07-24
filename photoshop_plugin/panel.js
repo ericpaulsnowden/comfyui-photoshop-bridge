@@ -22,7 +22,10 @@ const {
   isAutoFixEnabled,
   setAutoFixEnabled,
   getRefinedLayerMode,
-  setRefinedLayerMode
+  setRefinedLayerMode,
+  getCreativityRange,
+  setCreativityRange,
+  CREATIVITY_RANGES
 } = require('./prefs.js')
 const {
   toggleLive,
@@ -33,6 +36,7 @@ const {
   CAPTURE_SIZES
 } = require('./liveMode.js')
 const { sendToComfyUI } = require('./manualSend.js')
+const { resendLiveCreativity: resendCreativity } = require('./liveCreativity.js')
 
 // Same version source the `hello` handshake message uses (connection.js):
 // require('uxp').versions.plugin is documented to match manifest.json's
@@ -445,11 +449,72 @@ function initPanel() {
           logError(`Capture size change failed: ${describeError(error)}`)
         }
         refreshCaptureSizeButtons()
+        // The creativity band is per capture size — show (and send) the one
+        // that now applies.
+        refreshCreativityRangeButtons()
+        resendCreativity()
       })
       captureSizeButtons[px] = btn
       captureSizeRow.appendChild(btn)
     }
     refreshCaptureSizeButtons()
+  }
+
+  // Creativity range, remembered PER CAPTURE SIZE (owner report: the
+  // Low/Medium/High levels behaved very differently at 512/768/1024 — the
+  // right denoise band depends on the model+resolution combo). Switching
+  // capture size re-renders this row, so the band always shows the one that
+  // will actually be used.
+  const creativityRangeRow = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-creativity-range-row')
+  )
+  const creativityRangeHint = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-creativity-range-hint')
+  )
+  /** @type {Record<string, HTMLElement>} */
+  const creativityRangeButtons = {}
+
+  function refreshCreativityRangeButtons() {
+    const size = getCaptureSize()
+    const current = getCreativityRange(size)
+    for (const range of CREATIVITY_RANGES) {
+      const btn = creativityRangeButtons[range.key]
+      if (!btn) continue
+      const active = range.key === current.key
+      btn.setAttribute('variant', active ? 'cta' : 'secondary')
+      if (active) btn.removeAttribute('quiet')
+      else btn.setAttribute('quiet', '')
+    }
+    if (creativityRangeHint) {
+      creativityRangeHint.textContent =
+        `How far the preview panel's Low/Medium/High push the render, at ${size}px: ` +
+        `denoise ${current.min.toFixed(2)}\u2013${current.max.toFixed(2)}. ` +
+        'Saved per capture size \u2014 drop to Subtle if High looks chaotic at this size.'
+    }
+  }
+
+  if (creativityRangeRow) {
+    creativityRangeRow.style.display = 'flex'
+    creativityRangeRow.style.flexDirection = 'row'
+    const last = CREATIVITY_RANGES[CREATIVITY_RANGES.length - 1]
+    for (const range of CREATIVITY_RANGES) {
+      const btn = document.createElement('sp-button')
+      btn.setAttribute('variant', 'secondary')
+      btn.setAttribute('quiet', '')
+      btn.textContent = range.label
+      btn.style.flex = '1 1 0'
+      btn.style.marginRight = range.key === last.key ? '0' : '6px'
+      btn.addEventListener('click', () => {
+        setCreativityRange(getCaptureSize(), range.key)
+        refreshCreativityRangeButtons()
+        // Re-send the current level so the graph picks the new band up now,
+        // without waiting for the user to re-click a creativity level.
+        resendCreativity()
+      })
+      creativityRangeButtons[range.key] = btn
+      creativityRangeRow.appendChild(btn)
+    }
+    refreshCreativityRangeButtons()
   }
 
   // Refined layer Stack/Replace (refine pass R1, owner ask: main panel).

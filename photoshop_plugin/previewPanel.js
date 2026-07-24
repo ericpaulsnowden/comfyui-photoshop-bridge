@@ -37,7 +37,8 @@ const { connection } = require('./connection.js')
 const { logInfo, logWarn, describeError } = require('./log.js')
 const { setLivePrompt } = require('./livePrompt.js')
 const { setLiveCreativity } = require('./liveCreativity.js')
-const { liveEvents, getLiveState } = require('./liveMode.js')
+const { liveEvents, getLiveState, getCaptureSize } = require('./liveMode.js')
+const { getCreativityRange } = require('./prefs.js')
 const { makeDocKey, getDocSettings, saveDocSettings } = require('./livePrefs.js')
 const { addImageAsLayer, addRenderAsLayer } = require('./addAsLayer.js')
 const { requestRefineSafe } = require('./refineCapture.js')
@@ -77,6 +78,8 @@ let statusEl = null
 let promptField = null
 /** key -> the Low/Medium/High <sp-button> elements. @type {Record<string, any>} */
 let creativityButtons = {}
+/** @type {HTMLElement | null} */
+let creativityHint = null
 /** The level the user has picked, or null while the graph's own widget drives
  * denoise (nothing sent until the user chooses). @type {string | null} */
 let selectedCreativityKey = null
@@ -149,6 +152,7 @@ function applyDocSettings(docKey) {
   /** @type {any} */ (promptField).value = stored.prompt
   selectedCreativityKey = stored.creativityKey
   refreshCreativityButtons()
+  refreshCreativityHint()
   try {
     setLivePrompt(stored.prompt)
     if (stored.creativityKey) {
@@ -228,20 +232,41 @@ function buildDom() {
   addLayerOverlay.style.alignItems = 'center'
   addLayerOverlay.style.justifyContent = 'center'
 
+  // Both image actions live IN the overlay, stacked (owner ask 2026-07-24:
+  // Refine belongs on the image under "Add as a layer", not as more panel
+  // clutter). Column layout so they read as one action group.
+  const overlayStack = document.createElement('div')
+  overlayStack.style.display = 'flex'
+  overlayStack.style.flexDirection = 'column'
+  overlayStack.style.alignItems = 'center'
+
   addLayerButton = document.createElement('sp-button')
   addLayerButton.setAttribute('variant', 'cta')
   addLayerButton.textContent = 'Add as a layer'
   addLayerButton.addEventListener('click', () => {
     onAddAsLayer()
   })
-  addLayerOverlay.appendChild(addLayerButton)
+
+  refineButton = document.createElement('sp-button')
+  refineButton.setAttribute('variant', 'secondary')
+  refineButton.textContent = 'Refine'
+  refineButton.style.marginTop = '8px'
+  refineButton.addEventListener('click', () => {
+    onRefineClick()
+  })
+
+  overlayStack.appendChild(addLayerButton)
+  overlayStack.appendChild(refineButton)
+  addLayerOverlay.appendChild(overlayStack)
   imageWrap.appendChild(addLayerOverlay)
 
   imageWrap.addEventListener('pointerenter', () => {
     if (latestJpegB64 && addLayerOverlay) addLayerOverlay.style.display = 'flex'
   })
   imageWrap.addEventListener('pointerleave', () => {
-    if (addLayerOverlay && !addingLayer) addLayerOverlay.style.display = 'none'
+    // Stay visible while either action is mid-flight, so its progress/result
+    // text ("Adding…", "Refining…") isn't hidden the moment the cursor moves.
+    if (addLayerOverlay && !addingLayer && !refining) addLayerOverlay.style.display = 'none'
   })
 
   // --- Controls UNDER the image: prompt + creativity slider. They live in
@@ -303,44 +328,20 @@ function buildDom() {
     creativityRow.appendChild(btn)
   }
 
-  const creativityHint = document.createElement('div')
-  creativityHint.textContent =
-    'Low = hug your drawing · High = reinterpret it. Until you pick, the graph’s own setting is used.'
+  creativityHint = document.createElement('div')
   creativityHint.style.fontSize = '10px'
   creativityHint.style.opacity = '0.5'
   creativityHint.style.marginTop = '4px'
+  refreshCreativityHint()
 
-  // Refine (refine pass R2): captures the document at full quality, uploads
-  // it, and the ComfyUI live loop runs the workflow's muted refine branch
-  // exactly once (pausing live re-renders while it works). The button stays
-  // busy until the refined result lands as the next result_frame.
-  const refineRow = document.createElement('div')
-  refineRow.style.display = 'flex'
-  refineRow.style.flexDirection = 'row'
-  refineRow.style.marginTop = '10px'
-  refineButton = document.createElement('sp-button')
-  refineButton.setAttribute('variant', 'secondary')
-  refineButton.textContent = 'Refine'
-  refineButton.style.flex = '1 1 0'
-  refineButton.addEventListener('click', () => {
-    onRefineClick()
-  })
-  refineRow.appendChild(refineButton)
-
-  const refineHint = document.createElement('div')
-  refineHint.textContent =
-    'Runs the workflow’s refine branch once at high quality (needs a muted "Photoshop Refine Source" chain). Live re-renders pause while it works.'
-  refineHint.style.fontSize = '10px'
-  refineHint.style.opacity = '0.5'
-  refineHint.style.marginTop = '4px'
-
+  // NB: Refine lives in the image overlay (above), NOT here — owner ask
+  // 2026-07-24: it belongs on the image under "Add as a layer", and its
+  // explanatory copy was removed from the panel as clutter.
   controls.appendChild(promptLabel)
   controls.appendChild(promptField)
   controls.appendChild(creativityLabel)
   controls.appendChild(creativityRow)
   controls.appendChild(creativityHint)
-  controls.appendChild(refineRow)
-  controls.appendChild(refineHint)
 
   // Onboarding hint ONLY: shown until the first render arrives, then hidden
   // for good. The old always-on line (doc title + render count) was removed —
@@ -366,6 +367,7 @@ function buildDom() {
     /** @type {any} */ (promptField).value = startupSettings.prompt
     selectedCreativityKey = startupSettings.creativityKey
     refreshCreativityButtons()
+    refreshCreativityHint()
   }
 
   return rootDiv
@@ -443,6 +445,9 @@ function resetRefineButton() {
     refineButton.textContent = 'Refine'
     refineButton.removeAttribute('disabled')
   }
+  // The overlay was pinned open while refining (see the pointerleave guard);
+  // let it hide again now that the action is over.
+  if (addLayerOverlay && !addingLayer) addLayerOverlay.style.display = 'none'
 }
 
 /**
@@ -471,6 +476,32 @@ function onRefineClick() {
   })
 }
 
+/**
+ * Renders the creativity hint, naming the denoise each level maps to RIGHT
+ * NOW — the band is a per-capture-size preference (the main panel's
+ * CREATIVITY RANGE), so the same level means different things at
+ * 512/768/1024 and the user should be able to SEE it (owner report
+ * 2026-07-24: "the creativity slider works VERY differently at different
+ * resolutions").
+ * @returns {void}
+ */
+function refreshCreativityHint() {
+  if (!creativityHint) return
+  const size = getCaptureSize()
+  const range = getCreativityRange(size)
+  const denoiseFor = (value) => (range.min + value * (range.max - range.min)).toFixed(2)
+  if (!selectedCreativityKey) {
+    creativityHint.textContent =
+      `Low → ${denoiseFor(0)} · Medium → ${denoiseFor(0.5)} · High → ${denoiseFor(1)} ` +
+      `denoise at ${size}px. Until you pick, the graph’s own setting is used.`
+    return
+  }
+  const level = CREATIVITY_LEVELS.find((l) => l.key === selectedCreativityKey)
+  creativityHint.textContent =
+    `${level ? level.label : ''} → denoise ${denoiseFor(level ? level.value : 0.5)} ` +
+    `(${range.label} range at ${size}px — change it in the main panel).`
+}
+
 /** Highlights whichever creativity button is currently selected. @returns {void} */
 function refreshCreativityButtons() {
   for (const level of CREATIVITY_LEVELS) {
@@ -493,6 +524,7 @@ function selectCreativity(key) {
   if (!level) return
   selectedCreativityKey = key
   refreshCreativityButtons()
+  refreshCreativityHint()
   try {
     setLiveCreativity(level.value)
   } catch (error) {
