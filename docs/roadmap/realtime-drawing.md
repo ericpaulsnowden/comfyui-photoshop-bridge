@@ -42,7 +42,7 @@ cpsb server (in ComfyUI)
 ComfyUI frontend (web/cpsb)
   └─ queuePrompt(0) per frame, COALESCED (≤1 queued while ≤1 runs — no busy loop)
 ComfyUI graph (user's own workflow)
-  └─ NEW node: Photoshop Live Canvas (IMAGE out; IS_CHANGED = frame counter → only
+  └─ NEW node: Photoshop Live Canvas (IMAGE out; IS_CHANGED = frame content hash → only
      the changed subgraph re-runs) → user's LCM/Lightning img2img → …
        └─ NEW node: Photoshop Live Preview (IMAGE in; pushes result JPEG back over
           the plugin websocket)
@@ -67,11 +67,11 @@ The plan's load-bearing unknowns, none guessable from docs:
 - **S-D (gates M5, deferred):** `putPixels` into a non-active layer mid-stroke — stutter/contention measurement. Not needed for M1-M4.
 
 ### M1 — Live capture + Photoshop Live Canvas node
-Plugin: per-document **Live Mode** toggle (main panel); history-id poll → debounced capture → `live_frame` (new lightweight WS message; single frame, JPEG b64, keep-latest). Server: in-memory live session + latest-frame slot + `cpsb.live` event. Node: **Photoshop Live Canvas** (IMAGE; IS_CHANGED = frame counter). PROTOCOL.md §3/§6 additions.
+Plugin: per-document **Live Mode** toggle (main panel); history-id poll → debounced capture → `live_frame` (new lightweight WS message; single frame, JPEG b64, keep-latest). Server: in-memory live session + latest-frame slot + `cpsb.live` event. Node: **Photoshop Live Canvas** (IMAGE; IS_CHANGED = a content hash of the frame — as built, NOT the plan's original frame-counter idea: the counter restarts per plugin connection and would alias across reconnects). PROTOCOL.md §3/§6 additions.
 **Useful alone:** draw in PS, watch the result re-render in the ComfyUI tab on a second monitor — the full loop minus in-PS preview.
 
 ### M2 — The loop + the recipe
-Frontend: `cpsb.live` → coalesced `queuePrompt(0)` (reuses the existing auto-queue seam; gated by a Live arm/disarm control so it never fires unexpectedly). Ship a **bundled example workflow** (Live Canvas → LCM/Lightning img2img with the reference settings: 1-4 steps, CFG 1-2, denoise 0.5 — the "creativity" knob → preview). Panel shows live status (fps, last-frame age, pause).
+Frontend: `cpsb.live` → coalesced `queuePrompt(0)` (reuses the existing auto-queue seam; gated by a Live arm/disarm control so it never fires unexpectedly). Ship a **bundled example workflow** (Live Canvas → LCM/Lightning img2img with the reference settings: 1-4 steps, CFG 1-2, denoise 0.5 — the "creativity" knob → preview). Panel shows live status (frames sent, capture ms, last-frame age; Stop Live is the pause — a live fps ticker is M4 polish).
 
 ### M3 — Feedback inside Photoshop
 Second manifest panel **"ComfyUI Preview"** (documented multi-panel; shares the existing connection singleton). New **Photoshop Live Preview** output node: pushes its IMAGE input back over the plugin WS as a JPEG `result_frame`; the panel displays it (img or canvas per S-C). This is the headline UX: **draw on the canvas, AI result lives in a docked panel beside it.**

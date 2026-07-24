@@ -206,11 +206,14 @@ class PluginConnection:
     #: replaced, NEVER a handoff, never written to disk, never in the
     #: gallery; it is a transient view of the canvas, and it dies with the
     #: connection exactly like the transfer buffers above (a reconnect
-    #: simply starts streaming fresh frames). `live_seq` is a SERVER-side
-    #: monotonic counter bumped per accepted frame -- the value
-    #: `PhotoshopLiveCanvas.IS_CHANGED` keys on -- deliberately not the
-    #: plugin's own seq, so a plugin restart/reconnect can never replay a
-    #: lower number and make ComfyUI think nothing changed.
+    #: simply starts streaming fresh frames). `live_seq` is a per-CONNECTION
+    #: counter bumped per accepted frame -- used for the `cpsb.live` event
+    #: payload, panel status, and logging ONLY. It deliberately ignores the
+    #: plugin's own seq, but it RESTARTS with each connection, which is
+    #: exactly why `PhotoshopLiveCanvas.IS_CHANGED` keys on a content hash
+    #: of `live_jpeg` rather than this counter (review-caught, 2026-07-24:
+    #: a counter key aliased across reconnects and served stale cached
+    #: renders).
     live_jpeg: bytes | None = None
     live_seq: int = 0
     live_doc_title: str = ""
@@ -2215,9 +2218,17 @@ async def send_result_frame(app: web.Application, data_b64: str, doc_title: str)
     plugin = slot.connection if slot is not None else None
     if plugin is None or not plugin.ready:
         return False
-    await plugin.ws.send_json(
-        {"type": "result_frame", "data_b64": data_b64, "doc_title": doc_title}
-    )
+    try:
+        await plugin.ws.send_json(
+            {"type": "result_frame", "data_b64": data_b64, "doc_title": doc_title}
+        )
+    except Exception as exc:
+        # A transport dying between the ready check and the write raises
+        # aiohttp's ClientConnectionResetError (an OSError) -- to this
+        # fire-and-forget push that is just "not delivered", never an error
+        # to propagate into a finished render (review-caught, 2026-07-24).
+        logger.warning("cpsb: result_frame not sent (%s)", exc)
+        return False
     return True
 
 

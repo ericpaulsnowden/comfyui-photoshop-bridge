@@ -5,7 +5,8 @@ ACTIVELY drawing in Photoshop: the plugin's Live Mode streams a keep-latest
 JPEG of the canvas over the plugin websocket after every detected stroke
 (``live_frame``, PROTOCOL.md §3 -- no save involved, no handoff, no disk),
 and this node serves the newest frame as ``(IMAGE, MASK)``. ``IS_CHANGED``
-keys on the server-side frame counter, so ComfyUI's own caching makes a
+keys on a CONTENT HASH of the newest frame (see its docstring for why not
+the frame counter), so ComfyUI's own caching makes a
 re-queue with no new frame a near-free no-op -- that is the entire
 backpressure story on the graph side, and it is why the live loop (M2's
 frontend queue, or a hand-clicked Queue) can fire liberally without wasting
@@ -43,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import concurrent.futures
+import hashlib
 import io
 import logging
 from typing import Any
@@ -63,6 +65,14 @@ _RESULT_SEND_TIMEOUT_SECONDS = 10.0
 #: JPEG quality for preview frames pushed to the Photoshop panel. 85 is the
 #: classic size/quality sweet spot; a preview panel never needs lossless.
 _RESULT_JPEG_QUALITY = 85
+
+#: Long-side cap for preview frames (review-caught, 2026-07-24): nothing else
+#: bounds the IMAGE input's size, and a natural "preview the upscaled result"
+#: wiring (a 4x upscaler before this node) would otherwise serialize a
+#: 10-20MB JPEG into ONE websocket frame per render, stalling the event loop
+#: and risking a silent plugin-side drop. The panel is a preview surface --
+#: 1024px is plenty, and mirrors the capture side's own 768px discipline.
+_RESULT_MAX_SIDE = 1024
 
 
 class PhotoshopLiveCanvas:
@@ -93,21 +103,29 @@ class PhotoshopLiveCanvas:
 
     @classmethod
     def IS_CHANGED(cls, auto_queue: str) -> str:
-        """The server-side live frame counter -- the caching key that makes the loop cheap.
+        """A content hash of the newest frame -- the caching key that makes the loop cheap.
 
-        A new frame changes the returned string, forcing re-execution on the
-        next queue; an unchanged frame leaves it stable, so ComfyUI serves
-        the whole downstream subgraph from cache (near-free). ``auto_queue``
-        is deliberately NOT folded in -- like ``timeout_seconds`` on the
-        other nodes, a widget change is already caught by ComfyUI's own
-        input diffing.
+        Keyed on the FRAME BYTES, deliberately not the frame counter
+        (review-caught bug, 2026-07-24): the counter lives on the
+        per-websocket ``PluginConnection`` and restarts at 0 on every plugin
+        reconnect, so a counter key like ``frame-1`` could ALIAS a
+        previous session's already-executed key and make ComfyUI serve the
+        OLD canvas's cached render for a brand-new drawing -- silently
+        swallowing the first stroke after every reconnect. A content hash
+        cannot alias across sessions, and its one "collision" is the
+        correct one by definition: identical canvas bytes -> identical
+        render -> serving the cache is exactly right. (~0.2ms to hash a
+        typical frame, only on IS_CHANGED calls -- noise next to a
+        generation.) ``auto_queue`` is deliberately NOT folded in -- like
+        ``timeout_seconds`` on the other nodes, a widget change is already
+        caught by ComfyUI's own input diffing.
         """
         state = nodes._require_state()
         frame = routes.get_live_frame(state.app)
         if frame is None:
             return "no-frame"
-        _jpeg, seq, _title = frame
-        return f"frame-{seq}"
+        jpeg, _seq, _title = frame
+        return hashlib.sha256(jpeg).hexdigest()[:16]
 
     def execute(self, auto_queue: str) -> tuple[Any, Any]:
         state = nodes._require_state()
@@ -188,6 +206,10 @@ class PhotoshopLivePreview:
         state = nodes._require_state()
 
         pil_image = nodes._tensor_to_pil(image)
+        # thumbnail() only ever shrinks (aspect preserved) -- a sampler-size
+        # render passes through untouched; see _RESULT_MAX_SIDE for why the
+        # cap exists at all.
+        pil_image.thumbnail((_RESULT_MAX_SIDE, _RESULT_MAX_SIDE))
         buffer = io.BytesIO()
         pil_image.save(buffer, format="JPEG", quality=_RESULT_JPEG_QUALITY)
         data_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -225,7 +247,14 @@ class PhotoshopLivePreview:
                 state.loop,
             )
             sent = future.result(timeout=_RESULT_SEND_TIMEOUT_SECONDS)
-        except (concurrent.futures.TimeoutError, RuntimeError) as exc:
+        except Exception as exc:
+            # Broad on purpose (review-caught, 2026-07-24): the future
+            # re-raises whatever the send coroutine raised, and a plugin
+            # transport dying mid-write raises aiohttp's
+            # ClientConnectionResetError -- an OSError subclass the old
+            # (TimeoutError, RuntimeError) tuple missed, which made the
+            # EXACT case this node's contract promises to absorb (plugin
+            # dropped mid-render) fail the finished render instead.
             if future is not None:
                 future.cancel()  # Best-effort; harmless if already done.
             return False, f"send timed out/failed: {exc}"

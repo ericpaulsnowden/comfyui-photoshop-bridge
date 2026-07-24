@@ -375,10 +375,11 @@ Plugin → server:
   are far below the 8 MiB websocket cap), NOT acked (fire-and-forget keep-latest: a bad
   or dropped frame is simply replaced by the next stroke's), and NEVER a handoff — the
   server holds exactly ONE frame in memory per connection (`PluginConnection.live_jpeg`),
-  bumps its own server-side counter (the plugin's `seq` is ignored so a reconnect can
-  never go backward), and emits `cpsb.live` (§5). `PhotoshopLiveCanvas` (§6f) serves the
-  newest frame; invalid base64/non-JPEG payloads are dropped with a log line, never an
-  error reply and never a socket teardown.
+  bumps a per-connection counter for the `cpsb.live` payload (the plugin's `seq` is
+  ignored; the counter is display/logging only — the node's cache key is a content hash
+  of the frame bytes, §6f), and emits `cpsb.live` (§5). `PhotoshopLiveCanvas` (§6f)
+  serves the newest frame; invalid base64/non-JPEG payloads are dropped with a log line,
+  never an error reply and never a socket teardown.
 - `{"type": "pong"}`
 
 Server → plugin:
@@ -555,10 +556,11 @@ research/research-annotate-node.md retain the design if ever revisited.
 - `"cpsb.tier2"` — plugin connection state changed:
   `{"connected": true, "ps_version": "26.5"}`
 - `"cpsb.live"` — a new live-drawing frame landed (realtime drawing M1):
-  `{"seq": 12, "doc_title": "sketch.psd"}`. `seq` is the server-side frame counter
-  (`PhotoshopLiveCanvas.IS_CHANGED`'s cache key). The M2 frontend live loop queues a
-  coalesced re-run on this event; consumers never fetch the frame itself — only the
-  node reads the in-memory slot, at execute time.
+  `{"seq": 12, "doc_title": "sketch.psd"}`. `seq` is a per-connection frame counter for
+  display/logging only (`PhotoshopLiveCanvas.IS_CHANGED`'s cache key is a content hash
+  of the frame, §6f). The M2 frontend live loop queues a coalesced re-run on this event;
+  consumers never fetch the frame itself — only the node reads the in-memory slot, at
+  execute time.
 
 **Universal cancel (product-owner requirement 2026-07-17):** ANY node that shows the
 "Editing in Photoshop…" badge (badges.js) MUST expose a working cancel ✕, regardless of
@@ -1105,10 +1107,14 @@ plugin is connected or no frame has streamed yet.
   entire server-side state is `PluginConnection`'s one keep-latest slot
   (`routes.get_live_frame`), which dies with the connection. None of the
   create/supersede/`wait_for_edit` machinery applies.
-- **`IS_CHANGED` = the server-side frame counter** (`frame-<seq>` / `"no-frame"`) — the
-  whole backpressure story on the graph side: a re-queue with no new frame is served from
-  ComfyUI's cache, near-free, so the M2 live loop (or a mashed Queue button) can fire
-  liberally.
+- **`IS_CHANGED` = a content hash of the newest frame's bytes** (`"no-frame"` when none)
+  — the whole backpressure story on the graph side: a re-queue with no new frame is
+  served from ComfyUI's cache, near-free, so the M2 live loop (or a mashed Queue button)
+  can fire liberally. A hash, deliberately NOT the frame counter: the counter restarts
+  with each plugin connection, so a counter key would alias across reconnects and serve
+  the OLD session's cached render for a new drawing (review-caught 2026-07-24).
+  Identical bytes hashing identically is the correct cache hit — same canvas, same
+  render.
 - **`auto_queue` widget (`On`/`Off`)** is read CLIENT-side only (`web/cpsb/live.js`, M2 —
   the same frontend-reads-the-widget gating as the bridge node's `mode` in `pasteback.js`):
   `On` auto-queues a coalesced re-run per arriving frame; `Off` still streams, the next
@@ -1201,14 +1207,17 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
   `cpsb.showUpgradeBanner` (bool, default true).
 - **Live loop** (`web/cpsb/live.js`, realtime drawing M2): each `cpsb.live` event queues at
-  most ONE coalesced `queuePrompt(0)` — armed only while the current graph contains a
-  `PhotoshopLiveCanvas` node with `auto_queue` = "On" (widget read client-side per event,
-  the same gating convention as `pasteback.js`'s bridge-mode check). Single-slot
-  backpressure: while ComfyUI is busy (tracked via its own `status` event's
-  `exec_info.queue_remaining`) new frames set a `trailing` flag instead of stacking
-  queues; one run fires when the queue drains and picks up whatever frame is newest by
-  then — intermediate frames are deliberately never rendered. Deliberately event-driven,
-  not Auto-Queue "Instant" (which still works, via IS_CHANGED caching, but busy-loops).
+  most ONE coalesced `queuePrompt(0)` — armed only while the current graph contains an
+  ACTIVE (non-muted/bypassed) `PhotoshopLiveCanvas` node with `auto_queue` = "On",
+  searched recursively through subgraphs (widget read client-side per event, the same
+  gating convention as `pasteback.js`'s bridge-mode check). Single-slot backpressure
+  (common case; a narrowly-raced extra queue between `queuePrompt` resolving and the
+  next status event is absorbed by IS_CHANGED caching): while ComfyUI is busy (tracked
+  via its own `status` event's `exec_info.queue_remaining`) new frames set a `trailing`
+  flag instead of stacking queues; one run fires when the queue drains and picks up
+  whatever frame is newest by then — intermediate frames are deliberately never
+  rendered. Deliberately event-driven, not Auto-Queue "Instant" (which still works, via
+  IS_CHANGED caching, but busy-loops).
 - **Gallery** (v0.5.36; overhauled 2026-07-22): each card leads with ONE larger
   thumbnail — the latest edit, or the original when no edit exists yet — with the
   original layered underneath for comparison. Grid is the gallery's ONLY layout (the

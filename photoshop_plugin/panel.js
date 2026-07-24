@@ -370,6 +370,11 @@ function initPanel() {
     }
     const parts = [`Watching "${live.docTitle}"`, `${live.framesSent} frames`]
     if (live.lastCaptureMs != null) parts.push(`${live.lastCaptureMs}ms capture`)
+    if (live.lastFrameAt != null) {
+      // Refreshed per liveEvents change (each frame/error), not on a clock —
+      // a live fps ticker is the roadmap's M4 polish, not M2's.
+      parts.push(`last frame ${Math.max(0, Math.round((Date.now() - live.lastFrameAt) / 1000))}s ago`)
+    }
     if (live.lastError) parts.push(`last error: ${live.lastError}`)
     liveStatus.textContent = parts.join(' · ')
   }

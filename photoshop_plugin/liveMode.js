@@ -4,8 +4,8 @@
  * streams a keep-latest JPEG of that document's composite to the server as
  * `live_frame` messages (PROTOCOL.md §3) after every detected change — no
  * save, no handoff, no disk. The ComfyUI-side `PhotoshopLiveCanvas` node
- * serves the newest frame; ComfyUI's own caching (IS_CHANGED keyed on the
- * server's frame counter) makes redundant re-queues near-free.
+ * serves the newest frame; ComfyUI's own caching (IS_CHANGED keyed on a
+ * content hash of the frame) makes redundant re-queues near-free.
  *
  * CHANGE DETECTION — a cheap poll of `document.activeHistoryState.id`, NOT a
  * notification listener, and NOT pixel diffing:
@@ -50,7 +50,12 @@ const { logInfo, logWarn, describeError } = require('./log.js')
 /** How often the history-state id is polled while Live Mode is active. */
 const LIVE_POLL_MS = 300
 
-/** Long-side pixel cap for captured frames (roadmap: never move full-res). */
+/**
+ * Long-side pixel cap for captured frames (roadmap: never move full-res).
+ * Applied to whichever dimension is LONGER (see captureAndSend) — a
+ * width-only cap would let a tall portrait doc stream frames with 9× the
+ * intended pixel budget (review-caught, 2026-07-24).
+ */
 const LIVE_TARGET_SIZE = 768
 
 /**
@@ -125,12 +130,27 @@ async function captureAndSend(doc) {
   const startedAt = Date.now()
   let jpegBase64
   try {
+    // Cap the LONG side: getPixels' targetSize scales proportionally when
+    // only one dimension is given, so pick the dimension by orientation.
+    // Reading width/height can throw on a just-closed doc — caught below
+    // with the rest of the capture.
     jpegBase64 = await core.executeAsModal(
       async () => {
+        const landscape = Number(doc.width) >= Number(doc.height)
+        const targetSize = landscape
+          ? { width: LIVE_TARGET_SIZE }
+          : { height: LIVE_TARGET_SIZE }
         const { imageData } = await imaging.getPixels({
           documentID: doc.id,
-          targetSize: { width: LIVE_TARGET_SIZE },
-          componentSize: 8
+          targetSize,
+          componentSize: 8,
+          // encodeImageData is documented RGB-only, and a live-drawn
+          // grayscale/CMYK doc would otherwise throw (or miscolor) every
+          // frame — request the conversion at capture (review-caught,
+          // 2026-07-24). applyAlpha mattes any alpha out, since the JPEG
+          // wire format can't carry it anyway.
+          colorSpace: 'RGB',
+          applyAlpha: true
         })
         try {
           return await imaging.encodeImageData({ imageData, base64: true })
@@ -145,8 +165,21 @@ async function captureAndSend(doc) {
     )
   } catch (error) {
     state.lastError = describeError(error)
-    logWarn(`live capture failed (will retry on next change): ${state.lastError}`)
+    // Reset the change marker so the NEXT tick retries this same canvas
+    // state — without this, a failed capture silently consumed the stroke
+    // and a burst's final stroke could stay unrendered forever
+    // (review-caught, 2026-07-24).
+    lastHistoryId = null
+    logWarn(`live capture failed (will retry next tick): ${state.lastError}`)
     notifyChanged()
+    return
+  }
+
+  // The capture ran async — the session may have been stopped or switched
+  // to another document meanwhile. A stale frame must not be sent: the
+  // server's keep-latest slot would show the WRONG document
+  // (review-caught, 2026-07-24).
+  if (!state.active || state.documentId !== doc.id) {
     return
   }
 

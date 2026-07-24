@@ -105,19 +105,48 @@ class TestImportability:
 
 
 class TestIsChanged:
+    """The cache key is a CONTENT HASH of the frame bytes, not the frame
+    counter -- the counter restarts per plugin connection, so a counter key
+    would alias across reconnects and serve a stale cached render for a new
+    drawing (PROTOCOL.md 6f)."""
+
     def test_no_frame_is_stable(self, live_app):
         assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == "no-frame"
         assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == "no-frame"
 
-    def test_each_frame_changes_the_key(self, context, live_app):
+    def test_each_new_canvas_changes_the_key(self, context, live_app):
         _app, connection = live_app
         push_frame(context, connection, (1, 1, 1))
         first = live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On")
-        assert first == "frame-1"
+        assert first != "no-frame"
         # No new frame -> stable key -> ComfyUI serves the run from cache.
         assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == first
         push_frame(context, connection, (2, 2, 2))
-        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == "frame-2"
+        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") != first
+
+    def test_identical_bytes_hit_the_cache(self, context, live_app):
+        """Same canvas re-sent (e.g. an undo back to a rendered state) is the
+        CORRECT cache hit: same pixels in, same render out."""
+        _app, connection = live_app
+        push_frame(context, connection, (5, 5, 5))
+        first = live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On")
+        push_frame(context, connection, (9, 9, 9))
+        push_frame(context, connection, (5, 5, 5))
+        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") == first
+
+    def test_key_survives_reconnect(self, context, live_app):
+        """The regression the hash exists to prevent: a NEW connection's first
+        frame restarts the seq counter at 1, so a counter-keyed cache would
+        collide with the old session's first frame and serve its stale render.
+        Different canvases must produce different keys across a reconnect."""
+        app, connection = live_app
+        push_frame(context, connection, (1, 1, 1))
+        old_session = live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On")
+
+        reconnected = routes_module.PluginConnection(ws=cast("object", None), ready=True)
+        app[routes_module._APP_KEY_PLUGIN].connection = reconnected
+        push_frame(context, reconnected, (200, 100, 50))
+        assert live_module.PhotoshopLiveCanvas.IS_CHANGED(auto_queue="On") != old_session
 
     def test_auto_queue_not_folded_in(self, context, live_app):
         _app, connection = live_app
