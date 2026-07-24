@@ -77,6 +77,11 @@ function initPanel() {
   // The always-visible boot banner index.js paints at load; panel.js takes
   // it over once connection state is known (adds the server version).
   const versionEl = /** @type {HTMLElement} */ (document.getElementById('cpsb-version'))
+  // The whole ACTIVE HANDOFFS section (its leading rule, title, list and
+  // actions) — hidden as a unit when nothing from ComfyUI is open.
+  const handoffSection = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-handoff-section')
+  )
   const handoffList = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-list'))
   const handoffClear = /** @type {HTMLElement} */ (document.getElementById('cpsb-handoff-clear'))
   const handoffActions = /** @type {HTMLElement} */ (
@@ -268,17 +273,17 @@ function initPanel() {
   function renderHandoffs() {
     const records = getActiveHandoffs()
     handoffList.innerHTML = ''
+    // Hide the ENTIRE section when nothing from ComfyUI is open (owner ask
+    // 2026-07-24) — no empty-state row taking up space. The section's leading
+    // rule lives inside #cpsb-handoff-section, so it collapses with it and the
+    // panel doesn't leave a double divider behind.
+    if (handoffSection) {
+      handoffSection.className = records.length ? '' : 'cpsb-collapsed'
+    }
     // Only offer "Clear list" when there's something to clear.
     handoffActions.className = records.length
       ? 'cpsb-conn-actions'
       : 'cpsb-conn-actions cpsb-collapsed'
-    if (records.length === 0) {
-      const empty = document.createElement('div')
-      empty.className = 'cpsb-empty'
-      empty.textContent = 'No documents from ComfyUI are currently open.'
-      handoffList.appendChild(empty)
-      return
-    }
     for (const record of records) {
       handoffList.appendChild(buildHandoffItem(record))
     }
