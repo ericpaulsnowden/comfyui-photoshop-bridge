@@ -127,6 +127,44 @@ function setAutoFixEnabled(enabled) {
   }
 }
 
+/** localStorage key for the refined-layer Stack-vs-Replace mode. */
+const REFINED_LAYER_MODE_KEY = 'cpsb.refinedLayerMode'
+
+/**
+ * How a refined image pushed from ComfyUI (`PhotoshopAddLayer` node,
+ * refine pass R1) lands in the document: `'stack'` adds a new layer per
+ * refine, `'replace'` deletes the previous layer(s) of the same name first.
+ * Main-panel control (owner ask 2026-07-24). Defaults to `'stack'` — the
+ * safe choice: never deletes anything without an explicit opt-in.
+ * @returns {'stack' | 'replace'}
+ */
+function getRefinedLayerMode() {
+  try {
+    if (typeof localStorage === 'undefined') return 'stack'
+    return localStorage.getItem(REFINED_LAYER_MODE_KEY) === 'replace' ? 'replace' : 'stack'
+  } catch (_error) {
+    return 'stack'
+  }
+}
+
+/**
+ * Persists the refined-layer mode, best-effort (same posture as
+ * {@link setAutoFixEnabled}).
+ * @param {'stack' | 'replace'} mode
+ * @returns {void}
+ */
+function setRefinedLayerMode(mode) {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(REFINED_LAYER_MODE_KEY, mode === 'replace' ? 'replace' : 'stack')
+    }
+  } catch (error) {
+    logWarn(
+      `could not persist the refined-layer mode (${describeError(error)}) — it will reset when Photoshop restarts`
+    )
+  }
+}
+
 /**
  * The plugin's one attempt, per session, at setting Photoshop's Maximize PSD
  * Compatibility preference to Always. Call from connection.js once the
@@ -170,4 +208,10 @@ async function ensureMaximizeCompatibility() {
   }
 }
 
-module.exports = { isAutoFixEnabled, setAutoFixEnabled, ensureMaximizeCompatibility }
+module.exports = {
+  isAutoFixEnabled,
+  setAutoFixEnabled,
+  ensureMaximizeCompatibility,
+  getRefinedLayerMode,
+  setRefinedLayerMode
+}

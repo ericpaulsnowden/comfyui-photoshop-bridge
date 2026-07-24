@@ -47,6 +47,8 @@ NODE_CLASS_MAPPINGS = {
     "PhotoshopLivePrompt": _cpsb_live.PhotoshopLivePrompt,
     "PhotoshopLiveCreativity": _cpsb_live.PhotoshopLiveCreativity,
     "PhotoshopLivePreview": _cpsb_live.PhotoshopLivePreview,
+    "PhotoshopRefineSource": _cpsb_live.PhotoshopRefineSource,
+    "PhotoshopAddLayer": _cpsb_live.PhotoshopAddLayer,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopBridge": "Edit in Photoshop",
@@ -58,6 +60,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopLivePrompt": "Photoshop Live Prompt",
     "PhotoshopLiveCreativity": "Photoshop Live Creativity",
     "PhotoshopLivePreview": "Photoshop Live Preview",
+    "PhotoshopRefineSource": "Photoshop Refine Source",
+    "PhotoshopAddLayer": "Photoshop Add Layer",
 }
 
 # ComfyUI checks os.path.isdir() on this itself (nodes.py load_custom_node),

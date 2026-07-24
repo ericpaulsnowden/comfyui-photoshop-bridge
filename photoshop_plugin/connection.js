@@ -477,6 +477,14 @@ class ConnectionManager extends EventTarget {
      * @type {Map<string, {resolve: (handoffId: string) => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>}>}
      */
     this._pendingPushes = new Map()
+    /**
+     * The single in-flight `request_render` download (refine pass R1), or
+     * null. Single-slot, not a map: the server serves one keep-latest
+     * render, so concurrent fetches have nothing distinct to fetch. See
+     * {@link requestLastRender}.
+     * @type {{chunks: string[], received: number, total: number | null, resolve: (bytes: Uint8Array) => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>} | null}
+     */
+    this._pendingRender = null
   }
 
   /**
@@ -582,6 +590,11 @@ class ConnectionManager extends EventTarget {
       pending.reject(new Error(reason))
     }
     this._pendingPushes.clear()
+    if (this._pendingRender) {
+      clearTimeout(this._pendingRender.timer)
+      this._pendingRender.reject(new Error(reason))
+      this._pendingRender = null
+    }
   }
 
   /**
@@ -758,6 +771,14 @@ class ConnectionManager extends EventTarget {
       this._onFileError(/** @type {CpsbFileErrorMessage} */ (msg))
       return
     }
+    if (msg.type === 'render_chunk') {
+      this._onRenderChunk(/** @type {{seq: number, total: number, data_b64: string}} */ (msg))
+      return
+    }
+    if (msg.type === 'render_error') {
+      this._onRenderError(/** @type {{error?: string}} */ (msg))
+      return
+    }
     if (msg.type === 'upload_ok') {
       this._onUploadResult(/** @type {CpsbUploadOkMessage} */ (msg).handoff_id, null, undefined)
       return
@@ -819,6 +840,67 @@ class ConnectionManager extends EventTarget {
     this._pendingDownloads.delete(msg.handoff_id)
     clearTimeout(pending.timer)
     pending.reject(new Error(msg.error || 'Server reported a file error'))
+  }
+
+  /**
+   * Downloads the server's FULL-QUALITY last live render (refine pass R1,
+   * PROTOCOL.md §3 `request_render` → chunked `render_chunk`s /
+   * `render_error`) — what the preview panel's "Add as a layer" places
+   * instead of its 1024px display JPEG. Single-flight: one fetch at a time
+   * (a second call while one is pending rejects immediately; the panel
+   * button is disabled during an add anyway).
+   * @returns {Promise<Uint8Array>} The PNG bytes.
+   */
+  requestLastRender() {
+    if (!this._socket || this._socket.readyState !== WS_READY_STATE_OPEN) {
+      return Promise.reject(new Error('Not connected to the ComfyUI server'))
+    }
+    if (this._pendingRender) {
+      return Promise.reject(new Error('A render download is already in progress'))
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingRender = null
+        reject(new Error(`request_render timed out after ${TRANSFER_TIMEOUT_MS}ms`))
+      }, TRANSFER_TIMEOUT_MS)
+      this._pendingRender = { chunks: [], received: 0, total: null, resolve, reject, timer }
+      this.send({ type: 'request_render' })
+    })
+  }
+
+  /**
+   * Accumulates one `render_chunk` for the in-flight {@link requestLastRender}
+   * call — the `_onFileChunk` shape, single-slot instead of map-keyed.
+   * @param {{seq: number, total: number, data_b64: string}} msg
+   * @returns {void}
+   */
+  _onRenderChunk(msg) {
+    const pending = this._pendingRender
+    if (!pending) return
+    if (pending.chunks[msg.seq] === undefined) pending.received += 1
+    pending.chunks[msg.seq] = msg.data_b64
+    pending.total = msg.total
+    if (pending.total === null || pending.received < pending.total) return
+    this._pendingRender = null
+    clearTimeout(pending.timer)
+    try {
+      pending.resolve(base64Decode(pending.chunks.join('')))
+    } catch (error) {
+      pending.reject(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+
+  /**
+   * Fails the in-flight {@link requestLastRender} call, if any.
+   * @param {{error?: string}} msg
+   * @returns {void}
+   */
+  _onRenderError(msg) {
+    const pending = this._pendingRender
+    if (!pending) return
+    this._pendingRender = null
+    clearTimeout(pending.timer)
+    pending.reject(new Error(msg.error || 'Server reported a render error'))
   }
 
   /**

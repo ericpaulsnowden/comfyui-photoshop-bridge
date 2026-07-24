@@ -3345,3 +3345,129 @@ class TestLiveCreativity:
             await _connect_tier2_plugin(ws, context, local_mode=False)
             await wait_until(lambda: routes_module.tier2_connected(client.app))
             assert routes_module.get_live_creativity(client.app) is None  # ready, untouched
+
+
+class TestRefinePush:
+    """`refine_push` (refine pass R2, PROTOCOL.md §3): the Refine click's
+    chunked full-quality canvas upload -> app-level slot + `cpsb.refine`."""
+
+    async def test_chunked_canvas_stored_and_event_emitted(
+        self, client, context, manager, events
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            payload = png_bytes((10, 20, 30))
+            data = base64.b64encode(payload).decode("ascii")
+            mid = len(data) // 2
+            for seq, chunk in enumerate((data[:mid], data[mid:])):
+                await ws.send_json(
+                    {
+                        "type": "refine_push",
+                        "refine_id": "r1",
+                        "seq": seq,
+                        "total": 2,
+                        "data_b64": chunk,
+                    }
+                )
+            ok = await asyncio.wait_for(ws.receive_json(), timeout=5)
+            assert ok == {"type": "refine_ok", "refine_id": "r1", "request_id": 1}
+
+            canvas = routes_module.get_refine_canvas(client.app)
+            assert canvas is not None
+            assert canvas[0] == payload
+            assert routes_module.get_refine_request_id(client.app) == 1
+            refine_events = events.of_type("cpsb.refine")
+            assert refine_events and refine_events[-1] == {"request_id": 1}
+
+    async def test_each_push_bumps_the_request_id(self, client, context, manager, events):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            for n, color in enumerate(((1, 1, 1), (2, 2, 2)), start=1):
+                await ws.send_json(
+                    {
+                        "type": "refine_push",
+                        "refine_id": f"r{n}",
+                        "seq": 0,
+                        "total": 1,
+                        "data_b64": base64.b64encode(png_bytes(color)).decode("ascii"),
+                    }
+                )
+                ok = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                assert ok["request_id"] == n
+            assert routes_module.get_refine_request_id(client.app) == 2
+
+    async def test_non_png_rejected_with_refine_error(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "refine_push",
+                    "refine_id": "bad",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(b"not a png").decode("ascii"),
+                }
+            )
+            reply = await asyncio.wait_for(ws.receive_json(), timeout=5)
+            assert reply["type"] == "refine_error"
+            assert reply["refine_id"] == "bad"
+            assert routes_module.get_refine_canvas(client.app) is None
+            assert routes_module.get_refine_request_id(client.app) == 0
+
+    async def test_invalid_base64_rejected(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "refine_push",
+                    "refine_id": "bad64",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": "!!!not-base64!!!",
+                }
+            )
+            reply = await asyncio.wait_for(ws.receive_json(), timeout=5)
+            assert reply["type"] == "refine_error"
+            assert routes_module.get_refine_canvas(client.app) is None
+
+
+class TestRequestRender:
+    """`request_render` (refine pass R1, PROTOCOL.md §3): the plugin fetching
+    the full-quality last render for "Add as a layer"."""
+
+    async def test_no_render_yet_replies_render_error(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "request_render"})
+            reply = await asyncio.wait_for(ws.receive_json(), timeout=5)
+            assert reply["type"] == "render_error"
+
+    async def test_serves_stored_render_as_chunked_png(self, client, context, manager):
+        source = Image.new("RGB", (24, 16), (200, 100, 50))
+        routes_module.set_last_render(client.app, source)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "request_render"})
+            chunks: dict[int, str] = {}
+            total = None
+            while total is None or len(chunks) < total:
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=5)
+                assert msg["type"] == "render_chunk", msg
+                chunks[msg["seq"]] = msg["data_b64"]
+                total = msg["total"]
+            png = base64.b64decode("".join(chunks[i] for i in range(total)))
+            round_tripped = Image.open(io.BytesIO(png))
+            assert round_tripped.size == (24, 16)
+            assert round_tripped.convert("RGB").getpixel((0, 0)) == (200, 100, 50)

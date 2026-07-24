@@ -353,6 +353,21 @@
         sharpest (best for SDXL models). Takes effect immediately.
       </div>
 
+      <!-- Refined layer mode (refine pass R1, owner ask 2026-07-24 — in the
+           MAIN panel, not the preview panel): how a refined image pushed by
+           the "Photoshop Add Layer" node lands in the document. Stack = a
+           new layer per refine; Replace = keep exactly one, deleting the
+           previous same-named layer first. Segmented sp-button row (the
+           capture-size pattern); panel.js highlights the persisted choice
+           (prefs.js) on click. -->
+      <div class="cpsb-field-label">REFINED LAYER</div>
+      <div id="cpsb-refined-layer-row" class="cpsb-conn-actions"></div>
+      <div class="cpsb-muted cpsb-conn-line">
+        When ComfyUI pushes a refined image into your document: Stack adds a
+        new layer each time; Replace swaps out the previous "ComfyUI refined"
+        layer.
+      </div>
+
       <!-- The prompt + creativity controls live in the second "ComfyUI
            Preview" panel (previewPanel.js), next to the render they affect and
            independent of this panel being collapsed. -->

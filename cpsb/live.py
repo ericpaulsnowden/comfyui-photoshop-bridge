@@ -1,11 +1,15 @@
 """The realtime-drawing nodes (docs/roadmap/realtime-drawing.md M1/M2/M3).
 
-Four nodes: ``PhotoshopLiveCanvas`` (the canvas in, Tier-2-required),
+Six nodes: ``PhotoshopLiveCanvas`` (the canvas in, Tier-2-required),
 ``PhotoshopLivePrompt`` (the preview panel's prompt in) and
-``PhotoshopLiveCreativity`` (the preview panel's creativity slider -> a denoise
-FLOAT) -- both NOT Tier-2-gated, falling back to their own widgets so
-ComfyUI-only works -- and ``PhotoshopLivePreview`` (the render back out to a
-docked Photoshop panel, which also hosts the prompt + creativity controls).
+``PhotoshopLiveCreativity`` (the preview panel's creativity control -> a
+denoise FLOAT) -- both NOT Tier-2-gated, falling back to their own widgets so
+ComfyUI-only works -- ``PhotoshopLivePreview`` (the render back out to a
+docked Photoshop panel, which also hosts the prompt + creativity controls),
+and the refine pass pair (roadmap R1): ``PhotoshopRefineSource`` (the last
+full-quality render and/or a full-res canvas capture back INTO any refine
+workflow) and ``PhotoshopAddLayer`` (a result pushed straight into the
+current document as a layer).
 
 ``PhotoshopLiveCanvas`` is the graph's window onto the canvas the user is
 ACTIVELY drawing in Photoshop: the plugin's Live Mode streams a keep-latest
@@ -356,6 +360,12 @@ class PhotoshopLivePreview:
         state = nodes._require_state()
 
         pil_image = nodes._tensor_to_pil(image)
+        # Refine-pass cornerstone (roadmap R1): keep the FULL-QUALITY render
+        # in the app-level keep-latest slot BEFORE the display copy is
+        # thumbnailed below -- `PhotoshopRefineSource` refines from it and
+        # the plugin's "Add as a layer" fetches it (`request_render`). The
+        # panel keeps getting the small JPEG; this slot is the real pixels.
+        routes.set_last_render(state.app, pil_image.copy())
         # thumbnail() only ever shrinks (aspect preserved) -- a sampler-size
         # render passes through untouched; see _RESULT_MAX_SIDE for why the
         # cap exists at all.
@@ -391,11 +401,9 @@ class PhotoshopLivePreview:
             return False, "running on the event-loop thread; skipping to avoid a deadlock"
 
         future: concurrent.futures.Future[bool] | None = None
+        coro = routes.send_result_frame(state.app, data_b64, doc_title)
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                routes.send_result_frame(state.app, data_b64, doc_title),
-                state.loop,
-            )
+            future = asyncio.run_coroutine_threadsafe(coro, state.loop)
             sent = future.result(timeout=_RESULT_SEND_TIMEOUT_SECONDS)
         except Exception as exc:
             # Broad on purpose (review-caught, 2026-07-24): the future
@@ -407,6 +415,199 @@ class PhotoshopLivePreview:
             # dropped mid-render) fail the finished render instead.
             if future is not None:
                 future.cancel()  # Best-effort; harmless if already done.
+            else:
+                coro.close()  # Never scheduled (no usable loop) -- avoid the warning.
+            return False, f"send timed out/failed: {exc}"
+
+        if not sent:
+            return False, "no Tier-2 plugin connected"
+        return True, ""
+
+
+#: Long-side cap for images pushed as Photoshop layers (refine pass R1;
+#: Eric's ceiling decision 2026-07-24: target the PSD's size, proportionally
+#: capped below 4096). The server caps PIXELS at 4096; the plugin scales the
+#: placed layer to the document bounds, so a document larger than 4096 still
+#: gets a full-canvas layer -- just from <=4096 source pixels.
+_ADD_LAYER_MAX_SIDE = 4096
+
+#: Bound on the cross-thread `add_layer` chunked send. Larger than the
+#: result-frame bound: a full-quality PNG can be tens of MB and the transfer
+#: is chunked, so give a remote (LAN) plugin real time before declaring it
+#: undeliverable.
+_ADD_LAYER_SEND_TIMEOUT_SECONDS = 60.0
+
+
+class PhotoshopRefineSource:
+    """Serves the refine pass its source images (roadmap R1, decided 2026-07-24).
+
+    Two ``IMAGE`` outputs, and the refine workflow wires whichever it wants
+    (Eric's "both, workflow picks" decision):
+
+    - ``render`` -- the last live render at FULL quality (the app-level slot
+      :func:`cpsb.routes.get_last_render`, stored by ``PhotoshopLivePreview``
+      before its display copy is downscaled). "Refine exactly what you saw."
+    - ``canvas`` -- the full-resolution canvas capture the plugin uploaded
+      with the Refine click (`refine_push`, PROTOCOL.md §3; proportionally
+      capped plugin-side per the <=4096 ceiling). The higher-quality-ceiling
+      source; composition can drift from the shown render.
+
+    FALLBACKS keep every wiring shape usable: a missing canvas serves the
+    render on both outputs (e.g. a manual ComfyUI-side Queue with no Refine
+    click -- the R1 path), a missing render serves the canvas on both, and
+    only BOTH missing interrupts with an actionable log. NOT Tier-2-gated:
+    the render slot fills without any plugin.
+
+    **Mute this node to disarm the refine branch.** ComfyUI prunes the whole
+    dependent subtree of a muted node from execution (verified on the test
+    rig, 2026-07-24) -- the frontend live loop un-mutes it for exactly one
+    queue per Refine click (`cpsb.refine`, web/cpsb/live.js) and re-mutes
+    after, so refine chains never run per-stroke.
+    """
+
+    CATEGORY = "image/photoshop"
+    RETURN_TYPES = ("IMAGE", "IMAGE")
+    RETURN_NAMES = ("render", "canvas")
+    FUNCTION = "execute"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {"required": {}}
+
+    @classmethod
+    def IS_CHANGED(cls) -> str:
+        """Key on (refine request, render, canvas) so each Refine click --
+        and each new render, for manual re-queues -- re-runs the branch once,
+        while an unchanged state is served from cache (the same backpressure
+        story as every other live node)."""
+        state = nodes._require_state()
+        app = state.app
+        render = routes.get_last_render(app)
+        canvas = routes.get_refine_canvas(app)
+        return (
+            f"req-{routes.get_refine_request_id(app)}"
+            f":render-{render[1] if render else 0}"
+            f":canvas-{canvas[1] if canvas else 0}"
+        )
+
+    def execute(self) -> tuple[Any, Any]:
+        state = nodes._require_state()
+
+        render = routes.get_last_render(state.app)
+        render_image = render[0] if render else None
+
+        canvas_image = None
+        canvas = routes.get_refine_canvas(state.app)
+        if canvas is not None:
+            png_bytes, canvas_seq = canvas
+            try:
+                canvas_image = Image.open(io.BytesIO(png_bytes))
+                canvas_image.load()
+            except Exception:
+                logger.warning(
+                    "cpsb refine: canvas capture %d failed to decode; falling back to the render",
+                    canvas_seq,
+                    exc_info=True,
+                )
+
+        if render_image is None and canvas_image is None:
+            logger.warning(
+                "cpsb refine: nothing to refine yet -- run the live loop (or click Refine "
+                "in the Photoshop preview panel) so a render or canvas capture exists."
+            )
+            nodes._raise_interrupt()
+
+        effective_render = render_image if render_image is not None else canvas_image
+        effective_canvas = canvas_image if canvas_image is not None else render_image
+        logger.info(
+            "cpsb refine: serving render=%s canvas=%s",
+            "live" if render_image is not None else "canvas-fallback",
+            "capture" if canvas_image is not None else "render-fallback",
+        )
+        render_tensor, _mask = nodes._tensors_from_image(effective_render)
+        canvas_tensor, _mask = nodes._tensors_from_image(effective_canvas)
+        return (render_tensor, canvas_tensor)
+
+
+class PhotoshopAddLayer:
+    """Pushes its IMAGE input into the CURRENT Photoshop document as a layer.
+
+    Refine pass R1 (roadmap; Eric's routing decision: "the workflow decides"
+    -- ending a chain in THIS node routes the result straight into the
+    document, ending it in ``PhotoshopLivePreview`` routes it to the preview
+    pane; wire both for both). An output node: encodes the first frame of
+    its input batch as full-quality PNG, proportionally capped at
+    {_ADD_LAYER_MAX_SIDE}px long side (the <=4096 ceiling -- the plugin
+    scales the placed layer to the document bounds, so pixels arrive capped
+    but the LAYER lands full-canvas), and sends it as chunked
+    ``add_layer_chunk`` messages (:func:`cpsb.routes.send_add_layer`). The
+    plugin places it honoring the main panel's Stack-vs-Replace preference.
+
+    **NOT Tier-2-gated with an interrupt** -- same no-fail contract and
+    rationale as :class:`PhotoshopLivePreview`: this runs at the END of a
+    (possibly expensive) refine; a dropped plugin must not throw the result
+    away, so a missing plugin is a logged no-op.
+    """
+
+    CATEGORY = "image/photoshop"
+    RETURN_TYPES = ()
+    FUNCTION = "execute"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "layer_name": ("STRING", {"default": "ComfyUI refined"}),
+            },
+        }
+
+    def execute(self, image: Any, layer_name: str) -> dict[str, Any]:
+        state = nodes._require_state()
+
+        pil_image = nodes._tensor_to_pil(image)
+        # thumbnail() only ever shrinks (aspect preserved); a render already
+        # under the ceiling passes through at full size.
+        pil_image.thumbnail((_ADD_LAYER_MAX_SIDE, _ADD_LAYER_MAX_SIDE))
+        buffer = io.BytesIO()
+        pil_image.save(buffer, format="PNG")
+        png_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        name = (layer_name or "").strip() or "ComfyUI refined"
+        sent, why = self._send_add_layer(state, png_b64, name)
+        if not sent:
+            logger.warning(
+                "cpsb refine: layer not delivered to Photoshop (%s) -- the image is still "
+                "visible in ComfyUI",
+                why,
+            )
+        else:
+            logger.info(
+                "cpsb refine: pushed %dx%d layer %r to Photoshop",
+                *pil_image.size,
+                name,
+            )
+        return {}
+
+    @staticmethod
+    def _send_add_layer(state: Any, png_b64: str, layer_name: str) -> tuple[bool, str]:
+        """Cross-thread, bounded chunked send -- the exact
+        :meth:`PhotoshopLivePreview._send_result` shape with a larger bound
+        (see :data:`_ADD_LAYER_SEND_TIMEOUT_SECONDS`)."""
+        if nodes._running_on_state_loop(state):
+            return False, "running on the event-loop thread; skipping to avoid a deadlock"
+
+        future: concurrent.futures.Future[bool] | None = None
+        coro = routes.send_add_layer(state.app, png_b64, layer_name)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, state.loop)
+            sent = future.result(timeout=_ADD_LAYER_SEND_TIMEOUT_SECONDS)
+        except Exception as exc:
+            if future is not None:
+                future.cancel()  # Best-effort; harmless if already done.
+            else:
+                coro.close()  # Never scheduled (no usable loop) -- avoid the warning.
             return False, f"send timed out/failed: {exc}"
 
         if not sent:

@@ -171,6 +171,16 @@ class _PendingPush:
 
 
 @dataclass
+class _PendingRefine:
+    """In-progress `refine_push` reassembly state for ONE Refine click
+    (refine pass R2, PROTOCOL.md §3): the full-quality canvas capture the
+    plugin uploads with the request. Same in-order chunk convention as
+    :class:`_PendingPush` (websocket delivery is ordered)."""
+
+    chunks: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PluginConnection:
     """State for the single active UXP plugin websocket connection (PROTOCOL.md §3)."""
 
@@ -200,6 +210,10 @@ class PluginConnection:
     #: real client mints a fresh `push_id` per attempt, so this stays tiny;
     #: freed with the connection like everything else here.
     rejected_push_ids: set[str] = field(default_factory=set)
+    #: In-progress `refine_push` reassembly buffers (refine pass R2), keyed by
+    #: the plugin's own `refine_id`. Same reconnect-restarts-cleanly posture
+    #: as `pending_pushes`.
+    pending_refines: dict[str, _PendingRefine] = field(default_factory=dict)
     #: Realtime drawing (docs/roadmap/realtime-drawing.md M1): the single
     #: keep-latest live-frame slot. `live_jpeg` is the newest JPEG the
     #: plugin's Live Mode captured (`live_frame` message) -- ONE frame, always
@@ -244,9 +258,53 @@ class _PluginSlot:
         self.connection: PluginConnection | None = None
 
 
+class _LiveRenderSlot:
+    """Keep-latest FULL-QUALITY copy of the newest live render (refine pass R1).
+
+    ``PhotoshopLivePreview`` stores the un-downscaled, un-JPEG'd render here
+    each time it runs -- the roadmap's refine-pass cornerstone: this is what
+    `PhotoshopRefineSource` refines from, and what the plugin's "Add as a
+    layer" fetches (`request_render`, §3) instead of its 1024px display JPEG.
+    Held as a PIL image (not PNG bytes) so the same-process node consumers pay
+    no encode cost; PNG encoding happens lazily, only when the plugin asks.
+
+    APP-level (not on :class:`PluginConnection`), deliberately: the render is
+    produced by ComfyUI, not the plugin, and must survive plugin reconnects.
+    One slot, replaced wholesale per render -- the same GIL-atomic
+    reference-swap posture as `live_jpeg` (writer: prompt-worker thread;
+    readers: prompt-worker thread and the websocket loop).
+    """
+
+    def __init__(self) -> None:
+        self.image: Any | None = None  # PIL.Image.Image, full resolution
+        self.seq: int = 0
+
+
+class _RefineSlot:
+    """Keep-latest refine request state (refine pass R2, PROTOCOL.md §3).
+
+    ``canvas_png`` is the newest full-quality canvas capture the plugin
+    uploaded with a Refine click (`refine_push` chunks, PNG, proportionally
+    capped plugin-side); ``request_id`` bumps per completed upload and is the
+    request key `PhotoshopRefineSource.IS_CHANGED` folds in, so each Refine
+    click re-runs the refine branch exactly once. App-level for the same
+    reason as :class:`_LiveRenderSlot` -- a mid-refine plugin reconnect must
+    not vaporize the request the frontend is about to serve.
+    """
+
+    def __init__(self) -> None:
+        self.canvas_png: bytes | None = None
+        self.canvas_seq: int = 0
+        self.request_id: int = 0
+
+
 _APP_KEY_CONTEXT: web.AppKey[CpsbContext] = web.AppKey("cpsb_context", CpsbContext)
 _APP_KEY_MANAGER: web.AppKey[HandoffManager] = web.AppKey("cpsb_manager", HandoffManager)
 _APP_KEY_PLUGIN: web.AppKey[_PluginSlot] = web.AppKey("cpsb_plugin", _PluginSlot)
+_APP_KEY_LIVE_RENDER: web.AppKey[_LiveRenderSlot] = web.AppKey(
+    "cpsb_live_render", _LiveRenderSlot
+)
+_APP_KEY_REFINE: web.AppKey[_RefineSlot] = web.AppKey("cpsb_refine", _RefineSlot)
 _APP_KEY_WATCHER: web.AppKey[CpsbWatcher | None] = web.AppKey("cpsb_watcher", CpsbWatcher)
 
 
@@ -277,6 +335,8 @@ def install(
     app[_APP_KEY_CONTEXT] = context
     app[_APP_KEY_MANAGER] = manager
     app[_APP_KEY_PLUGIN] = _PluginSlot()
+    app[_APP_KEY_LIVE_RENDER] = _LiveRenderSlot()
+    app[_APP_KEY_REFINE] = _RefineSlot()
     app[_APP_KEY_WATCHER] = watcher
 
 
@@ -2256,6 +2316,174 @@ def get_live_creativity(app: web.Application) -> float | None:
     return connection.live_creativity
 
 
+# --- Refine pass (docs/roadmap/realtime-drawing.md R1/R2) ---------------------
+
+#: PNG signature -- the only validation an assembled `refine_push` canvas
+#: gets server-side (the real decode cost is deferred to
+#: `PhotoshopRefineSource.execute`, mirroring `_JPEG_SOI`'s posture for
+#: live frames).
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def set_last_render(app: web.Application, image: Any) -> None:
+    """Store the newest render at FULL quality (refine-pass cornerstone).
+
+    Called by ``PhotoshopLivePreview.execute`` with the un-downscaled PIL
+    image BEFORE its display copy is thumbnailed. One keep-latest slot; the
+    reference swap is GIL-atomic (see :class:`_LiveRenderSlot`).
+    """
+    slot = app.get(_APP_KEY_LIVE_RENDER)
+    if slot is None:
+        return
+    slot.image = image
+    slot.seq += 1
+
+
+def get_last_render(app: web.Application) -> tuple[Any, int] | None:
+    """The newest full-quality render ``(pil_image, seq)``, or ``None``."""
+    slot = app.get(_APP_KEY_LIVE_RENDER)
+    if slot is None or slot.image is None:
+        return None
+    return slot.image, slot.seq
+
+
+def get_refine_canvas(app: web.Application) -> tuple[bytes, int] | None:
+    """The newest refine canvas capture ``(png_bytes, seq)``, or ``None``."""
+    slot = app.get(_APP_KEY_REFINE)
+    if slot is None or slot.canvas_png is None:
+        return None
+    return slot.canvas_png, slot.canvas_seq
+
+
+def get_refine_request_id(app: web.Application) -> int:
+    """The current refine request id (0 = never requested)."""
+    slot = app.get(_APP_KEY_REFINE)
+    return slot.request_id if slot is not None else 0
+
+
+async def _handle_refine_push(
+    context: CpsbContext,
+    app: web.Application,
+    connection: PluginConnection,
+    msg: dict[str, Any],
+) -> None:
+    """Handle one `refine_push` chunk (refine pass R2, PROTOCOL.md §3).
+
+    The plugin's Refine click uploads a full-quality PNG canvas capture as
+    chunked `refine_push` messages (`refine_id`/`seq`/`total`/`data_b64` --
+    the `manual_push` convention). Once reassembled: validates the PNG
+    signature, stores the bytes in the app-level refine slot, bumps the
+    request id, replies `refine_ok {refine_id, request_id}`, and emits
+    `cpsb.refine` (§5) so the frontend live loop runs the refine branch
+    once. A malformed transfer replies `refine_error` and stores nothing.
+    """
+    refine_id = msg.get("refine_id")
+    seq = msg.get("seq")
+    total = msg.get("total")
+    data_b64 = msg.get("data_b64")
+    if not refine_id or not isinstance(seq, int) or not isinstance(total, int) or total <= 0:
+        logger.warning("cpsb: refine_push with missing/invalid framing, ignoring")
+        return
+
+    async def _reject(error: str) -> None:
+        connection.pending_refines.pop(refine_id, None)
+        logger.warning("cpsb: refine_push %s rejected: %s", refine_id, error)
+        try:
+            await connection.ws.send_json(
+                {"type": "refine_error", "refine_id": refine_id, "error": error}
+            )
+        except Exception:
+            logger.warning("cpsb: refine_error reply not sent", exc_info=True)
+
+    if not isinstance(data_b64, str):
+        await _reject("chunk without data_b64")
+        return
+
+    pending = connection.pending_refines.setdefault(refine_id, _PendingRefine())
+    pending.chunks.append(data_b64)
+    if len(pending.chunks) < total:
+        return
+
+    connection.pending_refines.pop(refine_id, None)
+    try:
+        png = base64.b64decode("".join(pending.chunks), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        await _reject(f"invalid base64: {exc}")
+        return
+    if not png.startswith(_PNG_MAGIC):
+        await _reject("payload is not a PNG stream")
+        return
+
+    slot = app[_APP_KEY_REFINE]
+    slot.canvas_png = png
+    slot.canvas_seq += 1
+    slot.request_id += 1
+    try:
+        await connection.ws.send_json(
+            {"type": "refine_ok", "refine_id": refine_id, "request_id": slot.request_id}
+        )
+    except Exception:
+        logger.warning("cpsb: refine_ok reply not sent", exc_info=True)
+    logger.info(
+        "cpsb: refine request %d received (%d KB canvas)", slot.request_id, len(png) // 1024
+    )
+    context.send_event("cpsb.refine", {"request_id": slot.request_id})
+
+
+async def _handle_request_render(app: web.Application, connection: PluginConnection) -> None:
+    """Handle `request_render` (refine pass R1, PROTOCOL.md §3): serve the
+    full-quality last render to the plugin as chunked `render_chunk`
+    messages, or one `render_error` when no render exists yet.
+
+    Powers the upgraded "Add as a layer": the plugin fetches the REAL pixels
+    from the app-level slot instead of using its 1024px display JPEG. PNG
+    encoding is offloaded to a worker thread -- a full-res encode can take
+    hundreds of milliseconds and must not stall the websocket loop.
+    """
+    render = get_last_render(app)
+    if render is None:
+        try:
+            await connection.ws.send_json(
+                {"type": "render_error", "error": "no render available yet"}
+            )
+        except Exception:
+            logger.warning("cpsb: render_error reply not sent", exc_info=True)
+        return
+
+    image, seq = render
+
+    def _encode() -> bytes:
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    png = await asyncio.get_running_loop().run_in_executor(None, _encode)
+    data_b64 = base64.b64encode(png).decode("ascii")
+    chunks = _split_b64(data_b64)
+    total = len(chunks)
+    try:
+        for seq_index, chunk in enumerate(chunks):
+            await connection.ws.send_json(
+                {
+                    "type": "render_chunk",
+                    "seq": seq_index,
+                    "total": total,
+                    "data_b64": chunk,
+                }
+            )
+    except Exception as exc:
+        # Mid-transfer socket death: nothing to clean up server-side; the
+        # plugin's pending fetch times out / rejects on close.
+        logger.warning("cpsb: render transfer aborted (%s)", exc)
+        return
+    logger.info(
+        "cpsb: served render %d to the plugin (%d KB PNG, %d chunks)",
+        seq,
+        len(png) // 1024,
+        total,
+    )
+
+
 def get_live_frame(app: web.Application) -> tuple[bytes, int, str] | None:
     """The newest live canvas frame, or ``None`` when there is none to serve.
 
@@ -2311,11 +2539,57 @@ async def send_result_frame(app: web.Application, data_b64: str, doc_title: str)
     return True
 
 
+async def send_add_layer(
+    app: web.Application, png_b64: str, layer_name: str
+) -> bool:
+    """Push one refined image to the plugin to be placed as a document layer.
+
+    Refine pass R1 (docs/roadmap/realtime-drawing.md): the
+    ``PhotoshopAddLayer`` node calls this (cross-thread, exactly like
+    :func:`send_result_frame`'s caller) with the full-quality PNG of its
+    IMAGE input; the plugin reassembles the chunks (`add_layer_chunk`, §3 --
+    self-contained chunks, the pack's universal convention) and places the
+    image into the CURRENT document as a layer, honoring its own
+    stack-vs-replace preference. Fire-and-forget at the protocol level: no
+    ack, failure plugin-side is logged there.
+
+    Returns:
+        ``True`` once every chunk was handed to a connected, ready plugin's
+        websocket; ``False`` when no plugin is connected or the transport
+        died mid-transfer (the caller logs and no-ops -- a missing plugin
+        must not fail a finished render).
+    """
+    slot = app.get(_APP_KEY_PLUGIN)
+    plugin = slot.connection if slot is not None else None
+    if plugin is None or not plugin.ready:
+        return False
+    transfer_id = f"al-{time.monotonic_ns()}"
+    chunks = _split_b64(png_b64)
+    total = len(chunks)
+    try:
+        for seq, chunk in enumerate(chunks):
+            await plugin.ws.send_json(
+                {
+                    "type": "add_layer_chunk",
+                    "transfer_id": transfer_id,
+                    "seq": seq,
+                    "total": total,
+                    "data_b64": chunk,
+                    "layer_name": layer_name,
+                }
+            )
+    except Exception as exc:
+        logger.warning("cpsb: add_layer transfer not completed (%s)", exc)
+        return False
+    return True
+
+
 async def _handle_plugin_message(
     context: CpsbContext,
     manager: HandoffManager,
     connection: PluginConnection,
     raw: str,
+    app: web.Application | None = None,
 ) -> None:
     try:
         msg = json.loads(raw)
@@ -2407,6 +2681,16 @@ async def _handle_plugin_message(
         _handle_live_prompt(context, connection, msg)
     elif msg_type == "live_creativity":
         _handle_live_creativity(context, connection, msg)
+    elif msg_type == "refine_push":
+        if app is None:
+            logger.warning("cpsb: refine_push received with no app wired, ignoring")
+        else:
+            await _handle_refine_push(context, app, connection, msg)
+    elif msg_type == "request_render":
+        if app is None:
+            logger.warning("cpsb: request_render received with no app wired, ignoring")
+        else:
+            await _handle_request_render(app, connection)
     elif msg_type == "action_ok":
         # The PhotoshopAction node (cpsb/actions.py, not yet in PROTOCOL.md
         # §3) -- informational only, exactly like "opened"/"save_detected"
@@ -2454,7 +2738,9 @@ async def websocket_route(request: web.Request) -> web.WebSocketResponse:
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
-                await _handle_plugin_message(context, manager, connection, msg.data)
+                await _handle_plugin_message(
+                    context, manager, connection, msg.data, app=request.app
+                )
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 logger.warning("cpsb plugin websocket error: %s", ws.exception())
     finally:

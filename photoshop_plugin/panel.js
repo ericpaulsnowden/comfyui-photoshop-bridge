@@ -18,7 +18,12 @@
 const { connection } = require('./connection.js')
 const { getActiveHandoffs, registryEvents, deliverEdit, clearAllHandoffs } = require('./handoffs.js')
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
-const { isAutoFixEnabled, setAutoFixEnabled } = require('./prefs.js')
+const {
+  isAutoFixEnabled,
+  setAutoFixEnabled,
+  getRefinedLayerMode,
+  setRefinedLayerMode
+} = require('./prefs.js')
 const {
   toggleLive,
   getLiveState,
@@ -445,6 +450,47 @@ function initPanel() {
       captureSizeRow.appendChild(btn)
     }
     refreshCaptureSizeButtons()
+  }
+
+  // Refined layer Stack/Replace (refine pass R1, owner ask: main panel).
+  // Same segmented-row pattern as capture size; persisted via prefs.js and
+  // read by layerReceiver.js at placement time.
+  const refinedLayerRow = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-refined-layer-row')
+  )
+  /** @type {Record<string, HTMLElement>} */
+  const refinedLayerButtons = {}
+
+  function refreshRefinedLayerButtons() {
+    const current = getRefinedLayerMode()
+    for (const mode of ['stack', 'replace']) {
+      const btn = refinedLayerButtons[mode]
+      if (!btn) continue
+      const active = mode === current
+      btn.setAttribute('variant', active ? 'cta' : 'secondary')
+      if (active) btn.removeAttribute('quiet')
+      else btn.setAttribute('quiet', '')
+    }
+  }
+
+  if (refinedLayerRow) {
+    refinedLayerRow.style.display = 'flex'
+    refinedLayerRow.style.flexDirection = 'row'
+    for (const mode of /** @type {('stack' | 'replace')[]} */ (['stack', 'replace'])) {
+      const btn = document.createElement('sp-button')
+      btn.setAttribute('variant', 'secondary')
+      btn.setAttribute('quiet', '')
+      btn.textContent = mode === 'stack' ? 'Stack' : 'Replace'
+      btn.style.flex = '1 1 0'
+      btn.style.marginRight = mode === 'replace' ? '0' : '6px'
+      btn.addEventListener('click', () => {
+        setRefinedLayerMode(mode)
+        refreshRefinedLayerButtons()
+      })
+      refinedLayerButtons[mode] = btn
+      refinedLayerRow.appendChild(btn)
+    }
+    refreshRefinedLayerButtons()
   }
 
   // Send-to-ComfyUI button: same action as the Plugins-menu command, in the

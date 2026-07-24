@@ -397,6 +397,21 @@ Plugin → server:
   denoise band, falling back to its own widget when the slider was never touched. A
   non-numeric value is dropped with a log line. Emits `cpsb.livecreativity` (§5).
   Fire-and-forget, never a handoff, dies with the connection.
+- `{"type": "refine_push", "refine_id": "...", "seq": 0, "total": 3, "data_b64": "..."}` —
+  refine pass R2 (docs/roadmap/realtime-drawing.md): the Refine click's full-quality PNG
+  canvas capture (exported at document size, proportionally capped ≤4096px long side
+  plugin-side), chunked per the universal convention. Reassembled server-side into the
+  app-level refine slot; bumps the refine `request_id`; replies
+  `refine_ok {refine_id, request_id}` / `refine_error {refine_id, error}` (invalid
+  base64 / non-PNG stores nothing) and emits `cpsb.refine` (§5) so the frontend runs the
+  refine branch exactly once. The slot is APP-level (survives plugin reconnects), unlike
+  the live-frame slot.
+- `{"type": "request_render"}` — refine pass R1: the plugin asks for the FULL-QUALITY
+  last render (the app-level keep-latest slot `PhotoshopLivePreview` fills before
+  downscaling its display copy — the refine-pass cornerstone). Server replies with
+  chunked `render_chunk {seq, total, data_b64}` messages carrying a lossless PNG (encoded
+  lazily, off the event loop), or one `render_error {error}` when no render exists yet.
+  Powers the upgraded "Add as a layer": real pixels, not the 1024px display JPEG.
 - `{"type": "pong"}`
 
 Server → plugin:
@@ -431,11 +446,28 @@ Server → plugin:
   keep-latest, mirroring `live_frame` in the other direction: no ack, each frame replaces
   the last, and a frame arriving while the preview panel has never been opened is simply
   remembered and shown on first mount.
+- `{"type": "render_chunk", "seq": 0, "total": 3, "data_b64": "..."}` /
+  `{"type": "render_error", "error": "..."}` — the `request_render` response (refine pass
+  R1, above): the full-quality last render as chunked lossless PNG, or the no-render
+  failure. Same chunking scheme as `file_chunk`.
+- `{"type": "add_layer_chunk", "transfer_id": "...", "seq": 0, "total": 3,
+  "data_b64": "...", "layer_name": "ComfyUI refined"}` — refine pass R1: the
+  `PhotoshopAddLayer` node (§6f) pushing its IMAGE input (full-quality PNG,
+  proportionally capped ≤4096px long side server-side) to be placed into the CURRENT
+  document as a layer. Self-contained chunks keyed by `transfer_id`; the plugin
+  (`photoshop_plugin/layerReceiver.js`) reassembles, then places via the proven
+  temp-file → open → cross-document duplicate → scale-to-document-bounds path
+  (`addAsLayer.js`) — which is how the ≤4096 pixel ceiling meets Eric's "PSD size
+  ideally" ruling: pixels arrive capped, the LAYER lands full-canvas. Placement honors
+  the main panel's REFINED LAYER Stack/Replace preference (`prefs.js`): Stack adds a new
+  layer per refine; Replace first deletes existing top-level layers with the same name.
+  Fire-and-forget: no ack, plugin-side failures are logged there.
 - `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
   the socket (plugin reconnects with backoff).
 
-**File transfer chunking (`request_file`/`file_chunk`, `upload_edit`, and
-`manual_push`):** all three use the identical scheme. The sender base64-encodes the
+**File transfer chunking (`request_file`/`file_chunk`, `upload_edit`,
+`manual_push`, `refine_push`, `render_chunk`, and `add_layer_chunk`):** all use the
+identical scheme. The sender base64-encodes the
 ENTIRE file ONCE,
 then slices that single string into fixed-size pieces (~700,000 characters, comfortably
 inside a "~512KB–1MB base64 chunk" target) sent as successive frames carrying the same
@@ -588,6 +620,11 @@ research/research-annotate-node.md retain the design if ever revisited.
   `{"creativity": 0.75}` (0.0..1.0). The live loop re-queues on it like a frame or a
   prompt edit; the value is echoed for logging, but `PhotoshopLiveCreativity` (§6f) reads
   the slot server-side at execute time.
+- `"cpsb.refine"` — a Refine click's canvas upload completed (refine pass R2):
+  `{"request_id": 3}`. The frontend live loop (§8) un-mutes the graph's
+  `PhotoshopRefineSource` node(s), queues exactly ONE run, re-mutes them when the queue
+  drains, and pauses the live auto-queue for the duration (strokes keep streaming;
+  trailing state renders on resume).
 
 **Universal cancel (product-owner requirement 2026-07-17):** ANY node that shows the
 "Editing in Photoshop…" badge (badges.js) MUST expose a working cancel ✕, regardless of
@@ -1191,6 +1228,32 @@ plugin is connected or no frame has streamed yet.
   PROMPT field and Creativity buttons** (under the image), so the two live controls sit with
   the render they affect and survive collapsing the main "ComfyUI" panel — they feed
   `PhotoshopLivePrompt`/`PhotoshopLiveCreativity` via `live_prompt`/`live_creativity` (§3).
+  **Refine-pass cornerstone (R1):** before downscaling its display copy, this node stores
+  the render at FULL quality in an app-level keep-latest slot (`routes.set_last_render`) —
+  `PhotoshopRefineSource` refines from it, and `request_render` (§3) serves it to the
+  plugin's "Add as a layer", so the pane shows a small JPEG but the real pixels are never
+  lost. The slot survives plugin reconnects and dies with the server.
+- **`PhotoshopRefineSource`** (refine pass R1, same module): the refine branch's source.
+  TWO `IMAGE` outputs, and the refine workflow wires whichever it wants (Eric's "both,
+  workflow picks" decision 2026-07-24): `render` = the full-quality last render ("refine
+  exactly what you saw"); `canvas` = the full-resolution canvas capture uploaded with the
+  Refine click (`refine_push`, §3 — the higher-ceiling source; composition can drift).
+  Fallbacks keep every wiring usable: missing canvas → render serves both (the manual R1
+  path — queue the branch by hand with no Refine click), missing render → canvas serves
+  both, BOTH missing → interrupt with an actionable log. NOT Tier-2-gated. `IS_CHANGED`
+  keys on `(request_id, render_seq, canvas_seq)` so each Refine click — or a new render
+  under a manual re-queue — runs the branch exactly once, and an unchanged state is
+  cached. **Mute this node to disarm the refine branch**: ComfyUI prunes a muted node's
+  dependent subtree from execution (verified on the test rig against ComfyUI 0.28.0,
+  2026-07-24 — the queue succeeds, the branch is skipped, nothing errors), and the
+  frontend live loop un-mutes it for exactly one queue per `cpsb.refine`.
+- **`PhotoshopAddLayer`** (refine pass R1, same module): routes a result STRAIGHT into
+  the current Photoshop document as a layer — Eric's "the workflow decides" routing: end
+  a refine chain in `PhotoshopLivePreview` for the pane, in THIS node for a document
+  layer, or both. An OUTPUT node (`image` + `layer_name` inputs, default "ComfyUI
+  refined"); encodes full-quality PNG capped proportionally at 4096px long side and sends
+  `add_layer_chunk`s (§3). Same no-fail contract as Live Preview: no plugin = logged
+  no-op, never a failed render.
   Both controls persist PER DOCUMENT (`livePrefs.js`, keyed by path with a title fallback,
   newest-50): a plugin/Photoshop reload restores the active document's values, and starting
   Live Mode on a document loads THAT document's stored prompt/creativity and streams them —

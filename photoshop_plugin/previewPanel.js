@@ -39,7 +39,7 @@ const { setLivePrompt } = require('./livePrompt.js')
 const { setLiveCreativity } = require('./liveCreativity.js')
 const { liveEvents, getLiveState } = require('./liveMode.js')
 const { makeDocKey, getDocSettings, saveDocSettings } = require('./livePrefs.js')
-const { addRenderAsLayer } = require('./addAsLayer.js')
+const { addImageAsLayer, addRenderAsLayer } = require('./addAsLayer.js')
 
 /**
  * Creativity is a THREE-STEP choice, not a continuous slider (Eric's
@@ -355,6 +355,12 @@ function showLatest() {
  * document (addAsLayer.js), with in-button progress/error feedback. One add
  * at a time; the frame is snapshotted up front so a new render landing
  * mid-add can't swap the bytes under it.
+ *
+ * QUALITY (refine pass R1): first fetches the server's FULL-QUALITY copy of
+ * the render (`connection.requestLastRender()` — the un-downscaled,
+ * losslessly-kept original of the JPEG this panel displays) and places THAT;
+ * the panel's own 1024px display JPEG is only the fallback when the fetch
+ * fails (disconnected, or the server restarted since the render).
  * @returns {void}
  */
 function onAddAsLayer() {
@@ -363,7 +369,16 @@ function onAddAsLayer() {
   addingLayer = true
   addLayerButton.textContent = 'Adding…'
   addLayerButton.setAttribute('disabled', '')
-  addRenderAsLayer(frameB64)
+  connection
+    .requestLastRender()
+    .then((pngBytes) => addImageAsLayer(pngBytes, 'png', { layerName: 'ComfyUI render' }))
+    .catch((fetchError) => {
+      logWarn(
+        `full-quality render fetch failed (${describeError(fetchError)}) — placing the ` +
+          'panel display copy instead'
+      )
+      return addRenderAsLayer(frameB64)
+    })
     .then(() => {
       addLayerButton.textContent = 'Added ✓'
     })

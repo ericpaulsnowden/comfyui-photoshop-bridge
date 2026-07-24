@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -274,6 +275,20 @@ def preview_rig(context: CpsbContext, manager: HandoffManager, loop_thread):
     nodes_module._state = None
 
 
+@pytest.fixture
+def addlayer_rig(context: CpsbContext, manager: HandoffManager, loop_thread):
+    """A configured ``PhotoshopAddLayer`` with a ready fake plugin whose
+    socket records every send -- the ``preview_rig`` shape."""
+    socket = _RecordingSocket()
+    app = web.Application()
+    routes_module.install(app, context, manager)
+    connection = routes_module.PluginConnection(ws=cast("object", socket), ready=True)
+    app[routes_module._APP_KEY_PLUGIN].connection = connection
+    nodes_module.configure(context, manager, app, loop_thread)
+    yield live_module.PhotoshopAddLayer(), socket
+    nodes_module._state = None
+
+
 def make_image_tensor(color: tuple[int, int, int], size: tuple[int, int] = (24, 16)):
     import torch
 
@@ -405,6 +420,141 @@ class TestLiveCreativity:
             )
             != first
         )
+
+
+class TestLastRenderSlot:
+    """Refine-pass cornerstone (R1): `PhotoshopLivePreview` keeps the newest
+    render at FULL quality in the app-level slot -- the display JPEG stays
+    capped, the slot holds the real pixels."""
+
+    def test_full_resolution_kept_while_display_is_capped(
+        self, context, preview_rig, monkeypatch
+    ):
+        node, socket, _connection = preview_rig
+        # Tiny display cap so a small tensor exercises the same "slot keeps
+        # more than the wire" relationship a full-size render would.
+        monkeypatch.setattr(live_module, "_RESULT_MAX_SIDE", 8)
+        node.execute(image=make_image_tensor((10, 200, 30), size=(24, 16)))
+
+        state = nodes_module._require_state()
+        stored = routes_module.get_last_render(state.app)
+        assert stored is not None
+        image, seq = stored
+        assert image.size == (24, 16)  # FULL size, not the display cap
+        assert seq == 1
+        # The wire copy really was capped.
+        sent = socket.sent[-1]
+        assert sent["type"] == "result_frame"
+        wire = Image.open(io.BytesIO(base64.b64decode(sent["data_b64"])))
+        assert max(wire.size) <= 8
+
+    def test_slot_is_keep_latest(self, context, preview_rig):
+        node, _socket, _connection = preview_rig
+        node.execute(image=make_image_tensor((255, 0, 0)))
+        node.execute(image=make_image_tensor((0, 0, 255)))
+        state = nodes_module._require_state()
+        image, seq = routes_module.get_last_render(state.app)
+        assert seq == 2
+        assert image.getpixel((0, 0))[2] > 200  # newest (blue) won
+
+
+class TestRefineSource:
+    """`PhotoshopRefineSource` (R1): serves render + canvas with the decided
+    fallbacks; interrupts only when NOTHING exists to refine."""
+
+    def _canvas_png(self, color=(20, 40, 60), size=(30, 20)) -> bytes:
+        buffer = io.BytesIO()
+        Image.new("RGB", size, color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def _push_canvas(self, app, color=(20, 40, 60), size=(30, 20)) -> None:
+        slot = app[routes_module._APP_KEY_REFINE]
+        slot.canvas_png = self._canvas_png(color, size)
+        slot.canvas_seq += 1
+        slot.request_id += 1
+
+    def test_interrupts_when_nothing_exists(self, live_app):
+        node = live_module.PhotoshopRefineSource()
+        with raises_interrupt():
+            node.execute()
+
+    def test_serves_both_when_both_exist(self, context, live_app):
+        app, _connection = live_app
+        routes_module.set_last_render(app, Image.new("RGB", (24, 16), (255, 0, 0)))
+        self._push_canvas(app, color=(0, 0, 255), size=(30, 20))
+        node = live_module.PhotoshopRefineSource()
+        render_t, canvas_t = node.execute()
+        assert tuple(render_t.shape) == (1, 16, 24, 3)
+        assert tuple(canvas_t.shape) == (1, 20, 30, 3)
+
+    def test_missing_canvas_falls_back_to_render(self, context, live_app):
+        app, _connection = live_app
+        routes_module.set_last_render(app, Image.new("RGB", (24, 16), (255, 0, 0)))
+        node = live_module.PhotoshopRefineSource()
+        render_t, canvas_t = node.execute()
+        assert tuple(render_t.shape) == tuple(canvas_t.shape) == (1, 16, 24, 3)
+
+    def test_missing_render_falls_back_to_canvas(self, context, live_app):
+        app, _connection = live_app
+        self._push_canvas(app, size=(30, 20))
+        node = live_module.PhotoshopRefineSource()
+        render_t, canvas_t = node.execute()
+        assert tuple(render_t.shape) == tuple(canvas_t.shape) == (1, 20, 30, 3)
+
+    def test_is_changed_tracks_requests_renders_and_canvases(self, context, live_app):
+        app, _connection = live_app
+        first = live_module.PhotoshopRefineSource.IS_CHANGED()
+        routes_module.set_last_render(app, Image.new("RGB", (8, 8), (1, 1, 1)))
+        second = live_module.PhotoshopRefineSource.IS_CHANGED()
+        assert second != first
+        self._push_canvas(app)
+        third = live_module.PhotoshopRefineSource.IS_CHANGED()
+        assert third != second
+        assert live_module.PhotoshopRefineSource.IS_CHANGED() == third  # stable -> cached
+
+
+class TestAddLayer:
+    """`PhotoshopAddLayer` (R1): full-quality PNG out to the plugin as
+    chunked `add_layer_chunk` messages; capped; no-fail without a plugin."""
+
+    def test_sends_chunked_png_that_reassembles(self, context, addlayer_rig):
+        node, socket = addlayer_rig
+        node.execute(image=make_image_tensor((10, 200, 30), size=(24, 16)), layer_name="My layer")
+
+        chunks = [m for m in socket.sent if m["type"] == "add_layer_chunk"]
+        assert chunks, "no add_layer_chunk messages sent"
+        total = chunks[0]["total"]
+        assert len(chunks) == total
+        assert all(c["layer_name"] == "My layer" for c in chunks)
+        assert len({c["transfer_id"] for c in chunks}) == 1
+        ordered = sorted(chunks, key=lambda c: c["seq"])
+        png = base64.b64decode("".join(c["data_b64"] for c in ordered))
+        image = Image.open(io.BytesIO(png))
+        assert image.size == (24, 16)
+        assert image.convert("RGB").getpixel((0, 0)) == (10, 200, 30)
+
+    def test_caps_long_side(self, context, addlayer_rig, monkeypatch):
+        node, socket = addlayer_rig
+        monkeypatch.setattr(live_module, "_ADD_LAYER_MAX_SIDE", 12)
+        node.execute(image=make_image_tensor((5, 5, 5), size=(24, 16)), layer_name="x")
+        chunks = [m for m in socket.sent if m["type"] == "add_layer_chunk"]
+        ordered = sorted(chunks, key=lambda c: c["seq"])
+        png = base64.b64decode("".join(c["data_b64"] for c in ordered))
+        image = Image.open(io.BytesIO(png))
+        assert max(image.size) <= 12
+
+    def test_blank_layer_name_defaults(self, context, addlayer_rig):
+        node, socket = addlayer_rig
+        node.execute(image=make_image_tensor((1, 2, 3)), layer_name="   ")
+        chunks = [m for m in socket.sent if m["type"] == "add_layer_chunk"]
+        assert chunks and chunks[0]["layer_name"] == "ComfyUI refined"
+
+    def test_no_plugin_is_logged_noop(self, context, no_plugin_app, caplog):
+        node = live_module.PhotoshopAddLayer()
+        with caplog.at_level(logging.WARNING, logger="cpsb"):
+            result = node.execute(image=make_image_tensor((1, 2, 3)), layer_name="x")
+        assert result == {}
+        assert any("not delivered" in r.message for r in caplog.records)
 
 
 class TestLivePreview:

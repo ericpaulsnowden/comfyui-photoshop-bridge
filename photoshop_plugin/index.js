@@ -91,6 +91,10 @@ function bootstrap() {
   // Registers its connection listener at load (a result_frame arriving
   // before the preview panel is ever opened is remembered as the latest).
   const { mountPreviewPanel } = require('./previewPanel.js')
+  // Same reason: layerReceiver.js's module body registers the add_layer_chunk
+  // listener (refine pass R1 — the PhotoshopAddLayer node's pushes land even
+  // with no panel open).
+  require('./layerReceiver.js')
 
   /**
    * Implements the "Send edit back now" Plugins-menu command: re-delivers the
