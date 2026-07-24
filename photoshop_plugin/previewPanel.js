@@ -53,8 +53,6 @@ const CREATIVITY_LEVELS = [
 
 /** The latest frame, kept even while the panel is unmounted. */
 let latestDataUri = /** @type {string | null} */ (null)
-let latestDocTitle = ''
-let framesReceived = 0
 
 /** Built once, reattached on every mount. @type {HTMLElement | null} */
 let rootDiv = null
@@ -88,6 +86,11 @@ function buildDom() {
   rootDiv.style.flexDirection = 'column'
   rootDiv.style.height = '100%'
   rootDiv.style.padding = '8px'
+  // Theme-aware text color, same variable panel.html uses. Without it this
+  // panel's text inherited a near-black default — unreadable on Photoshop's
+  // dark panel background (Eric's report). The labels' opacity accents now
+  // dim a READABLE base instead of dimming black.
+  rootDiv.style.color = 'var(--uxp-host-text-color)'
 
   // A flex-fill wrapper OWNS the available space; the <img> inside is bounded
   // by BOTH dimensions and sized `auto`, so it always keeps its natural aspect
@@ -189,6 +192,9 @@ function buildDom() {
   controls.appendChild(creativityRow)
   controls.appendChild(creativityHint)
 
+  // Onboarding hint ONLY: shown until the first render arrives, then hidden
+  // for good. The old always-on line (doc title + render count) was removed —
+  // Eric: redundant with the main ComfyUI panel.
   statusEl = document.createElement('div')
   statusEl.id = 'cpsb-preview-status'
   statusEl.style.flex = '0 0 auto'
@@ -213,9 +219,9 @@ function showLatest() {
   if (!imageEl || !statusEl) return
   if (latestDataUri) {
     imageEl.src = latestDataUri
-    statusEl.textContent = latestDocTitle
-      ? `${latestDocTitle} · ${framesReceived} renders`
-      : `${framesReceived} renders`
+    // First render: retire the onboarding hint. No doc-title/render-count
+    // line — redundant with the main panel (Eric, 2026-07-24).
+    statusEl.style.display = 'none'
   }
 }
 
@@ -308,8 +314,6 @@ connection.addEventListener('message', (event) => {
   if (!msg || msg.type !== 'result_frame') return
   if (typeof msg.data_b64 !== 'string' || !msg.data_b64) return
   latestDataUri = `data:image/jpeg;base64,${msg.data_b64}`
-  latestDocTitle = typeof msg.doc_title === 'string' ? msg.doc_title : ''
-  framesReceived += 1
   showLatest()
 })
 
