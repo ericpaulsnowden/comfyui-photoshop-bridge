@@ -667,6 +667,29 @@ export function onStatusChanged(callback) {
 }
 
 /**
+ * @typedef {Object} CpsbLiveEvent
+ * Payload of the `cpsb.live` websocket event (PROTOCOL.md §5, realtime
+ * drawing M1/M2): a new live-drawing frame landed in the server's
+ * keep-latest slot.
+ * @property {number} seq - The server-side frame counter —
+ * `PhotoshopLiveCanvas.IS_CHANGED`'s cache key.
+ * @property {string} doc_title
+ */
+
+/**
+ * Subscribes to the `cpsb.live` websocket event (a live-drawing frame
+ * arrived — `live.js`'s coalesced auto-queue loop hangs off this).
+ * @param {(detail: CpsbLiveEvent) => void} callback
+ * @returns {() => void} Unsubscribe function.
+ */
+export function onLive(callback) {
+  /** @param {CustomEvent<CpsbLiveEvent>} event */
+  const handler = (event) => callback(event.detail)
+  api.addEventListener('cpsb.live', handler)
+  return () => api.removeEventListener('cpsb.live', handler)
+}
+
+/**
  * Subscribes to the `cpsb.tier2` websocket event (plugin connection state
  * changed).
  * @param {(detail: CpsbTier2Event) => void} callback

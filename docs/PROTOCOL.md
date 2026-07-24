@@ -1182,6 +1182,15 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
   (`node.imageIndex ?? 0`); an "Open all N in Photoshop" item appears for N ≤ 8.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
   `cpsb.showUpgradeBanner` (bool, default true).
+- **Live loop** (`web/cpsb/live.js`, realtime drawing M2): each `cpsb.live` event queues at
+  most ONE coalesced `queuePrompt(0)` — armed only while the current graph contains a
+  `PhotoshopLiveCanvas` node with `auto_queue` = "On" (widget read client-side per event,
+  the same gating convention as `pasteback.js`'s bridge-mode check). Single-slot
+  backpressure: while ComfyUI is busy (tracked via its own `status` event's
+  `exec_info.queue_remaining`) new frames set a `trailing` flag instead of stacking
+  queues; one run fires when the queue drains and picks up whatever frame is newest by
+  then — intermediate frames are deliberately never rendered. Deliberately event-driven,
+  not Auto-Queue "Instant" (which still works, via IS_CHANGED caching, but busy-loops).
 - **Gallery** (v0.5.36; overhauled 2026-07-22): each card leads with ONE larger
   thumbnail — the latest edit, or the original when no edit exists yet — with the
   original layered underneath for comparison. Grid is the gallery's ONLY layout (the

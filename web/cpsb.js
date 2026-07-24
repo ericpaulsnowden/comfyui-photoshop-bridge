@@ -25,6 +25,7 @@ import * as gallery from './cpsb/gallery.js'
 import * as loadpsd from './cpsb/loadpsd.js'
 import * as compose from './cpsb/compose.js'
 import * as annotate from './cpsb/annotate.js'
+import * as live from './cpsb/live.js'
 import * as ui from './cpsb/ui.js'
 import { SETTINGS } from './cpsb/settings.js'
 
@@ -165,6 +166,7 @@ app.registerExtension({
     safely('pasteback.init', () => pasteback.init())
     safely('badges.init', () => badges.init())
     safely('compose.init', () => compose.init())
+    safely('live.init', () => live.init())
     safely('gallery.registerGalleryTab', () => gallery.registerGalleryTab())
     safely('state.initState', () => state.initState())
     // Piggybacks on the same (idempotent — see state.js) initState() call
