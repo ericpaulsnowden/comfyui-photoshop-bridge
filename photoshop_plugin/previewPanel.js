@@ -39,6 +39,7 @@ const { setLivePrompt } = require('./livePrompt.js')
 const { setLiveCreativity } = require('./liveCreativity.js')
 const { liveEvents, getLiveState } = require('./liveMode.js')
 const { makeDocKey, getDocSettings, saveDocSettings } = require('./livePrefs.js')
+const { addRenderAsLayer } = require('./addAsLayer.js')
 
 /**
  * Creativity is a THREE-STEP choice, not a continuous slider (Eric's
@@ -56,6 +57,14 @@ const CREATIVITY_LEVELS = [
 
 /** The latest frame, kept even while the panel is unmounted. */
 let latestDataUri = /** @type {string | null} */ (null)
+/** The same frame's raw base64 (what "Add as a layer" writes to disk). */
+let latestJpegB64 = /** @type {string | null} */ (null)
+/** The hover overlay hosting the "Add as a layer" button. @type {HTMLElement | null} */
+let addLayerOverlay = null
+/** @type {any} */
+let addLayerButton = null
+/** Re-entrancy guard: one add at a time. */
+let addingLayer = false
 
 /** Built once, reattached on every mount. @type {HTMLElement | null} */
 let rootDiv = null
@@ -191,6 +200,40 @@ function buildDom() {
   imageEl.style.objectFit = 'contain'
   imageWrap.appendChild(imageEl)
 
+  // Hover overlay: a centered "Add as a layer" button over the render (owner
+  // ask 2026-07-24 — roll over the image, click, get a new layer). Shown via
+  // pointerenter/leave in JS (UXP :hover on arbitrary divs is not reliable),
+  // and only once a render exists. pointerenter/leave don't fire when moving
+  // onto the overlay's own button (they ignore child transitions), so the
+  // button stays put while the cursor is over it.
+  imageWrap.style.position = 'relative'
+  addLayerOverlay = document.createElement('div')
+  addLayerOverlay.id = 'cpsb-preview-addlayer-overlay'
+  addLayerOverlay.style.position = 'absolute'
+  addLayerOverlay.style.left = '0'
+  addLayerOverlay.style.top = '0'
+  addLayerOverlay.style.right = '0'
+  addLayerOverlay.style.bottom = '0'
+  addLayerOverlay.style.display = 'none'
+  addLayerOverlay.style.alignItems = 'center'
+  addLayerOverlay.style.justifyContent = 'center'
+
+  addLayerButton = document.createElement('sp-button')
+  addLayerButton.setAttribute('variant', 'cta')
+  addLayerButton.textContent = 'Add as a layer'
+  addLayerButton.addEventListener('click', () => {
+    onAddAsLayer()
+  })
+  addLayerOverlay.appendChild(addLayerButton)
+  imageWrap.appendChild(addLayerOverlay)
+
+  imageWrap.addEventListener('pointerenter', () => {
+    if (latestJpegB64 && addLayerOverlay) addLayerOverlay.style.display = 'flex'
+  })
+  imageWrap.addEventListener('pointerleave', () => {
+    if (addLayerOverlay && !addingLayer) addLayerOverlay.style.display = 'none'
+  })
+
   // --- Controls UNDER the image: prompt + creativity slider. They live in
   // THIS (preview/output) panel by design — they sit with the result they
   // affect, and they survive collapsing the main "ComfyUI" panel. Built with
@@ -307,6 +350,37 @@ function showLatest() {
   }
 }
 
+/**
+ * The "Add as a layer" click: pushes the current render into the active
+ * document (addAsLayer.js), with in-button progress/error feedback. One add
+ * at a time; the frame is snapshotted up front so a new render landing
+ * mid-add can't swap the bytes under it.
+ * @returns {void}
+ */
+function onAddAsLayer() {
+  if (addingLayer || !latestJpegB64 || !addLayerButton) return
+  const frameB64 = latestJpegB64
+  addingLayer = true
+  addLayerButton.textContent = 'Adding…'
+  addLayerButton.setAttribute('disabled', '')
+  addRenderAsLayer(frameB64)
+    .then(() => {
+      addLayerButton.textContent = 'Added ✓'
+    })
+    .catch((error) => {
+      logWarn(`"Add as a layer" failed: ${describeError(error)}`)
+      addLayerButton.textContent = 'Failed — see log'
+    })
+    .finally(() => {
+      addingLayer = false
+      setTimeout(() => {
+        if (addLayerButton) addLayerButton.textContent = 'Add as a layer'
+        addLayerButton?.removeAttribute('disabled')
+        if (addLayerOverlay) addLayerOverlay.style.display = 'none'
+      }, 1200)
+    })
+}
+
 /** Highlights whichever creativity button is currently selected. @returns {void} */
 function refreshCreativityButtons() {
   for (const level of CREATIVITY_LEVELS) {
@@ -396,6 +470,7 @@ connection.addEventListener('message', (event) => {
   const msg = /** @type {CustomEvent} */ (event).detail
   if (!msg || msg.type !== 'result_frame') return
   if (typeof msg.data_b64 !== 'string' || !msg.data_b64) return
+  latestJpegB64 = msg.data_b64
   latestDataUri = `data:image/jpeg;base64,${msg.data_b64}`
   showLatest()
 })

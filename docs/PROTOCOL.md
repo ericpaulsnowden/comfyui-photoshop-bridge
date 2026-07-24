@@ -1191,6 +1191,16 @@ plugin is connected or no frame has streamed yet.
   PROMPT field and Creativity buttons** (under the image), so the two live controls sit with
   the render they affect and survive collapsing the main "ComfyUI" panel — they feed
   `PhotoshopLivePrompt`/`PhotoshopLiveCreativity` via `live_prompt`/`live_creativity` (§3).
+  Both controls persist PER DOCUMENT (`livePrefs.js`, keyed by path with a title fallback,
+  newest-50): a plugin/Photoshop reload restores the active document's values, and starting
+  Live Mode on a document loads THAT document's stored prompt/creativity and streams them —
+  settings follow the file, never leak across files. Hovering the render shows a centered
+  **"Add as a layer"** button (`addAsLayer.js`): temp-file → `app.open` → cross-document
+  `Layer.duplicate` (manualSend's proven machinery, reversed) → `scale`/`translate` to the
+  document bounds — a new top raster layer named "ComfyUI render", no batchPlay. Text is
+  theme-aware (`--uxp-host-text-color`); the only status line is the pre-first-render
+  onboarding hint, hidden once a render arrives (no doc-title/render-count line — redundant
+  with the main panel).
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 

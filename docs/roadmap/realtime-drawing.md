@@ -98,7 +98,7 @@ Raised in conversation with Eric while building the live loop; captured here so 
 - ~~**Configurable capture resolution.**~~ **SHIPPED v0.5.55** — a CAPTURE SIZE control (512/768/1024, persisted, default 768) in the main panel's LIVE MODE section; changing it mid-session re-captures immediately. The auto-pick-from-model-family idea remains open.
 - **Model / preset picker in the panel.** Pick a fast model + its correct sampler recipe (LCM vs Turbo vs Lightning want different sampler/CFG) from Photoshop, instead of hand-setting the KSampler. Would prevent the two traps Eric hit: a non-few-step checkpoint, and stacking an accelerator LoRA on an already-distilled checkpoint.
 - **"Wrong fast-model setup" guardrail.** Detect/warn when the graph pairs `lcm`/tiny-steps with a checkpoint that has no distillation (blur/near-passthrough), or stacks an LCM LoRA on a Lightning/Turbo checkpoint (conflicting distillations).
-- **Persist panel prompt + creativity across reloads** (prefs.js), like the server-address field — so a plugin reload doesn't drop the last prompt/slider position.
+- ~~**Persist panel prompt + creativity across reloads**~~ **SHIPPED v0.5.57** — per-DOCUMENT persistence (`livePrefs.js`, keyed by file path with a title fallback): reloads restore the active document's values, Live-Mode start loads the watched document's own settings. Tied to the file per Eric, so settings never leak across documents.
 - **Negative-prompt control from the panel** (pairs with a CFG-preserving model like Hyper-SD-CFG, where the negative actually does something).
 
 ## Decision points that are Eric's (flagged, not decided)

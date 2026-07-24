@@ -1195,4 +1195,4 @@ class ConnectionManager extends EventTarget {
 /** The one websocket connection this plugin maintains, for the lifetime of the plugin. */
 const connection = new ConnectionManager()
 
-module.exports = { pathToFileUrl, connection }
+module.exports = { pathToFileUrl, connection, base64Decode }
