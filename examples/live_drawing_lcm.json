@@ -88,7 +88,7 @@
         "Node name for S&R": "CheckpointLoaderSimple"
       },
       "widgets_values": [
-        "put-an-LCM-or-Lightning-model.safetensors"
+        "DreamShaper8_LCM.safetensors"
       ]
     },
     {
@@ -423,7 +423,7 @@
         "text": ""
       },
       "widgets_values": [
-        "REALTIME DRAWING \u2014 quickstart\n\n1) Point the Checkpoint at a FAST few-step model: an LCM, SDXL-Turbo, or\n   SDXL-Lightning checkpoint (or a base model + its LCM LoRA). These\n   sampler settings (lcm sampler, 4 steps, CFG 2) ONLY behave on a\n   few-step model. With a NORMAL SD1.5/SDXL model instead, set\n   sampler_name=euler, scheduler=normal, steps~20, cfg~7.\n\n2) In Photoshop: open the ComfyUI Bridge panel, click Start Live, draw.\n\n3) Type your prompt in the panel's LIVE PROMPT field \u2014 it drives the\n   \"Photoshop Live Prompt\" node here (no need to edit the graph).\n\n4) denoise = your creativity knob. LOW (~0.4) hugs your drawing; HIGH\n   (~0.8) follows the prompt more. If changing the prompt seems to do\n   nothing, your denoise is too low OR your checkpoint isn't a few-step\n   model (see step 1)."
+        "REALTIME DRAWING - quickstart\n\n1) Point the Checkpoint at a FAST few-step model. A PLAIN model\n   (v1-5-pruned, SDXL base, DreamShaper/Juggernaut with NO\n   LCM/Turbo/Lightning/Hyper in the name) will NOT work with these\n   settings - it barely denoises at 4 steps, so the output stays ~99%\n   your drawing and the prompt does nothing. Recommended:\n\n   - SD1.5, zero-setup drop-in (works with THIS graph as-is):\n     DreamShaper8_LCM.safetensors  (HF: Lykon/dreamshaper-8-lcm)\n\n   - SDXL, best quality (10GB+ VRAM) - then set the KSampler below to\n     sampler=euler, scheduler=sgm_uniform, CFG 1.0 (keep 4 steps):\n     sdxl_lightning_4step.safetensors  (HF: ByteDance/SDXL-Lightning)\n\n   - Keep your own SD1.5 model? Add the LCM-LoRA\n     (latent-consistency/lcm-lora-sdv1-5) via a LoraLoaderModelOnly\n     node between Checkpoint and KSampler, strength 1.0.\n\n   - No download at all: set the KSampler to sampler=euler,\n     scheduler=normal, steps=20, CFG=7 - works with ANY model but is\n     ~5x slower (draw, pause, see result - not a smooth live loop).\n\n2) In Photoshop: open the ComfyUI Bridge panel, click Start Live, draw.\n\n3) Type your prompt in the panel's LIVE PROMPT field - it drives the\n   \"Photoshop Live Prompt\" node here (no need to edit the graph).\n\n4) denoise = your creativity knob. LOW (~0.4) hugs your drawing; HIGH\n   (~0.8) follows the prompt more."
       ],
       "title": "READ ME \u2014 realtime drawing quickstart",
       "color": "#432",
