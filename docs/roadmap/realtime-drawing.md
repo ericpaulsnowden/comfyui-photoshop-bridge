@@ -91,6 +91,25 @@ Second manifest panel **"ComfyUI Preview"** (documented multi-panel; shares the 
 ### M5 — In-canvas "AI Preview" layer (spike-gated on S-D; off by default)
 `putPixels` into a dedicated pixel layer, whole session wrapped in ONE `suspendHistory`/`resumeHistory` pair (documented; collapses hundreds of writes into one undo step; auto-resume safety net on modal exit). Only if S-D shows acceptable brush contention — no shipped plugin has proven this, and the likely failure is stroke stutter. The M3 panel remains the default feedback surface regardless.
 
+## R — Refine pass (PLANNED, decided with Eric 2026-07-24; NOT started)
+
+**Ask (Eric):** "push a low quality preview through a ComfyUI node to render a higher resolution preview — flexible enough to go through any workflow and back into the preview pane and/or into a layer in the current document."
+
+**Cornerstone:** when `PhotoshopLivePreview` runs it briefly holds the render at FULL quality (the tensor, before the 1024px/JPEG-85 display copy). Keep it: a server-side keep-latest **last-render slot at full quality (lossless PNG)**. That slot powers the refine source AND upgrades the existing "Add as a layer" button from the 1024 JPEG to full quality — a win even before refine ships.
+
+**Decisions (all Eric's, 2026-07-24 — the recommended options, confirmed):**
+1. **Source = both, workflow picks.** New `PhotoshopRefineSource` node exposes TWO outputs: the last render (refine exactly what you saw, predictable) and a fresh full-resolution canvas capture (higher ceiling, composition can drift). Each refine workflow wires whichever it wants.
+2. **Execution v1 = same graph, muted branch.** The refine chain lives in the SAME workflow as the live branch, muted until the first Refine click; the frontend un-mutes on the first `cpsb.refine`, queues one run, re-mutes. Request-id-keyed `IS_CHANGED` gives free coexistence after that: on strokes the refine branch serves cache, on a refine the live branch serves cache. (The un-mute/re-mute dance is the riskiest novel bit — R2.)
+3. **Live loop auto-pauses during a refine, auto-resumes** when the result lands. Strokes keep streaming (keep-latest), so resume renders the newest state immediately.
+4. **Routing = the workflow decides.** Chain ends in `PhotoshopLivePreview` → preview pane (downscale cap lifted for refined results); ends in a NEW **`PhotoshopAddLayer`** output node → pushed straight into the current document as a layer (v0.5.58's add-as-layer machinery, fed full-res PNG over the existing chunked transfer); wire both → both. No plugin-side picker.
+
+**Phases:**
+- **R1 (foundation, low risk):** full-quality result slot; `PhotoshopRefineSource` (render + canvas-capture outputs); `PhotoshopAddLayer`; full-res upgrade of the existing Add-as-layer button. Usable day one via manual Queue on a refine branch/workflow — no trigger plumbing.
+- **R2 (one-click):** Refine button in the preview panel → `refine_request` → `cpsb.refine` → un-mute/queue/re-mute + live-loop auto-pause/resume. Bundled example grows a muted refine branch (upscale-model → img2img ~0.35 denoise → both outputs).
+- **R3 (= M4's tab-free driver):** plugin triggers a SAVED refine workflow by name via server-side `/prompt` — "any workflow" without the browser tab being on it. The endgame; R1/R2 don't need it.
+
+**Open items for build time:** result-size ceiling for the layer push (4096?); whether `PhotoshopAddLayer` names/stacks layers per refine or replaces a "ComfyUI refined" layer; canvas-capture output's size cap (full-res vs CAPTURE SIZE).
+
 ## Discussed but NOT yet implemented (backlog)
 Raised in conversation with Eric while building the live loop; captured here so they aren't lost. Not scheduled into a milestone yet.
 - **Creativity slider → more than denoise.** Today the slider drives only the KSampler `denoise` (via `PhotoshopLiveCreativity`). Eric asked for it to "modify the settings (at least denoise but possibly other settings)". Candidates to fold in behind the one slider or add adjacent controls: **steps** (INT out), **CFG** (FLOAT out — but risky on distilled models that require CFG≈1), and per-model presets. Cleanest path: extend `PhotoshopLiveCreativity` with optional extra outputs, or a companion `PhotoshopLiveSampler` node exposing steps/CFG.
