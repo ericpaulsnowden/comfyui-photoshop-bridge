@@ -61,6 +61,7 @@ const { app, core, constants } = require('photoshop')
 const { logInfo, logError, describeError } = require('./log.js')
 const { runExport, exportFlattenedDocument } = require('./exporter.js')
 const { pushManualSend } = require('./uploader.js')
+const { connection } = require('./connection.js')
 
 /**
  * Shows a two-button native dialog asking the user what to send. Works from
@@ -103,6 +104,54 @@ async function showSendPicker() {
   try {
     const result = await dialog.uxpShowModal({ title: 'ComfyUI Bridge', resize: 'none' })
     return result === 'layer' || result === 'document' ? result : null
+  } finally {
+    dialog.remove()
+  }
+}
+
+/**
+ * Shown when the plugin isn't connected to ComfyUI and the user tries to
+ * send: a send would just fail (nothing is listening), so instead of the
+ * layer/document picker they get a clear "Connect first" choice (owner ask
+ * 2026-07-24). Returns whether the user chose to Connect.
+ * @returns {Promise<boolean>}
+ */
+async function showConnectPrompt() {
+  const dialog = document.createElement('dialog')
+
+  const heading = document.createElement('h3')
+  heading.textContent = 'Not connected to ComfyUI'
+  dialog.appendChild(heading)
+
+  const body = document.createElement('p')
+  body.textContent =
+    'The plugin isn’t connected to ComfyUI, so a send would fail. Connect now, ' +
+    'then run Send to ComfyUI again.'
+  dialog.appendChild(body)
+
+  const actions = document.createElement('div')
+  actions.style.display = 'flex'
+  actions.style.gap = '8px'
+  actions.style.justifyContent = 'flex-end'
+
+  const cancelButton = document.createElement('sp-button')
+  cancelButton.setAttribute('variant', 'secondary')
+  cancelButton.textContent = 'Cancel'
+  cancelButton.addEventListener('click', () => dialog.close('cancel'))
+
+  const connectButton = document.createElement('sp-button')
+  connectButton.setAttribute('variant', 'cta')
+  connectButton.textContent = 'Connect'
+  connectButton.addEventListener('click', () => dialog.close('connect'))
+
+  actions.appendChild(cancelButton)
+  actions.appendChild(connectButton)
+  dialog.appendChild(actions)
+  document.body.appendChild(dialog)
+
+  try {
+    const result = await dialog.uxpShowModal({ title: 'ComfyUI Bridge', resize: 'none' })
+    return result === 'connect'
   } finally {
     dialog.remove()
   }
@@ -183,6 +232,27 @@ async function sendToComfyUI() {
   }
   if (!doc) {
     logError('"Send to ComfyUI": no active document')
+    return
+  }
+
+  // If ComfyUI isn't connected, a send has nowhere to land — offer to connect
+  // instead of showing send options that would silently fail (owner ask).
+  if (connection.getState().status !== 'connected') {
+    let wantsConnect = false
+    try {
+      wantsConnect = await showConnectPrompt()
+    } catch (error) {
+      logError(`"Send to ComfyUI" connect prompt failed: ${describeError(error)}`)
+      return
+    }
+    if (wantsConnect) {
+      try {
+        connection.connect()
+        logInfo('"Send to ComfyUI": connecting — run Send again once connected')
+      } catch (error) {
+        logError(`"Send to ComfyUI" connect failed: ${describeError(error)}`)
+      }
+    }
     return
   }
 

@@ -69,7 +69,7 @@ try {
  */
 function bootstrap() {
   const { entrypoints } = uxp
-  const { app } = require('photoshop')
+  const { app, core } = require('photoshop')
   // Local modules use CommonJS require/module.exports with explicit `.js`
   // extensions — the exact multi-file pattern documented in Adobe's UXP
   // "Importing Modules" tutorial (require("./file.js") + module.exports),
@@ -93,10 +93,17 @@ function bootstrap() {
   const { mountPreviewPanel } = require('./previewPanel.js')
 
   /**
-   * Implements the "Send" Plugins-menu command: exports and uploads
-   * the active document's current state without waiting for a save event
-   * (PLAN.md §2, §5 — the missed-save safety net, e.g. for a user who only
-   * ever uses Export/Save a Copy rather than a plain Cmd/Ctrl+S).
+   * Implements the "Send edit back now" Plugins-menu command: re-delivers the
+   * active document's current state to the handoff ComfyUI opened it from,
+   * without waiting for a save event (PLAN.md §2, §5 — the missed-save safety
+   * net, e.g. for a user who only ever uses Export/Save a Copy rather than a
+   * plain Cmd/Ctrl+S).
+   *
+   * This ONLY applies to a document ComfyUI itself opened. When it can't act
+   * (no document, or the active document isn't a ComfyUI handoff), it now
+   * shows a VISIBLE alert rather than only logging — Eric found it "doesn't
+   * seem to do anything," because the no-op cases were silent and this command
+   * is easily confused with "Send to ComfyUI" (which pushes a NEW layer/doc).
    * @returns {Promise<void>}
    */
   async function sendBackNowForActiveDocument() {
@@ -108,7 +115,7 @@ function bootstrap() {
       doc = null
     }
     if (!doc) {
-      logError('"Send": no active document')
+      await core.showAlert('Send edit back: no document is open.')
       return
     }
     let record = findByDocumentId(doc.id)
@@ -122,7 +129,10 @@ function bootstrap() {
       }
     }
     if (!record) {
-      logError(`"Send": "${doc.title}" is not a document ComfyUI opened`)
+      await core.showAlert(
+        `“${doc.title}” isn’t a document ComfyUI opened, so there’s no edit to send ` +
+          'back. To push this document INTO ComfyUI instead, use “Send to ComfyUI”.'
+      )
       return
     }
     await deliverEdit(record.handoffId)

@@ -20,6 +20,7 @@ const { getActiveHandoffs, registryEvents, deliverEdit, clearAllHandoffs } = req
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
 const { isAutoFixEnabled, setAutoFixEnabled } = require('./prefs.js')
 const { toggleLive, getLiveState, liveEvents } = require('./liveMode.js')
+const { sendToComfyUI } = require('./manualSend.js')
 
 // Same version source the `hello` handshake message uses (connection.js):
 // require('uxp').versions.plugin is documented to match manifest.json's
@@ -387,6 +388,20 @@ function initPanel() {
     }
   })
   liveEvents.addEventListener('change', renderLive)
+
+  // Send-to-ComfyUI button: same action as the Plugins-menu command, in the
+  // panel too (owner ask). manualSend handles the not-connected case with its
+  // own Connect prompt, so no gating needed here.
+  const sendButton = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-send-to-comfyui')
+  )
+  if (sendButton) {
+    sendButton.addEventListener('click', () => {
+      sendToComfyUI().catch((error) => {
+        logError(`"Send to ComfyUI" (panel) failed: ${describeError(error)}`)
+      })
+    })
+  }
 
   renderConnection()
   renderHandoffs()
