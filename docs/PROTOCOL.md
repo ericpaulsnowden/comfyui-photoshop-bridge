@@ -369,7 +369,8 @@ Plugin → server:
   creates a handoff at all.
 - `{"type": "live_frame", "seq": 12, "data_b64": "<jpeg>", "doc_title": "sketch.psd"}` —
   realtime drawing (docs/roadmap/realtime-drawing.md M1): one save-free snapshot of the
-  Live-Mode document (JPEG, captured via `imaging.getPixels` downscaled to 768px long
+  Live-Mode document (JPEG, captured via `imaging.getPixels` downscaled to 512/768/1024px
+  — the main panel's CAPTURE SIZE control, default 768 — on the long
   side + `encodeImageData`), sent after every detected canvas change (a ~300ms poll of
   the document's history-state id — `photoshop_plugin/liveMode.js`). NOT chunked (frames
   are far below the 8 MiB websocket cap), NOT acked (fire-and-forget keep-latest: a bad
@@ -1150,7 +1151,8 @@ plugin is connected or no frame has streamed yet.
 - Plugin control surface: the panel's **LIVE MODE** section (`Start Live`/`Stop Live`,
   status line) — one session at a time, watching the document that was active when
   started; auto-stops when that document closes. Capture cadence: ~300ms history-id poll,
-  768px long-side `targetSize`, `dispose()` after every capture (`liveMode.js`'s doc
+  configurable 512/768/1024px long-side `targetSize` (the panel's CAPTURE SIZE control,
+  default 768, persisted), `dispose()` after every capture (`liveMode.js`'s doc
   comment carries the research/spike provenance — the history-id poll's stroke-promptness
   is spike S-A, owner-verified via the checklist).
 - **`PhotoshopLivePrompt`** (same module): serves the prompt the user typed in the

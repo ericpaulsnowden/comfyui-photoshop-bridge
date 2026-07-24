@@ -51,12 +51,66 @@ const { logInfo, logWarn, describeError } = require('./log.js')
 const LIVE_POLL_MS = 300
 
 /**
- * Long-side pixel cap for captured frames (roadmap: never move full-res).
- * Applied to whichever dimension is LONGER (see captureAndSend) — a
- * width-only cap would let a tall portrait doc stream frames with 9× the
- * intended pixel budget (review-caught, 2026-07-24).
+ * The capture sizes the panel offers (long-side pixel cap; roadmap: never
+ * move full-res). 512 = fastest / SD1.5-native; 768 = the balanced default;
+ * 1024 = sharpest / SDXL-native (SDXL renders looked soft at 768 — Eric).
  */
-const LIVE_TARGET_SIZE = 768
+const CAPTURE_SIZES = [512, 768, 1024]
+
+/** Default long-side capture cap when nothing has been persisted. */
+const DEFAULT_CAPTURE_SIZE = 768
+
+/** localStorage key for the persisted capture size (global setting — the
+ * size is a hardware/model trade-off, not a per-document one). */
+const CAPTURE_SIZE_STORAGE_KEY = 'cpsb.liveCaptureSize'
+
+/**
+ * Current long-side pixel cap, applied to whichever dimension is LONGER
+ * (see captureAndSend) — a width-only cap would let a tall portrait doc
+ * stream frames with 9× the intended pixel budget (review-caught,
+ * 2026-07-24). Mutable via {@link setCaptureSize} (panel control,
+ * 2026-07-24); read fresh per capture so a mid-session change applies to
+ * the very next frame.
+ */
+let captureSize = (() => {
+  try {
+    if (typeof localStorage === 'undefined') return DEFAULT_CAPTURE_SIZE
+    const stored = Number(localStorage.getItem(CAPTURE_SIZE_STORAGE_KEY))
+    return CAPTURE_SIZES.includes(stored) ? stored : DEFAULT_CAPTURE_SIZE
+  } catch (_error) {
+    return DEFAULT_CAPTURE_SIZE
+  }
+})()
+
+/** @returns {number} The current long-side capture cap in pixels. */
+function getCaptureSize() {
+  return captureSize
+}
+
+/**
+ * Sets the long-side capture cap (panel control). Persisted best-effort;
+ * takes effect on the next capture. If a session is live, the change marker
+ * is reset so the very next tick re-captures the current canvas at the new
+ * size — no stroke needed to see the effect.
+ * @param {number} px - One of {@link CAPTURE_SIZES}; anything else is ignored.
+ * @returns {void}
+ */
+function setCaptureSize(px) {
+  if (!CAPTURE_SIZES.includes(px) || px === captureSize) return
+  captureSize = px
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(CAPTURE_SIZE_STORAGE_KEY, String(px))
+    }
+  } catch (_error) {
+    // Session-only is fine — mirrors prefs.js's best-effort persistence.
+  }
+  if (state.active) {
+    lastHistoryId = null // re-capture the current canvas at the new size
+  }
+  logInfo(`live capture size set to ${px}px`)
+  notifyChanged()
+}
 
 /**
  * @typedef {Object} CpsbLiveState
@@ -138,8 +192,8 @@ async function captureAndSend(doc) {
       async () => {
         const landscape = Number(doc.width) >= Number(doc.height)
         const targetSize = landscape
-          ? { width: LIVE_TARGET_SIZE }
-          : { height: LIVE_TARGET_SIZE }
+          ? { width: captureSize }
+          : { height: captureSize }
         const { imageData } = await imaging.getPixels({
           documentID: doc.id,
           targetSize,
@@ -259,7 +313,7 @@ function startLive() {
   if (!timer) {
     timer = setInterval(tick, LIVE_POLL_MS)
   }
-  logInfo(`live mode ON for "${doc.title}" (${LIVE_POLL_MS}ms poll, ${LIVE_TARGET_SIZE}px)`)
+  logInfo(`live mode ON for "${doc.title}" (${LIVE_POLL_MS}ms poll, ${captureSize}px)`)
   notifyChanged()
   return true
 }
@@ -293,4 +347,13 @@ function getLiveState() {
   return { ...state }
 }
 
-module.exports = { toggleLive, startLive, stopLive, getLiveState, liveEvents }
+module.exports = {
+  toggleLive,
+  startLive,
+  stopLive,
+  getLiveState,
+  liveEvents,
+  getCaptureSize,
+  setCaptureSize,
+  CAPTURE_SIZES
+}

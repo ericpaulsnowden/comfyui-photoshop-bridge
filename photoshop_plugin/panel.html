@@ -340,6 +340,19 @@
       <div id="cpsb-live-status" class="cpsb-muted cpsb-conn-line">
         Streams the active document to the Photoshop Live Canvas node as you draw.
       </div>
+
+      <!-- Capture size (owner ask 2026-07-24): the long-side pixel cap for
+           live frames. A segmented sp-button row (the same pattern as the
+           preview panel's creativity control — no sp-picker in UXP);
+           panel.js highlights the persisted choice and calls
+           liveMode.setCaptureSize on click. -->
+      <div class="cpsb-field-label">CAPTURE SIZE</div>
+      <div id="cpsb-capture-size-row" class="cpsb-conn-actions"></div>
+      <div class="cpsb-muted cpsb-conn-line">
+        Long side of each live frame. 512 = fastest, 768 = balanced, 1024 =
+        sharpest (best for SDXL models). Takes effect immediately.
+      </div>
+
       <!-- The prompt + creativity controls live in the second "ComfyUI
            Preview" panel (previewPanel.js), next to the render they affect and
            independent of this panel being collapsed. -->

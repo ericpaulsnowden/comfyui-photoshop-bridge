@@ -19,7 +19,14 @@ const { connection } = require('./connection.js')
 const { getActiveHandoffs, registryEvents, deliverEdit, clearAllHandoffs } = require('./handoffs.js')
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
 const { isAutoFixEnabled, setAutoFixEnabled } = require('./prefs.js')
-const { toggleLive, getLiveState, liveEvents } = require('./liveMode.js')
+const {
+  toggleLive,
+  getLiveState,
+  liveEvents,
+  getCaptureSize,
+  setCaptureSize,
+  CAPTURE_SIZES
+} = require('./liveMode.js')
 const { sendToComfyUI } = require('./manualSend.js')
 
 // Same version source the `hello` handshake message uses (connection.js):
@@ -393,6 +400,52 @@ function initPanel() {
     }
   })
   liveEvents.addEventListener('change', renderLive)
+
+  // Capture-size segmented control (owner ask 2026-07-24): one sp-button per
+  // size, the current choice highlighted — same pattern as the preview
+  // panel's creativity buttons. Built in JS so the sizes live in ONE place
+  // (liveMode.js's CAPTURE_SIZES), not duplicated into markup.
+  const captureSizeRow = /** @type {HTMLElement} */ (
+    document.getElementById('cpsb-capture-size-row')
+  )
+  /** @type {Record<number, HTMLElement>} */
+  const captureSizeButtons = {}
+
+  function refreshCaptureSizeButtons() {
+    const current = getCaptureSize()
+    for (const px of CAPTURE_SIZES) {
+      const btn = captureSizeButtons[px]
+      if (!btn) continue
+      const active = px === current
+      btn.setAttribute('variant', active ? 'cta' : 'secondary')
+      if (active) btn.removeAttribute('quiet')
+      else btn.setAttribute('quiet', '')
+    }
+  }
+
+  if (captureSizeRow) {
+    captureSizeRow.style.display = 'flex'
+    captureSizeRow.style.flexDirection = 'row'
+    for (const px of CAPTURE_SIZES) {
+      const btn = document.createElement('sp-button')
+      btn.setAttribute('variant', 'secondary')
+      btn.setAttribute('quiet', '')
+      btn.textContent = String(px)
+      btn.style.flex = '1 1 0'
+      btn.style.marginRight = px === CAPTURE_SIZES[CAPTURE_SIZES.length - 1] ? '0' : '6px'
+      btn.addEventListener('click', () => {
+        try {
+          setCaptureSize(px)
+        } catch (error) {
+          logError(`Capture size change failed: ${describeError(error)}`)
+        }
+        refreshCaptureSizeButtons()
+      })
+      captureSizeButtons[px] = btn
+      captureSizeRow.appendChild(btn)
+    }
+    refreshCaptureSizeButtons()
+  }
 
   // Send-to-ComfyUI button: same action as the Plugins-menu command, in the
   // panel too (owner ask). manualSend handles the not-connected case with its
