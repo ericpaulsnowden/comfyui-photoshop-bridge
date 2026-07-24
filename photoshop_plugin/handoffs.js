@@ -301,23 +301,43 @@ function findByPath(path) {
 }
 
 /**
+/**
+ * Handoff ids whose documents were observed CLOSED but whose
+ * `document_closed` report has not yet been delivered to the server. Every
+ * prune path feeds this set (see {@link pruneClosedHandoffs}), and
+ * {@link startDocumentCloseWatcher} flushes it whenever the connection is
+ * actually up. Two real loss modes forced this indirection (a plain
+ * send-inside-the-prune-callback lost the signal both ways): (1)
+ * `connection.send` silently DROPS messages while the socket is down (its
+ * own documented best-effort posture) yet the record was pruned regardless,
+ * so a document closed during a server restart/network blip was never
+ * reported after reconnect; (2) `getActiveHandoffs()` — called on every
+ * panel render — runs the SAME prune without any callback, so a render
+ * landing inside the watcher's 5s window consumed the closed record before
+ * the watcher ever saw it. Either way `plugin_doc_open` stayed true/null
+ * server-side and the gallery's "Closed without saving" chip — the entire
+ * point of the feature — never appeared.
+ * @type {Set<string>}
+ */
+const pendingCloseReports = new Set()
+
+/**
  * Drops any tracked handoff whose Photoshop document has been CLOSED since we
  * opened it (the "clear when no longer active" behavior). A record with no
  * `documentId` yet (mid-open) is left alone so an in-flight open isn't pruned.
  * Silent — no `notifyChanged()` — so it's safe to call from inside a render
  * (which `getActiveHandoffs` is); the manual clear path notifies explicitly.
- * @param {(record: CpsbHandoffRecord) => void} [onPruned] - Called for each
- * pruned record BEFORE it's removed from the registry — see
- * {@link startDocumentCloseWatcher}, the one other caller, which uses this to
- * tell the server a document closed without this function needing to know
- * anything about the connection itself.
+ * EVERY pruned handoff is queued on {@link pendingCloseReports} — reporting
+ * is decoupled from pruning precisely so no caller (renders included) can
+ * consume a closure without the server eventually hearing about it.
  * @returns {number} How many were pruned.
  */
-function pruneClosedHandoffs(onPruned) {
+function pruneClosedHandoffs() {
   let removed = 0
   for (const record of Array.from(byHandoffId.values())) {
     if (record.documentId != null && findOpenDocument(record) == null) {
-      onPruned?.(record)
+      pendingCloseReports.add(record.handoffId)
+      logInfo(`handoff ${record.handoffId}: document "${record.docTitle}" closed`)
       byHandoffId.delete(record.handoffId)
       if (record.path) byPath.delete(record.path)
       byDocumentId.delete(record.documentId)
@@ -344,26 +364,29 @@ function getActiveHandoffs() {
 const DOC_CLOSE_CHECK_MS = 5000
 
 /**
- * Periodically tells the server when a tracked handoff's Photoshop document
- * closes (gallery overhaul, 2026-07-22) — the SAME `app.documents` check
- * {@link pruneClosedHandoffs} already runs for this plugin's own panel list,
- * just also reported to the server now, so the ComfyUI-side gallery can show
- * a REAL "is this still open?" signal for a Tier-2 handoff instead of the
- * old client-only "editing for over an hour" guess it used to make with no
- * plugin involved at all (`web/cpsb/state.js`, removed). One source of truth
- * for "is this handoff's document still open" — this function does not
- * duplicate {@link findOpenDocument}'s own scan, it just adds a callback onto
- * the SAME pruning pass. Started once at module load; this module has no
- * teardown (mirrors `saveListener.js`'s own permanent top-level
- * registration), so a plain top-level `setInterval` running for the plugin's
- * whole lifetime is appropriate.
+ * Periodically (a) runs the same closed-document prune the panel's own
+ * renders run, and (b) FLUSHES {@link pendingCloseReports} to the server as
+ * `document_closed` messages — but only while the connection is actually
+ * up, retrying on later ticks otherwise, so a closure observed during a
+ * disconnect still reaches the server after reconnect (the server's handoff
+ * records persist across its restarts via meta.json, so a late report still
+ * lands on the right handoff; an unknown id is just a logged warning
+ * server-side). This is the ComfyUI gallery's REAL "is this still open?"
+ * signal for a Tier-2 handoff (gallery overhaul, 2026-07-22), replacing the
+ * old client-only "editing for over an hour" guess. Started once at module
+ * load; this module has no teardown (mirrors `saveListener.js`'s own
+ * permanent top-level registration), so a plain top-level `setInterval`
+ * running for the plugin's whole lifetime is appropriate.
  */
 function startDocumentCloseWatcher() {
   setInterval(() => {
-    pruneClosedHandoffs((record) => {
-      connection.send({ type: 'document_closed', handoff_id: record.handoffId })
-      logInfo(`handoff ${record.handoffId}: document "${record.docTitle}" closed`)
-    })
+    pruneClosedHandoffs()
+    if (pendingCloseReports.size === 0) return
+    if (connection.getState().status !== 'connected') return // retry next tick
+    for (const handoffId of Array.from(pendingCloseReports)) {
+      connection.send({ type: 'document_closed', handoff_id: handoffId })
+      pendingCloseReports.delete(handoffId)
+    }
   }, DOC_CLOSE_CHECK_MS)
 }
 

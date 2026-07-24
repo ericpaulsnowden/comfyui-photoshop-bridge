@@ -4,10 +4,17 @@
  * while `editing` — a hover-revealed ✕ that cancels the handoff directly
  * from the node (PROTOCOL.md §2 `/cpsb/cancel`: "The frontend surfaces it
  * directly on the node's 'Editing in Photoshop…' badge (hover → cancel)").
- * Driven by `cpsb.status`. (A prior version also flashed "Edited" —
- * checkmark, ~2s — on `cpsb.updated`; removed in the gallery overhaul,
- * 2026-07-22, owner ask: the gallery's own green "Edited" chip is now the
- * only completion signal, decluttering the node canvas.)
+ * Driven by `cpsb.status` (set + most clears) and `cpsb.updated` (clear on
+ * edit arrival — the ingest path's ONLY event; without that subscription a
+ * Tier-1 badge had nothing to clear it and spun forever, see
+ * notifyEditArrived). A `cpsb.status` carrying `plugin_doc_open: false`
+ * clears rather than sets: the plugin reported the document closed, so
+ * there is nothing left to spin for (matches the gallery's "Closed without
+ * saving" chip instead of contradicting it). (A prior version also flashed
+ * "Edited" — checkmark, ~2s — on `cpsb.updated`; that FLASH stays removed
+ * per the gallery overhaul, 2026-07-22, owner ask: the gallery's own green
+ * "Edited" chip is the only completion signal, decluttering the node
+ * canvas.)
  *
  * Implemented via chained `node.onDrawForeground` / `onMouseDown` /
  * `onMouseMove` / `onMouseLeave` hooks installed from `nodeCreated`, per the
@@ -620,33 +627,72 @@ export function installBadgeHook(node) {
 }
 
 /**
- * @param {import('./api.js').CpsbStatusEvent} detail
+ * Deletes *nodeId*'s badge, but only when it still belongs to *handoffId*
+ * (or predates handoff-id tracking) — a late event for a superseded handoff
+ * must not blow away a newer "editing" badge for the same node (e.g. the
+ * user hits Start Fresh immediately after Cancel, racing the old handoff's
+ * server-side confirmation). The shared guard for every clearing path:
+ * non-editing statuses, a document-closed report, and an arriving edit.
+ * @param {string} nodeId
+ * @param {string | undefined} handoffId
  */
-function notifyStatus({ origin_node_id: nodeId, handoff_id: handoffId, status }) {
-  if (status === 'editing') {
-    badgesByNode.set(nodeId, { kind: 'editing', since: Date.now(), handoffId })
-    ensureAnimationTimer()
-  } else {
-    // Every other status (pending / edited / cancelled / discarded /
-    // superseded / error) means "this handoff has nothing left to show
-    // here" — the gallery's own chip is now the only place "edited" shows at
-    // all (gallery overhaul, 2026-07-22; this file no longer flashes its own
-    // "Edited" checkmark on cpsb.updated). Only clear the badge if it still
-    // belongs to THIS handoff, or predates handoff-id tracking — a late
-    // cancel/error confirmation for a superseded handoff must not blow away
-    // a newer "editing" badge for the same node (e.g. the user hits Start
-    // Fresh immediately after Cancel, racing the old handoff's server-side
-    // confirmation).
-    const current = badgesByNode.get(nodeId)
-    if (!current || !current.handoffId || current.handoffId === handoffId) {
-      badgesByNode.delete(nodeId)
-    }
+function clearBadgeFor(nodeId, handoffId) {
+  const current = badgesByNode.get(nodeId)
+  if (!current || !current.handoffId || current.handoffId === handoffId) {
+    badgesByNode.delete(nodeId)
   }
   app.graph?.setDirtyCanvas(true, false)
 }
 
 /**
- * Subscribes to `cpsb.status`. Call once from `cpsb.js`'s `setup()`.
+ * @param {import('./api.js').CpsbStatusEvent} detail
+ */
+function notifyStatus({ origin_node_id: nodeId, handoff_id: handoffId, status, plugin_doc_open }) {
+  if (status === 'editing') {
+    if (plugin_doc_open === false) {
+      // The Tier-2 plugin reported this handoff's DOCUMENT CLOSED
+      // (document_closed -> set_plugin_doc_open, whose cpsb.status keeps
+      // status "editing" but now carries plugin_doc_open) — there is
+      // nothing in Photoshop left to spin for. Clear instead of set:
+      // before this branch, the close announcement itself (re)created an
+      // animated "Editing in Photoshop…" badge that then contradicted the
+      // gallery's own "Closed without saving" chip forever.
+      clearBadgeFor(nodeId, handoffId)
+      return
+    }
+    badgesByNode.set(nodeId, { kind: 'editing', since: Date.now(), handoffId })
+    ensureAnimationTimer()
+  } else {
+    // Every other status (pending / cancelled / discarded / superseded /
+    // error) means "this handoff has nothing left to show here". Note
+    // "edited" is NOT conveyed by cpsb.status at all — the ingest path
+    // emits only cpsb.updated (handoff.py's _append_edit_locked flips the
+    // status without _emit_status), which notifyEditArrived below handles.
+    clearBadgeFor(nodeId, handoffId)
+    return
+  }
+  app.graph?.setDirtyCanvas(true, false)
+}
+
+/**
+ * An edit landed (`cpsb.updated` — the ONLY signal the ingest path emits;
+ * see notifyStatus's else-branch comment). Clears the node's "Editing in
+ * Photoshop…" badge: the round trip this badge announced is complete, and
+ * the gallery's own "Edited" chip is the completion signal (gallery
+ * overhaul, 2026-07-22 — deliberately NO transient checkmark flash here,
+ * that stays removed). Restoring THIS subscription fixes a real regression
+ * that removal caused: with cpsb.updated unsubscribed entirely, a Tier-1
+ * round trip's badge had no clearing event at all — it spun forever after
+ * the edit arrived, keeping the 120ms repaint timer alive with it.
+ * @param {import('./api.js').CpsbUpdatedEvent} detail
+ */
+function notifyEditArrived({ origin_node_id: nodeId, handoff_id: handoffId }) {
+  clearBadgeFor(nodeId, handoffId)
+}
+
+/**
+ * Subscribes to `cpsb.status` / `cpsb.updated`. Call once from `cpsb.js`'s
+ * `setup()`.
  */
 export function init() {
   api.onStatusChanged((detail) => {
@@ -654,6 +700,13 @@ export function init() {
       notifyStatus(detail)
     } catch (error) {
       api.warn('failed to update node badge from cpsb.status', error)
+    }
+  })
+  api.onUpdated((detail) => {
+    try {
+      notifyEditArrived(detail)
+    } catch (error) {
+      api.warn('failed to clear node badge from cpsb.updated', error)
     }
   })
 }

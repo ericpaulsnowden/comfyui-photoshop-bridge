@@ -51,25 +51,40 @@ async function runExport(doc) {
 }
 
 /**
- * Flattens *doc* and exports it to PNG bytes (batchPlay, falling back to the
- * Imaging API) -- the shared inner logic {@link runExport} wraps with its
- * own "duplicate the ORIGINAL doc first, close the duplicate after" caller
- * contract. Factored out (2026-07-23, "send a layer/document to ComfyUI")
- * so a caller that has already produced its OWN throwaway document by some
- * other means -- e.g. isolating a single layer into a fresh document, which
- * has nothing to do with duplicating an existing one -- can reuse the exact
- * same export path without `runExport`'s redundant extra duplicate. Callers
- * own *doc*'s lifecycle: this function flattens and reads it, but never
- * closes it. Must run inside `core.executeAsModal` (mutates *doc* via
- * `.flatten()`) -- callers already inside one (like `runExport`) call this
- * directly; a caller starting fresh must wrap its own call.
+ * Exports *doc* to PNG bytes (batchPlay, falling back to the Imaging API) --
+ * the shared inner logic {@link runExport} wraps with its own "duplicate the
+ * ORIGINAL doc first, close the duplicate after" caller contract. Factored
+ * out (2026-07-23, "send a layer/document to ComfyUI") so a caller that has
+ * already produced its OWN throwaway document by some other means -- e.g.
+ * isolating a single layer into a fresh document, which has nothing to do
+ * with duplicating an existing one -- can reuse the exact same export path
+ * without `runExport`'s redundant extra duplicate.
+ *
+ * `flatten` (default true, `runExport`'s long-shipped behavior) controls
+ * whether *doc* is flattened first. Pass `false` to PRESERVE TRANSPARENCY:
+ * `Document.flatten()` composites onto an opaque Background (alpha becomes
+ * white), while both export paths below handle an un-flattened document
+ * fine WITH its alpha intact -- the batchPlay save writes the composite of
+ * whatever layers exist (a PNG save of a document with transparent regions
+ * keeps them transparent), and the Imaging fallback's own doc comment
+ * already notes it deliberately leaves `applyAlpha` unset so alpha survives.
+ * The layer-send path uses this: matting a lone extracted layer onto white
+ * would defeat the point of sending "just that layer".
+ *
+ * Callers own *doc*'s lifecycle: this function may flatten and read it, but
+ * never closes it. Must run inside `core.executeAsModal` (may mutate *doc*)
+ * -- callers already inside one (like `runExport`) call this directly; a
+ * caller starting fresh must wrap its own call.
  * @param {import('photoshop').Document} doc - A throwaway/isolated document,
- * safe to flatten destructively.
+ * safe to mutate destructively.
+ * @param {{flatten?: boolean}} [options]
  * @returns {Promise<Uint8Array>} PNG-encoded bytes.
  * @throws {Error} If both the primary and fallback export paths fail.
  */
-async function exportFlattenedDocument(doc) {
-  await doc.flatten()
+async function exportFlattenedDocument(doc, { flatten = true } = {}) {
+  if (flatten) {
+    await doc.flatten()
+  }
   try {
     return await exportViaBatchPlay(doc)
   } catch (batchPlayError) {

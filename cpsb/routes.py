@@ -90,7 +90,14 @@ _WS_CHUNK_CHARS = 700_000
 _WS_MAX_MSG_SIZE_BYTES = 8 * 1024 * 1024
 
 _VALID_SOURCE_TYPES = ("input", "output", "temp")
-_VALID_ORIGIN_KINDS = ("load_image", "terminal_output", "bridge_node", "load_psd")
+#: Kept in hand-sync with `cpsb.handoff.OriginKind` (this pack's established
+#: hand-sync convention for small stable string sets). `manual_send` matters
+#: here even though a push is created by the plugin websocket, never by
+#: `POST /cpsb/open`: the GALLERY re-opens a pushed card through this route
+#: (`mode: "original"`, which short-circuits to the managed PSD the push
+#: handler wrote) -- omitting it made that Open button 400 with
+#: "Invalid origin_kind".
+_VALID_ORIGIN_KINDS = ("load_image", "terminal_output", "bridge_node", "load_psd", "manual_send")
 _VALID_MODES = ("new", "original", "fresh")
 
 #: Valid `kind` values for a plugin websocket `upload_edit` message (remote
@@ -186,6 +193,13 @@ class PluginConnection:
     #: ComfyUI" feature, 2026-07-23. Same reconnect-restarts-cleanly posture
     #: as `pending_uploads`.
     pending_pushes: dict[str, _PendingPush] = field(default_factory=dict)
+    #: Tombstones for pushes that already got a `manual_push_error` mid-burst
+    #: (see `_handle_manual_push_chunk`'s malformed branch): the sender's
+    #: remaining chunks for that `push_id` are dropped instead of silently
+    #: recreating an unfinishable partial buffer. Per-connection and every
+    #: real client mints a fresh `push_id` per attempt, so this stays tiny;
+    #: freed with the connection like everything else here.
+    rejected_push_ids: set[str] = field(default_factory=set)
 
 
 class _PluginSlot:
@@ -1935,7 +1949,13 @@ async def _handle_upload_edit_chunk(
         try:
             image = Image.open(io.BytesIO(raw_bytes))
             image.load()
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
+            # Broad on purpose (same rationale as _handle_manual_push_chunk's
+            # decode): Pillow's DecompressionBombError is a direct Exception
+            # subclass the old (OSError, ValueError) tuple missed, and an
+            # uncaught raise here escapes the websocket message loop and
+            # tears down the whole Tier-2 socket instead of failing one
+            # upload.
             await connection.ws.send_json(
                 {
                     "type": "upload_error",
@@ -1996,9 +2016,19 @@ async def _handle_manual_push_chunk(
     if not push_id:
         logger.warning("cpsb plugin sent manual_push with no push_id, ignoring")
         return
+    if push_id in connection.rejected_push_ids:
+        # This push already got its manual_push_error (e.g. a malformed chunk
+        # mid-stream) -- but the sender transmits every chunk back-to-back
+        # before any reply can reach it, so the REST of the burst still
+        # arrives. Without this tombstone, setdefault() below would silently
+        # recreate a _PendingPush whose len(chunks) can never reach `total`,
+        # leaking a multi-MB partial buffer on the connection until the
+        # socket closes.
+        return
     if not isinstance(seq, int) or not isinstance(total, int) or total < 1 or data_b64 is None:
         logger.warning("cpsb plugin sent a malformed manual_push chunk for %s, ignoring", push_id)
         connection.pending_pushes.pop(push_id, None)
+        connection.rejected_push_ids.add(push_id)
         await connection.ws.send_json(
             {
                 "type": "manual_push_error",
@@ -2025,23 +2055,58 @@ async def _handle_manual_push_chunk(
     try:
         image = Image.open(io.BytesIO(raw_bytes))
         image.load()
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
+        # Deliberately broad, mirroring _ingest_psd_upload's identical
+        # posture: Pillow raises more than OSError/ValueError here -- most
+        # concretely DecompressionBombError (a direct Exception subclass) on
+        # a huge whole-document send, ~179M pixels at Pillow's default
+        # MAX_IMAGE_PIXELS, well within Photoshop's 30k x 30k range. An
+        # uncaught raise here doesn't fail one push, it escapes the
+        # websocket message loop and tears down the ENTIRE Tier-2 socket
+        # (verified live), killing every other in-flight transfer with it.
         await connection.ws.send_json(
             {"type": "manual_push_error", "push_id": push_id, "error": f"Invalid image data: {exc}"}
         )
         return
 
-    meta = manager.create(
-        origin_node_id=f"ps-push:{push_id}",
-        origin_kind="manual_send",
-        workflow_name="",
-        source=SourceRef(filename=pending.title, subfolder="", type="temp"),
-        original_image=image,
-    )
-    psd_path = manager.psd_path(meta)
-    write_psd(psd_path, image)
-    manager.note_source_written(meta.handoff_id)
-    manager.ingest_edit(meta.handoff_id, image, "plugin")
+    meta: HandoffMeta | None = None
+    try:
+        meta = manager.create(
+            origin_node_id=f"ps-push:{push_id}",
+            origin_kind="manual_send",
+            workflow_name="",
+            source=SourceRef(filename=pending.title, subfolder="", type="temp"),
+            original_image=image,
+        )
+        psd_path = manager.psd_path(meta)
+        # _normalize_for_psd_write is load-bearing: write_psd is a bare
+        # PSDImage.frompil, which raises (AttributeError, verified against
+        # the shipped psd-tools) for palette-mode "P" and 16-bit "I;16"
+        # images -- both real PNG modes a pushed export can decode to. The
+        # /cpsb/open route already normalizes before its own write_psd call
+        # for exactly this reason; skipping it here crashed the socket.
+        write_psd(psd_path, _normalize_for_psd_write(image))
+        manager.note_source_written(meta.handoff_id)
+        manager.ingest_edit(meta.handoff_id, image, "plugin")
+    except Exception:
+        # Same never-let-it-escape-the-message-loop posture as the decode
+        # above. If the handoff was already created, mark it errored rather
+        # than deleting it: "error" is visible in the gallery (diagnosable,
+        # removable) AND in PURGEABLE_STATUSES (cleanup reclaims it), while
+        # a silently-abandoned "pending" handoff would sit unexplained
+        # forever -- pending is not purgeable.
+        logger.exception("cpsb: manual_push %s failed while creating its handoff", push_id)
+        if meta is not None:
+            with contextlib.suppress(Exception):
+                manager.mark_error(meta.handoff_id, "Photoshop push failed while ingesting")
+        await connection.ws.send_json(
+            {
+                "type": "manual_push_error",
+                "push_id": push_id,
+                "error": "Server failed to ingest the pushed image (see the ComfyUI log)",
+            }
+        )
+        return
 
     logger.info(
         "cpsb: created handoff %s from Photoshop-initiated push %r (push_id %s)",

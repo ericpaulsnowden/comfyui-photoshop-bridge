@@ -1305,6 +1305,15 @@ class HandoffManager:
                 "handoff_id": meta.handoff_id,
                 "origin_node_id": meta.origin_node_id,
                 "status": meta.status,
+                # Carried so the node badge can tell a `document_closed`
+                # report (status still "editing", nothing to spin for -- the
+                # document is GONE) apart from a genuine open confirmation.
+                # Without this, the very event announcing the close
+                # (set_plugin_doc_open -> here) looked identical to "editing
+                # started" and (re)conjured an animated Editing badge that
+                # then contradicted the gallery's own "Closed without saving"
+                # chip forever (web/cpsb/badges.js notifyStatus).
+                "plugin_doc_open": meta.plugin_doc_open,
             },
         )
 

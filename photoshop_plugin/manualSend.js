@@ -32,13 +32,15 @@
  * SPIKES.md spike 6): `Layer.duplicate(destDoc)`'s pixel-offset/position
  * behavior when `destDoc` is a FRESH same-size document is undocumented --
  * Adobe's own reference example only covers duplicating into an ALREADY-
- * OPEN, pre-existing document. If the layer's content lands shifted instead
- * of preserving its original canvas position, the Trim-to-bounds step below
- * still produces a CORRECT crop of whatever pixels actually landed -- so the
- * worst case is a cosmetically-shifted-but-otherwise-valid export, never
- * silent corruption. A batchPlay "duplicate to new document" descriptor was
- * considered and deliberately NOT used instead: it is unverified for UXP
- * specifically (only the whole-DOCUMENT-duplicate variant is forum-
+ * OPEN, pre-existing document. Because the destination is created with
+ * `fill: TRANSPARENT` and exported WITHOUT flattening (both load-bearing --
+ * see {@link runLayerExport}'s own comments), a position shift cannot
+ * corrupt the result: the Trim-to-transparent-bounds step still crops
+ * correctly around wherever the pixels actually landed, so the worst case
+ * is the crop being taken from a shifted spot, never a wrong-sized or
+ * white-matted image. A batchPlay "duplicate to new document" descriptor
+ * was considered and deliberately NOT used instead: it is unverified for
+ * UXP specifically (only the whole-DOCUMENT-duplicate variant is forum-
  * confirmed, and that variant is itself reported broken on Photoshop 2026),
  * so building on it would trade one undocumented risk for a worse one.**
  *
@@ -126,16 +128,32 @@ async function runLayerExport(doc) {
         throw new Error('No active layer to export')
       }
       const layerName = layer.name
+      // fill: TRANSPARENT is load-bearing, not cosmetic. createDocument's
+      // default fill is an opaque white Background layer, under which
+      // trim(TRANSPARENT) below finds no transparent pixels and silently
+      // no-ops — the export would come back full-canvas-sized and matted
+      // on white, indistinguishable from a whole-document send. mode: RGB
+      // pins the export pipeline's expectation regardless of the source
+      // document's own color mode (the duplicate converts on the way in).
       const destDoc = await app.createDocument({
         width: doc.width,
         height: doc.height,
-        resolution: doc.resolution
+        resolution: doc.resolution,
+        mode: constants.NewDocumentMode.RGB,
+        fill: constants.DocumentFill.TRANSPARENT
       })
       try {
         await layer.duplicate(destDoc)
         app.activeDocument = destDoc
         await destDoc.trim(constants.TrimType.TRANSPARENT, true, true, true, true)
-        const bytes = await exportFlattenedDocument(destDoc)
+        // flatten: false — Document.flatten() composites onto an opaque
+        // Background, matting this lone layer's transparency onto white,
+        // which defeats the point of sending "just that layer". Both export
+        // paths preserve alpha on an un-flattened document (see
+        // exportFlattenedDocument's own doc), so the PNG that reaches
+        // ComfyUI keeps it — and Add-as-node's LoadImage derives its MASK
+        // from exactly that alpha.
+        const bytes = await exportFlattenedDocument(destDoc, { flatten: false })
         return { bytes, title: `${layerName} (layer)` }
       } finally {
         destDoc.closeWithoutSaving()

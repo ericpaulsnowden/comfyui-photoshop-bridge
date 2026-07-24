@@ -2892,6 +2892,219 @@ class TestManualPush:
             assert msg["push_id"] == "push-6"
             assert len(manager.list_all()) == before
 
+    async def test_pushed_card_reopens_via_open_route(self, client, context, manager):
+        """The gallery's Open button on a pushed card POSTs /cpsb/open with
+        `origin_kind: "manual_send"` and `mode: "original"` — the whole
+        reason the push handler writes a real managed PSD. Regression: the
+        route's _VALID_ORIGIN_KINDS allowlist originally omitted
+        "manual_send", so this exact request 400'd ("Invalid origin_kind")
+        and the button was dead on arrival."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-8",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((30, 60, 90))).decode("ascii"),
+                    "title": "Sky (layer)",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            meta = manager.get(ack["handoff_id"])
+
+            # Exactly what gallery.js's openBodyFromMeta sends for mode
+            # "original" on this card.
+            response = await client.post(
+                "/cpsb/open",
+                json={
+                    "filename": meta.source.filename,
+                    "subfolder": meta.source.subfolder,
+                    "type": meta.source.type,
+                    "origin_node_id": meta.origin_node_id,
+                    "origin_kind": "manual_send",
+                    "workflow_name": meta.workflow_name,
+                    "mode": "original",
+                },
+            )
+            assert response.status == 200
+            data = await response.json()
+            assert data["handoff_id"] == meta.handoff_id
+            assert data["tier"] == 2
+            # And the plugin actually receives the open command for the
+            # managed PSD the push wrote.
+            command = await ws.receive_json(timeout=5)
+            assert command["type"] == "open_handoff"
+            assert command["handoff_id"] == meta.handoff_id
+
+    async def test_palette_mode_png_is_normalized_not_a_crash(self, client, context, manager):
+        """write_psd is a bare PSDImage.frompil, which RAISES for palette-mode
+        ("P") images — and an exception escaping this handler doesn't fail one
+        push, it tears down the whole plugin websocket. Regression for the
+        missing _normalize_for_psd_write call (the /cpsb/open route always had
+        it; the push handler originally didn't)."""
+        buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), (200, 40, 40)).convert("P").save(buffer, format="PNG")
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-p",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                    "title": "indexed.png",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack["type"] == "manual_push_ok"
+            meta = manager.get(ack["handoff_id"])
+            assert meta.status == "edited"
+            assert manager.psd_path(meta).is_file()
+
+    async def test_decompression_bomb_replies_error_and_keeps_socket_alive(
+        self, client, context, manager, monkeypatch
+    ):
+        """PIL's DecompressionBombError subclasses Exception directly — the
+        original narrow (OSError, ValueError) catch missed it, and the raise
+        escaped the message loop and killed the Tier-2 socket. Reproduced
+        for real by lowering Pillow's pixel limit instead of shipping a
+        180-megapixel fixture."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 10)  # 24x16 > 2*10 -> bomb
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-bomb",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((1, 1, 1))).decode("ascii"),
+                    "title": "huge.png",
+                }
+            )
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "manual_push_error"
+            assert msg["push_id"] == "push-bomb"
+
+            # The socket survived: a normal push right after still works.
+            monkeypatch.undo()
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-after-bomb",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((2, 2, 2))).decode("ascii"),
+                    "title": "ok.png",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack["type"] == "manual_push_ok"
+
+    async def test_ingest_failure_marks_handoff_error_and_keeps_socket_alive(
+        self, client, context, manager, monkeypatch
+    ):
+        """A failure AFTER manager.create() (write_psd/ingest) must reply
+        manual_push_error and mark the half-created handoff `error` (visible,
+        removable, purgeable) — never escape the message loop (socket
+        teardown) or strand an unexplained never-purgeable `pending` card."""
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("simulated write failure")
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            monkeypatch.setattr(routes_module, "write_psd", boom)
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-boom",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((3, 3, 3))).decode("ascii"),
+                    "title": "doomed.png",
+                }
+            )
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "manual_push_error"
+            assert msg["push_id"] == "push-boom"
+            orphans = [m for m in manager.list_all() if m.origin_node_id == "ps-push:push-boom"]
+            assert len(orphans) == 1
+            assert orphans[0].status == "error"  # terminal, visible, purgeable
+
+            # Socket alive and clean state: the next push succeeds.
+            monkeypatch.undo()
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-after-boom",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((4, 4, 4))).decode("ascii"),
+                    "title": "fine.png",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack["type"] == "manual_push_ok"
+
+    async def test_chunks_after_error_do_not_recreate_a_buffer(self, client, context, manager):
+        """The sender bursts every chunk before any reply can reach it, so
+        the chunks FOLLOWING a mid-stream error used to setdefault() a fresh
+        _PendingPush that could never complete — a multi-MB leak held until
+        the socket closed. The rejected push_id is now tombstoned."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            # Chunk 0 malformed (missing total) -> error + tombstone.
+            await ws.send_json({"type": "manual_push", "push_id": "push-leak", "seq": 0})
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "manual_push_error"
+
+            # The rest of the burst arrives anyway.
+            for seq in (1, 2):
+                await ws.send_json(
+                    {
+                        "type": "manual_push",
+                        "push_id": "push-leak",
+                        "seq": seq,
+                        "total": 3,
+                        "data_b64": "aGk=",
+                        "title": "x",
+                    }
+                )
+
+            # Give the server a beat to process, then a fresh push proving the
+            # loop is healthy — and whose ok-reply ORDERING also proves the
+            # trailing chunks above were handled (dropped) first.
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-clean",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((5, 5, 5))).decode("ascii"),
+                    "title": "clean.png",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack["type"] == "manual_push_ok"
+
+            slot = client.app[routes_module._APP_KEY_PLUGIN]
+            assert "push-leak" not in slot.connection.pending_pushes  # no recreated buffer
+            assert "push-leak" in slot.connection.rejected_push_ids
+
     async def test_appears_in_status_route(self, client, context, manager):
         async with client.ws_connect("/cpsb/ws") as ws:
             await _connect_tier2_plugin(ws, context, local_mode=False)

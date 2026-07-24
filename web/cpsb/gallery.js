@@ -837,6 +837,13 @@ function rebuild() {
   if (!rootEl) return
   try {
     rootEl.replaceChildren()
+    // Clear any in-progress compare hold. rebuild() fires on EVERY cpsb.*
+    // event, so it can land mid-hold — replaceChildren() just destroyed the
+    // held "Hold to compare" button, and a detached element never receives
+    // the pointerup that would have removed this class. Without this line
+    // the gallery gets stuck showing every card's BEFORE image (chips still
+    // saying "Edited") until the user presses and releases the new button.
+    rootEl.classList.remove('cpsb-gallery-comparing')
 
     rootEl.appendChild(
       ui.el('div', {
@@ -933,6 +940,10 @@ function renderGallery(container) {
 function destroyGallery() {
   unsubscribeState?.()
   unsubscribeState = null
+  // Same mid-hold hygiene as rebuild(): if the tab unmounts while "Hold to
+  // compare" is held, the class must not survive on a container ComfyUI
+  // may reuse for the next mount.
+  rootEl?.classList.remove('cpsb-gallery-comparing')
   rootEl?.replaceChildren()
   rootEl = null
 }
@@ -965,7 +976,7 @@ export function registerGalleryTab() {
     id: 'cpsb.gallery',
     icon: 'cpsb-ps-icon',
     title: 'Photoshop Edits',
-    tooltip: 'Photoshop Edits — round trips for this workflow',
+    tooltip: 'Photoshop Edits — every round trip, all workflows',
     type: 'custom',
     render: renderGallery,
     destroy: destroyGallery

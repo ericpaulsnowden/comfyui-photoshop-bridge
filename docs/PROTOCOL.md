@@ -93,6 +93,12 @@ case; it is not a separate mechanism.
   "source_hash": "<sha256 hex of the original image's normalized PNG encoding>",
   "source": {"filename": "ComfyUI_00042_.png", "subfolder": "", "type": "output"},
   "psd_filename": "ComfyUI_00042_.psd",
+  "managed_dir": "cpsb",              // managed_folder_name at creation; null on legacy metas
+  "edit_in_place": false,             // §6b Edit-original (load_psd only)
+  "original_path": null,              // absolute path of the user's file when edit_in_place
+  "trigger_policy": "Re-run workflow" | "Update only (don't re-run)" | "Ignore (do nothing)",
+  "wants_layered_psd": false,         // §6d remote Tier-2 layered annotate
+  "plugin_doc_open": null,            // true/false per the plugin's opened/document_closed; null = unknown
   "created_ts": 1752680000.0,
   "updated_ts": 1752680123.4,
   "status": "pending" | "editing" | "edited" | "cancelled" | "discarded" | "superseded" | "error",
@@ -155,7 +161,10 @@ Create a handoff and open it in Photoshop. Body (JSON):
   "subfolder": "",
   "type": "output",              // "input" | "output" | "temp" — same triple as /view
   "origin_node_id": "17",         // graph node id as string
-  "origin_kind": "load_image",    // "load_image" | "terminal_output" | "bridge_node"
+  "origin_kind": "load_image",    // "load_image" | "terminal_output" | "bridge_node" | "load_psd" | "manual_send"
+                                  // (manual_send bodies are only ever the gallery RE-opening a pushed
+                                  //  card, mode:"original" — a push itself is created by §3's
+                                  //  manual_push websocket message, never by this route)
   "workflow_name": "my-workflow", // optional, for the gallery
   "mode": "new"                   // "new" | "original" | "fresh"
 }
@@ -319,11 +328,16 @@ Plugin → server:
 - `{"type": "document_closed", "handoff_id": "..."}` — gallery overhaul (2026-07-22): the
   plugin's own periodic `app.documents` check (`photoshop_plugin/handoffs.js`'s
   `startDocumentCloseWatcher`/`pruneClosedHandoffs`, every 5s) detected that a tracked
-  handoff's document closed. Server records `plugin_doc_open: false`
-  (`HandoffMeta.plugin_doc_open`) — never touches `status` — so the gallery can show a
-  real "closed without saving" signal for a Tier-2 handoff (`web/cpsb/state.js`'s
-  `getDisplayStatus`), replacing an old client-only "editing for over an hour" guess that
-  had no plugin involvement at all.
+  handoff's document closed. Delivery is queued-and-retried, not fire-and-forget: every
+  prune path (the watcher AND the panel-render prune) stashes the closure in a
+  `pendingCloseReports` set that the watcher flushes only while the connection is up —
+  so a document closed during a server restart/network blip is still reported after
+  reconnect (the server's handoff records persist across restarts via `meta.json`, so
+  the late report lands; an unknown id is just a logged warning). Server records
+  `plugin_doc_open: false` (`HandoffMeta.plugin_doc_open`) — never touches `status` — so
+  the gallery can show a real "closed without saving" signal for a Tier-2 handoff
+  (`web/cpsb/state.js`'s `getDisplayStatus`), replacing an old client-only "editing for
+  over an hour" guess that had no plugin involvement at all.
 - `{"type": "request_file", "handoff_id": "..."}` — REMOTE-mode PSD download (replaces a
   `fetch` of `GET /cpsb/file/{handoff_id}`, which UXP blocks for a non-localhost host).
   Server replies with one or more `file_chunk`s or a `file_error`, reading the exact same
@@ -388,7 +402,9 @@ Server → plugin:
 ENTIRE file ONCE,
 then slices that single string into fixed-size pieces (~700,000 characters, comfortably
 inside a "~512KB–1MB base64 chunk" target) sent as successive frames carrying the same
-`handoff_id`, an increasing `seq` starting at 0, and a constant `total` (chunk count).
+correlation id (`handoff_id` for `request_file`/`file_chunk` and `upload_edit`; `push_id`
+for `manual_push` — no handoff exists yet there, see its own bullet above), an increasing
+`seq` starting at 0, and a constant `total` (chunk count).
 The receiver's job is only "concatenate every chunk's `data_b64` in `seq` order, then
 base64-decode ONCE at the end" — chunks are never independently decodable, which avoids
 any per-chunk base64 padding/alignment subtlety (padding only ever appears at the very
@@ -510,7 +526,13 @@ research/research-annotate-node.md retain the design if ever revisited.
    "sibling_output": null }
   ```
 - `"cpsb.status"` — handoff lifecycle changed (badge/gallery refresh):
-  `{"handoff_id": "...", "origin_node_id": "17", "status": "editing"}`
+  `{"handoff_id": "...", "origin_node_id": "17", "status": "editing", "plugin_doc_open": null}`
+  `plugin_doc_open` mirrors the meta field (§1) at emit time. Load-bearing for the node
+  badge: a `status: "editing"` event carrying `plugin_doc_open: false` is a
+  document-CLOSED report (`document_closed` → `set_plugin_doc_open`), which clears the
+  badge rather than (re)creating it. NB the ingest path emits ONLY `cpsb.updated` — an
+  edit landing never produces a `cpsb.status`, so `badges.js` subscribes to both (the
+  `cpsb.updated` subscription is what clears a Tier-1 badge when the edit arrives).
 - `"cpsb.tier2"` — plugin connection state changed:
   `{"connected": true, "ps_version": "26.5"}`
 

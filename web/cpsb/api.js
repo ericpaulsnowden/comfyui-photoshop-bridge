@@ -225,6 +225,12 @@ export function warn(...args) {
  * @property {string} handoff_id
  * @property {string} origin_node_id
  * @property {CpsbStatus} status
+ * @property {boolean | null} [plugin_doc_open] - Mirrors
+ * `CpsbHandoffMeta.plugin_doc_open` at emit time. Load-bearing for
+ * `badges.js`: a `status: "editing"` event carrying `false` is a
+ * document-CLOSED report (`document_closed` → `set_plugin_doc_open`), which
+ * must clear the node badge, not (re)create it. Absent on events from a
+ * backend predating the field — treated like `null`/unknown.
  */
 
 /**

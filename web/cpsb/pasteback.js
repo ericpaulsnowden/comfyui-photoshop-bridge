@@ -480,6 +480,27 @@ function handleUpdated(payload) {
     handleLoadPsd(payload)
     return
   }
+  if (payload.origin_kind === 'manual_send') {
+    // A Photoshop-initiated push ("Send to ComfyUI", 2026-07-23) NEVER had a
+    // graph node — its origin_node_id is the synthesized `ps-push:...`
+    // sentinel. Without this branch it fell through to
+    // handleLoadImageOrBridge's missing-node path, whose toast claims "the
+    // node this edit belongs to was removed from the workflow" — factually
+    // wrong for a card that never had one. Same Add-as-node affordance,
+    // accurate words.
+    ui.showActionToast({
+      summary: 'Sent from Photoshop',
+      detail: 'Added to the Photoshop Edits gallery — add it to the workflow from there, or right here.',
+      actionLabel: 'Add as node',
+      onAction: () =>
+        addLoadImageNodeNear(null, {
+          filename: payload.filename,
+          subfolder: payload.subfolder,
+          type: payload.type
+        })
+    })
+    return
+  }
   handleLoadImageOrBridge(payload)
 }
 

@@ -218,11 +218,19 @@ class TestPluginDocOpen:
         manager.set_plugin_doc_open(meta.handoff_id, False)
         assert manager.get(meta.handoff_id).status == "editing"
 
-    def test_emits_cpsb_status(self, manager, events):
+    def test_emits_cpsb_status_carrying_plugin_doc_open(self, manager, events):
+        """The event must CARRY plugin_doc_open: badges.js needs to tell a
+        document-closed report (status still "editing", clear the badge)
+        apart from a genuine open confirmation (set the badge) — without the
+        field, the close announcement itself re-conjured an Editing badge
+        that contradicted the gallery's "Closed without saving" chip."""
         meta = create_handoff(manager)
-        manager.set_plugin_doc_open(meta.handoff_id, True)
+        manager.mark_editing(meta.handoff_id)
+        manager.set_plugin_doc_open(meta.handoff_id, False)
         payloads = events.of_type("cpsb.status")
         assert payloads[-1]["handoff_id"] == meta.handoff_id
+        assert payloads[-1]["status"] == "editing"
+        assert payloads[-1]["plugin_doc_open"] is False
 
     def test_unknown_handoff_raises(self, manager):
         with pytest.raises(HandoffNotFoundError):

@@ -176,20 +176,54 @@ async function uploadLayeredPsd(handoffId, psdBytes) {
 }
 
 /**
+ * Rejection messages from `connection.js` that mean the transfer NEVER
+ * reached (or stopped reaching) the server as a whole: the socket wasn't
+ * open (`pushManualSendOverWs`'s own immediate rejection) or dropped
+ * mid-flight (`_rejectAllPending`). Kept in hand-sync with those literal
+ * strings — this pack's established convention for small stable string sets.
+ * These are the ONLY failures {@link pushManualSend} retries, because they
+ * are the only ones where a retry cannot double-create: the server's
+ * reassembly buffers live on the per-websocket PluginConnection, so a
+ * connection-level failure guarantees the dead attempt can never complete
+ * server-side, and the reconnected socket starts from empty buffers.
+ * @type {ReadonlySet<string>}
+ */
+const PUSH_CONNECTION_FAILURES = new Set([
+  'Not connected to the ComfyUI server',
+  'Connection closed'
+])
+
+/**
  * Sends `bytes` as a brand-new "send a layer/document to ComfyUI" push
  * (2026-07-23) via {@link connection.pushManualSendOverWs} — always over the
  * websocket, regardless of LOCAL/REMOTE mode (unlike an edit for an
  * EXISTING handoff, a push has no pre-arranged shared-filesystem path to
  * write onto in LOCAL mode either; the server mints the handoff and writes
  * its managed copy itself either way, so there is nothing for a LOCAL-mode
- * HTTP variant to gain here). Same retry-with-backoff quality bar as
- * {@link uploadEditOverWebsocket}, except each attempt generates a FRESH
- * `push_id` — reusing one across attempts risks the server reassembling a
- * stale partial buffer from an earlier, abandoned attempt.
+ * HTTP variant to gain here).
+ *
+ * UNLIKE {@link uploadEditOverWebsocket}, this retries ONLY connection-level
+ * failures ({@link PUSH_CONNECTION_FAILURES}) — a deliberate difference, not
+ * an omission, because a push is a non-idempotent CREATE with no server-side
+ * idempotency key:
+ * - An ACK TIMEOUT is not retried: the chunks are usually still in flight or
+ *   being processed on the healthy socket, so a retried attempt (with the
+ *   fresh push_id below) would land as a SECOND push — the server completes
+ *   both and the user gets duplicate gallery cards and managed PSDs.
+ *   `upload_edit` never had this problem only because it is keyed by an
+ *   existing handoff_id and therefore naturally idempotent.
+ * - A `manual_push_error` is not retried: the server's rejections here
+ *   (bad base64, undecodable image, ingest failure) are deterministic for
+ *   the same bytes — resending an identical multi-MB payload twice more can
+ *   only stall the shared control socket.
+ * Each retry that IS made mints a fresh `push_id`: reusing one would let a
+ * reconnected server mix a stale partial buffer with the new attempt's
+ * chunks (buffers die with the connection, but same-connection retries after
+ * an immediate "Not connected" rejection never sent anything at all).
  * @param {string} title
  * @param {Uint8Array} bytes
  * @returns {Promise<string | null>} The new `handoff_id` on success, `null`
- * after every retry is exhausted.
+ * on failure (already logged).
  */
 async function pushManualSend(title, bytes) {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -197,9 +231,19 @@ async function pushManualSend(title, bytes) {
     try {
       return await connection.pushManualSendOverWs(pushId, bytes, title)
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!PUSH_CONNECTION_FAILURES.has(message)) {
+        logError(
+          `manual_push (title=${title}) rejected (${describeError(error)}) — not retrying: ` +
+            `only connection-level failures are safely retryable for a push (see ` +
+            `PUSH_CONNECTION_FAILURES); a timeout may still complete server-side and a ` +
+            `server rejection is deterministic`
+        )
+        return null
+      }
       logWarn(
-        `manual_push (title=${title}) failed, attempt ${attempt}/${MAX_ATTEMPTS}: ` +
-          describeError(error)
+        `manual_push (title=${title}) hit a connection failure, attempt ` +
+          `${attempt}/${MAX_ATTEMPTS}: ${describeError(error)}`
       )
     }
     if (attempt < MAX_ATTEMPTS) {
