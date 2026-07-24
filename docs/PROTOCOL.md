@@ -389,8 +389,8 @@ Plugin → server:
   a workflow without a panel prompt still works — clearing the field "hands control back"
   to the graph). Emits `cpsb.liveprompt` (§5). Like `live_frame`: fire-and-forget, never
   a handoff, dies with the connection.
-- `{"type": "live_creativity", "value": 0.75}` — realtime drawing creativity slider: the
-  preview panel's Creativity slider position, `0.0..1.0` (`liveCreativity.js`, debounced).
+- `{"type": "live_creativity", "value": 0.75}` — realtime drawing creativity control: the
+  preview panel's Creativity level (Low/Medium/High → `0.0`/`0.5`/`1.0`) (`liveCreativity.js`).
   The server clamps it to `0.0..1.0` and holds the newest in ONE keep-latest slot
   (`PluginConnection.live_creativity`); `PhotoshopLiveCreativity` (§6f) maps it onto a
   denoise band, falling back to its own widget when the slider was never touched. A
@@ -583,7 +583,7 @@ research/research-annotate-node.md retain the design if ever revisited.
   re-render like a stroke. The text is deliberately NOT in the payload:
   `PhotoshopLivePrompt` (§6f) reads it server-side at execute time, the same posture as
   `cpsb.live`.
-- `"cpsb.livecreativity"` — the preview panel's Creativity slider moved:
+- `"cpsb.livecreativity"` — the preview panel's Creativity level changed:
   `{"creativity": 0.75}` (0.0..1.0). The live loop re-queues on it like a frame or a
   prompt edit; the value is echoed for logging, but `PhotoshopLiveCreativity` (§6f) reads
   the slot server-side at execute time.
@@ -1164,8 +1164,10 @@ plugin is connected or no frame has streamed yet.
   streamed panel text (or `"no-live-prompt"`), so a panel edit busts the cache; the
   widget's own value is diffed natively by ComfyUI.
 - **`PhotoshopLiveCreativity`** (same module): a `FLOAT` output for the KSampler's
-  `denoise` input (convert that widget to an input). The preview panel's Creativity slider
-  (`live_creativity`, §3) streams `0.0..1.0`; the node maps it onto a denoise band
+  `denoise` input (convert that widget to an input). The preview panel's Creativity control
+  (**Low/Medium/High** buttons — a continuous slider was too granular to read) streams
+  `0.0..1.0` (`live_creativity`, §3) — the levels land on the band's min/mid/max; the node
+  maps it onto a denoise band
   (`min_denoise`..`max_denoise` widgets, default 0.40..0.85) so the user tunes how much
   the AI reinterprets the drawing — low = hug the sketch, high = reinterpret — WITHOUT
   opening ComfyUI. Denoise is the single most effective adherence control at a fixed
@@ -1184,7 +1186,7 @@ plugin is connected or no frame has streamed yet.
   Multi-panel mount caveats (show-fires-once, node-carrying shape variance) are handled
   in `previewPanel.js`/`index.js` per the community-verified example; the img-refresh
   rate is roadmap spike S-C, owner-verified via the checklist. **This panel also hosts the
-  PROMPT field and Creativity slider** (under the image), so the two live controls sit with
+  PROMPT field and Creativity buttons** (under the image), so the two live controls sit with
   the render they affect and survive collapsing the main "ComfyUI" panel — they feed
   `PhotoshopLivePrompt`/`PhotoshopLiveCreativity` via `live_prompt`/`live_creativity` (§3).
 
@@ -1256,9 +1258,9 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
   `cpsb.showUpgradeBanner` (bool, default true).
 - **Live loop** (`web/cpsb/live.js`, realtime drawing M2): each `cpsb.live` event — AND
-  each `cpsb.liveprompt` (prompt changed) and `cpsb.livecreativity` (slider moved) event —
+  each `cpsb.liveprompt` (prompt changed) and `cpsb.livecreativity` (level changed) event —
   queues at most ONE coalesced `queuePrompt(0)` via a shared `requestQueue()` seam (a
-  prompt tweak or slider drag re-renders like a stroke) — armed only while the current
+  prompt tweak or creativity change re-renders like a stroke) — armed only while the current
   graph contains an
   ACTIVE (non-muted/bypassed) `PhotoshopLiveCanvas` node with `auto_queue` = "On",
   searched recursively through subgraphs (widget read client-side per event, the same

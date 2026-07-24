@@ -37,9 +37,19 @@ const { logInfo, logWarn, describeError } = require('./log.js')
 const { setLivePrompt } = require('./livePrompt.js')
 const { setLiveCreativity } = require('./liveCreativity.js')
 
-/** Slider's initial position (percent). Purely cosmetic until the user drags
- * it — until then the `PhotoshopLiveCreativity` node uses its own widget. */
-const DEFAULT_CREATIVITY_PCT = 60
+/**
+ * Creativity is a THREE-STEP choice, not a continuous slider (Eric's
+ * feedback: the 0–100 slider was too granular — nothing changed perceptibly
+ * between neighbouring percents, only across low/medium/high). Each level
+ * sends a 0..1 value that `PhotoshopLiveCreativity` maps onto its denoise
+ * band, so Low/Medium/High land on the band's min / midpoint / max.
+ * @type {{ key: string, label: string, value: number }[]}
+ */
+const CREATIVITY_LEVELS = [
+  { key: 'low', label: 'Low', value: 0.0 },
+  { key: 'medium', label: 'Medium', value: 0.5 },
+  { key: 'high', label: 'High', value: 1.0 }
+]
 
 /** The latest frame, kept even while the panel is unmounted. */
 let latestDataUri = /** @type {string | null} */ (null)
@@ -54,8 +64,14 @@ let imageEl = null
 let statusEl = null
 /** @type {HTMLElement | null} */
 let promptField = null
-/** @type {HTMLElement | null} */
-let creativitySlider = null
+/** key -> the Low/Medium/High <sp-button> elements. @type {Record<string, any>} */
+let creativityButtons = {}
+/** The level the user has picked, or null while the graph's own widget drives
+ * denoise (nothing sent until the user chooses). @type {string | null} */
+let selectedCreativityKey = null
+/** Last connection status seen, so we re-flush controls only on the
+ * transition INTO 'connected' (the reconnect desync fix). */
+let lastConnStatus = /** @type {string | null} */ (null)
 
 /**
  * Builds the panel DOM once. Plain DOM + inline styles: this document's CSS
@@ -136,54 +152,41 @@ function buildDom() {
     }
   })
 
-  const creativityHeader = document.createElement('div')
-  creativityHeader.style.display = 'flex'
-  creativityHeader.style.flexDirection = 'row'
-  creativityHeader.style.justifyContent = 'space-between'
-  creativityHeader.style.fontSize = '10px'
-  creativityHeader.style.opacity = '0.6'
-  creativityHeader.style.margin = '10px 0 4px'
-  const creativityLabel = document.createElement('span')
+  const creativityLabel = document.createElement('div')
   creativityLabel.textContent = 'CREATIVITY'
-  const creativityValue = document.createElement('span')
-  creativityValue.id = 'cpsb-preview-creativity-value'
-  creativityHeader.appendChild(creativityLabel)
-  creativityHeader.appendChild(creativityValue)
+  creativityLabel.style.fontSize = '10px'
+  creativityLabel.style.opacity = '0.6'
+  creativityLabel.style.margin = '10px 0 4px'
 
-  /** @param {number} pct */
-  const renderCreativityValue = (pct) => {
-    creativityValue.textContent = `${Math.round(pct)}% · ${pct <= 50 ? 'faithful' : 'imaginative'}`
+  // Low / Medium / High as a segmented row of buttons (not a slider) — the
+  // selected level gets the loud CTA variant, the rest stay quiet.
+  const creativityRow = document.createElement('div')
+  creativityRow.style.display = 'flex'
+  creativityRow.style.flexDirection = 'row'
+  creativityButtons = {}
+  for (const level of CREATIVITY_LEVELS) {
+    const btn = document.createElement('sp-button')
+    btn.setAttribute('variant', 'secondary')
+    btn.setAttribute('quiet', '')
+    btn.textContent = level.label
+    btn.style.flex = '1 1 0'
+    btn.style.marginRight = level.key === 'high' ? '0' : '6px'
+    btn.addEventListener('click', () => selectCreativity(level.key))
+    creativityButtons[level.key] = btn
+    creativityRow.appendChild(btn)
   }
-
-  creativitySlider = document.createElement('sp-slider')
-  creativitySlider.id = 'cpsb-preview-creativity'
-  creativitySlider.setAttribute('min', '0')
-  creativitySlider.setAttribute('max', '100')
-  creativitySlider.setAttribute('value', String(DEFAULT_CREATIVITY_PCT))
-  creativitySlider.style.width = '100%'
-  renderCreativityValue(DEFAULT_CREATIVITY_PCT)
-  creativitySlider.addEventListener('input', () => {
-    const pct = Number(/** @type {any} */ (creativitySlider).value)
-    if (!Number.isFinite(pct)) return
-    renderCreativityValue(pct)
-    try {
-      setLiveCreativity(pct / 100)
-    } catch (error) {
-      logWarn(`live creativity send failed: ${describeError(error)}`)
-    }
-  })
 
   const creativityHint = document.createElement('div')
   creativityHint.textContent =
-    'Low = hug your drawing · High = reinterpret it (drives Photoshop Live Creativity → denoise).'
+    'Low = hug your drawing · High = reinterpret it. Until you pick, the graph’s own setting is used.'
   creativityHint.style.fontSize = '10px'
   creativityHint.style.opacity = '0.5'
   creativityHint.style.marginTop = '4px'
 
   controls.appendChild(promptLabel)
   controls.appendChild(promptField)
-  controls.appendChild(creativityHeader)
-  controls.appendChild(creativitySlider)
+  controls.appendChild(creativityLabel)
+  controls.appendChild(creativityRow)
   controls.appendChild(creativityHint)
 
   statusEl = document.createElement('div')
@@ -213,6 +216,59 @@ function showLatest() {
     statusEl.textContent = latestDocTitle
       ? `${latestDocTitle} · ${framesReceived} renders`
       : `${framesReceived} renders`
+  }
+}
+
+/** Highlights whichever creativity button is currently selected. @returns {void} */
+function refreshCreativityButtons() {
+  for (const level of CREATIVITY_LEVELS) {
+    const btn = creativityButtons[level.key]
+    if (!btn) continue
+    const active = level.key === selectedCreativityKey
+    btn.setAttribute('variant', active ? 'cta' : 'secondary')
+    if (active) btn.removeAttribute('quiet')
+    else btn.setAttribute('quiet', '')
+  }
+}
+
+/**
+ * Picks a creativity level, highlights it, and streams its 0..1 value.
+ * @param {string} key
+ * @returns {void}
+ */
+function selectCreativity(key) {
+  const level = CREATIVITY_LEVELS.find((l) => l.key === key)
+  if (!level) return
+  selectedCreativityKey = key
+  refreshCreativityButtons()
+  try {
+    setLiveCreativity(level.value)
+  } catch (error) {
+    logWarn(`live creativity send failed: ${describeError(error)}`)
+  }
+}
+
+/**
+ * Re-sends the panel's current control values to the server. Called on every
+ * (re)connect: a new plugin connection resets the server's keep-latest slots
+ * to empty, so without this the panel would still SHOW a prompt/level the
+ * graph no longer receives (Eric hit exactly this after toggling Live Mode /
+ * reconnecting — he had to retype to re-sync). The prompt is always re-sent
+ * (empty just clears, matching an empty field); creativity is re-sent only if
+ * the user actually picked a level (otherwise the graph's own widget stays in
+ * charge).
+ * @returns {void}
+ */
+function flushControls() {
+  if (!promptField) return // panel never built — nothing to sync
+  try {
+    setLivePrompt(/** @type {any} */ (promptField).value || '')
+    if (selectedCreativityKey) {
+      const level = CREATIVITY_LEVELS.find((l) => l.key === selectedCreativityKey)
+      if (level) setLiveCreativity(level.value)
+    }
+  } catch (error) {
+    logWarn(`control re-sync failed: ${describeError(error)}`)
   }
 }
 
@@ -255,6 +311,20 @@ connection.addEventListener('message', (event) => {
   latestDocTitle = typeof msg.doc_title === 'string' ? msg.doc_title : ''
   framesReceived += 1
   showLatest()
+})
+
+// Re-sync the panel's controls whenever the connection (re)establishes: a new
+// server-side connection starts with EMPTY prompt/creativity slots, so the
+// panel's shown values must be re-sent or the graph silently loses them.
+// Registered at module load (like the message listener) so it survives
+// reconnects even while the panel is unmounted.
+connection.addEventListener('statechange', (event) => {
+  const state = /** @type {CustomEvent} */ (event).detail
+  const status = state && state.status
+  if (status === 'connected' && lastConnStatus !== 'connected') {
+    flushControls()
+  }
+  lastConnStatus = status
 })
 
 module.exports = { mountPreviewPanel }
