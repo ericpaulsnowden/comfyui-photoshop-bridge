@@ -34,6 +34,12 @@
 
 const { connection } = require('./connection.js')
 const { logInfo, logWarn, describeError } = require('./log.js')
+const { setLivePrompt } = require('./livePrompt.js')
+const { setLiveCreativity } = require('./liveCreativity.js')
+
+/** Slider's initial position (percent). Purely cosmetic until the user drags
+ * it — until then the `PhotoshopLiveCreativity` node uses its own widget. */
+const DEFAULT_CREATIVITY_PCT = 60
 
 /** The latest frame, kept even while the panel is unmounted. */
 let latestDataUri = /** @type {string | null} */ (null)
@@ -46,6 +52,10 @@ let rootDiv = null
 let imageEl = null
 /** @type {HTMLElement | null} */
 let statusEl = null
+/** @type {HTMLElement | null} */
+let promptField = null
+/** @type {HTMLElement | null} */
+let creativitySlider = null
 
 /**
  * Builds the panel DOM once. Plain DOM + inline styles: this document's CSS
@@ -92,15 +102,101 @@ function buildDom() {
   imageEl.style.objectFit = 'contain'
   imageWrap.appendChild(imageEl)
 
+  // --- Controls UNDER the image: prompt + creativity slider. They live in
+  // THIS (preview/output) panel by design — they sit with the result they
+  // affect, and they survive collapsing the main "ComfyUI" panel. Built with
+  // Spectrum widgets via createElement, since this panel has no HTML document
+  // of its own (see the file doc). Both stream to the server (debounced) and
+  // drive the matching nodes; a workflow without those nodes just ignores the
+  // stream.
+  const controls = document.createElement('div')
+  controls.id = 'cpsb-preview-controls'
+  controls.style.flex = '0 0 auto'
+  controls.style.padding = '8px 0 0'
+
+  const promptLabel = document.createElement('div')
+  promptLabel.textContent = 'PROMPT'
+  promptLabel.style.fontSize = '10px'
+  promptLabel.style.opacity = '0.6'
+  promptLabel.style.marginBottom = '4px'
+
+  promptField = document.createElement('sp-textfield')
+  promptField.id = 'cpsb-preview-prompt'
+  promptField.setAttribute('multiline', '')
+  promptField.setAttribute(
+    'placeholder',
+    'Describe what you want — drives the Photoshop Live Prompt node'
+  )
+  promptField.style.width = '100%'
+  promptField.addEventListener('input', () => {
+    try {
+      setLivePrompt(/** @type {any} */ (promptField).value || '')
+    } catch (error) {
+      logWarn(`live prompt send failed: ${describeError(error)}`)
+    }
+  })
+
+  const creativityHeader = document.createElement('div')
+  creativityHeader.style.display = 'flex'
+  creativityHeader.style.flexDirection = 'row'
+  creativityHeader.style.justifyContent = 'space-between'
+  creativityHeader.style.fontSize = '10px'
+  creativityHeader.style.opacity = '0.6'
+  creativityHeader.style.margin = '10px 0 4px'
+  const creativityLabel = document.createElement('span')
+  creativityLabel.textContent = 'CREATIVITY'
+  const creativityValue = document.createElement('span')
+  creativityValue.id = 'cpsb-preview-creativity-value'
+  creativityHeader.appendChild(creativityLabel)
+  creativityHeader.appendChild(creativityValue)
+
+  /** @param {number} pct */
+  const renderCreativityValue = (pct) => {
+    creativityValue.textContent = `${Math.round(pct)}% · ${pct <= 50 ? 'faithful' : 'imaginative'}`
+  }
+
+  creativitySlider = document.createElement('sp-slider')
+  creativitySlider.id = 'cpsb-preview-creativity'
+  creativitySlider.setAttribute('min', '0')
+  creativitySlider.setAttribute('max', '100')
+  creativitySlider.setAttribute('value', String(DEFAULT_CREATIVITY_PCT))
+  creativitySlider.style.width = '100%'
+  renderCreativityValue(DEFAULT_CREATIVITY_PCT)
+  creativitySlider.addEventListener('input', () => {
+    const pct = Number(/** @type {any} */ (creativitySlider).value)
+    if (!Number.isFinite(pct)) return
+    renderCreativityValue(pct)
+    try {
+      setLiveCreativity(pct / 100)
+    } catch (error) {
+      logWarn(`live creativity send failed: ${describeError(error)}`)
+    }
+  })
+
+  const creativityHint = document.createElement('div')
+  creativityHint.textContent =
+    'Low = hug your drawing · High = reinterpret it (drives Photoshop Live Creativity → denoise).'
+  creativityHint.style.fontSize = '10px'
+  creativityHint.style.opacity = '0.5'
+  creativityHint.style.marginTop = '4px'
+
+  controls.appendChild(promptLabel)
+  controls.appendChild(promptField)
+  controls.appendChild(creativityHeader)
+  controls.appendChild(creativitySlider)
+  controls.appendChild(creativityHint)
+
   statusEl = document.createElement('div')
   statusEl.id = 'cpsb-preview-status'
+  statusEl.style.flex = '0 0 auto'
   statusEl.style.fontSize = '11px'
   statusEl.style.opacity = '0.7'
-  statusEl.style.padding = '6px 0 0'
+  statusEl.style.padding = '8px 0 0'
   statusEl.textContent =
     'Waiting for a render — add a "Photoshop Live Preview" node to the workflow.'
 
   rootDiv.appendChild(imageWrap)
+  rootDiv.appendChild(controls)
   rootDiv.appendChild(statusEl)
   return rootDiv
 }

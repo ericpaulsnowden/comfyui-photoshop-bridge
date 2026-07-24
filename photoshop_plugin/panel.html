@@ -239,11 +239,6 @@
         margin-right: 8px;
       }
 
-      /* Full-width multiline prompt field in the LIVE MODE section. */
-      .cpsb-live-prompt-field {
-        width: 100%;
-        margin-bottom: 6px;
-      }
 
       .cpsb-log {
         margin-top: 8px;
@@ -323,23 +318,12 @@
       <div id="cpsb-live-status" class="cpsb-muted cpsb-conn-line">
         Streams the active document to the Photoshop Live Canvas node as you draw.
       </div>
-
-      <!-- Live prompt: drives a "Photoshop Live Prompt" node in the workflow,
-           so the render can be steered from HERE instead of the ComfyUI graph
-           (livePrompt.js streams edits, debounced). Empty = the node uses its
-           own default text, so a workflow without this field still works. -->
-      <div class="cpsb-field-label">LIVE PROMPT</div>
-      <sp-textfield
-        id="cpsb-live-prompt"
-        class="cpsb-live-prompt-field"
-        multiline
-        placeholder="Describe what you're making — drives the Photoshop Live Prompt node"
-      ></sp-textfield>
+      <!-- The prompt + creativity controls live in the second "ComfyUI
+           Preview" panel (previewPanel.js), next to the render they affect and
+           independent of this panel being collapsed. -->
       <div class="cpsb-muted cpsb-conn-line">
-        Add a "Photoshop Live Prompt" node and wire it into your positive
-        prompt. Leave empty to use the node's own text. While the live loop is
-        running (a Live Canvas node with auto-queue on), changing this
-        re-renders live.
+        Prompt &amp; creativity controls are in the "ComfyUI Preview" panel
+        (Plugins &rsaquo; ComfyUI Bridge &rsaquo; ComfyUI Preview).
       </div>
 
       <div class="cpsb-rule"></div>

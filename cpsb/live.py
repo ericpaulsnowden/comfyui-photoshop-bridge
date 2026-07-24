@@ -1,9 +1,11 @@
 """The realtime-drawing nodes (docs/roadmap/realtime-drawing.md M1/M2/M3).
 
-Three nodes: ``PhotoshopLiveCanvas`` (the canvas in, Tier-2-required),
-``PhotoshopLivePrompt`` (the panel's prompt in, NOT Tier-2-gated -- falls back
-to its own widget so ComfyUI-only works), and ``PhotoshopLivePreview`` (the
-render back out to a docked Photoshop panel).
+Four nodes: ``PhotoshopLiveCanvas`` (the canvas in, Tier-2-required),
+``PhotoshopLivePrompt`` (the preview panel's prompt in) and
+``PhotoshopLiveCreativity`` (the preview panel's creativity slider -> a denoise
+FLOAT) -- both NOT Tier-2-gated, falling back to their own widgets so
+ComfyUI-only works -- and ``PhotoshopLivePreview`` (the render back out to a
+docked Photoshop panel, which also hosts the prompt + creativity controls).
 
 ``PhotoshopLiveCanvas`` is the graph's window onto the canvas the user is
 ACTIVELY drawing in Photoshop: the plugin's Live Mode streams a keep-latest
@@ -244,6 +246,76 @@ class PhotoshopLivePrompt:
         return (effective,)
 
 
+class PhotoshopLiveCreativity:
+    """A "creativity" knob for the live loop, driven from the preview panel.
+
+    Outputs a ``FLOAT`` to wire into the KSampler's ``denoise`` input (convert
+    that widget to an input). The preview panel's Creativity slider streams
+    ``0.0..1.0`` (``live_creativity``, PROTOCOL.md §3); this node maps it onto
+    a denoise band ``[min_denoise, max_denoise]`` so the user tunes how much
+    the AI re-imagines their drawing WITHOUT opening ComfyUI. Low creativity =
+    hug the sketch (low denoise); high = reinterpret it (high denoise).
+
+    Denoise is the single most effective adherence control for img2img (and,
+    at a fixed few-step count, the fix for "the render looks 99% like my
+    drawing"). It is the one setting exposed here; the slider could later
+    drive more (CFG, steps) -- see the roadmap.
+
+    **NOT Tier-2-gated** (like :class:`PhotoshopLivePrompt`): falls back to its
+    own ``creativity`` widget when the panel isn't driving it, so the
+    ComfyUI-only path still works.
+    """
+
+    CATEGORY = "image/photoshop"
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("denoise",)
+    FUNCTION = "execute"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "creativity": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_denoise": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "max_denoise": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    @staticmethod
+    def _denoise(creativity: float, min_denoise: float, max_denoise: float) -> float:
+        # sorted() so a min>max misconfiguration can't invert the band.
+        lo, hi = sorted((float(min_denoise), float(max_denoise)))
+        c = max(0.0, min(1.0, float(creativity)))
+        return round(lo + c * (hi - lo), 4)
+
+    @classmethod
+    def IS_CHANGED(cls, creativity: float, min_denoise: float, max_denoise: float) -> str:
+        """Bust the cache when the PANEL slider changes.
+
+        The widget values are diffed natively by ComfyUI, so this only
+        surfaces the panel-streamed value (namespaced ``live:``, like
+        :meth:`PhotoshopLivePrompt.IS_CHANGED`, so it can never alias the
+        no-panel sentinel), letting a slider drag re-run the graph while an
+        untouched slider is served from cache.
+        """
+        state = nodes._require_state()
+        live = routes.get_live_creativity(state.app)
+        return f"live:{live}" if live is not None else "no-live-creativity"
+
+    def execute(
+        self, creativity: float, min_denoise: float, max_denoise: float
+    ) -> tuple[float]:
+        state = nodes._require_state()
+        live = routes.get_live_creativity(state.app)
+        effective = live if live is not None else creativity
+        denoise = self._denoise(effective, min_denoise, max_denoise)
+        source = "panel slider" if live is not None else "node widget"
+        logger.info(
+            "cpsb live: creativity %.2f from %s -> denoise %.3f", effective, source, denoise
+        )
+        return (denoise,)
+
+
 class PhotoshopLivePreview:
     """Pushes its IMAGE input to the plugin's "ComfyUI Preview" panel (M3).
 
@@ -251,7 +323,7 @@ class PhotoshopLivePreview:
     and each render appears in a panel DOCKED INSIDE PHOTOSHOP, beside the
     canvas the user is drawing on -- the roadmap's headline UX. An output
     node (``OUTPUT_NODE = True``, no return sockets); encodes the first
-    frame of its input batch as JPEG (quality {_RESULT_JPEG_QUALITY}) and
+    frame of its input batch as JPEG (quality 85, ``_RESULT_JPEG_QUALITY``) and
     sends it as a single ``result_frame`` websocket message
     (:func:`cpsb.routes.send_result_frame`) -- fire-and-forget keep-latest,
     mirroring ``live_frame``'s posture in the other direction.

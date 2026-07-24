@@ -1,6 +1,6 @@
 {
-  "last_node_id": 11,
-  "last_link_id": 13,
+  "last_node_id": 12,
+  "last_link_id": 14,
   "nodes": [
     {
       "id": 1,
@@ -251,6 +251,14 @@
           "name": "latent_image",
           "type": "LATENT",
           "link": 8
+        },
+        {
+          "name": "denoise",
+          "type": "FLOAT",
+          "link": 14,
+          "widget": {
+            "name": "denoise"
+          }
         }
       ],
       "outputs": [
@@ -423,11 +431,46 @@
         "text": ""
       },
       "widgets_values": [
-        "REALTIME DRAWING - quickstart\n\n1) Point the Checkpoint at a FAST few-step model. A PLAIN model\n   (v1-5-pruned, SDXL base, DreamShaper/Juggernaut with NO\n   LCM/Turbo/Lightning/Hyper in the name) will NOT work with these\n   settings - it barely denoises at 4 steps, so the output stays ~99%\n   your drawing and the prompt does nothing. Recommended:\n\n   - SD1.5, zero-setup drop-in (works with THIS graph as-is):\n     DreamShaper8_LCM.safetensors  (HF: Lykon/dreamshaper-8-lcm)\n\n   - SDXL, best quality (10GB+ VRAM) - then set the KSampler below to\n     sampler=euler, scheduler=sgm_uniform, CFG 1.0 (keep 4 steps):\n     sdxl_lightning_4step.safetensors  (HF: ByteDance/SDXL-Lightning)\n\n   - Keep your own SD1.5 model? Add the LCM-LoRA\n     (latent-consistency/lcm-lora-sdv1-5) via a LoraLoaderModelOnly\n     node between Checkpoint and KSampler, strength 1.0.\n\n   - No download at all: set the KSampler to sampler=euler,\n     scheduler=normal, steps=20, CFG=7 - works with ANY model but is\n     ~5x slower (draw, pause, see result - not a smooth live loop).\n\n2) In Photoshop: open the ComfyUI Bridge panel, click Start Live, draw.\n\n3) Type your prompt in the panel's LIVE PROMPT field - it drives the\n   \"Photoshop Live Prompt\" node here (no need to edit the graph).\n\n4) denoise = your creativity knob. LOW (~0.4) hugs your drawing; HIGH\n   (~0.8) follows the prompt more."
+        "REALTIME DRAWING - quickstart\n\n1) Point the Checkpoint at a FAST few-step model. A PLAIN model\n   (v1-5-pruned, SDXL base, DreamShaper/Juggernaut with NO\n   LCM/Turbo/Lightning/Hyper in the name) will NOT work - it barely\n   denoises at 4 steps, so the output stays ~99% your drawing.\n   Recommended:\n   - SD1.5 zero-setup drop-in (works with THIS graph as-is):\n     DreamShaper8_LCM.safetensors  (HF: Lykon/dreamshaper-8-lcm)\n   - SDXL, best quality (10GB+ VRAM): sdxl_lightning_4step.safetensors\n     (HF: ByteDance/SDXL-Lightning) - then set the KSampler to\n     sampler=euler, scheduler=sgm_uniform, CFG 1.0, and do NOT add an\n     LCM LoRA (Lightning is already few-step).\n\n2) In Photoshop: open the ComfyUI Bridge panel, Start Live, and draw.\n\n3) The PROMPT and CREATIVITY controls are in the 'ComfyUI Preview'\n   panel (Plugins > ComfyUI Bridge > ComfyUI Preview), under the image:\n   - PROMPT box drives the 'Photoshop Live Prompt' node here.\n   - CREATIVITY slider drives the 'Photoshop Live Creativity' node,\n     which sets this KSampler's denoise. Low = hug your drawing,\n     high = reinterpret it. That is the fix for 'looks like my drawing':\n     effective work ~= steps x denoise, so at 4 steps keep it high\n     enough (the slider maps to denoise 0.40-0.85 by default).\n\nYou never have to edit this graph to change the prompt or adherence -\ndo it from the Photoshop panel."
       ],
       "title": "READ ME \u2014 realtime drawing quickstart",
       "color": "#432",
       "bgcolor": "#653"
+    },
+    {
+      "id": 12,
+      "type": "PhotoshopLiveCreativity",
+      "pos": [
+        40,
+        680
+      ],
+      "size": {
+        "0": 320,
+        "1": 110
+      },
+      "flags": {},
+      "order": 12,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "denoise",
+          "type": "FLOAT",
+          "links": [
+            14
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopLiveCreativity"
+      },
+      "widgets_values": [
+        0.6,
+        0.4,
+        0.85
+      ],
+      "title": "Photoshop Live Creativity (slider in the PS preview panel)"
     }
   ],
   "links": [
@@ -534,6 +577,14 @@
       3,
       1,
       "STRING"
+    ],
+    [
+      14,
+      12,
+      0,
+      6,
+      4,
+      "FLOAT"
     ]
   ],
   "groups": [],

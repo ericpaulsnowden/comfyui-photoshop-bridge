@@ -712,6 +712,27 @@ export function onLivePrompt(callback) {
 }
 
 /**
+ * @typedef {Object} CpsbLiveCreativityEvent
+ * Payload of the `cpsb.livecreativity` websocket event (realtime drawing
+ * creativity slider): the user moved the preview panel's Creativity slider.
+ * @property {number} creativity - The new value, 0.0..1.0. The node maps it
+ * onto a denoise band server-side; consumers only need the re-render nudge.
+ */
+
+/**
+ * Subscribes to the `cpsb.livecreativity` websocket event (the creativity
+ * slider changed — `live.js` re-queues on it just like a frame or a prompt).
+ * @param {(detail: CpsbLiveCreativityEvent) => void} callback
+ * @returns {() => void} Unsubscribe function.
+ */
+export function onLiveCreativity(callback) {
+  /** @param {CustomEvent<CpsbLiveCreativityEvent>} event */
+  const handler = (event) => callback(event.detail)
+  api.addEventListener('cpsb.livecreativity', handler)
+  return () => api.removeEventListener('cpsb.livecreativity', handler)
+}
+
+/**
  * Subscribes to the `cpsb.tier2` websocket event (plugin connection state
  * changed).
  * @param {(detail: CpsbTier2Event) => void} callback

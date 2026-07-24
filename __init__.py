@@ -45,6 +45,7 @@ NODE_CLASS_MAPPINGS = {
     "PhotoshopAction": _cpsb_actions.PhotoshopAction,
     "PhotoshopLiveCanvas": _cpsb_live.PhotoshopLiveCanvas,
     "PhotoshopLivePrompt": _cpsb_live.PhotoshopLivePrompt,
+    "PhotoshopLiveCreativity": _cpsb_live.PhotoshopLiveCreativity,
     "PhotoshopLivePreview": _cpsb_live.PhotoshopLivePreview,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -55,6 +56,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopAction": "Run Photoshop Action",
     "PhotoshopLiveCanvas": "Photoshop Live Canvas",
     "PhotoshopLivePrompt": "Photoshop Live Prompt",
+    "PhotoshopLiveCreativity": "Photoshop Live Creativity",
     "PhotoshopLivePreview": "Photoshop Live Preview",
 }
 

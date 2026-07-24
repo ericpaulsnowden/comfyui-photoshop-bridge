@@ -20,7 +20,6 @@ const { getActiveHandoffs, registryEvents, deliverEdit, clearAllHandoffs } = req
 const { getLogLines, onLogLine, logError, describeError } = require('./log.js')
 const { isAutoFixEnabled, setAutoFixEnabled } = require('./prefs.js')
 const { toggleLive, getLiveState, liveEvents } = require('./liveMode.js')
-const { setLivePrompt } = require('./livePrompt.js')
 
 // Same version source the `hello` handshake message uses (connection.js):
 // require('uxp').versions.plugin is documented to match manifest.json's
@@ -388,22 +387,6 @@ function initPanel() {
     }
   })
   liveEvents.addEventListener('change', renderLive)
-
-  // Live prompt field: stream each edit to the server (debounced in
-  // livePrompt.js) so a "Photoshop Live Prompt" node can serve it. Guarded in
-  // case the element is absent (older panel.html): the panel must still boot.
-  const livePromptField = /** @type {HTMLInputElement} */ (
-    document.getElementById('cpsb-live-prompt')
-  )
-  if (livePromptField) {
-    livePromptField.addEventListener('input', () => {
-      try {
-        setLivePrompt(livePromptField.value || '')
-      } catch (error) {
-        logError(`Live prompt send failed: ${describeError(error)}`)
-      }
-    })
-  }
 
   renderConnection()
   renderHandoffs()

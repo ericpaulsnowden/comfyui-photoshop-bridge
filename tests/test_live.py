@@ -88,6 +88,16 @@ def push_prompt(
     )
 
 
+def push_creativity(
+    context: CpsbContext,
+    connection: routes_module.PluginConnection,
+    value: float,
+) -> None:
+    routes_module._handle_live_creativity(
+        context, connection, {"type": "live_creativity", "value": value}
+    )
+
+
 def push_frame(
     context: CpsbContext,
     connection: routes_module.PluginConnection,
@@ -332,6 +342,69 @@ class TestLivePrompt:
         push_prompt(context, connection, "no-live-prompt")
         typed_key = live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET)
         assert typed_key != empty_key  # no aliasing -> clearing re-runs
+
+
+class TestLiveCreativity:
+    """`PhotoshopLiveCreativity`: maps the panel slider (0..1) onto a denoise
+    band, falling back to its own widget so ComfyUI-only works."""
+
+    def test_falls_back_to_widget_denoise(self, live_app):
+        node = live_module.PhotoshopLiveCreativity()
+        # creativity 0.5 over band [0.4, 0.85] -> 0.4 + 0.5*0.45 = 0.625
+        (denoise,) = node.execute(creativity=0.5, min_denoise=0.4, max_denoise=0.85)
+        assert denoise == pytest.approx(0.625)
+        assert (
+            live_module.PhotoshopLiveCreativity.IS_CHANGED(
+                creativity=0.5, min_denoise=0.4, max_denoise=0.85
+            )
+            == "no-live-creativity"
+        )
+
+    def test_falls_back_with_no_plugin(self, no_plugin_app):
+        node = live_module.PhotoshopLiveCreativity()
+        (denoise,) = node.execute(creativity=0.0, min_denoise=0.4, max_denoise=0.85)
+        assert denoise == pytest.approx(0.4)  # creativity 0 -> min
+
+    def test_panel_slider_overrides_widget(self, context, live_app):
+        _app, connection = live_app
+        push_creativity(context, connection, 1.0)  # max creativity -> max_denoise
+        node = live_module.PhotoshopLiveCreativity()
+        (denoise,) = node.execute(creativity=0.0, min_denoise=0.4, max_denoise=0.85)
+        assert denoise == pytest.approx(0.85)
+        assert (
+            live_module.PhotoshopLiveCreativity.IS_CHANGED(
+                creativity=0.0, min_denoise=0.4, max_denoise=0.85
+            )
+            == "live:1.0"
+        )
+
+    def test_value_is_clamped_to_unit_range(self, context, live_app):
+        _app, connection = live_app
+        push_creativity(context, connection, 5.0)  # out of range -> clamped to 1.0
+        assert routes_module.get_live_creativity(_app) == 1.0
+        node = live_module.PhotoshopLiveCreativity()
+        (denoise,) = node.execute(creativity=0.0, min_denoise=0.4, max_denoise=0.85)
+        assert denoise == pytest.approx(0.85)
+
+    def test_inverted_band_does_not_invert_output(self, live_app):
+        """min>max is sorted so the map can't run backwards."""
+        node = live_module.PhotoshopLiveCreativity()
+        (denoise,) = node.execute(creativity=1.0, min_denoise=0.9, max_denoise=0.3)
+        assert denoise == pytest.approx(0.9)  # sorted -> [0.3, 0.9], creativity 1 -> 0.9
+
+    def test_is_changed_tracks_each_slider_move(self, context, live_app):
+        _app, connection = live_app
+        push_creativity(context, connection, 0.3)
+        first = live_module.PhotoshopLiveCreativity.IS_CHANGED(
+            creativity=0.5, min_denoise=0.4, max_denoise=0.85
+        )
+        push_creativity(context, connection, 0.7)
+        assert (
+            live_module.PhotoshopLiveCreativity.IS_CHANGED(
+                creativity=0.5, min_denoise=0.4, max_denoise=0.85
+            )
+            != first
+        )
 
 
 class TestLivePreview:

@@ -389,6 +389,13 @@ Plugin → server:
   a workflow without a panel prompt still works — clearing the field "hands control back"
   to the graph). Emits `cpsb.liveprompt` (§5). Like `live_frame`: fire-and-forget, never
   a handoff, dies with the connection.
+- `{"type": "live_creativity", "value": 0.75}` — realtime drawing creativity slider: the
+  preview panel's Creativity slider position, `0.0..1.0` (`liveCreativity.js`, debounced).
+  The server clamps it to `0.0..1.0` and holds the newest in ONE keep-latest slot
+  (`PluginConnection.live_creativity`); `PhotoshopLiveCreativity` (§6f) maps it onto a
+  denoise band, falling back to its own widget when the slider was never touched. A
+  non-numeric value is dropped with a log line. Emits `cpsb.livecreativity` (§5).
+  Fire-and-forget, never a handoff, dies with the connection.
 - `{"type": "pong"}`
 
 Server → plugin:
@@ -570,12 +577,16 @@ research/research-annotate-node.md retain the design if ever revisited.
   of the frame, §6f). The M2 frontend live loop queues a coalesced re-run on this event;
   consumers never fetch the frame itself — only the node reads the in-memory slot, at
   execute time.
-- `"cpsb.liveprompt"` — the panel's LIVE PROMPT field changed (realtime drawing prompt
+- `"cpsb.liveprompt"` — the preview panel's PROMPT field changed (realtime drawing prompt
   control): `{"has_prompt": true}` (`false` when the field was cleared). The M2 frontend
   live loop re-queues on this event exactly like a new frame — a prompt tweak should
   re-render like a stroke. The text is deliberately NOT in the payload:
   `PhotoshopLivePrompt` (§6f) reads it server-side at execute time, the same posture as
   `cpsb.live`.
+- `"cpsb.livecreativity"` — the preview panel's Creativity slider moved:
+  `{"creativity": 0.75}` (0.0..1.0). The live loop re-queues on it like a frame or a
+  prompt edit; the value is echoed for logging, but `PhotoshopLiveCreativity` (§6f) reads
+  the slot server-side at execute time.
 
 **Universal cancel (product-owner requirement 2026-07-17):** ANY node that shows the
 "Editing in Photoshop…" badge (badges.js) MUST expose a working cancel ✕, regardless of
@@ -1143,7 +1154,7 @@ plugin is connected or no frame has streamed yet.
   comment carries the research/spike provenance — the history-id poll's stroke-promptness
   is spike S-A, owner-verified via the checklist).
 - **`PhotoshopLivePrompt`** (same module): serves the prompt the user typed in the
-  panel's **LIVE PROMPT** field (`live_prompt`, §3) as its `STRING` output — wire it into
+  preview panel's **PROMPT** field (`live_prompt`, §3) as its `STRING` output — wire it into
   a `CLIPTextEncode` `text` input (convert the widget to an input) so the render is
   steered from inside Photoshop. **NOT Tier-2-gated** (unlike Live Canvas): a prompt is
   just text, not save-free capture, so the node ALWAYS returns a usable value — it falls
@@ -1152,6 +1163,16 @@ plugin is connected or no frame has streamed yet.
   plugin makes it *better* (type in the panel, re-renders live). `IS_CHANGED` returns the
   streamed panel text (or `"no-live-prompt"`), so a panel edit busts the cache; the
   widget's own value is diffed natively by ComfyUI.
+- **`PhotoshopLiveCreativity`** (same module): a `FLOAT` output for the KSampler's
+  `denoise` input (convert that widget to an input). The preview panel's Creativity slider
+  (`live_creativity`, §3) streams `0.0..1.0`; the node maps it onto a denoise band
+  (`min_denoise`..`max_denoise` widgets, default 0.40..0.85) so the user tunes how much
+  the AI reinterprets the drawing — low = hug the sketch, high = reinterpret — WITHOUT
+  opening ComfyUI. Denoise is the single most effective adherence control at a fixed
+  few-step count (it is the fix for "the render looks 99% like my drawing": effective work
+  ≈ steps × denoise). **NOT Tier-2-gated**: falls back to its own `creativity` widget when
+  the slider was never touched, so ComfyUI-only works. `IS_CHANGED` surfaces the streamed
+  value (namespaced `live:`, same anti-alias as the prompt node).
 - **`PhotoshopLivePreview`** (M3, same module): the loop's feedback surface. An OUTPUT
   node (IMAGE in, no return sockets) that JPEG-encodes each render (quality 85) and
   pushes it as `result_frame` (§3) to the plugin's **"ComfyUI Preview" panel** — a second
@@ -1162,7 +1183,10 @@ plugin is connected or no frame has streamed yet.
   worse than the missing preview (the CANVAS node already gates the pipeline's start).
   Multi-panel mount caveats (show-fires-once, node-carrying shape variance) are handled
   in `previewPanel.js`/`index.js` per the community-verified example; the img-refresh
-  rate is roadmap spike S-C, owner-verified via the checklist.
+  rate is roadmap spike S-C, owner-verified via the checklist. **This panel also hosts the
+  PROMPT field and Creativity slider** (under the image), so the two live controls sit with
+  the render they affect and survive collapsing the main "ComfyUI" panel — they feed
+  `PhotoshopLivePrompt`/`PhotoshopLiveCreativity` via `live_prompt`/`live_creativity` (§3).
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 
@@ -1232,9 +1256,10 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
   `cpsb.showUpgradeBanner` (bool, default true).
 - **Live loop** (`web/cpsb/live.js`, realtime drawing M2): each `cpsb.live` event — AND
-  each `cpsb.liveprompt` event (the panel prompt changed) — queues at
-  most ONE coalesced `queuePrompt(0)` via a shared `requestQueue()` seam (a prompt tweak
-  re-renders like a stroke) — armed only while the current graph contains an
+  each `cpsb.liveprompt` (prompt changed) and `cpsb.livecreativity` (slider moved) event —
+  queues at most ONE coalesced `queuePrompt(0)` via a shared `requestQueue()` seam (a
+  prompt tweak or slider drag re-renders like a stroke) — armed only while the current
+  graph contains an
   ACTIVE (non-muted/bypassed) `PhotoshopLiveCanvas` node with `auto_queue` = "On",
   searched recursively through subgraphs (widget read client-side per event, the same
   gating convention as `pasteback.js`'s bridge-mode check). Single-slot backpressure

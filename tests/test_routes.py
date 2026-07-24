@@ -3301,3 +3301,47 @@ class TestLivePrompt:
             await _connect_tier2_plugin(ws, context, local_mode=False)
             await wait_until(lambda: routes_module.tier2_connected(client.app))
             assert routes_module.get_live_prompt(client.app) is None  # ready, no prompt yet
+
+
+class TestLiveCreativity:
+    """`live_creativity` (realtime creativity slider): the preview panel's
+    slider, streamed to one keep-latest slot, clamped to 0.0..1.0."""
+
+    async def test_value_stored_and_event_emitted(self, client, context, manager, events):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "live_creativity", "value": 0.75})
+            await wait_until(lambda: routes_module.get_live_creativity(client.app) == 0.75)
+            evs = events.of_type("cpsb.livecreativity")
+            assert evs and evs[-1] == {"creativity": 0.75}
+
+    async def test_value_is_clamped(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "live_creativity", "value": 9.0})
+            await wait_until(lambda: routes_module.get_live_creativity(client.app) == 1.0)
+            await ws.send_json({"type": "live_creativity", "value": -3.0})
+            await wait_until(lambda: routes_module.get_live_creativity(client.app) == 0.0)
+
+    async def test_non_numeric_value_dropped(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "live_creativity", "value": 0.5})
+            await wait_until(lambda: routes_module.get_live_creativity(client.app) == 0.5)
+            await ws.send_json({"type": "live_creativity", "value": "not-a-number"})
+            # Bad value dropped: the slot keeps the last good value.
+            await ws.send_json({"type": "live_creativity", "value": 0.6})
+            await wait_until(lambda: routes_module.get_live_creativity(client.app) == 0.6)
+
+    async def test_get_live_creativity_none_without_plugin(self, client, context, manager):
+        assert routes_module.get_live_creativity(client.app) is None
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            assert routes_module.get_live_creativity(client.app) is None  # ready, untouched

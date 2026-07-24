@@ -224,6 +224,11 @@ class PluginConnection:
     #: node widget when ``None`` (so the ComfyUI-only path still works). Like
     #: `live_jpeg` it is a transient view that dies with the connection.
     live_prompt: str | None = None
+    #: Realtime drawing "creativity" knob (0.0..1.0) from the preview panel's
+    #: slider (`live_creativity` message), or ``None`` when unset.
+    #: `PhotoshopLiveCreativity` maps it onto a denoise band and falls back to
+    #: its own widget when ``None``. Transient, dies with the connection.
+    live_creativity: float | None = None
 
 
 class _PluginSlot:
@@ -2217,6 +2222,40 @@ def get_live_prompt(app: web.Application) -> str | None:
     return connection.live_prompt
 
 
+def _handle_live_creativity(
+    context: CpsbContext, connection: PluginConnection, msg: dict[str, Any]
+) -> None:
+    """Handle one `live_creativity` (realtime creativity slider, PROTOCOL.md §3).
+
+    Stores the preview panel's slider value (clamped to 0.0..1.0) and emits
+    `cpsb.livecreativity` so the frontend live loop re-queues -- a slider drag
+    re-renders exactly like a stroke or a prompt edit. A non-numeric value is
+    dropped with a log line (fire-and-forget, keep-latest). The node reads the
+    slot at execute time and maps it onto its denoise band.
+    """
+    try:
+        value = float(msg.get("value"))
+    except (TypeError, ValueError):
+        logger.warning("cpsb: live_creativity with non-numeric value, dropping")
+        return
+    connection.live_creativity = max(0.0, min(1.0, value))
+    context.send_event("cpsb.livecreativity", {"creativity": connection.live_creativity})
+
+
+def get_live_creativity(app: web.Application) -> float | None:
+    """The newest panel creativity value (0.0..1.0), or ``None`` when unset.
+
+    ``None`` (no plugin, not ready, or slider never touched) tells
+    `PhotoshopLiveCreativity` to use its own node widget instead. Same
+    accessor convention as :func:`get_live_prompt`.
+    """
+    slot = app.get(_APP_KEY_PLUGIN)
+    connection = slot.connection if slot is not None else None
+    if connection is None or not connection.ready:
+        return None
+    return connection.live_creativity
+
+
 def get_live_frame(app: web.Application) -> tuple[bytes, int, str] | None:
     """The newest live canvas frame, or ``None`` when there is none to serve.
 
@@ -2366,6 +2405,8 @@ async def _handle_plugin_message(
         _handle_live_frame(context, connection, msg)
     elif msg_type == "live_prompt":
         _handle_live_prompt(context, connection, msg)
+    elif msg_type == "live_creativity":
+        _handle_live_creativity(context, connection, msg)
     elif msg_type == "action_ok":
         # The PhotoshopAction node (cpsb/actions.py, not yet in PROTOCOL.md
         # §3) -- informational only, exactly like "opened"/"save_detected"
