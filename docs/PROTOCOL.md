@@ -406,6 +406,13 @@ Server → plugin:
   identical bytes can never change the outcome); `invalid_image`/`malformed` are left
   retryable, matching the HTTP path's own behavior of still retrying after a 400.
 - `{"type": "handoff_cancelled", "handoff_id": "..."}` — stop tracking that document.
+- `{"type": "result_frame", "data_b64": "<jpeg>", "doc_title": "sketch.psd"}` — realtime
+  drawing M3: one rendered live-loop result, sent by the `PhotoshopLivePreview` node
+  (§6f) after each render for the plugin's "ComfyUI Preview" panel
+  (`photoshop_plugin/previewPanel.js`, the second panel entrypoint). Fire-and-forget
+  keep-latest, mirroring `live_frame` in the other direction: no ack, each frame replaces
+  the last, and a frame arriving while the preview panel has never been opened is simply
+  remembered and shown on first mount.
 - `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
   the socket (plugin reconnects with backoff).
 
@@ -1114,6 +1121,17 @@ plugin is connected or no frame has streamed yet.
   768px long-side `targetSize`, `dispose()` after every capture (`liveMode.js`'s doc
   comment carries the research/spike provenance — the history-id poll's stroke-promptness
   is spike S-A, owner-verified via the checklist).
+- **`PhotoshopLivePreview`** (M3, same module): the loop's feedback surface. An OUTPUT
+  node (IMAGE in, no return sockets) that JPEG-encodes each render (quality 85) and
+  pushes it as `result_frame` (§3) to the plugin's **"ComfyUI Preview" panel** — a second
+  manifest panel entrypoint (documented multi-panel; one shared JS context, so it reuses
+  the same connection singleton), dockable beside the canvas. Deliberately NOT
+  Tier-2-gated with an interrupt: it runs at the END of a render, so a dropped plugin is
+  a logged no-op — killing a finished render over a missing preview surface would be
+  worse than the missing preview (the CANVAS node already gates the pipeline's start).
+  Multi-panel mount caveats (show-fires-once, node-carrying shape variance) are handled
+  in `previewPanel.js`/`index.js` per the community-verified example; the img-refresh
+  rate is roadmap spike S-C, owner-verified via the checklist.
 
 ## 7. Photoshop discovery & launch (Tier 1, backend)
 

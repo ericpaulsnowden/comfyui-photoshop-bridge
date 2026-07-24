@@ -1,6 +1,6 @@
 {
-  "last_node_id": 8,
-  "last_link_id": 11,
+  "last_node_id": 9,
+  "last_link_id": 12,
   "nodes": [
     {
       "id": 1,
@@ -298,7 +298,8 @@
           "name": "IMAGE",
           "type": "IMAGE",
           "links": [
-            11
+            11,
+            12
           ],
           "slot_index": 0
         }
@@ -331,6 +332,32 @@
       "outputs": [],
       "properties": {
         "Node name for S&R": "PreviewImage"
+      }
+    },
+    {
+      "id": 9,
+      "type": "PhotoshopLivePreview",
+      "pos": [
+        1400,
+        560
+      ],
+      "size": {
+        "0": 260,
+        "1": 60
+      },
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 12
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PhotoshopLivePreview"
       }
     }
   ],
@@ -420,6 +447,14 @@
       7,
       0,
       8,
+      0,
+      "IMAGE"
+    ],
+    [
+      12,
+      7,
+      0,
+      9,
       0,
       "IMAGE"
     ]

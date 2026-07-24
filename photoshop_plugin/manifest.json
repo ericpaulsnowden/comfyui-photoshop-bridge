@@ -2,7 +2,7 @@
   "manifestVersion": 5,
   "id": "com.cpsb.comfyui-bridge",
   "name": "ComfyUI Bridge",
-  "version": "0.5.46",
+  "version": "0.5.47",
   "main": "panel.html",
   "host": {
     "app": "PS",
@@ -23,6 +23,17 @@
       "maximumSize": { "width": 2000, "height": 2000 },
       "preferredDockedSize": { "width": 280, "height": 400 },
       "preferredFloatingSize": { "width": 280, "height": 400 }
+    },
+    {
+      "type": "panel",
+      "id": "comfyuiPreview",
+      "label": {
+        "default": "ComfyUI Preview"
+      },
+      "minimumSize": { "width": 200, "height": 200 },
+      "maximumSize": { "width": 2000, "height": 2000 },
+      "preferredDockedSize": { "width": 320, "height": 340 },
+      "preferredFloatingSize": { "width": 320, "height": 340 }
     },
     {
       "type": "command",

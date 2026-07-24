@@ -88,6 +88,9 @@ function bootstrap() {
   const { initPanel } = require('./panel.js')
   const { logError, describeError } = require('./log.js')
   const { sendToComfyUI } = require('./manualSend.js')
+  // Registers its connection listener at load (a result_frame arriving
+  // before the preview panel is ever opened is remembered as the latest).
+  const { mountPreviewPanel } = require('./previewPanel.js')
 
   /**
    * Implements the "Send" Plugins-menu command: exports and uploads
@@ -143,6 +146,30 @@ function bootstrap() {
             initPanel()
           } catch (error) {
             logError(`panel create failed: ${describeError(error)}`)
+          }
+        }
+      },
+      // Second panel (realtime drawing M3): multi-panel is documented
+      // (EntryPoints reference's own panels-map example) — both panels
+      // share this one JS context, so previewPanel.js reuses the same
+      // connection singleton with no extra plumbing. Both create() and
+      // show() attempt the mount (mountPreviewPanel is idempotent):
+      // the community-verified multi-panel example notes show() fires only
+      // once at creation on some hosts, and which of the two carries the
+      // root node varies — covering both is the belt-and-braces.
+      comfyuiPreview: {
+        create(event) {
+          try {
+            mountPreviewPanel(event)
+          } catch (error) {
+            logError(`preview panel create failed: ${describeError(error)}`)
+          }
+        },
+        show(event) {
+          try {
+            mountPreviewPanel(event)
+          } catch (error) {
+            logError(`preview panel show failed: ${describeError(error)}`)
           }
         }
       }

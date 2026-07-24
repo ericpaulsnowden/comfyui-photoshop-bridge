@@ -44,6 +44,7 @@ NODE_CLASS_MAPPINGS = {
     "PhotoshopAnnotate": _cpsb_annotate.PhotoshopAnnotate,
     "PhotoshopAction": _cpsb_actions.PhotoshopAction,
     "PhotoshopLiveCanvas": _cpsb_live.PhotoshopLiveCanvas,
+    "PhotoshopLivePreview": _cpsb_live.PhotoshopLivePreview,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopBridge": "Edit in Photoshop",
@@ -52,6 +53,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopAnnotate": "Annotate for Edit",
     "PhotoshopAction": "Run Photoshop Action",
     "PhotoshopLiveCanvas": "Photoshop Live Canvas",
+    "PhotoshopLivePreview": "Photoshop Live Preview",
 }
 
 # ComfyUI checks os.path.isdir() on this itself (nodes.py load_custom_node),

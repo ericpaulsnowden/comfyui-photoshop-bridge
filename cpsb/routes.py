@@ -2195,6 +2195,32 @@ def get_live_frame(app: web.Application) -> tuple[bytes, int, str] | None:
     return connection.live_jpeg, connection.live_seq, connection.live_doc_title
 
 
+async def send_result_frame(app: web.Application, data_b64: str, doc_title: str) -> bool:
+    """Push one rendered live-loop result to the plugin's preview panel.
+
+    Realtime drawing M3 (docs/roadmap/realtime-drawing.md): the
+    ``PhotoshopLivePreview`` node calls this (cross-thread, exactly like
+    :func:`send_run_action`'s caller) with the JPEG of its IMAGE input; the
+    plugin's "ComfyUI Preview" panel displays it. Single message -- result
+    frames are a few hundred KB, far under any frame cap -- and
+    fire-and-forget keep-latest like `live_frame` in the other direction:
+    no ack, a dropped frame is replaced by the next render.
+
+    Returns:
+        ``True`` once the message was handed to a connected, ready plugin's
+        websocket; ``False`` when no plugin is connected (the caller logs
+        and no-ops -- a missing preview surface must not fail a render).
+    """
+    slot = app.get(_APP_KEY_PLUGIN)
+    plugin = slot.connection if slot is not None else None
+    if plugin is None or not plugin.ready:
+        return False
+    await plugin.ws.send_json(
+        {"type": "result_frame", "data_b64": data_b64, "doc_title": doc_title}
+    )
+    return True
+
+
 async def _handle_plugin_message(
     context: CpsbContext,
     manager: HandoffManager,

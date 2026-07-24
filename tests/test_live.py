@@ -174,3 +174,92 @@ class TestExecute:
         node = live_module.PhotoshopLiveCanvas()
         with raises_interrupt():
             node.execute(auto_queue="On")
+
+
+class _RecordingSocket:
+    """Same recording fake as ``tests/test_actions.py``'s."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send_json(self, payload: dict) -> None:
+        self.sent.append(payload)
+
+
+@pytest.fixture
+def loop_thread():
+    import asyncio
+    import threading
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+
+
+@pytest.fixture
+def preview_rig(context: CpsbContext, manager: HandoffManager, loop_thread):
+    """A configured ``PhotoshopLivePreview`` with a ready fake plugin whose
+    socket records every send -- mirrors ``tests/test_actions.py``'s
+    ``tier2_action`` fixture."""
+    socket = _RecordingSocket()
+    app = web.Application()
+    routes_module.install(app, context, manager)
+    connection = routes_module.PluginConnection(ws=cast("object", socket), ready=True)
+    app[routes_module._APP_KEY_PLUGIN].connection = connection
+    nodes_module.configure(context, manager, app, loop_thread)
+    yield live_module.PhotoshopLivePreview(), socket, connection
+    nodes_module._state = None
+
+
+def make_image_tensor(color: tuple[int, int, int], size: tuple[int, int] = (24, 16)):
+    import torch
+
+    array = np.zeros((size[1], size[0], 3), dtype=np.float32)
+    array[..., 0], array[..., 1], array[..., 2] = (c / 255.0 for c in color)
+    return torch.from_numpy(array)[None, ...]
+
+
+class TestLivePreview:
+    def test_sends_result_frame_jpeg(self, context, preview_rig):
+        node, socket, connection = preview_rig
+        push_frame(context, connection, (1, 1, 1), title="sketch.psd")
+
+        result = node.execute(image=make_image_tensor((0, 200, 0)))
+
+        assert result == {}
+        frames = [m for m in socket.sent if m.get("type") == "result_frame"]
+        assert len(frames) == 1
+        assert frames[0]["doc_title"] == "sketch.psd"
+        decoded = Image.open(io.BytesIO(base64.b64decode(frames[0]["data_b64"])))
+        decoded.load()
+        assert decoded.size == (24, 16)
+        red, green, blue = decoded.getpixel((0, 0))
+        assert green > 150 and red < 60 and blue < 60  # JPEG-lossy green
+
+    def test_no_plugin_is_a_logged_noop_not_a_failure(
+        self, context, manager, loop_thread, caplog
+    ):
+        """The preview surface going missing must never kill a finished
+        render (class docstring) -- unlike the CANVAS node's hard gate."""
+        import logging as logging_module
+
+        app = web.Application()
+        routes_module.install(app, context, manager)
+        nodes_module.configure(context, manager, app, loop_thread)
+        try:
+            node = live_module.PhotoshopLivePreview()
+            with caplog.at_level(logging_module.WARNING, logger="cpsb"):
+                result = node.execute(image=make_image_tensor((9, 9, 9)))
+            assert result == {}
+            assert any("not delivered" in record.message for record in caplog.records)
+        finally:
+            nodes_module._state = None
+
+    def test_output_node_contract(self):
+        assert live_module.PhotoshopLivePreview.OUTPUT_NODE is True
+        assert live_module.PhotoshopLivePreview.RETURN_TYPES == ()
+        spec = live_module.PhotoshopLivePreview.INPUT_TYPES()
+        assert spec["required"]["image"] == ("IMAGE",)

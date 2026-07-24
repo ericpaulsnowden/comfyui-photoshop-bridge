@@ -136,6 +136,7 @@ class TestDisplayNameMapping:
             "PhotoshopAnnotate": "Annotate for Edit",
             "PhotoshopAction": "Run Photoshop Action",
             "PhotoshopLiveCanvas": "Photoshop Live Canvas",
+            "PhotoshopLivePreview": "Photoshop Live Preview",
         }
         # The class ids themselves -- what saved workflows reference -- must be untouched.
         assert set(entry.NODE_CLASS_MAPPINGS) == {
@@ -145,6 +146,7 @@ class TestDisplayNameMapping:
             "PhotoshopAnnotate",
             "PhotoshopAction",
             "PhotoshopLiveCanvas",
+            "PhotoshopLivePreview",
         }
         assert entry.NODE_CLASS_MAPPINGS["PhotoshopBridge"] is nodes_module.PhotoshopBridge
         assert entry.NODE_CLASS_MAPPINGS["PhotoshopLoadPSD"] is load_psd_module.PhotoshopLoadPSD
