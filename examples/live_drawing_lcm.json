@@ -1,6 +1,6 @@
 {
-  "last_node_id": 9,
-  "last_link_id": 12,
+  "last_node_id": 11,
+  "last_link_id": 13,
   "nodes": [
     {
       "id": 1,
@@ -38,14 +38,15 @@
       },
       "widgets_values": [
         "On"
-      ]
+      ],
+      "title": "Photoshop Live Canvas (your drawing)"
     },
     {
       "id": 2,
       "type": "CheckpointLoaderSimple",
       "pos": [
         40,
-        360
+        340
       ],
       "size": {
         "0": 320,
@@ -87,28 +88,36 @@
         "Node name for S&R": "CheckpointLoaderSimple"
       },
       "widgets_values": [
-        "v1-5-pruned-emaonly.safetensors"
+        "put-an-LCM-or-Lightning-model.safetensors"
       ]
     },
     {
       "id": 3,
       "type": "CLIPTextEncode",
       "pos": [
-        420,
-        320
+        560,
+        300
       ],
       "size": {
         "0": 340,
         "1": 100
       },
       "flags": {},
-      "order": 2,
+      "order": 4,
       "mode": 0,
       "inputs": [
         {
           "name": "clip",
           "type": "CLIP",
           "link": 3
+        },
+        {
+          "name": "text",
+          "type": "STRING",
+          "link": 13,
+          "widget": {
+            "name": "text"
+          }
         }
       ],
       "outputs": [
@@ -127,21 +136,21 @@
       "widgets_values": [
         "a detailed digital painting, vivid colors"
       ],
-      "title": "Positive prompt"
+      "title": "Positive prompt (driven by the panel)"
     },
     {
       "id": 4,
       "type": "CLIPTextEncode",
       "pos": [
-        420,
-        470
+        560,
+        460
       ],
       "size": {
         "0": 340,
         "1": 100
       },
       "flags": {},
-      "order": 3,
+      "order": 2,
       "mode": 0,
       "inputs": [
         {
@@ -172,7 +181,7 @@
       "id": 5,
       "type": "VAEEncode",
       "pos": [
-        420,
+        560,
         180
       ],
       "size": {
@@ -180,7 +189,7 @@
         "1": 60
       },
       "flags": {},
-      "order": 4,
+      "order": 3,
       "mode": 0,
       "inputs": [
         {
@@ -212,7 +221,7 @@
       "id": 6,
       "type": "KSampler",
       "pos": [
-        820,
+        960,
         200
       ],
       "size": {
@@ -261,17 +270,17 @@
         0,
         "fixed",
         4,
-        1.5,
+        2.0,
         "lcm",
         "sgm_uniform",
-        0.5
+        0.65
       ]
     },
     {
       "id": 7,
       "type": "VAEDecode",
       "pos": [
-        1160,
+        1300,
         200
       ],
       "size": {
@@ -312,7 +321,7 @@
       "id": 8,
       "type": "PreviewImage",
       "pos": [
-        1400,
+        1540,
         200
       ],
       "size": {
@@ -338,8 +347,8 @@
       "id": 9,
       "type": "PhotoshopLivePreview",
       "pos": [
-        1400,
-        560
+        1540,
+        540
       ],
       "size": {
         "0": 260,
@@ -358,7 +367,67 @@
       "outputs": [],
       "properties": {
         "Node name for S&R": "PhotoshopLivePreview"
-      }
+      },
+      "title": "Photoshop Live Preview (back into PS)"
+    },
+    {
+      "id": 10,
+      "type": "PhotoshopLivePrompt",
+      "pos": [
+        40,
+        500
+      ],
+      "size": {
+        "0": 320,
+        "1": 120
+      },
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "prompt",
+          "type": "STRING",
+          "links": [
+            13
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopLivePrompt"
+      },
+      "widgets_values": [
+        "a detailed digital painting, vivid colors"
+      ],
+      "title": "Photoshop Live Prompt (type in the PS panel)"
+    },
+    {
+      "id": 11,
+      "type": "Note",
+      "pos": [
+        960,
+        500
+      ],
+      "size": {
+        "0": 480,
+        "1": 300
+      },
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "text": ""
+      },
+      "widgets_values": [
+        "REALTIME DRAWING \u2014 quickstart\n\n1) Point the Checkpoint at a FAST few-step model: an LCM, SDXL-Turbo, or\n   SDXL-Lightning checkpoint (or a base model + its LCM LoRA). These\n   sampler settings (lcm sampler, 4 steps, CFG 2) ONLY behave on a\n   few-step model. With a NORMAL SD1.5/SDXL model instead, set\n   sampler_name=euler, scheduler=normal, steps~20, cfg~7.\n\n2) In Photoshop: open the ComfyUI Bridge panel, click Start Live, draw.\n\n3) Type your prompt in the panel's LIVE PROMPT field \u2014 it drives the\n   \"Photoshop Live Prompt\" node here (no need to edit the graph).\n\n4) denoise = your creativity knob. LOW (~0.4) hugs your drawing; HIGH\n   (~0.8) follows the prompt more. If changing the prompt seems to do\n   nothing, your denoise is too low OR your checkpoint isn't a few-step\n   model (see step 1)."
+      ],
+      "title": "READ ME \u2014 realtime drawing quickstart",
+      "color": "#432",
+      "bgcolor": "#653"
     }
   ],
   "links": [
@@ -457,6 +526,14 @@
       9,
       0,
       "IMAGE"
+    ],
+    [
+      13,
+      10,
+      0,
+      3,
+      1,
+      "STRING"
     ]
   ],
   "groups": [],

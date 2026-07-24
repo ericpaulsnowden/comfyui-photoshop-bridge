@@ -67,6 +67,27 @@ def no_plugin_node(context: CpsbContext, manager: HandoffManager):
     nodes_module._state = None
 
 
+@pytest.fixture
+def no_plugin_app(context: CpsbContext, manager: HandoffManager):
+    """App installed + nodes configured, but NO plugin connection -- the
+    ComfyUI-only path (`PhotoshopLivePrompt` falling back to its widget)."""
+    app = web.Application()
+    routes_module.install(app, context, manager)
+    nodes_module.configure(context, manager, app, cast("object", None))
+    yield app
+    nodes_module._state = None
+
+
+def push_prompt(
+    context: CpsbContext,
+    connection: routes_module.PluginConnection,
+    text: str,
+) -> None:
+    routes_module._handle_live_prompt(
+        context, connection, {"type": "live_prompt", "text": text}
+    )
+
+
 def push_frame(
     context: CpsbContext,
     connection: routes_module.PluginConnection,
@@ -249,6 +270,68 @@ def make_image_tensor(color: tuple[int, int, int], size: tuple[int, int] = (24, 
     array = np.zeros((size[1], size[0], 3), dtype=np.float32)
     array[..., 0], array[..., 1], array[..., 2] = (c / 255.0 for c in color)
     return torch.from_numpy(array)[None, ...]
+
+
+class TestLivePrompt:
+    """`PhotoshopLivePrompt`: serves the panel prompt, falling back to its own
+    node widget so the ComfyUI-only path still works."""
+
+    WIDGET = "a moody watercolor"
+
+    def test_falls_back_to_widget_with_no_streamed_prompt(self, live_app):
+        node = live_module.PhotoshopLivePrompt()
+        assert node.execute(prompt=self.WIDGET) == (self.WIDGET,)
+        assert live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET) == "no-live-prompt"
+
+    def test_falls_back_to_widget_with_no_plugin(self, no_plugin_app):
+        """No connection at all -> use the node widget (ComfyUI-only)."""
+        node = live_module.PhotoshopLivePrompt()
+        assert node.execute(prompt=self.WIDGET) == (self.WIDGET,)
+        assert live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET) == "no-live-prompt"
+
+    def test_serves_streamed_panel_prompt_over_widget(self, context, live_app):
+        _app, connection = live_app
+        push_prompt(context, connection, "a red origami bird")
+        node = live_module.PhotoshopLivePrompt()
+        assert node.execute(prompt=self.WIDGET) == ("a red origami bird",)
+        # IS_CHANGED namespaces the streamed value so it can never alias the
+        # empty-state sentinel (review-caught, 2026-07-24).
+        assert (
+            live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET)
+            == "live:a red origami bird"
+        )
+
+    def test_empty_panel_prompt_clears_back_to_widget(self, context, live_app):
+        _app, connection = live_app
+        push_prompt(context, connection, "temporary override")
+        push_prompt(context, connection, "")
+        node = live_module.PhotoshopLivePrompt()
+        assert node.execute(prompt=self.WIDGET) == (self.WIDGET,)
+        assert live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET) == "no-live-prompt"
+
+    def test_whitespace_panel_prompt_clears_back_to_widget(self, context, live_app):
+        _app, connection = live_app
+        push_prompt(context, connection, "   \n  ")
+        node = live_module.PhotoshopLivePrompt()
+        assert node.execute(prompt=self.WIDGET) == (self.WIDGET,)
+
+    def test_is_changed_tracks_each_panel_edit(self, context, live_app):
+        _app, connection = live_app
+        push_prompt(context, connection, "a cat")
+        first = live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET)
+        push_prompt(context, connection, "a dog")
+        assert live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET) != first
+
+    def test_streamed_text_cannot_alias_empty_sentinel(self, context, live_app):
+        """Regression (review-caught, 2026-07-24): a user typing the literal
+        sentinel string then clearing the field must still re-execute and fall
+        back to the widget -- the streamed key is namespaced so it can never
+        equal the empty-state key."""
+        _app, connection = live_app
+        empty_key = live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET)
+        push_prompt(context, connection, "no-live-prompt")
+        typed_key = live_module.PhotoshopLivePrompt.IS_CHANGED(prompt=self.WIDGET)
+        assert typed_key != empty_key  # no aliasing -> clearing re-runs
 
 
 class TestLivePreview:

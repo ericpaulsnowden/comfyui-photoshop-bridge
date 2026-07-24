@@ -690,6 +690,28 @@ export function onLive(callback) {
 }
 
 /**
+ * @typedef {Object} CpsbLivePromptEvent
+ * Payload of the `cpsb.liveprompt` websocket event (PROTOCOL.md §5, realtime
+ * drawing prompt control): the user edited the plugin panel's Live prompt
+ * field. The text itself is deliberately NOT carried — `PhotoshopLivePrompt`
+ * reads it server-side at execute time; consumers only need the nudge.
+ * @property {boolean} has_prompt - Whether the panel field is now non-empty.
+ */
+
+/**
+ * Subscribes to the `cpsb.liveprompt` websocket event (the panel prompt
+ * changed — `live.js` re-queues on it just like a new frame).
+ * @param {(detail: CpsbLivePromptEvent) => void} callback
+ * @returns {() => void} Unsubscribe function.
+ */
+export function onLivePrompt(callback) {
+  /** @param {CustomEvent<CpsbLivePromptEvent>} event */
+  const handler = (event) => callback(event.detail)
+  api.addEventListener('cpsb.liveprompt', handler)
+  return () => api.removeEventListener('cpsb.liveprompt', handler)
+}
+
+/**
  * Subscribes to the `cpsb.tier2` websocket event (plugin connection state
  * changed).
  * @param {(detail: CpsbTier2Event) => void} callback

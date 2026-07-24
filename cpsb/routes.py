@@ -217,6 +217,13 @@ class PluginConnection:
     live_jpeg: bytes | None = None
     live_seq: int = 0
     live_doc_title: str = ""
+    #: Realtime drawing (docs/roadmap/realtime-drawing.md M2 prompt control):
+    #: the newest prompt the user typed in the plugin panel's Live Mode
+    #: field (`live_prompt` message), or ``None`` when the field is empty /
+    #: never set. `PhotoshopLivePrompt` serves this, falling back to its own
+    #: node widget when ``None`` (so the ComfyUI-only path still works). Like
+    #: `live_jpeg` it is a transient view that dies with the connection.
+    live_prompt: str | None = None
 
 
 class _PluginSlot:
@@ -2177,6 +2184,39 @@ def _handle_live_frame(
     )
 
 
+def _handle_live_prompt(
+    context: CpsbContext, connection: PluginConnection, msg: dict[str, Any]
+) -> None:
+    """Handle one `live_prompt` (realtime drawing prompt control, PROTOCOL.md §3).
+
+    Stores the panel's prompt text in *connection*'s single slot and emits
+    `cpsb.liveprompt` so the frontend live loop re-queues (exactly like a new
+    frame). An empty / whitespace-only text CLEARS the slot back to ``None``
+    so `PhotoshopLivePrompt` falls back to its node widget -- clearing the
+    panel field "hands control back" to the workflow's own default. The event
+    payload deliberately carries no text: consumers never need it, and the
+    node reads the slot at execute time (same posture as `live_frame`).
+    """
+    text = msg.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    connection.live_prompt = text or None
+    context.send_event("cpsb.liveprompt", {"has_prompt": connection.live_prompt is not None})
+
+
+def get_live_prompt(app: web.Application) -> str | None:
+    """The newest panel-typed live prompt, or ``None`` when there is none.
+
+    ``None`` (no plugin, not ready, or an empty field) tells
+    `PhotoshopLivePrompt` to use its own node widget instead -- the one gate
+    the node checks. Same accessor convention as :func:`get_live_frame`.
+    """
+    slot = app.get(_APP_KEY_PLUGIN)
+    connection = slot.connection if slot is not None else None
+    if connection is None or not connection.ready:
+        return None
+    return connection.live_prompt
+
+
 def get_live_frame(app: web.Application) -> tuple[bytes, int, str] | None:
     """The newest live canvas frame, or ``None`` when there is none to serve.
 
@@ -2324,6 +2364,8 @@ async def _handle_plugin_message(
         await _handle_manual_push_chunk(manager, connection, msg)
     elif msg_type == "live_frame":
         _handle_live_frame(context, connection, msg)
+    elif msg_type == "live_prompt":
+        _handle_live_prompt(context, connection, msg)
     elif msg_type == "action_ok":
         # The PhotoshopAction node (cpsb/actions.py, not yet in PROTOCOL.md
         # §3) -- informational only, exactly like "opened"/"save_detected"

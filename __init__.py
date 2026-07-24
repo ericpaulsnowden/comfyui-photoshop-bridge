@@ -44,6 +44,7 @@ NODE_CLASS_MAPPINGS = {
     "PhotoshopAnnotate": _cpsb_annotate.PhotoshopAnnotate,
     "PhotoshopAction": _cpsb_actions.PhotoshopAction,
     "PhotoshopLiveCanvas": _cpsb_live.PhotoshopLiveCanvas,
+    "PhotoshopLivePrompt": _cpsb_live.PhotoshopLivePrompt,
     "PhotoshopLivePreview": _cpsb_live.PhotoshopLivePreview,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -53,6 +54,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PhotoshopAnnotate": "Annotate for Edit",
     "PhotoshopAction": "Run Photoshop Action",
     "PhotoshopLiveCanvas": "Photoshop Live Canvas",
+    "PhotoshopLivePrompt": "Photoshop Live Prompt",
     "PhotoshopLivePreview": "Photoshop Live Preview",
 }
 

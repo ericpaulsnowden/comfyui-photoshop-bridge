@@ -380,6 +380,15 @@ Plugin → server:
   of the frame bytes, §6f), and emits `cpsb.live` (§5). `PhotoshopLiveCanvas` (§6f)
   serves the newest frame; invalid base64/non-JPEG payloads are dropped with a log line,
   never an error reply and never a socket teardown.
+- `{"type": "live_prompt", "text": "a red origami bird"}` — realtime drawing prompt
+  control: the text the user typed in the panel's **LIVE PROMPT** field
+  (`photoshop_plugin/livePrompt.js`, debounced ~250ms so a burst of keystrokes sends one
+  message). The server strips it and holds the newest in ONE keep-latest slot
+  (`PluginConnection.live_prompt`); an empty/whitespace-only `text` CLEARS the slot back
+  to `None`, which makes `PhotoshopLivePrompt` (§6f) fall back to its own node widget (so
+  a workflow without a panel prompt still works — clearing the field "hands control back"
+  to the graph). Emits `cpsb.liveprompt` (§5). Like `live_frame`: fire-and-forget, never
+  a handoff, dies with the connection.
 - `{"type": "pong"}`
 
 Server → plugin:
@@ -561,6 +570,12 @@ research/research-annotate-node.md retain the design if ever revisited.
   of the frame, §6f). The M2 frontend live loop queues a coalesced re-run on this event;
   consumers never fetch the frame itself — only the node reads the in-memory slot, at
   execute time.
+- `"cpsb.liveprompt"` — the panel's LIVE PROMPT field changed (realtime drawing prompt
+  control): `{"has_prompt": true}` (`false` when the field was cleared). The M2 frontend
+  live loop re-queues on this event exactly like a new frame — a prompt tweak should
+  re-render like a stroke. The text is deliberately NOT in the payload:
+  `PhotoshopLivePrompt` (§6f) reads it server-side at execute time, the same posture as
+  `cpsb.live`.
 
 **Universal cancel (product-owner requirement 2026-07-17):** ANY node that shows the
 "Editing in Photoshop…" badge (badges.js) MUST expose a working cancel ✕, regardless of
@@ -1127,6 +1142,16 @@ plugin is connected or no frame has streamed yet.
   768px long-side `targetSize`, `dispose()` after every capture (`liveMode.js`'s doc
   comment carries the research/spike provenance — the history-id poll's stroke-promptness
   is spike S-A, owner-verified via the checklist).
+- **`PhotoshopLivePrompt`** (same module): serves the prompt the user typed in the
+  panel's **LIVE PROMPT** field (`live_prompt`, §3) as its `STRING` output — wire it into
+  a `CLIPTextEncode` `text` input (convert the widget to an input) so the render is
+  steered from inside Photoshop. **NOT Tier-2-gated** (unlike Live Canvas): a prompt is
+  just text, not save-free capture, so the node ALWAYS returns a usable value — it falls
+  back to its own multiline `prompt` widget whenever the panel field is empty or no plugin
+  is connected. That keeps the ComfyUI-only path working (type in the node) while the
+  plugin makes it *better* (type in the panel, re-renders live). `IS_CHANGED` returns the
+  streamed panel text (or `"no-live-prompt"`), so a panel edit busts the cache; the
+  widget's own value is diffed natively by ComfyUI.
 - **`PhotoshopLivePreview`** (M3, same module): the loop's feedback surface. An OUTPUT
   node (IMAGE in, no return sockets) that JPEG-encodes each render (quality 85) and
   pushes it as `result_frame` (§3) to the plugin's **"ComfyUI Preview" panel** — a second
@@ -1206,8 +1231,10 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
   (`node.imageIndex ?? 0`); an "Open all N in Photoshop" item appears for N ≤ 8.
 - Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
   `cpsb.showUpgradeBanner` (bool, default true).
-- **Live loop** (`web/cpsb/live.js`, realtime drawing M2): each `cpsb.live` event queues at
-  most ONE coalesced `queuePrompt(0)` — armed only while the current graph contains an
+- **Live loop** (`web/cpsb/live.js`, realtime drawing M2): each `cpsb.live` event — AND
+  each `cpsb.liveprompt` event (the panel prompt changed) — queues at
+  most ONE coalesced `queuePrompt(0)` via a shared `requestQueue()` seam (a prompt tweak
+  re-renders like a stroke) — armed only while the current graph contains an
   ACTIVE (non-muted/bypassed) `PhotoshopLiveCanvas` node with `auto_queue` = "On",
   searched recursively through subgraphs (widget read client-side per event, the same
   gating convention as `pasteback.js`'s bridge-mode check). Single-slot backpressure

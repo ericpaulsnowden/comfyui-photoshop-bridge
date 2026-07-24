@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-photoshop-bridge"
 description = "Round-trip images between ComfyUI and Photoshop: right-click any image, edit it in Photoshop, and your save lands back on the originating node automatically."
-version = "0.5.48"
+version = "0.5.49"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"

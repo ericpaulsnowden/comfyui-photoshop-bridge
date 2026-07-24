@@ -3252,3 +3252,52 @@ class TestLiveFrame:
             await _connect_tier2_plugin(ws, context, local_mode=False)
             await wait_until(lambda: routes_module.tier2_connected(client.app))
             assert routes_module.get_live_frame(client.app) is None  # ready, no frame yet
+
+
+class TestLivePrompt:
+    """`live_prompt` (realtime drawing prompt control): the panel's prompt
+    field, streamed to one keep-latest slot. Empty text clears the slot so the
+    `PhotoshopLivePrompt` node falls back to its own widget.
+    """
+
+    async def test_prompt_stored_and_event_emitted(self, client, context, manager, events):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "live_prompt", "text": "a red origami bird"})
+            await wait_until(
+                lambda: routes_module.get_live_prompt(client.app) == "a red origami bird"
+            )
+            prompt_events = events.of_type("cpsb.liveprompt")
+            assert prompt_events and prompt_events[-1] == {"has_prompt": True}
+
+    async def test_prompt_is_stripped_and_kept_latest(self, client, context, manager):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "live_prompt", "text": "  first  "})
+            await ws.send_json({"type": "live_prompt", "text": "  second  "})
+            await wait_until(lambda: routes_module.get_live_prompt(client.app) == "second")
+
+    async def test_empty_text_clears_slot_and_event_says_so(
+        self, client, context, manager, events
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            await ws.send_json({"type": "live_prompt", "text": "temporary"})
+            await wait_until(lambda: routes_module.get_live_prompt(client.app) == "temporary")
+            await ws.send_json({"type": "live_prompt", "text": "   "})  # whitespace clears
+            await wait_until(lambda: routes_module.get_live_prompt(client.app) is None)
+            prompt_events = events.of_type("cpsb.liveprompt")
+            assert prompt_events[-1] == {"has_prompt": False}
+
+    async def test_get_live_prompt_none_without_plugin(self, client, context, manager):
+        assert routes_module.get_live_prompt(client.app) is None  # no plugin at all
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            assert routes_module.get_live_prompt(client.app) is None  # ready, no prompt yet

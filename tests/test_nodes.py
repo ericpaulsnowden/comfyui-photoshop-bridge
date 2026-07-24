@@ -136,6 +136,7 @@ class TestDisplayNameMapping:
             "PhotoshopAnnotate": "Annotate for Edit",
             "PhotoshopAction": "Run Photoshop Action",
             "PhotoshopLiveCanvas": "Photoshop Live Canvas",
+            "PhotoshopLivePrompt": "Photoshop Live Prompt",
             "PhotoshopLivePreview": "Photoshop Live Preview",
         }
         # The class ids themselves -- what saved workflows reference -- must be untouched.
@@ -146,6 +147,7 @@ class TestDisplayNameMapping:
             "PhotoshopAnnotate",
             "PhotoshopAction",
             "PhotoshopLiveCanvas",
+            "PhotoshopLivePrompt",
             "PhotoshopLivePreview",
         }
         assert entry.NODE_CLASS_MAPPINGS["PhotoshopBridge"] is nodes_module.PhotoshopBridge

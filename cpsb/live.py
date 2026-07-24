@@ -1,4 +1,9 @@
-"""The realtime-drawing nodes (docs/roadmap/realtime-drawing.md M1/M3).
+"""The realtime-drawing nodes (docs/roadmap/realtime-drawing.md M1/M2/M3).
+
+Three nodes: ``PhotoshopLiveCanvas`` (the canvas in, Tier-2-required),
+``PhotoshopLivePrompt`` (the panel's prompt in, NOT Tier-2-gated -- falls back
+to its own widget so ComfyUI-only works), and ``PhotoshopLivePreview`` (the
+render back out to a docked Photoshop panel).
 
 ``PhotoshopLiveCanvas`` is the graph's window onto the canvas the user is
 ACTIVELY drawing in Photoshop: the plugin's Live Mode streams a keep-latest
@@ -164,6 +169,79 @@ class PhotoshopLiveCanvas:
 
         logger.info("cpsb live: serving frame %d from %r (%dx%d)", seq, doc_title, *image.size)
         return nodes._tensors_from_image(image)
+
+
+class PhotoshopLivePrompt:
+    """Serves the prompt the user typed in the plugin panel's Live Mode field.
+
+    The realtime companion to :class:`PhotoshopLiveCanvas`: wire its ``STRING``
+    output into a ``CLIPTextEncode`` ``text`` input (convert the widget to an
+    input) so the user can drive the prompt from INSIDE Photoshop -- change the
+    words in the panel, the live loop re-renders with them, no tabbing to the
+    ComfyUI graph. The panel streams each edit as a ``live_prompt`` message
+    (PROTOCOL.md §3); the server keeps the newest in one slot
+    (:func:`cpsb.routes.get_live_prompt`).
+
+    **NOT Tier-2-gated**, unlike the canvas node: a prompt is not save-free
+    capture, it is just text, and the ComfyUI-only path must keep working
+    (``bridge-design-ethos.md``: "the ComfyUI-only version must work"). So the
+    node ALWAYS has a usable value -- it falls back to its own ``prompt``
+    widget whenever the panel field is empty or no plugin is connected. The
+    plugin makes it *better* (edit live, without leaving Photoshop), never
+    *required*.
+    """
+
+    CATEGORY = "image/photoshop"
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("prompt",)
+    FUNCTION = "execute"
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "prompt": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "a detailed digital painting, vivid colors",
+                    },
+                ),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, prompt: str) -> str:
+        """Bust the cache when the PANEL prompt changes.
+
+        The node widget's own value is already diffed by ComfyUI (it is a
+        graph input), so this only needs to surface the plugin-streamed
+        prompt, which the graph cannot otherwise see. Returns that streamed
+        text (namespaced ``"live:"``) or the ``"no-live-prompt"`` sentinel
+        when the field is empty / no plugin, so typing in the panel re-runs
+        the graph while an unchanged field is served from cache -- the same
+        backpressure story as the canvas node.
+
+        The ``"live:"`` prefix keeps the empty-state sentinel in a value-space
+        no panel text can occupy (review-caught, 2026-07-24): without it, a
+        user who literally typed ``no-live-prompt`` then CLEARED the field
+        would hit the identical cache signature -- ComfyUI folds this return
+        into the node's cache key alongside the widget value -- and the
+        node would keep serving the stale ``no-live-prompt`` instead of
+        falling back to the widget. A streamed prompt is always a non-empty
+        stripped string, so ``live:<text>`` can never equal the sentinel.
+        """
+        state = nodes._require_state()
+        live = routes.get_live_prompt(state.app)
+        return f"live:{live}" if live is not None else "no-live-prompt"
+
+    def execute(self, prompt: str) -> tuple[str]:
+        state = nodes._require_state()
+        live = routes.get_live_prompt(state.app)
+        effective = live if live is not None else prompt
+        source = "plugin panel" if live is not None else "node widget"
+        logger.info("cpsb live: serving prompt from %s (%d chars)", source, len(effective))
+        return (effective,)
 
 
 class PhotoshopLivePreview:

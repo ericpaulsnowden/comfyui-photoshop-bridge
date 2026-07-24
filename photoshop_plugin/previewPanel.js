@@ -63,13 +63,34 @@ function buildDom() {
   rootDiv.style.height = '100%'
   rootDiv.style.padding = '8px'
 
+  // A flex-fill wrapper OWNS the available space; the <img> inside is bounded
+  // by BOTH dimensions and sized `auto`, so it always keeps its natural aspect
+  // ratio. The previous layout put `flex: 1 1 auto` directly on the <img>,
+  // which in a column flexbox forces the image to grow to fill the column's
+  // height while `width: 100%` fixed its width independently -- i.e. it
+  // squashed/stretched the render whenever the panel was resized to a
+  // different aspect than the image (the skew Eric reported). Constraining the
+  // image with max-width/max-height + width/height:auto preserves aspect on
+  // its own, even on UXP builds that ignore object-fit; object-fit:contain is
+  // belt-and-suspenders where it IS honored, and the wrapper centers whatever
+  // letterboxing results.
+  const imageWrap = document.createElement('div')
+  imageWrap.id = 'cpsb-preview-image-wrap'
+  imageWrap.style.flex = '1 1 auto'
+  imageWrap.style.minHeight = '0'
+  imageWrap.style.display = 'flex'
+  imageWrap.style.alignItems = 'center'
+  imageWrap.style.justifyContent = 'center'
+  imageWrap.style.overflow = 'hidden'
+
   imageEl = document.createElement('img')
   imageEl.id = 'cpsb-preview-image'
-  imageEl.style.width = '100%'
-  imageEl.style.flex = '1 1 auto'
-  // UXP img has no object-fit guarantee; width-bound scaling is the safe
-  // baseline and keeps aspect via natural sizing.
+  imageEl.style.maxWidth = '100%'
+  imageEl.style.maxHeight = '100%'
+  imageEl.style.width = 'auto'
   imageEl.style.height = 'auto'
+  imageEl.style.objectFit = 'contain'
+  imageWrap.appendChild(imageEl)
 
   statusEl = document.createElement('div')
   statusEl.id = 'cpsb-preview-status'
@@ -79,7 +100,7 @@ function buildDom() {
   statusEl.textContent =
     'Waiting for a render — add a "Photoshop Live Preview" node to the workflow.'
 
-  rootDiv.appendChild(imageEl)
+  rootDiv.appendChild(imageWrap)
   rootDiv.appendChild(statusEl)
   return rootDiv
 }

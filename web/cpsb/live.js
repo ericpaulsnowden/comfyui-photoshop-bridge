@@ -1,8 +1,10 @@
 /**
  * @file The realtime-drawing live loop (docs/roadmap/realtime-drawing.md M2):
- * every `cpsb.live` event (a new frame in the server's keep-latest slot) can
- * queue ONE coalesced re-run of the current workflow, so re-renders track
- * the user's strokes with no busy-looping and no queue pileup.
+ * every `cpsb.live` event (a new frame in the server's keep-latest slot) —
+ * and every `cpsb.liveprompt` event (the user edited the panel's Live prompt
+ * field) — can queue ONE coalesced re-run of the current workflow, so
+ * re-renders track the user's strokes AND prompt tweaks with no busy-looping
+ * and no queue pileup.
  *
  * WHY event-driven, not Auto-Queue "Instant": every serious realtime
  * integration researched (Krita AI Diffusion's own ComfyClient, the shipped
@@ -103,12 +105,19 @@ function fireQueue() {
     })
 }
 
-/** @returns {void} */
-function onLiveFrame() {
+/**
+ * A live change happened (a new frame, OR the panel prompt was edited) —
+ * request one coalesced re-run. Both triggers share this seam: a prompt
+ * tweak should re-render exactly like a stroke, and the same single-slot
+ * backpressure applies to both (only the NEWEST state matters, whichever
+ * input changed).
+ * @returns {void}
+ */
+function requestQueue() {
   if (!isArmed()) return
   if (queueInFlight || queueRemaining > 0) {
-    // Busy — remember that newer strokes exist, render them when the queue
-    // drains. One flag, not a counter: only the NEWEST frame matters.
+    // Busy — remember that newer state exists, render it when the queue
+    // drains. One flag, not a counter: only the NEWEST state matters.
     trailing = true
     return
   }
@@ -140,9 +149,16 @@ function onComfyStatus(event) {
 export function init() {
   api.onLive(() => {
     try {
-      onLiveFrame()
+      requestQueue()
     } catch (error) {
       api.warn('live loop: failed to handle cpsb.live', error)
+    }
+  })
+  api.onLivePrompt(() => {
+    try {
+      requestQueue()
+    } catch (error) {
+      api.warn('live loop: failed to handle cpsb.liveprompt', error)
     }
   })
   comfyApi.addEventListener('status', (event) => {
