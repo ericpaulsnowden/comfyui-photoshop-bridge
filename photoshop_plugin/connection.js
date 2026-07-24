@@ -485,6 +485,13 @@ class ConnectionManager extends EventTarget {
      * @type {{chunks: string[], received: number, total: number | null, resolve: (bytes: Uint8Array) => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>} | null}
      */
     this._pendingRender = null
+    /**
+     * In-flight `refine_push` uploads awaiting a `refine_ok`/`refine_error`
+     * ack, keyed by the plugin's own `refine_id` (refine pass R2). See
+     * {@link pushRefineOverWs}.
+     * @type {Map<string, {resolve: (requestId: number) => void, reject: (error: Error) => void, timer: ReturnType<typeof setTimeout>}>}
+     */
+    this._pendingRefinePushes = new Map()
   }
 
   /**
@@ -595,6 +602,11 @@ class ConnectionManager extends EventTarget {
       this._pendingRender.reject(new Error(reason))
       this._pendingRender = null
     }
+    for (const pending of this._pendingRefinePushes.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error(reason))
+    }
+    this._pendingRefinePushes.clear()
   }
 
   /**
@@ -796,6 +808,16 @@ class ConnectionManager extends EventTarget {
     if (msg.type === 'manual_push_error') {
       const errorMsg = /** @type {{push_id: string, error: string}} */ (msg)
       this._onManualPushResult(errorMsg.push_id, null, errorMsg.error || 'Push rejected')
+      return
+    }
+    if (msg.type === 'refine_ok') {
+      const okMsg = /** @type {{refine_id: string, request_id: number}} */ (msg)
+      this._onRefinePushResult(okMsg.refine_id, okMsg.request_id, null)
+      return
+    }
+    if (msg.type === 'refine_error') {
+      const errorMsg = /** @type {{refine_id: string, error: string}} */ (msg)
+      this._onRefinePushResult(errorMsg.refine_id, null, errorMsg.error || 'Refine rejected')
       return
     }
     // open_handoff / handoff_cancelled / anything future and unrecognized —
@@ -1247,6 +1269,60 @@ class ConnectionManager extends EventTarget {
         })
       }
     })
+  }
+
+  /**
+   * Uploads one Refine click's full-quality PNG canvas capture as chunked
+   * `refine_push` messages (refine pass R2, docs/PROTOCOL.md §3) and awaits
+   * the server's `refine_ok`/`refine_error` ack — `pushManualSendOverWs`'s
+   * exact shape, resolving with the server's new refine `request_id`.
+   * @param {string} refineId
+   * @param {Uint8Array} bytes
+   * @returns {Promise<number>}
+   */
+  pushRefineOverWs(refineId, bytes) {
+    if (!this._socket || this._socket.readyState !== WS_READY_STATE_OPEN) {
+      return Promise.reject(new Error('Not connected to the ComfyUI server'))
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingRefinePushes.delete(refineId)
+        reject(new Error(`refine_push ${refineId} timed out after ${TRANSFER_TIMEOUT_MS}ms`))
+      }, TRANSFER_TIMEOUT_MS)
+      this._pendingRefinePushes.set(refineId, { resolve, reject, timer })
+
+      const chunks = splitIntoChunks(base64Encode(bytes))
+      const total = chunks.length
+      for (let seq = 0; seq < total; seq++) {
+        this.send({
+          type: 'refine_push',
+          refine_id: refineId,
+          seq,
+          total,
+          data_b64: chunks[seq]
+        })
+      }
+    })
+  }
+
+  /**
+   * Resolves/rejects the in-flight {@link pushRefineOverWs} call for
+   * `refineId`. A result with no pending push is ignored.
+   * @param {string} refineId
+   * @param {number | null} requestId - The server's request id on `refine_ok`.
+   * @param {string | null} errorMessage - `null` for `refine_ok`.
+   * @returns {void}
+   */
+  _onRefinePushResult(refineId, requestId, errorMessage) {
+    const pending = this._pendingRefinePushes.get(refineId)
+    if (!pending) return
+    this._pendingRefinePushes.delete(refineId)
+    clearTimeout(pending.timer)
+    if (errorMessage) {
+      pending.reject(new Error(errorMessage))
+    } else {
+      pending.resolve(/** @type {number} */ (requestId))
+    }
   }
 
   /** @returns {CpsbConnectionState} */

@@ -91,7 +91,18 @@ Second manifest panel **"ComfyUI Preview"** (documented multi-panel; shares the 
 ### M5 — In-canvas "AI Preview" layer (spike-gated on S-D; off by default)
 `putPixels` into a dedicated pixel layer, whole session wrapped in ONE `suspendHistory`/`resumeHistory` pair (documented; collapses hundreds of writes into one undo step; auto-resume safety net on modal exit). Only if S-D shows acceptable brush contention — no shipped plugin has proven this, and the likely failure is stroke stutter. The M3 panel remains the default feedback surface regardless.
 
-## R — Refine pass (PLANNED, decided with Eric 2026-07-24; NOT started)
+## R — Refine pass (R1+R2 SHIPPED v0.5.59–60, 2026-07-24; R3 not started)
+
+**Shipped decisions beyond the four below (Eric, at build green-light):** the layer-push
+ceiling is "the PSD's size ideally, proportionally capped below 4096" — implemented as:
+pixels are capped at 4096px long side on BOTH legs (the plugin's canvas capture downscales
+its export duplicate before upload; `PhotoshopAddLayer` thumbnails before sending), and
+the plugin scales the placed layer to the document bounds, so the LAYER always lands at
+PSD size. Stack-vs-Replace is a MAIN-panel control (REFINED LAYER section; prefs.js,
+default Stack; Replace deletes previous same-named top-level layers first). The bundled
+example ships a muted refine branch (2× lanczos + 8-step denoise-0.35 polish → both the
+pane and a "ComfyUI refined" layer). Mute-prune behavior verified against a real ComfyUI
+0.28.0 on the test rig before building.
 
 **Ask (Eric):** "push a low quality preview through a ComfyUI node to render a higher resolution preview — flexible enough to go through any workflow and back into the preview pane and/or into a layer in the current document."
 
@@ -104,9 +115,9 @@ Second manifest panel **"ComfyUI Preview"** (documented multi-panel; shares the 
 4. **Routing = the workflow decides.** Chain ends in `PhotoshopLivePreview` → preview pane (downscale cap lifted for refined results); ends in a NEW **`PhotoshopAddLayer`** output node → pushed straight into the current document as a layer (v0.5.58's add-as-layer machinery, fed full-res PNG over the existing chunked transfer); wire both → both. No plugin-side picker.
 
 **Phases:**
-- **R1 (foundation, low risk):** full-quality result slot; `PhotoshopRefineSource` (render + canvas-capture outputs); `PhotoshopAddLayer`; full-res upgrade of the existing Add-as-layer button. Usable day one via manual Queue on a refine branch/workflow — no trigger plumbing.
-- **R2 (one-click):** Refine button in the preview panel → `refine_request` → `cpsb.refine` → un-mute/queue/re-mute + live-loop auto-pause/resume. Bundled example grows a muted refine branch (upscale-model → img2img ~0.35 denoise → both outputs).
-- **R3 (= M4's tab-free driver):** plugin triggers a SAVED refine workflow by name via server-side `/prompt` — "any workflow" without the browser tab being on it. The endgame; R1/R2 don't need it.
+- **R1 (foundation, low risk — SHIPPED v0.5.59):** full-quality result slot; `PhotoshopRefineSource` (render + canvas-capture outputs); `PhotoshopAddLayer`; full-res upgrade of the existing Add-as-layer button. Usable day one via manual Queue on a refine branch/workflow — no trigger plumbing.
+- **R2 (one-click — SHIPPED v0.5.60):** Refine button in the preview panel → `refine_request` → `cpsb.refine` → un-mute/queue/re-mute + live-loop auto-pause/resume. Bundled example grows a muted refine branch (upscale-model → img2img ~0.35 denoise → both outputs).
+- **R3 (= M4's tab-free driver, NOT started):** plugin triggers a SAVED refine workflow by name via server-side `/prompt` — "any workflow" without the browser tab being on it. The endgame; R1/R2 don't need it.
 
 **Open items for build time:** result-size ceiling for the layer push (4096?); whether `PhotoshopAddLayer` names/stacks layers per refine or replaces a "ComfyUI refined" layer; canvas-capture output's size cap (full-res vs CAPTURE SIZE).
 

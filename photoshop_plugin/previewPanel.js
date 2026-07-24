@@ -40,6 +40,7 @@ const { setLiveCreativity } = require('./liveCreativity.js')
 const { liveEvents, getLiveState } = require('./liveMode.js')
 const { makeDocKey, getDocSettings, saveDocSettings } = require('./livePrefs.js')
 const { addImageAsLayer, addRenderAsLayer } = require('./addAsLayer.js')
+const { requestRefineSafe } = require('./refineCapture.js')
 
 /**
  * Creativity is a THREE-STEP choice, not a continuous slider (Eric's
@@ -82,6 +83,15 @@ let selectedCreativityKey = null
 /** Last connection status seen, so we re-flush controls only on the
  * transition INTO 'connected' (the reconnect desync fix). */
 let lastConnStatus = /** @type {string | null} */ (null)
+/** The Refine button (refine pass R2). @type {any} */
+let refineButton = null
+/** True from a Refine click until its result lands (or times out). */
+let refining = false
+/** @type {ReturnType<typeof setTimeout> | null} */
+let refineResetTimer = null
+/** Bound on waiting for a refined result before the button resets — refine
+ * chains can be slow (SUPIR-class), so generous. */
+const REFINE_BUTTON_TIMEOUT_MS = 180000
 /** The Live-Mode documentId whose settings are currently loaded, so the
  * per-file restore fires once per session-doc, not on every frame's
  * liveEvents change. @type {number | null} */
@@ -300,11 +310,37 @@ function buildDom() {
   creativityHint.style.opacity = '0.5'
   creativityHint.style.marginTop = '4px'
 
+  // Refine (refine pass R2): captures the document at full quality, uploads
+  // it, and the ComfyUI live loop runs the workflow's muted refine branch
+  // exactly once (pausing live re-renders while it works). The button stays
+  // busy until the refined result lands as the next result_frame.
+  const refineRow = document.createElement('div')
+  refineRow.style.display = 'flex'
+  refineRow.style.flexDirection = 'row'
+  refineRow.style.marginTop = '10px'
+  refineButton = document.createElement('sp-button')
+  refineButton.setAttribute('variant', 'secondary')
+  refineButton.textContent = 'Refine'
+  refineButton.style.flex = '1 1 0'
+  refineButton.addEventListener('click', () => {
+    onRefineClick()
+  })
+  refineRow.appendChild(refineButton)
+
+  const refineHint = document.createElement('div')
+  refineHint.textContent =
+    'Runs the workflow’s refine branch once at high quality (needs a muted "Photoshop Refine Source" chain). Live re-renders pause while it works.'
+  refineHint.style.fontSize = '10px'
+  refineHint.style.opacity = '0.5'
+  refineHint.style.marginTop = '4px'
+
   controls.appendChild(promptLabel)
   controls.appendChild(promptField)
   controls.appendChild(creativityLabel)
   controls.appendChild(creativityRow)
   controls.appendChild(creativityHint)
+  controls.appendChild(refineRow)
+  controls.appendChild(refineHint)
 
   // Onboarding hint ONLY: shown until the first render arrives, then hidden
   // for good. The old always-on line (doc title + render count) was removed —
@@ -394,6 +430,45 @@ function onAddAsLayer() {
         if (addLayerOverlay) addLayerOverlay.style.display = 'none'
       }, 1200)
     })
+}
+
+/** Resets the Refine button to its idle state. @returns {void} */
+function resetRefineButton() {
+  refining = false
+  if (refineResetTimer) {
+    clearTimeout(refineResetTimer)
+    refineResetTimer = null
+  }
+  if (refineButton) {
+    refineButton.textContent = 'Refine'
+    refineButton.removeAttribute('disabled')
+  }
+}
+
+/**
+ * The Refine click: capture + upload (refineCapture.js), then wait for the
+ * refined result to land as the next `result_frame` (which resets the
+ * button), bounded by {@link REFINE_BUTTON_TIMEOUT_MS}.
+ * @returns {void}
+ */
+function onRefineClick() {
+  if (refining || !refineButton) return
+  refining = true
+  refineButton.textContent = 'Capturing…'
+  refineButton.setAttribute('disabled', '')
+  requestRefineSafe().then((requestId) => {
+    if (!refining) return // already reset (e.g. reconnect)
+    if (requestId == null) {
+      // Failed — refineCapture already logged the why.
+      if (refineButton) refineButton.textContent = 'Refine failed — see log'
+      refineResetTimer = setTimeout(resetRefineButton, 2500)
+      return
+    }
+    if (refineButton) refineButton.textContent = 'Refining…'
+    // A refine chain can be legitimately slow; if nothing ever lands, reset
+    // rather than wedge the button forever.
+    refineResetTimer = setTimeout(resetRefineButton, REFINE_BUTTON_TIMEOUT_MS)
+  })
 }
 
 /** Highlights whichever creativity button is currently selected. @returns {void} */
@@ -488,6 +563,9 @@ connection.addEventListener('message', (event) => {
   latestJpegB64 = msg.data_b64
   latestDataUri = `data:image/jpeg;base64,${msg.data_b64}`
   showLatest()
+  // A result landing while a Refine is in flight IS the refined result
+  // (live re-renders are paused during a refine) — the button's done signal.
+  if (refining) resetRefineButton()
 })
 
 // Re-sync the panel's controls whenever the connection (re)establishes: a new
@@ -500,6 +578,11 @@ connection.addEventListener('statechange', (event) => {
   const status = state && state.status
   if (status === 'connected' && lastConnStatus !== 'connected') {
     flushControls()
+  }
+  // A mid-refine disconnect can never deliver the refined result on this
+  // connection — unwedge the button rather than waiting out the long timeout.
+  if (status !== 'connected' && refining) {
+    resetRefineButton()
   }
   lastConnStatus = status
 })

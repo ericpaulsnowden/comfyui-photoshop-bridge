@@ -733,6 +733,28 @@ export function onLiveCreativity(callback) {
 }
 
 /**
+ * @typedef {Object} CpsbRefineEvent
+ * Payload of the `cpsb.refine` websocket event (refine pass R2): a Refine
+ * click's canvas upload completed server-side; the live loop should run the
+ * graph's muted refine branch exactly once.
+ * @property {number} request_id - The server's monotonically increasing
+ * refine request id (also folded into `PhotoshopRefineSource.IS_CHANGED`).
+ */
+
+/**
+ * Subscribes to the `cpsb.refine` websocket event (`live.js` runs the
+ * un-mute → queue → re-mute dance on it and pauses the live loop meanwhile).
+ * @param {(detail: CpsbRefineEvent) => void} callback
+ * @returns {() => void} Unsubscribe function.
+ */
+export function onRefine(callback) {
+  /** @param {CustomEvent<CpsbRefineEvent>} event */
+  const handler = (event) => callback(event.detail)
+  api.addEventListener('cpsb.refine', handler)
+  return () => api.removeEventListener('cpsb.refine', handler)
+}
+
+/**
  * Subscribes to the `cpsb.tier2` websocket event (plugin connection state
  * changed).
  * @param {(detail: CpsbTier2Event) => void} callback

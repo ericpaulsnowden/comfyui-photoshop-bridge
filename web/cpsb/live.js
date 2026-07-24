@@ -35,6 +35,15 @@
  * for the bridge node's mode). No Live Canvas node, or all "Off": frames
  * still stream server-side and the next MANUAL queue picks up the newest;
  * this file just stays out of the way.
+ *
+ * REFINE (refine pass R2, `cpsb.refine`): a Refine click runs the graph's
+ * muted refine branch exactly once — un-mute every muted
+ * `PhotoshopRefineSource` (remembering each node's ORIGINAL mode), queue one
+ * run, and when that queue drains restore the modes and resume the live
+ * loop. While refining, live triggers set `trailing` instead of queueing
+ * (Eric's auto-pause decision: the refine gets the GPU to itself; the newest
+ * strokes render on resume). NOT gated on arming — a refine is an explicit
+ * click and works with `auto_queue` Off or no Live Canvas at all.
  */
 
 import { app } from '../../../scripts/app.js'
@@ -44,9 +53,25 @@ import * as api from './api.js'
 /** The Live Canvas node's class id (must match `__init__.py`'s mapping). */
 const LIVE_CANVAS_NODE_TYPE = 'PhotoshopLiveCanvas'
 
+/** The Refine Source node's class id (refine pass R2). */
+const REFINE_SOURCE_NODE_TYPE = 'PhotoshopRefineSource'
+
+/** litegraph node modes: 0 = ALWAYS (active), 2 = NEVER (muted). */
+const NODE_MODE_ALWAYS = 0
+
 let queueInFlight = false
 let trailing = false
 let queueRemaining = 0
+
+/** True from a `cpsb.refine` queue until that queue drains — pauses the live
+ * auto-queue (Eric's decision: refine gets the GPU to itself; strokes keep
+ * streaming and the trailing state renders on resume). */
+let refining = false
+
+/** The Refine Source nodes this refine un-muted, with their original modes,
+ * so the re-mute restores EXACTLY what the user had (muted vs bypassed).
+ * @type {{node: any, mode: number}[]} */
+let unmutedRefineNodes = []
 
 /**
  * Whether *node* is an ACTIVE armed Live Canvas: right type, `auto_queue`
@@ -116,6 +141,12 @@ function fireQueue() {
  */
 function requestQueue() {
   if (!isArmed()) return
+  if (refining) {
+    // A refine holds the GPU (Eric's auto-pause decision). Strokes keep
+    // streaming server-side; render the newest state when the refine drains.
+    trailing = true
+    return
+  }
   if (queueInFlight || queueRemaining > 0) {
     // Busy — remember that newer state exists, render it when the queue
     // drains. One flag, not a counter: only the NEWEST state matters.
@@ -123,6 +154,69 @@ function requestQueue() {
     return
   }
   fireQueue()
+}
+
+/**
+ * Collects every `PhotoshopRefineSource` node in the graph, searched
+ * recursively through subgraphs (the `isArmed` walk).
+ * @param {any} [graph]
+ * @param {number} [depth]
+ * @returns {any[]}
+ */
+function collectRefineSources(graph = app.graph, depth = 0) {
+  if (!graph || depth > 8) return []
+  const nodes = graph._nodes
+  if (!Array.isArray(nodes)) return []
+  const found = []
+  for (const node of nodes) {
+    if ((node.comfyClass || node.type) === REFINE_SOURCE_NODE_TYPE) found.push(node)
+    if (node.subgraph) found.push(...collectRefineSources(node.subgraph, depth + 1))
+  }
+  return found
+}
+
+/**
+ * A Refine click's upload completed (`cpsb.refine`): run the refine branch
+ * exactly once — un-mute every muted `PhotoshopRefineSource`, queue ONE run,
+ * and let {@link onComfyStatus} re-mute + resume the live loop when the
+ * queue drains. Deliberately NOT gated on {@link isArmed}: a refine is an
+ * explicit user action and must work even with `auto_queue` Off or no Live
+ * Canvas in the graph. Verified against a real ComfyUI (0.28.0, test rig):
+ * a muted node's dependent subtree is pruned from queues, and un-mute +
+ * queue executes it.
+ * @returns {void}
+ */
+function onRefineRequest() {
+  const sources = collectRefineSources()
+  if (!sources.length) {
+    api.warn(
+      'refine requested, but the current workflow has no "Photoshop Refine Source" node — ' +
+        'add a (muted) refine branch to use Refine'
+    )
+    return
+  }
+  for (const node of sources) {
+    const mode = node.mode ?? NODE_MODE_ALWAYS
+    if (mode !== NODE_MODE_ALWAYS) {
+      unmutedRefineNodes.push({ node, mode })
+      node.mode = NODE_MODE_ALWAYS
+    }
+  }
+  refining = true
+  fireQueue()
+}
+
+/**
+ * Restores the modes {@link onRefineRequest} overrode (muted stays muted,
+ * bypassed stays bypassed) and ends the refine pause.
+ * @returns {void}
+ */
+function endRefine() {
+  for (const entry of unmutedRefineNodes) {
+    entry.node.mode = entry.mode
+  }
+  unmutedRefineNodes = []
+  refining = false
 }
 
 /**
@@ -136,7 +230,13 @@ function onComfyStatus(event) {
   const remaining = event?.detail?.exec_info?.queue_remaining
   if (typeof remaining !== 'number') return
   queueRemaining = remaining
-  if (remaining === 0 && trailing && !queueInFlight) {
+  if (remaining !== 0) return
+  if (refining && !queueInFlight) {
+    // The refine queue drained (success OR error — either way the run is
+    // over): re-mute the refine branch and resume the live loop.
+    endRefine()
+  }
+  if (trailing && !queueInFlight && !refining) {
     trailing = false
     if (isArmed()) fireQueue()
   }
@@ -167,6 +267,13 @@ export function init() {
       requestQueue()
     } catch (error) {
       api.warn('live loop: failed to handle cpsb.livecreativity', error)
+    }
+  })
+  api.onRefine(() => {
+    try {
+      onRefineRequest()
+    } catch (error) {
+      api.warn('live loop: failed to handle cpsb.refine', error)
     }
   })
   comfyApi.addEventListener('status', (event) => {

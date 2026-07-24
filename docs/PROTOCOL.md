@@ -1346,7 +1346,15 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
   flag instead of stacking queues; one run fires when the queue drains and picks up
   whatever frame is newest by then — intermediate frames are deliberately never
   rendered. Deliberately event-driven, not Auto-Queue "Instant" (which still works, via
-  IS_CHANGED caching, but busy-loops).
+  IS_CHANGED caching, but busy-loops). **Refine (R2, `cpsb.refine`):** a Refine click
+  runs the graph's muted refine branch exactly once — un-mute every muted
+  `PhotoshopRefineSource` (remembering each node's ORIGINAL mode), queue one run, and
+  when that queue drains restore the modes and resume. While refining, live triggers set
+  `trailing` instead of queueing (the auto-pause decision: the refine owns the GPU;
+  strokes keep streaming and the newest state renders on resume). NOT gated on arming —
+  a refine is an explicit click and works with `auto_queue` Off or no Live Canvas node.
+  No `PhotoshopRefineSource` in the graph → a console warning, nothing queued, nothing
+  paused.
 - **Gallery** (v0.5.36; overhauled 2026-07-22): each card leads with ONE larger
   thumbnail — the latest edit, or the original when no edit exists yet — with the
   original layered underneath for comparison. Grid is the gallery's ONLY layout (the

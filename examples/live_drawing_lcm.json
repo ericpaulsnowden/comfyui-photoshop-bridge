@@ -1,6 +1,6 @@
 {
-  "last_node_id": 12,
-  "last_link_id": 14,
+  "last_node_id": 19,
+  "last_link_id": 25,
   "nodes": [
     {
       "id": 1,
@@ -61,7 +61,8 @@
           "name": "MODEL",
           "type": "MODEL",
           "links": [
-            5
+            5,
+            19
           ],
           "slot_index": 0
         },
@@ -79,7 +80,9 @@
           "type": "VAE",
           "links": [
             2,
-            10
+            10,
+            17,
+            23
           ],
           "slot_index": 2
         }
@@ -125,7 +128,8 @@
           "name": "CONDITIONING",
           "type": "CONDITIONING",
           "links": [
-            6
+            6,
+            20
           ],
           "slot_index": 0
         }
@@ -164,7 +168,8 @@
           "name": "CONDITIONING",
           "type": "CONDITIONING",
           "links": [
-            7
+            7,
+            21
           ],
           "slot_index": 0
         }
@@ -420,7 +425,7 @@
       ],
       "size": {
         "0": 480,
-        "1": 300
+        "1": 420
       },
       "flags": {},
       "order": 10,
@@ -431,7 +436,7 @@
         "text": ""
       },
       "widgets_values": [
-        "REALTIME DRAWING - quickstart\n\n1) Point the Checkpoint at a FAST few-step model. A PLAIN model\n   (v1-5-pruned, SDXL base, DreamShaper/Juggernaut with NO\n   LCM/Turbo/Lightning/Hyper in the name) will NOT work - it barely\n   denoises at 4 steps, so the output stays ~99% your drawing.\n   Recommended:\n   - SD1.5 zero-setup drop-in (works with THIS graph as-is):\n     DreamShaper8_LCM.safetensors  (HF: Lykon/dreamshaper-8-lcm)\n   - SDXL, best quality (10GB+ VRAM): sdxl_lightning_4step.safetensors\n     (HF: ByteDance/SDXL-Lightning) - then set the KSampler to\n     sampler=euler, scheduler=sgm_uniform, CFG 1.0, do NOT add an\n     LCM LoRA (Lightning is already few-step), and set the plugin\n     panel's CAPTURE SIZE to 1024 (SDXL's native size - sharper).\n\n2) In Photoshop: open the ComfyUI Bridge panel, Start Live, and draw.\n\n3) The PROMPT and CREATIVITY controls are in the 'ComfyUI Preview'\n   panel (Plugins > ComfyUI Bridge > ComfyUI Preview), under the image:\n   - PROMPT box drives the 'Photoshop Live Prompt' node here.\n   - CREATIVITY (Low / Medium / High buttons) drives the 'Photoshop\n     Live Creativity' node, which sets this KSampler's denoise. Low =\n     hug your drawing, High = reinterpret it. That is the fix for\n     'looks like my drawing': effective work ~= steps x denoise, so at\n     4 steps favor Medium/High (the levels map onto denoise 0.40-0.85).\n\nYou never have to edit this graph to change the prompt or adherence -\ndo it from the Photoshop panel."
+        "REALTIME DRAWING - quickstart\n\n1) Point the Checkpoint at a FAST few-step model. A PLAIN model\n   (v1-5-pruned, SDXL base, DreamShaper/Juggernaut with NO\n   LCM/Turbo/Lightning/Hyper in the name) will NOT work - it barely\n   denoises at 4 steps, so the output stays ~99% your drawing.\n   Recommended:\n   - SD1.5 zero-setup drop-in (works with THIS graph as-is):\n     DreamShaper8_LCM.safetensors  (HF: Lykon/dreamshaper-8-lcm)\n   - SDXL, best quality (10GB+ VRAM): sdxl_lightning_4step.safetensors\n     (HF: ByteDance/SDXL-Lightning) - then set the KSampler to\n     sampler=euler, scheduler=sgm_uniform, CFG 1.0, do NOT add an\n     LCM LoRA (Lightning is already few-step), and set the plugin\n     panel's CAPTURE SIZE to 1024 (SDXL's native size - sharper).\n\n2) In Photoshop: open the ComfyUI Bridge panel, Start Live, and draw.\n\n3) The PROMPT and CREATIVITY controls are in the 'ComfyUI Preview'\n   panel (Plugins > ComfyUI Bridge > ComfyUI Preview), under the image:\n   - PROMPT box drives the 'Photoshop Live Prompt' node here.\n   - CREATIVITY (Low / Medium / High buttons) drives the 'Photoshop\n     Live Creativity' node, which sets this KSampler's denoise. Low =\n     hug your drawing, High = reinterpret it. That is the fix for\n     'looks like my drawing': effective work ~= steps x denoise, so at\n     4 steps favor Medium/High (the levels map onto denoise 0.40-0.85).\n\nYou never have to edit this graph to change the prompt or adherence -\ndo it from the Photoshop panel.\n\nREFINE (new): the bottom branch is the refine pass and its\n'Photoshop Refine Source' node ships MUTED - the live loop never runs\nit. Click REFINE in the ComfyUI Preview panel: your document uploads\nat full quality, this branch runs ONCE (2x lanczos upscale + an 8-step\nlow-denoise polish), live re-renders pause meanwhile, and the result\ngoes to BOTH the preview pane and a 'ComfyUI refined' document layer\n(the 'Photoshop Add Layer' node; Stack/Replace is in the main panel).\nDelete either output node to route to just one. You can also un-mute\nthe source and press Queue to run it manually - no plugin needed."
       ],
       "title": "READ ME \u2014 realtime drawing quickstart",
       "color": "#432",
@@ -471,6 +476,279 @@
         0.85
       ],
       "title": "Photoshop Live Creativity (slider in the PS preview panel)"
+    },
+    {
+      "id": 13,
+      "type": "PhotoshopRefineSource",
+      "pos": [
+        40,
+        960
+      ],
+      "size": {
+        "0": 320,
+        "1": 70
+      },
+      "flags": {},
+      "order": 13,
+      "mode": 2,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "render",
+          "type": "IMAGE",
+          "links": [
+            15
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "canvas",
+          "type": "IMAGE",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopRefineSource"
+      },
+      "title": "Photoshop Refine Source (MUTED \u2014 Refine button runs it)"
+    },
+    {
+      "id": 14,
+      "type": "ImageScaleBy",
+      "pos": [
+        420,
+        960
+      ],
+      "size": {
+        "0": 260,
+        "1": 80
+      },
+      "flags": {},
+      "order": 14,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 15
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            16
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageScaleBy"
+      },
+      "widgets_values": [
+        "lanczos",
+        2.0
+      ]
+    },
+    {
+      "id": 15,
+      "type": "VAEEncode",
+      "pos": [
+        720,
+        960
+      ],
+      "size": {
+        "0": 200,
+        "1": 60
+      },
+      "flags": {},
+      "order": 15,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "pixels",
+          "type": "IMAGE",
+          "link": 16
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 17
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            18
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEEncode"
+      }
+    },
+    {
+      "id": 16,
+      "type": "KSampler",
+      "pos": [
+        960,
+        900
+      ],
+      "size": {
+        "0": 300,
+        "1": 240
+      },
+      "flags": {},
+      "order": 16,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 19
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 20
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 21
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 18
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            22
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        0,
+        "fixed",
+        8,
+        1.5,
+        "lcm",
+        "sgm_uniform",
+        0.35
+      ],
+      "title": "Refine KSampler (polish pass)"
+    },
+    {
+      "id": 17,
+      "type": "VAEDecode",
+      "pos": [
+        1300,
+        960
+      ],
+      "size": {
+        "0": 200,
+        "1": 60
+      },
+      "flags": {},
+      "order": 17,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 22
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 23
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            24,
+            25
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      }
+    },
+    {
+      "id": 18,
+      "type": "PhotoshopLivePreview",
+      "pos": [
+        1540,
+        900
+      ],
+      "size": {
+        "0": 260,
+        "1": 60
+      },
+      "flags": {},
+      "order": 18,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 24
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PhotoshopLivePreview"
+      },
+      "title": "Refined \u2192 preview pane"
+    },
+    {
+      "id": 19,
+      "type": "PhotoshopAddLayer",
+      "pos": [
+        1540,
+        1010
+      ],
+      "size": {
+        "0": 280,
+        "1": 80
+      },
+      "flags": {},
+      "order": 19,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 25
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PhotoshopAddLayer"
+      },
+      "widgets_values": [
+        "ComfyUI refined"
+      ],
+      "title": "Refined \u2192 document layer"
     }
   ],
   "links": [
@@ -585,6 +863,94 @@
       6,
       4,
       "FLOAT"
+    ],
+    [
+      15,
+      13,
+      0,
+      14,
+      0,
+      "IMAGE"
+    ],
+    [
+      16,
+      14,
+      0,
+      15,
+      0,
+      "IMAGE"
+    ],
+    [
+      17,
+      2,
+      2,
+      15,
+      1,
+      "VAE"
+    ],
+    [
+      18,
+      15,
+      0,
+      16,
+      3,
+      "LATENT"
+    ],
+    [
+      19,
+      2,
+      0,
+      16,
+      0,
+      "MODEL"
+    ],
+    [
+      20,
+      3,
+      0,
+      16,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      21,
+      4,
+      0,
+      16,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      22,
+      16,
+      0,
+      17,
+      0,
+      "LATENT"
+    ],
+    [
+      23,
+      2,
+      2,
+      17,
+      1,
+      "VAE"
+    ],
+    [
+      24,
+      17,
+      0,
+      18,
+      0,
+      "IMAGE"
+    ],
+    [
+      25,
+      17,
+      0,
+      19,
+      0,
+      "IMAGE"
     ]
   ],
   "groups": [],
