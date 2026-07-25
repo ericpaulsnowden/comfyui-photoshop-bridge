@@ -234,11 +234,25 @@ function buildDom() {
 
   // Both image actions live IN the overlay, stacked (owner ask 2026-07-24:
   // Refine belongs on the image under "Add as a layer", not as more panel
-  // clutter). Column layout so they read as one action group.
+  // clutter). Column layout so they read as one action group, on an opaque
+  // theme-colored card: these buttons sit over an arbitrary RENDER, so the
+  // card is what guarantees contrast no matter what's underneath (owner
+  // report 2026-07-24: the Refine button "has no background color and is
+  // hard to read" — Spectrum's `secondary` variant is an OUTLINE button with
+  // a transparent fill, invisible over a busy image, unlike `cta`'s solid
+  // fill next to it).
   const overlayStack = document.createElement('div')
   overlayStack.style.display = 'flex'
   overlayStack.style.flexDirection = 'column'
   overlayStack.style.alignItems = 'center'
+  overlayStack.style.padding = '12px'
+  overlayStack.style.borderRadius = '8px'
+  // Host theme colors, so this reads correctly in all four Photoshop themes
+  // rather than assuming a dark panel.
+  overlayStack.style.backgroundColor = 'var(--uxp-host-background-color)'
+  overlayStack.style.borderWidth = '1px'
+  overlayStack.style.borderStyle = 'solid'
+  overlayStack.style.borderColor = 'var(--uxp-host-border-color)'
 
   addLayerButton = document.createElement('sp-button')
   addLayerButton.setAttribute('variant', 'cta')
@@ -251,6 +265,12 @@ function buildDom() {
   refineButton.setAttribute('variant', 'secondary')
   refineButton.textContent = 'Refine'
   refineButton.style.marginTop = '8px'
+  // Belt-and-braces on top of the card: a transparent-fill Spectrum variant
+  // lets the HOST element's own background show through, so this gives the
+  // outline button a real fill without betting on a variant name UXP may or
+  // may not implement.
+  refineButton.style.backgroundColor = 'var(--uxp-host-widget-hover-background-color)'
+  refineButton.style.borderRadius = '4px'
   refineButton.addEventListener('click', () => {
     onRefineClick()
   })
