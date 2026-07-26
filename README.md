@@ -14,29 +14,132 @@ comfyui-photoshop-bridge ships as a single ComfyUI custom node pack with two tie
 
 Neither tier syncs individual Photoshop layers back into the ComfyUI graph — a ComfyUI image is a flat RGB tensor, so this is a whole-image round trip, not a layer-level bridge. (Your layers are preserved *in Photoshop* on the local/edit-in-place paths; they just don't flow into the graph as layers.)
 
-## Nodes and features
+## Do I need the Photoshop plugin?
 
-Right-clicking an image and choosing **Open in Photoshop** is the core action, and it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds eleven nodes (category `image/photoshop`):
+**Short answer: mostly no — but two nodes genuinely can't exist without it.**
 
-- **Edit in Photoshop** — a node that opens its input in Photoshop and, in the default "Wait for first save" mode, *blocks* the workflow until you save, then continues with your edit. Also offers "Re-run on every save" and "Open only" modes, a timeout, and a cancel.
-- **Load PSD** — start a workflow from a `.psd`/`.psb` — or a **`.tif`/`.tiff`** — in ComfyUI's input folder, with an on-node **preview** (rendered server-side, no Photoshop needed) and an optional "edit the original in place" mode. Outputs IMAGE + MASK. An **`on_save`** widget controls what a save in Photoshop actually does — *Re-run workflow* (default), *Update only* (take the edit, don't re-run), or *Ignore* (saving does nothing). Set it to Ignore when you want to open a PSD, shuffle layers, push one back and close, without the graph firing every time you hit save. It's enforced on the server, so it governs the plugin's **Send** button too, not just automatic saves.
-- **Compose Layers to PSD** — stack multiple images into one layered, grouped PSD, then (by default) open it in Photoshop and block until you save. Outputs the flattened composite, the written PSD's filename, and a **`layers`** batch — one frame per layer — so a Preview node shows every layer individually instead of just the flat result. Leave the target empty and every run writes a fresh numbered PSD; **Browse…** to any PSD on the ComfyUI machine (or name a new one right in the dialog) and runs **accumulate into that single reviewable document**, each in its own numbered group. Writes are atomic, so a failed run can never truncate the document you've been collecting into — and safe to point at a file another node in this pack already has open (e.g. a Load PSD "edit original" target): a compose write into it is never mistaken for a Photoshop save on that other node's side. Whatever mode you use, the node shows **`Written: <filename>`** after a run with a **Copy Path** button (copies the full path on the ComfyUI machine) and offers **Open in Photoshop** on right-click — so a "Don't open (composite only)" run isn't a file you then have to go hunting for. You can also just point a **Load PSD** node at it: Compose writes into the same `input/` folder that node lists.
-- **Annotate for Edit** — hand an image to Photoshop; it opens with an auto-created empty transparent **"Instructions"** layer. Just paint on that layer with any brush, any color, to mark a region; you can edit the base image too. Save, and you get back four outputs covering the three views of the result:
-  - `image` — everything **but** your marks (your base edits baked in). Pair with `mask` for inpainting / mask-driven models.
-  - `mask` — your marks alone.
-  - `annotated` — image **and** marks combined, for visual-prompt edit models that take no mask ("edit what I circled"). The `box_composite` toggle picks the form: off = your real strokes, on = a tidy red box at their bounding box (what Kontext / Qwen-Image-Edit respond to).
-  - `instruction` — your text, verbatim.
+This pack is one ComfyUI custom node pack with two tiers (see [How it works](#how-it-works) above). Tier 1 needs nothing beyond the node pack; Tier 2 is an optional Photoshop panel. Here is exactly what that changes, feature by feature:
 
-  Rename or delete the Instructions layer and it's just treated as a plain edited image. A **`mode`** widget matches the other nodes — *Wait for first save* (block until you save) or *Re-run on every save* (keep the doc open and re-run with your new mask each save, to iterate on the drawing), plus *Pass through*. A **Re-open in Photoshop** button on the node gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
-- **Run Photoshop Action** — give it an image and the name of a **saved Photoshop Action** (plus its set), and it opens the image, plays that Action, and returns the processed result to your workflow — no manual step. This one **requires the Tier-2 plugin** (there's no way to trigger a Photoshop Action without it), and it says so clearly if the plugin isn't connected. Heads-up: an Action that pops an interactive dialog mid-run can stall Photoshop — use Actions that run start-to-finish unattended.
-- **Photoshop Live Canvas + Photoshop Live Prompt + Photoshop Live Creativity + Photoshop Live Preview** — realtime drawing, end to end **without leaving Photoshop**: toggle **Live Mode** in the plugin panel and Live Canvas serves a fresh snapshot of the canvas you're drawing on after **every stroke — no saving** (a lightweight change-detect poll, downscaled capture, ~sub-second). With its **`auto_queue`** widget On, every stroke queues a re-render automatically (coalesced — always your newest strokes, never a backlog); wire the result into **Live Preview** and each render lands in a **"ComfyUI Preview" panel docked right beside your canvas in Photoshop**. **Steer the render without touching the graph — right from that preview panel, under the image:** a **PROMPT** box feeds **Photoshop Live Prompt** into your positive prompt, and a **Creativity** control (**Low / Medium / High**) feeds **Photoshop Live Creativity** into the KSampler's `denoise` (low = hug your drawing, high = reinterpret it), with a **CREATIVITY RANGE** setting in the main panel — Subtle/Balanced/Bold, remembered **per capture size**, because the same denoise behaves very differently at 512 vs 1024 depending on your model — both re-render live as you change them, both **persist per document** (reopen a file and its prompt/creativity come back — settings never leak across files), and both fall back to their node widgets so a ComfyUI-only setup still works. The controls sit with the render they affect, so they stay usable even if you collapse the main panel. **Hover the render and click "Add as a layer"** to drop it into your document as a new layer scaled to the canvas. A **CAPTURE SIZE** control in the main panel (512/768/1024, persisted) sets the live frames' long side — use 1024 with SDXL-class models for sharper results. A ready-made workflow ships in [`examples/live_drawing_lcm.json`](examples/live_drawing_lcm.json): drop it in, point the checkpoint at a **fast few-step model** and draw. These bundled settings (`lcm` sampler, 4 steps, CFG 2) only behave on a few-step model — a plain checkpoint (SD1.5 base, SDXL base, DreamShaper/Juggernaut with no LCM/Turbo/Lightning/Hyper in the name) barely denoises at 4 steps, which is exactly the "output looks 99% like my drawing and the prompt does nothing" trap. Concrete picks: **`DreamShaper8_LCM.safetensors`** (HF `Lykon/dreamshaper-8-lcm`, SD1.5, ~2 GB) is a true zero-setup drop-in — swap it in and this graph just works; for best quality on 10 GB+ VRAM use **`sdxl_lightning_4step.safetensors`** (HF `ByteDance/SDXL-Lightning`) and change the KSampler to `euler`/`sgm_uniform`/CFG 1.0 (keep 4 steps). Prefer to keep your own SD1.5 model? Add the LCM-LoRA (`latent-consistency/lcm-lora-sdv1-5`) via a `LoraLoaderModelOnly` node. No download at all? Set the KSampler to `euler`/`normal`, ~20 steps, CFG ~7 — works with any model but ~5× slower. **`denoise` is your creativity knob:** low (~0.4) hugs your drawing, high (~0.8) follows the prompt more — if changing the prompt seems to do nothing, your denoise is too low or your model isn't a few-step model. The seed is fixed so only your drawing and prompt change the output. Expect roughly a second from stroke to re-render on a strong GPU — live iteration, not 30fps video. Frames are ephemeral — never saved to disk, never in the gallery. Live Canvas **requires the Tier-2 plugin** (save-free capture is impossible without it); Live Prompt does not (it falls back to its widget). Live Canvas's MASK output is always empty (the live stream is JPEG); derive masks downstream.
-- **Photoshop Refine Source + Photoshop Add Layer** — the **refine pass**: when a live render is worth keeping, push it through ANY workflow at high quality and land the result back in Photoshop. The server keeps every live render at **full quality** behind the scenes (the preview pane only shows a small copy), and **Refine Source** serves it — plus a full-resolution capture of your canvas — into whatever refine chain you build (upscaler, high-step img2img, anything). End the chain in **Live Preview** to see the result in the preview pane, in **Add Layer** to place it **straight into your open document as a layer** (scaled to the document bounds; pixels capped at 4096px long side), or both. A **REFINED LAYER** control in the main panel picks whether repeated refines **Stack** new layers or **Replace** the previous one. In the bundled workflow the refine branch ships **muted** — click **Refine** in the preview panel and the loop runs it exactly once (pausing live re-renders while it works), or un-mute and Queue it manually from ComfyUI with no plugin at all. The preview panel's "Add as a layer" hover button also upgraded: it now places the server's full-quality render, not the small display copy.
+| Photoshop plugin | Features |
+|---|---|
+| **Not needed at all** | **Load PSD** · **Compose Layers to PSD** · **Photoshop Live Prompt** · **Photoshop Live Creativity** · **Photoshop Refine Source** — these either never touch Photoshop, or fall back to their own node widgets. |
+| **Optional — works without it** | **Open in Photoshop** (right-click) · **Edit in Photoshop** · **Annotate for Edit** · Load PSD's *edit in place* · Compose's *open in Photoshop* — all work via Tier 1 (the OS opens Photoshop, a file-watcher catches your save). The plugin makes them instant, higher-fidelity, and cross-machine. |
+| **Required** | **Run Photoshop Action** · **Photoshop Live Canvas** — there is no Tier-1 way to play an Action, or to capture your canvas *without a save*. Both say so clearly instead of failing mysteriously. |
+| **Required to be useful** | **Photoshop Live Preview** · **Photoshop Add Layer** · **Send to ComfyUI** · the whole **ComfyUI Preview panel** (prompt, creativity, Refine, Add as a layer) — these deliver *into* Photoshop, so without the plugin they run but have nowhere to land (a logged no-op, never a failed render). |
 
-Handoffs opened in Photoshop are **named after the file they came from** — `Eric-Headshot.jpg` opens as `Eric-Headshot.psd`, not an anonymous `source.psd` — so document tabs and file dropdowns stay tellable-apart.
+The rule behind that table: **anything that can work without the plugin, does.** The plugin exists to make things better, not to gate the basics — the only hard exceptions are the two things that are genuinely impossible otherwise.
 
-A **"Photoshop Edits" sidebar gallery** tracks every round trip — across all your workflows, each card titled with its workflow's name — as a grid of cards: **Open** it again in Photoshop, **Add** it as a node, **Reveal** its origin node on the canvas, or **Remove** it from the list. Each card leads with the latest edit — hold the gallery's **"Hold to compare"** button to see every card's original at once. A card still `Editing` whose Tier-2 plugin has confirmed the document is closed shows "Closed without saving" instead of guessing from elapsed time. Any node that's waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
+## The nodes
 
-**Send TO ComfyUI, starting from Photoshop.** Everything above starts from a ComfyUI node; **Plugins ▸ Send to ComfyUI** goes the other way — pick **Active Layer** or **Whole Document** in the small dialog that pops up, and it lands as a new, ready-to-use card in the sidebar gallery, no workflow or node required to receive it. Click **Add** on that card to drop it into any workflow as a Load Image node. Requires the Tier-2 plugin (there's no Tier-1 equivalent — this has no ComfyUI node to fall back to). Only the topmost layer of a multi-layer selection is sent; merge manually first if you need more than one.
+Right-clicking any image and choosing **Open in Photoshop** is the core action, and it needs no node at all — it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds eleven nodes (all in the `image/photoshop` category).
+
+### Edit in Photoshop
+
+> **Plugin: optional** — Tier 1 handles it; the plugin makes it instant and cross-machine.
+
+Opens its input image in Photoshop and, in the default **Wait for first save** mode, *blocks* the workflow until you save — then continues with your edit as the node's output. Also offers **Re-run on every save** (keep iterating, each save re-runs the graph) and **Open only (don't wait)**, plus a timeout and a working cancel.
+
+### Load PSD
+
+> **Plugin: not needed** — the preview is rendered server-side, with no Photoshop involved.
+
+Starts a workflow *from* a `.psd`/`.psb` — or a **`.tif`/`.tiff`** — sitting in ComfyUI's input folder. Shows an on-node **preview** and outputs IMAGE + MASK. An optional **edit the original in place** mode opens that very file in Photoshop and takes your saves back (that part uses Tier 1 or the plugin).
+
+An **`on_save`** widget controls what a save in Photoshop actually does: *Re-run workflow* (default), *Update only* (take the edit, don't re-run), or *Ignore* (saving does nothing). Set it to Ignore when you want to open a PSD, shuffle layers, push one back and close, without the graph firing on every save. It's enforced on the server, so it governs the plugin's **Send** button too, not just automatic saves.
+
+### Compose Layers to PSD
+
+> **Plugin: not needed** to write the PSD; opening it in Photoshop uses Tier 1 or the plugin.
+
+Stacks multiple images into one **layered, grouped PSD**, then (by default) opens it in Photoshop and blocks until you save. Outputs the flattened composite, the written PSD's filename, and a **`layers`** batch — one frame per layer — so a Preview node shows every layer individually instead of just the flat result.
+
+Leave the target empty and every run writes a fresh numbered PSD; **Browse…** to any PSD on the ComfyUI machine (or name a new one right in the dialog) and runs **accumulate into that single reviewable document**, each in its own numbered group. Writes are atomic, so a failed run can never truncate the document you've been collecting into — and it's safe to point at a file another node in this pack already has open (e.g. a Load PSD "edit original" target): a compose write is never mistaken for a Photoshop save on that other node's side.
+
+After a run the node shows **`Written: <filename>`** with a **Copy Path** button and offers **Open in Photoshop** on right-click — so even a "Don't open (composite only)" run isn't a file you have to go hunting for. Compose writes into the same `input/` folder **Load PSD** lists, so you can chain the two.
+
+### Annotate for Edit
+
+> **Plugin: optional** — Tier 1 handles it.
+
+Hands an image to Photoshop, which opens it with an auto-created empty transparent **"Instructions"** layer. Paint on that layer with any brush, any color, to mark a region; you can edit the base image too. Save, and you get back four outputs covering the three useful views of the result:
+
+- **`image`** — everything *but* your marks (your base edits baked in). Pair with `mask` for inpainting / mask-driven models.
+- **`mask`** — your marks alone.
+- **`annotated`** — image *and* marks combined, for visual-prompt edit models that take no mask ("edit what I circled"). The `box_composite` toggle picks the form: off = your real strokes, on = a tidy red box at their bounding box (what Kontext / Qwen-Image-Edit respond to).
+- **`instruction`** — your text, verbatim.
+
+Rename or delete the Instructions layer and it's treated as a plain edited image. The **`mode`** widget matches the other nodes (*Wait for first save*, *Re-run on every save*, *Pass through*), and a **Re-open in Photoshop** button gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
+
+### Run Photoshop Action
+
+> **Plugin: REQUIRED** — there is no way to trigger a Photoshop Action without it. The node says so clearly if the plugin isn't connected.
+
+Give it an image and the name of a **saved Photoshop Action** (plus its set), and it opens the image, plays that Action, and returns the processed result to your workflow — no manual step. Heads-up: an Action that pops an interactive dialog mid-run can stall Photoshop, so use Actions that run start-to-finish unattended.
+
+### Photoshop Live Canvas
+
+> **Plugin: REQUIRED** — save-free capture is impossible without it.
+
+The input side of **realtime drawing**. Toggle **Live Mode** in the plugin panel and this node serves a fresh snapshot of the canvas you're drawing on after **every stroke — no saving** (a lightweight change-detect poll plus a downscaled capture, ~sub-second). With its **`auto_queue`** widget On, every stroke queues a re-render automatically, coalesced so you always get your newest strokes and never a backlog.
+
+A **CAPTURE SIZE** control in the main panel (512 / 768 / 1024, persisted) sets the live frames' long side — use 1024 with SDXL-class models for sharper results. Frames are ephemeral: never written to disk, never added to the gallery. The MASK output is always empty (the live stream is JPEG, which carries no alpha); derive masks downstream.
+
+### Photoshop Live Prompt
+
+> **Plugin: not needed** — falls back to its own text widget, so a ComfyUI-only setup works.
+
+Outputs a `STRING` to wire into a `CLIPTextEncode`'s `text` input, so you can **type your prompt in Photoshop** instead of the graph. The **PROMPT** box lives in the ComfyUI Preview panel, right under the render it affects; edits re-render live. Prompts **persist per document** — reopen a file and its prompt comes back, and settings never leak between files.
+
+### Photoshop Live Creativity
+
+> **Plugin: not needed** — falls back to its own widgets.
+
+Outputs a `FLOAT` for the KSampler's `denoise` input, driven by a **Low / Medium / High** control in the preview panel: low hugs your drawing, high reinterprets it. Because the same denoise behaves very differently at 512 vs 1024 depending on your model, the band those levels map onto is a **CREATIVITY RANGE** setting in the main panel (Subtle / Balanced / Bold) **remembered per capture size** — and the preview panel always names the exact denoise each level currently means.
+
+### Photoshop Live Preview
+
+> **Plugin: required to be useful** — it delivers *into* Photoshop. Without it the node runs and logs a no-op rather than failing your render.
+
+The output side of the live loop: wire your rendered IMAGE here and each result appears in the **"ComfyUI Preview" panel docked beside your canvas in Photoshop**. Hover the render for **Add as a layer** (drops it into your document, scaled to the canvas) and **Refine** (below). Behind the scenes this node also keeps every render at **full quality** server-side, which is what the refine pass and Add-as-a-layer actually place — the panel only *displays* a small copy.
+
+### Photoshop Refine Source
+
+> **Plugin: not needed** — serves the last render even with no plugin connected.
+
+The input side of the **refine pass**. Two IMAGE outputs, and your refine workflow wires whichever it wants: **`render`** (the last live render, at full quality — "refine exactly what I saw") and **`canvas`** (a full-resolution capture of your document, sent when you click Refine — a higher quality ceiling, though composition can drift). Either one missing falls back to the other, so every wiring shape works.
+
+**Mute this node to disarm the refine branch** — ComfyUI skips its whole downstream chain, so an expensive refine never runs per-stroke. Clicking **Refine** in the panel un-mutes it for exactly one run, then re-mutes it.
+
+### Photoshop Add Layer
+
+> **Plugin: required to be useful** — it delivers *into* Photoshop; without it, a logged no-op.
+
+Ends a chain by pushing the result **straight into your open Photoshop document as a layer**, scaled to the document bounds (pixels capped at 4096px on the long side). A **REFINED LAYER** control in the main panel picks whether repeated refines **Stack** new layers or **Replace** the previous one.
+
+## Realtime drawing: draw in Photoshop, watch it re-render
+
+The four `Live` nodes plus the refine pass make one loop: **draw → see an AI render in a panel beside your canvas → steer it with a prompt and a creativity dial → refine the good one at high quality → drop it into your document as a layer.** All of it without leaving Photoshop.
+
+A ready-made workflow ships in [`examples/live_drawing_lcm.json`](examples/live_drawing_lcm.json) — drop it in, point the checkpoint at a fast model, and draw.
+
+**Pick the right model — this is the one setup mistake that breaks everything.** The bundled settings (`lcm` sampler, 4 steps, CFG 2) only behave on a **few-step model**. A plain checkpoint (SD1.5 base, SDXL base, DreamShaper/Juggernaut with no LCM/Turbo/Lightning/Hyper in the name) barely denoises at 4 steps — which is exactly the "the output looks 99% like my drawing and the prompt does nothing" trap.
+
+- **Zero-setup drop-in:** `DreamShaper8_LCM.safetensors` (HF `Lykon/dreamshaper-8-lcm`, SD1.5, ~2 GB) — swap it in and the bundled graph just works.
+- **Best quality on 10 GB+ VRAM:** `sdxl_lightning_4step.safetensors` (HF `ByteDance/SDXL-Lightning`), then set the KSampler to `euler` / `sgm_uniform` / CFG 1.0 (keep 4 steps) and **don't** add an LCM LoRA — Lightning is already few-step, and stacking two accelerators fights itself.
+- **Keep your own SD1.5 model:** add the LCM-LoRA (`latent-consistency/lcm-lora-sdv1-5`) through a `LoraLoaderModelOnly` node.
+- **No download at all:** set the KSampler to `euler` / `normal`, ~20 steps, CFG ~7 — works with any model, but roughly 5× slower.
+
+Expect about a second from stroke to re-render on a strong GPU: live iteration, not 30fps video. The seed is fixed on purpose, so only your drawing and your prompt change the output.
+
+**The refine pass** turns a good live render into a finished one. Click **Refine** on the render (hover it in the preview panel) and the workflow's refine branch runs **once** at high quality — pausing live re-renders while it works — then delivers the result wherever you wired it: back to the preview pane (**Live Preview**), straight into your document as a layer (**Add Layer**), or both. Prefer to drive it yourself? Un-mute **Refine Source** and press Queue in ComfyUI, no plugin required.
+
+## Beyond the nodes
+
+**The "Photoshop Edits" sidebar gallery** tracks every round trip — across all your workflows, each card titled with its workflow's name — as a grid of cards: **Open** it again in Photoshop, **Add** it as a node, **Reveal** its origin node on the canvas, or **Remove** it from the list. Each card leads with the latest edit; press and hold any thumbnail to compare it against its original. A card still `Editing` whose plugin has confirmed the document is closed shows "Closed without saving" instead of guessing from elapsed time. Any node waiting on Photoshop shows an "Editing in Photoshop…" badge with a working cancel.
+
+**Send TO ComfyUI, starting from Photoshop.** Everything above starts from a ComfyUI node; **Plugins ▸ ComfyUI Bridge ▸ Send to ComfyUI** (or the button in the panel) goes the other way — pick **Active Layer** or **Whole Document**, and it lands as a new, ready-to-use card in the sidebar gallery, with no workflow or node required to receive it. Click **Add** on that card to drop it into any workflow as a Load Image node. *Requires the plugin* — there's no Tier-1 equivalent, since nothing in ComfyUI initiates it. Only the topmost layer of a multi-layer selection is sent; merge manually first if you need more than one.
+
+**Sensible file names.** Handoffs opened in Photoshop are **named after the file they came from** — `Eric-Headshot.jpg` opens as `Eric-Headshot.psd`, not an anonymous `source.psd` — so document tabs and file dropdowns stay tellable-apart.
 
 <!-- demo.gif -->
 *(Right-click an image → Open in Photoshop → edit → Cmd/Ctrl+S → the node updates. Demo GIF coming.)*
@@ -110,7 +213,6 @@ The round trip, the eleven nodes, the gallery, and cross-machine editing all wor
 - **A packaged, signed plugin install** (`.ccx` / Adobe Exchange), so Tier 2 doesn't require developer mode + UDT.
 - **A ComfyUI Registry listing** (so Manager can find it by search, not just Git URL).
 - **A fuller Photoshop-side gallery** (the panel currently lists active hand-offs, not a browsable history).
-- **Auto-setting Maximize PSD Compatibility** at connect time, to retire that one-time manual step.
 
 ## Limitations
 
