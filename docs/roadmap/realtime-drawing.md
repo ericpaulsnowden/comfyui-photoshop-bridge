@@ -1,6 +1,24 @@
 # Roadmap — Real-time drawing feedback (draw in Photoshop, live ComfyUI re-render)
 
-**Status:** planned (research done 2026-07-24; NOT started — plan only, per Eric)
+**Status (updated 2026-07-27):** **M1–M3 SHIPPED** (v0.5.45, v0.5.46, v0.5.47,
+all 2026-07-23; hardening pass v0.5.48 same day) — the whole "draw → live
+re-render → docked PS preview panel" loop described in the Architecture
+diagram below is live, plus the Prompt/Creativity panel controls that were
+folded into M2 (v0.5.49–v0.5.51, 2026-07-23/24). **Refine R1+R2 also SHIPPED**
+(v0.5.59–v0.5.60, 2026-07-24; polish through v0.5.62, 2026-07-25 — see the
+"R — Refine pass" section below, which already carries its own accurate
+per-phase status). **M4 is only partially done** — configurable capture size
+shipped (v0.5.55, struck through in the backlog section below) but the
+adaptive scheduler, tab-free `/prompt` driver, and ROI capture have no code
+anywhere in `photoshop_plugin/`/`cpsb/` (checked 2026-07-27) — same as **R3
+(the tab-free driver, = M4's driver item)**, still not started. **M5
+(in-canvas "AI Preview" layer) NOT started** — no `putPixels`/`suspendHistory`
+usage found in the plugin. Evidence:
+`git -C comfyui-photoshop-bridge log --oneline`. The rest of this document
+(architecture, milestone bodies, the R section, and the backlog list below)
+was already kept current milestone-by-milestone as things shipped — only
+this top status line had drifted behind that. Original line, superseded:
+"planned (research done 2026-07-24; NOT started — plan only, per Eric)".
 **Ask (Eric, 2026-07-24):** "do work in photoshop, especially drawing, and get realtime feedback."
 **Verdict up front:** worth building, and cheaper than it looks — the transport/export half already exists in this pack; the genuinely new work is a capture loop, a scheduler, and a preview surface, all with proven designs to port.
 
@@ -59,18 +77,23 @@ Design commitments:
 
 ## Milestones (each independently useful)
 
-### M0 — Live spikes (throwaway plugin build; ~an hour of Eric's Photoshop time)
+### M0 — Live spikes (throwaway plugin build; ~an hour of Eric's Photoshop time) — RESOLVED (implicitly, by shipping M1–M3)
+No standalone spike write-up/LIVE RESULTS section exists for S-A/S-B/S-C in
+this file, but M1–M3 (which each depend on their answer) shipped and were
+hardened live (v0.5.44/v0.5.48 review passes), so treat S-A/S-B/S-C as
+answered in the affirmative by the shipped code. S-D (gates M5) remains
+genuinely open — M5 has not been attempted.
 The plan's load-bearing unknowns, none guessable from docs:
 - **S-A (gates M1):** does `activeDocument.activeHistoryState.id` update promptly at stroke mouse-up under a 250ms poll, or only "after clicking away"? (Also log `historyStateChanged` timestamps alongside, to settle the event question for good.)
 - **S-B (gates M1):** `getPixels(targetSize 512/768/1024)` + `encodeImageData` timing, called every ~300ms for 2+ minutes — measure ms/frame, memory with `dispose()`, and what happens when it fires **mid-brushstroke** (stall? queue? clean frame?).
 - **S-C (gates M3):** panel `<img>` src-swap at 2-10Hz — smooth, or does it need `<canvas>`?
 - **S-D (gates M5, deferred):** `putPixels` into a non-active layer mid-stroke — stutter/contention measurement. Not needed for M1-M4.
 
-### M1 — Live capture + Photoshop Live Canvas node
+### M1 — Live capture + Photoshop Live Canvas node — SHIPPED v0.5.45, 2026-07-23
 Plugin: per-document **Live Mode** toggle (main panel); history-id poll → debounced capture → `live_frame` (new lightweight WS message; single frame, JPEG b64, keep-latest). Server: in-memory live session + latest-frame slot + `cpsb.live` event. Node: **Photoshop Live Canvas** (IMAGE; IS_CHANGED = a content hash of the frame — as built, NOT the plan's original frame-counter idea: the counter restarts per plugin connection and would alias across reconnects). PROTOCOL.md §3/§6 additions.
 **Useful alone:** draw in PS, watch the result re-render in the ComfyUI tab on a second monitor — the full loop minus in-PS preview.
 
-### M2 — The loop + the recipe
+### M2 — The loop + the recipe — SHIPPED v0.5.46, 2026-07-23 (prompt/creativity controls SHIPPED v0.5.49–v0.5.51, 2026-07-23/24)
 Frontend: `cpsb.live` → coalesced `queuePrompt(0)` (reuses the existing auto-queue seam; gated by a Live arm/disarm control so it never fires unexpectedly). Ship a **bundled example workflow** (Live Canvas → LCM/Lightning img2img with the reference settings → preview). Panel shows live status (frames sent, capture ms, last-frame age; Stop Live is the pause — a live fps ticker is M4 polish).
 
 **Prompt + creativity controls (shipped in M2, added after Eric's live tests):** two nodes fed from controls **in the "ComfyUI Preview" panel, under the image** (they sit with the render they affect and survive collapsing the main panel):
@@ -79,16 +102,16 @@ Frontend: `cpsb.live` → coalesced `queuePrompt(0)` (reuses the existing auto-q
 
 Both re-render via the shared `requestQueue()` seam (`cpsb.liveprompt`/`cpsb.livecreativity`), and both are **NOT Tier-2-gated** — they fall back to their own node widgets so ComfyUI-only still works. Diagnosis that drove this: the "prompt/output barely changes" symptom is denoise + few-step-model, NOT wiring — the drawing's latent dominates at low denoise, weak low-CFG LCM adherence compounds it, and `lcm`/4-step on a non-few-step checkpoint (or a distilled checkpoint with an accelerator LoRA stacked on top) barely denoises. The on-canvas Note states the model requirement and the effective-work ≈ steps × denoise relationship.
 
-### M3 — Feedback inside Photoshop
+### M3 — Feedback inside Photoshop — SHIPPED v0.5.47, 2026-07-23
 Second manifest panel **"ComfyUI Preview"** (documented multi-panel; shares the existing connection singleton). New **Photoshop Live Preview** output node: pushes its IMAGE input back over the plugin WS as a JPEG `result_frame`; the panel displays it (img or canvas per S-C). This is the headline UX: **draw on the canvas, AI result lives in a docked panel beside it.**
 
-### M4 — Robustness & upgrades
+### M4 — Robustness & upgrades — PARTIALLY SHIPPED as of 2026-07-27 (capture-size cap only, v0.5.55)
 - Adaptive scheduler (port Krita's `LiveScheduler` semantics: no debounce while fast, grace when slow).
 - Tab-free driver: server-side direct `/prompt` resubmission with a frontend-captured graph (`graphToPrompt` snapshot on arm) — removes the browser from the loop.
 - Remote-mode tuning (Mac PS → PC Comfy): frame-size cap, adaptive JPEG quality.
 - ROI capture (`sourceBounds` + `targetSize`) for big canvases.
 
-### M5 — In-canvas "AI Preview" layer (spike-gated on S-D; off by default)
+### M5 — In-canvas "AI Preview" layer (spike-gated on S-D; off by default) — NOT STARTED as of 2026-07-27
 `putPixels` into a dedicated pixel layer, whole session wrapped in ONE `suspendHistory`/`resumeHistory` pair (documented; collapses hundreds of writes into one undo step; auto-resume safety net on modal exit). Only if S-D shows acceptable brush contention — no shipped plugin has proven this, and the likely failure is stroke stutter. The M3 panel remains the default feedback surface regardless.
 
 ## R — Refine pass (R1+R2 SHIPPED v0.5.59–60, 2026-07-24; R3 not started)

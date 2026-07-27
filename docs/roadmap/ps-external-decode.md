@@ -1,6 +1,16 @@
 # Roadmap — Photoshop-routed external-format decode
 
-**Status:** planned (research done 2026-07-21; not yet built)
+**Status (updated 2026-07-27):** **M1 SHIPPED v0.5.40, 2026-07-19** — "Load
+PSD accepts TIFF from the upload button; drop third-party .ai/.dng decoders"
+(`git -C comfyui-photoshop-bridge log --oneline`). Confirmed against the
+current code: `cpsb/raster_io.py` and `cpsb/load_psd.py` no longer import
+`pypdfium2`/`rawpy`, and both carry comments pointing `.ai`/raw to "the
+Tier-2 'Open via Photoshop' node" as future work. **M2 (the `PhotoshopOpen`
+/ "Open via Photoshop" node) is NOT built** — no `cpsb/open_external.py` or
+`photoshop_plugin/openExternal.js` exists, and the node is absent from the
+README's eleven-node list. M3/M4 also not started. This matches the
+existing `docs/roadmap/README.md` index entry, which was already accurate.
+**Status (original, research done 2026-07-21; not yet built):**
 **Owner decisions (Eric, 2026-07-21):**
 - Lives in a **new dedicated Tier-2 node**, *not* an extension of Load PSD. Load PSD stays ComfyUI-only (PSD/PSB/TIFF, instant, no plugin).
 - **`.ai` first (flagship). `.dng` is a later, spike-gated milestone.**
@@ -43,7 +53,7 @@ Either legacy `app.open(entry, CameraRAWOpenOptions, asSmartObject=false)` (pins
 
 ## Milestones (each independently useful)
 
-### M1 — Clean the accepted-format surface *(ships immediately; no plugin, no risk)*
+### M1 — Clean the accepted-format surface *(ships immediately; no plugin, no risk)* — SHIPPED v0.5.40, 2026-07-19
 **User value:** TIFF upload works from the Load PSD button (Eric's exact ask); no third-party deps anywhere; the format list is honest.
 - Remove `pypdfium2`/`rawpy` from `cpsb/raster_io.py` (`AI_EXTENSIONS`, `RAW_EXTENSIONS`, `pypdfium2_available`, `rawpy_available`, `_decode_ai`, `_decode_raw`, `_AI_RENDER_SCALE`, `_optional_module`; collapse `available_extensions()`/`decode_to_rgb8()` to TIFF-only). Keep all TIFF code + `EDIT_IN_PLACE_CAPABLE_EXTENSIONS`.
 - Remove the `.ai`/`.dng` tests (`tests/test_psd_io.py` `TestDecodeAi`/`TestDecodeRaw` + their fixture helpers; `tests/test_load_psd.py` the AI/raw listing+validate+dependency-error tests). Keep all TIFF tests.
@@ -52,7 +62,7 @@ Either legacy `app.open(entry, CameraRAWOpenOptions, asSmartObject=false)` (pins
 - **Release note:** `.ai`/`.dng` no longer load via Load PSD — that capability moves to the new node (M2/M3). A saved workflow pointing Load PSD at a `.ai`/`.dng` will stop resolving it.
 - **Acceptance:** tests green on both interpreters; TIFF selectable via combo AND the upload button; button reads "Upload Photoshop File" with the format list beneath it.
 
-### M2 — "Open via Photoshop" node for `.ai` *(flagship; Tier-2; validated live)*
+### M2 — "Open via Photoshop" node for `.ai` *(flagship; Tier-2; validated live)* — NOT STARTED as of 2026-07-27
 **User value:** load an Illustrator `.ai` into ComfyUI with Photoshop's exact rendering, no third-party lib — a capability nothing else in the ComfyUI ecosystem has.
 - New Tier-2 node (working name **`PhotoshopOpen` / "Open via Photoshop"**), `cpsb/open_external.py`, modeled on `cpsb/actions.py`. Inputs: a file picker (combo of `.ai` files in the input dir, hand-rolled upload widget like Load PSD, accept `.ai`), `timeout_seconds`. Output `(IMAGE, MASK)`.
 - Server: gate on `tier2_connected` (interrupt if no plugin, clear log — no ComfyUI-only fallback by design); create a handoff pointing at the ORIGINAL `.ai` (reuse the `original_path` mechanic); open via the shared seam; send new `open_external` trigger (bounded send, mirror `_send_run_action`); block on `wait_for_edit`; consume via `_load_edit_tensors`.
@@ -62,7 +72,7 @@ Either legacy `app.open(entry, CameraRAWOpenOptions, asSmartObject=false)` (pins
 - **Spike (Eric, live):** does a real `.ai` open headlessly via the descriptor without a dialog, and rasterize correctly (art with no background → real alpha for the MASK)? This is the load-bearing unknown; ships spike-gated exactly as the Run Action node did.
 - **Acceptance:** automated tests for the server plumbing (handoff, gate, message, wait/consume) green on both interpreters; Eric confirms a real `.ai` loads matching Photoshop's render.
 
-### M3 — `.dng` via Camera Raw *(later; Tier-2; higher-risk, spike-gated)*
+### M3 — `.dng` via Camera Raw *(later; Tier-2; higher-risk, spike-gated)* — NOT STARTED as of 2026-07-27
 **User value:** PS-exact raw decode that inherits your ACR edits, zero third-party dep. *(Flagged redundant with rawpy nodes for basic raw — pursue only for the PS-fidelity niche.)*
 - Extend the M2 node to accept `.dng` (+ optionally `.cr2/.nef/.arw/…`), opening via the Camera Raw descriptor; force 8-bit + pinned colorspace + `settings:CAMERA` for determinism.
 - **Gated on its own live freeze spike** — Camera Raw's dialog is the higher-risk, less-documented path; only proceed once M2 proves the two-message + executeAsModal pattern on the safer `.ai` format.

@@ -4,9 +4,11 @@ Before locking in the M1 implementation, we're validating eight assumptions the 
 
 **Status as of 2026-07-20:** these M0 spikes have been overtaken by production. The pack shipped through **v0.5.30** — four nodes, the Tier-1 and Tier-2 round trips, and cross-machine (Mac Photoshop ↔ PC ComfyUI) editing — and Eric has personally validated the whole feature set on his own machines (50/50 manual-test items). Spikes 2, 6, 7 were proven live on Photoshop 27.8.0 (2026-07-17; see **LIVE RESULTS** at the bottom). Spikes **1, 3, 4, 5 are now confirmed in production** — the right-click menu, psd-tools PSD write fidelity, the save-detection watcher (Windows on Eric's PC + macOS in dev), and paste-back + auto-queue all ship and are validated by real use, not a throwaway spike. The one genuinely open item is **spike 8 (programmatic Maximize Compatibility)** — in progress as an auto-set-on-connect feature, pending live validation.
 
+**Status as of 2026-07-27:** all eight spikes are now resolved — **spike 8 shipped as a real feature in v0.5.31** ("plugin auto-sets Maximize PSD Compatibility on connect") and was **live-validated by Eric on 2026-07-21** (recorded on the living test checklist, `research/checklists/comfy-ps-bridge.html`: "Plugin auto-sets Maximize PSD Compatibility on connect — v0.5.31 — validated by Eric · 2026-07-21 (spike 8 confirmed on real Photoshop)"). See the corrected checklist item and Spike 8 section below. Also stale in the 2026-07-20 paragraph above: the pack is at **v0.5.62** as of this date (not v0.5.30) with **eleven nodes** (not four — see the README's "The nodes" section), and the living test checklist now shows 111 archived/validated items (not 50), all 0 currently active. That paragraph is left as an unedited historical snapshot; treat the version/node-count numbers in it as dated 2026-07-20, not current. Evidence: `git -C comfyui-photoshop-bridge log --oneline`, `README.md`, `research/checklists/comfy-ps-bridge.html`.
+
 The rule: **M1 design isn't final until every spike below has a written yes/no/workaround answer.**
 
-This project is pre-release — see the status note at the top of the [main README](../README.md). The design assumptions these spikes were written to de-risk are now settled by the shipped, user-validated v0.5.30 feature set; only spike 8 (Maximize Compatibility) is still being proven live.
+This project is pre-release — see the status note at the top of the [main README](../README.md). The design assumptions these spikes were written to de-risk are now settled by the shipped, user-validated v0.5.30 feature set; only spike 8 (Maximize Compatibility) is still being proven live. **Update, 2026-07-27: spike 8 is no longer open — see above.**
 
 ## Prerequisites
 
@@ -24,7 +26,7 @@ This project is pre-release — see the status note at the top of the [main READ
 - [x] 5. Clipspace-style paste-back + auto-queue — **CONFIRMED IN PRODUCTION** (edits paste back to the origin node; auto-queue-on-save validated, incl. annotate re-run mode)
 - [x] 6. Silent PNG export via `batchPlay` — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
 - [x] 7. Save-event listener + document identity — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
-- [ ] 8. Programmatic Maximize Compatibility preference — **IN PROGRESS** (auto-set-on-connect feature; pending live validation on Eric's Photoshop)
+- [x] 8. Programmatic Maximize Compatibility preference — **CONFIRMED IN PRODUCTION** (v0.5.31, auto-set-on-connect; validated live by Eric 2026-07-21 — see LIVE RESULTS)
 
 ---
 
@@ -208,10 +210,10 @@ _Confirmed call sequence (including any extra calls needed) and queuePrompt beha
 5. Confirm this doesn't require any permission beyond the plugin's existing manifest, and that the change persists across a Photoshop restart.
 
 **Status:**
-- [ ] **IN PROGRESS** — being implemented as an auto-set-Maximize-Compatibility-on-connect plugin feature; the batchPlay descriptor still needs live validation on Eric's Photoshop.
+- [x] **CONFIRMED IN PRODUCTION** (v0.5.31, 2026-07-19; validated live by Eric 2026-07-21) — auto-set-Maximize-Compatibility-on-connect shipped and the live validation this spike was gating is done. See Results below.
 
 ### Results
-_Whether get/set worked, the exact descriptors used, and the final yes/no on automatic preference-setting go here._
+**Get/set WORKED, via the typed API rather than a batchPlay descriptor** (v0.5.31 commit message: "Turned out cleaner than a batchPlay spike: UXP exposes the preference through its typed API (PS ≥ 24.0) — `app.preferences.fileHandling.maximizeCompatibility`, set to `constants.MaximizeCompatibility.ALWAYS` inside `core.executeAsModal`"). New `photoshop_plugin/prefs.js`: on first successful connect of a session, reads the pref and sets it to Always only if it isn't already (fire-and-forget, once-per-session, idempotent, try/catch-wrapped), gated by a default-ON Advanced-section toggle so users can opt out. Final yes/no: **yes, automatic preference-setting works** — recorded on the living test checklist as "Plugin auto-sets Maximize PSD Compatibility on connect — v0.5.31 — validated by Eric · 2026-07-21 (spike 8 confirmed on real Photoshop)" (`research/checklists/comfy-ps-bridge.html`). The v0.5.31 commit itself shipped the code without a live Photoshop available to test on ("NOT verifiable here (no Photoshop): that the typed setter actually flips the preference... that IS the spike-8 live test") — the checklist record from two days later is the actual live-validation evidence.
 
 ---
 
