@@ -29,19 +29,23 @@ except ImportError as _relative_import_error:
         from cpsb import live as _cpsb_live
         from cpsb import load_psd as _cpsb_load_psd
         from cpsb import nodes as _cpsb_nodes
-    except ImportError:
-        # Both branches failed. Re-raise the FIRST error, not this one: when
-        # the real cause is a missing third-party dependency, the fallback
-        # fails with a misleading "No module named 'cpsb'" that buries it
-        # (reported from a Linux install, 2026-07-26, where the real error
-        # was a missing `watchdog`). Name the actual missing module and the
-        # fix instead.
+    except ImportError as _flat_import_error:
+        # BOTH branches failed, so report BOTH reasons. Either one can be the
+        # informative half and the other pure noise, depending on how the file
+        # was loaded, so picking one always risks burying the real cause:
+        #   - loaded as a package (how ComfyUI does it), the relative error is
+        #     real ("No module named 'watchdog'") and the flat one is noise
+        #     ("No module named 'cpsb'") -- the Linux report, 2026-07-26;
+        #   - loaded flat by tooling, the relative error is the noise and the
+        #     flat one carries the truth.
         raise ImportError(
-            f"comfyui-photoshop-bridge could not be imported: {_relative_import_error}. "
-            "If that names a third-party module, this pack's dependencies are not "
-            "installed in the SAME Python that runs ComfyUI -- install them with: "
-            "pip install -r requirements.txt  (from the pack's folder, using "
-            "ComfyUI's own Python/venv)."
+            "comfyui-photoshop-bridge could not be imported. "
+            f"Package-relative import failed with: {_relative_import_error}. "
+            f"Flat import failed with: {_flat_import_error}. "
+            "If either names a third-party module, this pack's dependencies are "
+            "not installed in the SAME Python that runs ComfyUI -- install them "
+            "with: pip install -r requirements.txt  (from the pack's folder, "
+            "using ComfyUI's own Python/venv)."
         ) from _relative_import_error
 
 logger = logging.getLogger("cpsb")
