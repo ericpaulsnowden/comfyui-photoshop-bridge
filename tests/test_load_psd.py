@@ -86,7 +86,7 @@ class TestImportability:
 class TestContractShape:
     def test_node_attributes(self):
         node = load_psd_module.PhotoshopLoadPSD
-        assert node.CATEGORY == "image/photoshop"
+        assert node.CATEGORY == "Photoshop Bridge/Handoffs"
         assert node.RETURN_TYPES == ("IMAGE", "MASK")
         assert node.FUNCTION == "execute"
 

@@ -349,7 +349,7 @@ class PhotoshopLoadPSD:
     already settled by the time any edit reaches this node's consume path.
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Handoffs"
     RETURN_TYPES = ("IMAGE", "MASK")
     OUTPUT_TOOLTIPS = (
         "The flattened image, or the latest edit if one has been saved back.",

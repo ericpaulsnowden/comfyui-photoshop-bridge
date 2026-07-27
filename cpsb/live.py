@@ -100,7 +100,7 @@ class PhotoshopLiveCanvas:
     alpha; module docstring).
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Live Rendering"
     RETURN_TYPES = ("IMAGE", "MASK")
     OUTPUT_TOOLTIPS = (
         "The newest frame captured from the Photoshop canvas.",
@@ -224,7 +224,7 @@ class PhotoshopLivePrompt:
     *required*.
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Live Rendering"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("prompt",)
     OUTPUT_TOOLTIPS = (
@@ -314,7 +314,7 @@ class PhotoshopLiveCreativity:
     ComfyUI-only path still works.
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Live Rendering"
     RETURN_TYPES = ("FLOAT",)
     RETURN_NAMES = ("denoise",)
     OUTPUT_TOOLTIPS = (
@@ -459,7 +459,7 @@ class PhotoshopLivePreview:
     nothing is saved anywhere, so there is no metadata to embed.
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Live Rendering"
     RETURN_TYPES = ()
     FUNCTION = "execute"
     OUTPUT_NODE = True
@@ -593,7 +593,7 @@ class PhotoshopRefineSource:
     after, so refine chains never run per-stroke.
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Live Rendering"
     RETURN_TYPES = ("IMAGE", "IMAGE")
     RETURN_NAMES = ("render", "canvas")
     OUTPUT_TOOLTIPS = (
@@ -694,7 +694,7 @@ class PhotoshopAddLayer:
     away, so a missing plugin is a logged no-op.
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Live Rendering"
     RETURN_TYPES = ()
     FUNCTION = "execute"
     OUTPUT_NODE = True

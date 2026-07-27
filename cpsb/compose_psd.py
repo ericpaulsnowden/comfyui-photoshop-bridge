@@ -1433,7 +1433,7 @@ class PhotoshopComposePSD:
     loading it.
     """
 
-    CATEGORY = "image/photoshop"
+    CATEGORY = "Photoshop Bridge/Handoffs"
     RETURN_TYPES = ("IMAGE", "MASK", "STRING", "IMAGE")
     RETURN_NAMES = ("image", "mask", "filename", "layers")
     OUTPUT_TOOLTIPS = (

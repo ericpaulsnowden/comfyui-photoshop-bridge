@@ -191,7 +191,7 @@ class TestImportability:
 
 class TestContractShape:
     def test_node_attributes(self):
-        assert ComposePSD.CATEGORY == "image/photoshop"
+        assert ComposePSD.CATEGORY == "Photoshop Bridge/Handoffs"
         # `layers` (v0.5.25) is APPENDED so saved workflows' existing links,
         # which ComfyUI stores by output slot index, keep their meaning.
         assert ComposePSD.RETURN_TYPES == ("IMAGE", "MASK", "STRING", "IMAGE")

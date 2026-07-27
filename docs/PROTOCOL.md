@@ -686,7 +686,7 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 ## 6. Bridge node
 
 - Class `PhotoshopBridge` (stable node id — saved workflows depend on it), display name
-  "Edit in Photoshop", category `image/photoshop`.
+  "Edit in Photoshop", category `Photoshop Bridge/Handoffs`.
 - Inputs: `image` (IMAGE); `mode` (COMBO, exactly these strings — the frontend matches
   on them: `"Wait for first save"` (default) | `"Re-run on every save"` |
   `"Open only (don't wait)"`); `timeout_seconds` (INT, default 1800, min 10, max
@@ -730,7 +730,7 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 ### 6b. Load PSD node
 
 - Class `PhotoshopLoadPSD` (unique id — plain "LoadPSD" collides with other packs),
-  display name "Load PSD", category `image/photoshop`.
+  display name "Load PSD", category `Photoshop Bridge/Handoffs`.
 - Inputs: `psd` (COMBO of `.psd`/`.psb` files in the input directory, refreshed like
   LoadImage's combo) — the frontend adds a custom upload widget (accept `.psd,.psb`,
   hand-rolled input + POST to ComfyUI's own `/upload/image`; the stock IMAGEUPLOAD
@@ -829,7 +829,7 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 ### 6c. Compose Layers to PSD node
 
 - Class `PhotoshopComposePSD`, display name "Compose Layers to PSD", category
-  `image/photoshop`.
+  `Photoshop Bridge/Handoffs`.
 - Frontend gives it AUTO-GROWING image inputs: `image_1`, `image_2`, … — connecting one
   reveals the next empty socket (pattern forked from rgthree's MIT implementation, with
   attribution comment). Backend accepts any number ≥ 1 via optional inputs. Each socket
@@ -1041,7 +1041,7 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 ### 6d. Annotate for Edit node
 
 - Class `PhotoshopAnnotate`, display name "Annotate for Edit", category
-  `image/photoshop`.
+  `Photoshop Bridge/Handoffs`.
 - Inputs: `image` (IMAGE); `instruction` (STRING, multiline, default ""); optional
   `mask` (MASK). Widgets: `mode` (COMBO, renamed from `annotate_mode` in v0.5.30 —
   breaking, see below: "Pass through" (default) | "Wait for first save" |
@@ -1155,7 +1155,7 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 
 ### 6e. Run Photoshop Action node (v0.5.35)
 
-- Class `PhotoshopAction`, display "Run Photoshop Action", category `image/photoshop`
+- Class `PhotoshopAction`, display "Run Photoshop Action", category `Photoshop Bridge/Handoffs`
   (`cpsb/actions.py`; registered as the pack's 5th node). Inputs: `image` (IMAGE); widgets
   `action_name` (STRING) + `action_set` (STRING, default "") — plain strings, NOT a dropdown,
   because UXP cannot enumerate Actions at node-def time; `timeout_seconds` (INT, default

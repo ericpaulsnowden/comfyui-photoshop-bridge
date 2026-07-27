@@ -31,7 +31,7 @@ The rule behind that table: **anything that can work without the plugin, does.**
 
 ## The nodes
 
-Right-clicking any image and choosing **Open in Photoshop** is the core action, and it needs no node at all — it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds eleven nodes (all in the `image/photoshop` category).
+Right-clicking any image and choosing **Open in Photoshop** is the core action, and it needs no node at all — it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds eleven nodes, organized under **Photoshop Bridge** in the node browser: **Handoffs** for the round-trip nodes, **Live Rendering** for the live drawing loop.
 
 ### Edit in Photoshop
 
