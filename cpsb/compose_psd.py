@@ -1436,7 +1436,26 @@ class PhotoshopComposePSD:
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("IMAGE", "MASK", "STRING", "IMAGE")
     RETURN_NAMES = ("image", "mask", "filename", "layers")
+    OUTPUT_TOOLTIPS = (
+        "The flattened composite of every connected layer (or your saved edit, once one arrives).",
+        "Marks any canvas area no input layer covers (1.0 = uncovered, 0.0 = covered).",
+        "The written PSD's filename, relative to the input folder -- feed this straight "
+        "into a Load PSD node's psd widget.",
+        "One image per layer, each placed at its real position on the shared canvas -- "
+        "connect this batch to a Preview node to see every layer individually, since the "
+        "image output only ever shows the flattened composite.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Combines multiple connected images into one multi-layer .psd file, one layer "
+        "per input, written to ComfyUI's input folder. Works with ComfyUI alone, "
+        "including opening the result in Photoshop and waiting for your edits -- "
+        "installing the Photoshop panel plugin makes that round trip instant instead of "
+        "file-based. Double-click an image input's socket to rename it; that name "
+        "becomes the layer's name in the PSD. Point existing_psd_path at a file to "
+        "append each run as a new group in one growing review document instead of "
+        "writing a separate file every time."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -1487,35 +1506,111 @@ class PhotoshopComposePSD:
         ``existing_psd`` COMBO that used to sit here too -- see the class
         docstring's "WIDGET-POSITION BREAKING CHANGE" note.)
         """
-        optional = {f"image_{i}": ("IMAGE",) for i in range(1, MAX_IMAGE_INPUTS + 1)}
+        optional = {
+            f"image_{i}": (
+                "IMAGE",
+                {
+                    "tooltip": (
+                        "One image layer. image_1 is the bottom layer; each "
+                        "higher-numbered socket stacks above it. Double-click the socket "
+                        "to rename it -- that name becomes the layer's name in the "
+                        "written PSD."
+                    )
+                },
+            )
+            for i in range(1, MAX_IMAGE_INPUTS + 1)
+        }
         return {
             "required": {
-                "group_name": ("STRING", {"default": DEFAULT_GROUP_NAME}),
+                "group_name": (
+                    "STRING",
+                    {
+                        "default": DEFAULT_GROUP_NAME,
+                        "tooltip": (
+                            "Name of the group every input's layer is placed inside, in "
+                            "the written PSD."
+                        ),
+                    },
+                ),
                 # Hidden on-canvas by the frontend (web/cpsb/compose.js) --
                 # NOT a textbox the user edits directly (that removed
                 # `layer_name` widget's replacement, per the product owner's
                 # "Remove the separate layer name textbox" ask). Filled by
                 # double-clicking an image_N INPUT SLOT to rename it; see the
                 # class docstring's rename paragraph and _parse_layer_names.
-                "layer_names": ("STRING", {"default": ""}),
+                "layer_names": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "Auto-filled by renaming an image input's socket "
+                            "(double-click it) -- the JSON list of custom layer names. "
+                            "Not meant to be edited by hand."
+                        ),
+                    },
+                ),
                 "mode": (
                     [
                         nodes.BridgeMode.WAIT_FIRST_SAVE,
                         nodes.BridgeMode.RERUN_EVERY_SAVE,
                         MODE_DONT_OPEN,
                     ],
-                    {"default": nodes.BridgeMode.WAIT_FIRST_SAVE},
+                    {
+                        "default": nodes.BridgeMode.WAIT_FIRST_SAVE,
+                        "tooltip": (
+                            "How this node treats Photoshop after writing the PSD. "
+                            "'Wait for first save' opens Photoshop and pauses the "
+                            "workflow until you save, then returns your edited "
+                            "composite. 'Re-run on every save' opens Photoshop once and "
+                            "re-queues the workflow automatically each time you save. "
+                            "'Don't open (composite only)' just writes the file and "
+                            "returns the flattened composite -- Photoshop never opens."
+                        ),
+                    },
                 ),
-                "timeout_seconds": ("INT", {"default": 1800, "min": 10, "max": 86400}),
+                "timeout_seconds": (
+                    "INT",
+                    {
+                        "default": 1800,
+                        "min": 10,
+                        "max": 86400,
+                        "tooltip": (
+                            "How long to wait for you to save in Photoshop before giving "
+                            "up and stopping the workflow, in seconds. Only used by "
+                            "'Wait for first save'."
+                        ),
+                    },
+                ),
                 "max_layers": (
                     "INT",
-                    {"default": DEFAULT_MAX_LAYERS, "min": 1, "max": 512},
+                    {
+                        "default": DEFAULT_MAX_LAYERS,
+                        "min": 1,
+                        "max": 512,
+                        "tooltip": (
+                            "Maximum number of images that become layers. Extra images "
+                            "beyond this cap are dropped (oldest first) rather than "
+                            "growing the document without limit."
+                        ),
+                    },
                 ),
                 # -- "append to existing document" (class docstring) --
                 # appended LAST: widget order is positional, so anything
                 # else here would corrupt every saved workflow's existing
                 # widget values.
-                "existing_psd_path": ("STRING", {"default": ""}),
+                "existing_psd_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "Optional path to an existing .psd/.psb file. When set, this "
+                            "run's layers are appended to that file as a new group "
+                            "instead of writing a fresh numbered file -- use Browse to "
+                            "pick one, or point at a path that doesn't exist yet to "
+                            "create it. Leave blank to always write a new file."
+                        ),
+                    },
+                ),
             },
             "optional": optional,
             "hidden": {"unique_id": "UNIQUE_ID"},

@@ -104,14 +104,16 @@ class TestContractShape:
     def test_input_types_unconfigured_returns_empty_combo(self):
         assert nodes_module._state is None
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["psd"] == ([],)
+        assert spec["required"]["psd"][0] == []
 
     def test_input_types_declares_edit_original_boolean_default_false(self, configured):
         """PROTOCOL.md §6b "Edit-original option": a BOOLEAN widget,
         default False (the safe, non-destructive copy behavior).
         """
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["edit_original"] == ("BOOLEAN", {"default": False})
+        edit_type, edit_config = spec["required"]["edit_original"]
+        assert edit_type == "BOOLEAN"
+        assert edit_config["default"] is False
 
     def test_on_save_declares_combo_defaulting_to_rerun(self, configured):
         """Product-owner requirement 2026-07-18: `on_save` is a COMBO of the
@@ -119,14 +121,13 @@ class TestContractShape:
         pre-existing behavior for every already-saved workflow.
         """
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["on_save"] == (
-            [
-                load_psd_module.OnSaveMode.RERUN,
-                load_psd_module.OnSaveMode.UPDATE_ONLY,
-                load_psd_module.OnSaveMode.IGNORE,
-            ],
-            {"default": load_psd_module.OnSaveMode.RERUN},
-        )
+        options, config = spec["required"]["on_save"]
+        assert options == [
+            load_psd_module.OnSaveMode.RERUN,
+            load_psd_module.OnSaveMode.UPDATE_ONLY,
+            load_psd_module.OnSaveMode.IGNORE,
+        ]
+        assert config["default"] == load_psd_module.OnSaveMode.RERUN
         assert load_psd_module.OnSaveMode.RERUN == "Re-run workflow"
 
     def test_policy_strings_are_identical_across_all_four_layers(self):
@@ -330,7 +331,7 @@ class TestListPsdFiles:
         (context.input_dir / "two.PSB").write_bytes(b"x")
         (context.input_dir / "photo.png").write_bytes(b"x")
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["psd"] == (["one.psd", "two.PSB"],)
+        assert spec["required"]["psd"][0] == ["one.psd", "two.PSB"]
 
 
 class TestBroadenedFormatsListing:
@@ -351,7 +352,7 @@ class TestBroadenedFormatsListing:
         (context.input_dir / "one.psd").write_bytes(b"x")
         (context.input_dir / "photo.tif").write_bytes(b"x")
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
-        assert spec["required"]["psd"] == (["one.psd", "photo.tif"],)
+        assert spec["required"]["psd"][0] == ["one.psd", "photo.tif"]
 
 
 class TestBroadenedFormatsValidateInputs:

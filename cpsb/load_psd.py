@@ -351,7 +351,21 @@ class PhotoshopLoadPSD:
 
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("IMAGE", "MASK")
+    OUTPUT_TOOLTIPS = (
+        "The flattened image, or the latest edit if one has been saved back.",
+        "Marks any transparent area of the image (1.0 = transparent, 0.0 = opaque). All "
+        "zero when the image has no transparency.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Loads a .psd, .psb, or .tiff file from ComfyUI's input folder and flattens it "
+        "into an image the rest of the workflow can use. Works with ComfyUI alone -- no "
+        "Photoshop plugin is required just to load a file. Right-click the node and "
+        "choose 'Open in Photoshop' to send the file back for editing -- the Photoshop "
+        "panel plugin, if connected, makes that round trip instant instead of "
+        "file-based. The edit_original and on_save widgets control where an edit is "
+        "saved and whether saving it re-runs the workflow."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -394,7 +408,15 @@ class PhotoshopLoadPSD:
         files = _list_psd_files(state.context.input_dir) if state is not None else []
         return {
             "required": {
-                "psd": (files,),
+                "psd": (
+                    files,
+                    {
+                        "tooltip": (
+                            "The .psd, .psb, or .tiff file to load, from ComfyUI's input "
+                            "folder."
+                        )
+                    },
+                ),
                 # PROTOCOL.md §6b "Edit-original option": default False (the
                 # safe, non-destructive copy-to-handoff behavior this node
                 # has always had). menu.js reads this widget's live value at
@@ -403,14 +425,35 @@ class PhotoshopLoadPSD:
                 # own execute()/IS_CHANGED never consult it (see their
                 # docstrings): it governs how a handoff gets OPENED, not
                 # what pixels this node returns once one exists.
-                "edit_original": ("BOOLEAN", {"default": False}),
+                "edit_original": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "When on, an edit saves back to your own original file in "
+                            "place instead of a separate managed copy. When off "
+                            "(default), edits are saved to a safe copy and your original "
+                            "file is never touched."
+                        ),
+                    },
+                ),
                 # On-save trigger policy (product-owner requirement
                 # 2026-07-18): MUST stay the last required entry -- see this
                 # method's own docstring above for why. Default RERUN keeps
                 # every existing saved workflow's behavior byte-identical.
                 "on_save": (
                     [OnSaveMode.RERUN, OnSaveMode.UPDATE_ONLY, OnSaveMode.IGNORE],
-                    {"default": OnSaveMode.RERUN},
+                    {
+                        "default": OnSaveMode.RERUN,
+                        "tooltip": (
+                            "What a save in Photoshop should do. 'Re-run workflow' "
+                            "re-runs the graph automatically so the edit reaches the "
+                            "outputs. 'Update only (don't re-run)' picks up the edit "
+                            "(gallery and badges update) but leaves the workflow alone "
+                            "until you queue it yourself. 'Ignore (do nothing)' skips "
+                            "the save entirely, as if this node weren't watching it."
+                        ),
+                    },
                 ),
             },
             "hidden": {

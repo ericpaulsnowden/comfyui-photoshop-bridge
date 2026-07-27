@@ -102,13 +102,40 @@ class PhotoshopLiveCanvas:
 
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("IMAGE", "MASK")
+    OUTPUT_TOOLTIPS = (
+        "The newest frame captured from the Photoshop canvas.",
+        "Always all zero -- the live stream has no alpha channel to derive a mask from. "
+        "Present for wiring parity with the other nodes in this pack.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Feeds the live drawing loop with the newest frame of whatever you're currently "
+        "drawing on the canvas in Photoshop, streamed automatically after every stroke "
+        "-- no saving required. Requires the Photoshop panel plugin, with Live Mode "
+        "turned on in its panel; there's no file-only fallback, since this needs a live "
+        "stream rather than a saved file. Use auto_queue to control whether an arriving "
+        "stroke re-queues the workflow for you or just waits for your next manual "
+        "queue. Pair with Photoshop Live Prompt / Photoshop Live Creativity and a "
+        "preview node for a real-time sketch-to-render loop."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "auto_queue": (["On", "Off"], {"default": "On"}),
+                "auto_queue": (
+                    ["On", "Off"],
+                    {
+                        "default": "On",
+                        "tooltip": (
+                            "Whether a new stroke in Photoshop automatically re-queues "
+                            "the workflow. 'On' re-queues (coalesced, so rapid strokes "
+                            "don't pile up runs). 'Off' still streams every stroke -- it "
+                            "just waits for you to queue manually to pick up the newest "
+                            "one."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -200,7 +227,19 @@ class PhotoshopLivePrompt:
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("prompt",)
+    OUTPUT_TOOLTIPS = (
+        "The effective prompt -- from the Photoshop panel if it's connected and "
+        "non-empty, otherwise this node's own prompt widget.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Supplies a text prompt you can type and edit live from the Photoshop panel, "
+        "without switching back to the ComfyUI tab -- wire its output into a CLIP Text "
+        "Encode node's text input. Works with ComfyUI alone using this node's own "
+        "prompt widget as a fallback; connecting the Photoshop panel plugin lets the "
+        "panel's own prompt field take over instead. Meant for the live drawing loop, "
+        "alongside Photoshop Live Canvas."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -211,6 +250,11 @@ class PhotoshopLivePrompt:
                     {
                         "multiline": True,
                         "default": "a detailed digital painting, vivid colors",
+                        "tooltip": (
+                            "Fallback prompt used when the Photoshop panel isn't "
+                            "connected or its own prompt field is empty. Once the panel "
+                            "is connected, typing there overrides this widget live."
+                        ),
                     },
                 ),
             },
@@ -273,15 +317,69 @@ class PhotoshopLiveCreativity:
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("FLOAT",)
     RETURN_NAMES = ("denoise",)
+    OUTPUT_TOOLTIPS = (
+        "The creativity level mapped onto the min_denoise..max_denoise range -- wire "
+        "this into a KSampler's denoise input.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Turns a single 'creativity' level into a denoise value for a sampler, so a "
+        "slider in the Photoshop panel controls how closely a live render sticks to "
+        "your sketch versus reinterpreting it. Works with ComfyUI alone using this "
+        "node's own creativity widget as a fallback; connecting the Photoshop panel "
+        "plugin lets its Creativity slider drive the value live instead. Wire the "
+        "denoise output into a KSampler's denoise input (convert that widget to an "
+        "input first). Use min_denoise/max_denoise to set the range the slider maps "
+        "onto -- low creativity stays close to the drawing, high creativity "
+        "reinterprets it more freely."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "creativity": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "min_denoise": ("FLOAT", {"default": 0.40, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "max_denoise": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "creativity": (
+                    "FLOAT",
+                    {
+                        "default": 0.6,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Fallback creativity level (0 = hug the drawing, 1 = "
+                            "reinterpret it freely), used when the Photoshop panel's "
+                            "Creativity slider isn't driving this node."
+                        ),
+                    },
+                ),
+                "min_denoise": (
+                    "FLOAT",
+                    {
+                        "default": 0.40,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Denoise value creativity=0 maps to -- how little the "
+                            "sampler changes your drawing at the lowest creativity "
+                            "setting."
+                        ),
+                    },
+                ),
+                "max_denoise": (
+                    "FLOAT",
+                    {
+                        "default": 0.85,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Denoise value creativity=1 maps to -- how much the sampler "
+                            "can reinterpret your drawing at the highest creativity "
+                            "setting."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -365,12 +463,24 @@ class PhotoshopLivePreview:
     RETURN_TYPES = ()
     FUNCTION = "execute"
     OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Sends the input image to a preview panel docked inside Photoshop, right next "
+        "to the canvas you're drawing on -- the display surface for the live drawing "
+        "loop. Requires the Photoshop panel plugin to actually show anything; without "
+        "it connected, this node quietly does nothing rather than stopping the "
+        "workflow, since the render itself already succeeded. Use at the end of a "
+        "live-loop render, alongside Photoshop Refine Source and Photoshop Add Layer "
+        "for the optional refine pass."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image": ("IMAGE",),
+                "image": (
+                    "IMAGE",
+                    {"tooltip": "The rendered image to display in the Photoshop preview panel."},
+                ),
             },
         }
 
@@ -486,7 +596,24 @@ class PhotoshopRefineSource:
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("IMAGE", "IMAGE")
     RETURN_NAMES = ("render", "canvas")
+    OUTPUT_TOOLTIPS = (
+        "The last full-quality render from Photoshop Live Preview. Falls back to the "
+        "canvas capture if no render exists yet.",
+        "A full-resolution capture of the Photoshop canvas, taken when you clicked "
+        "Refine. Falls back to the last render if no capture exists yet.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Feeds a refine pass its starting image: the last full-quality render from "
+        "Photoshop Live Preview, a full-resolution capture of the Photoshop canvas, or "
+        "both -- wire whichever output your refine workflow wants. Works with ComfyUI "
+        "alone; the render output fills in without any plugin connected, and the "
+        "canvas output fills in when the Photoshop panel plugin sends one. Falls back "
+        "to whichever of the two it has when the other is missing, and only stops the "
+        "workflow if neither is available yet. Mute this node to disarm the whole "
+        "refine branch so it only runs on an explicit Refine click, not on every "
+        "drawing stroke."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
@@ -571,13 +698,36 @@ class PhotoshopAddLayer:
     RETURN_TYPES = ()
     FUNCTION = "execute"
     OUTPUT_NODE = True
+    DESCRIPTION = (
+        "Pushes the input image into the current Photoshop document as a new layer -- "
+        "the way to route a refine pass's result straight back into your document "
+        "instead of (or alongside) the preview panel. Requires the Photoshop panel "
+        "plugin to actually deliver the layer; without it connected, this node quietly "
+        "does nothing rather than stopping the workflow, since the image is already "
+        "visible in ComfyUI either way. Set layer_name to control the name Photoshop "
+        "gives the new layer."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image": ("IMAGE",),
-                "layer_name": ("STRING", {"default": "ComfyUI refined"}),
+                "image": (
+                    "IMAGE",
+                    {
+                        "tooltip": (
+                            "The image to add as a new layer in the current Photoshop "
+                            "document."
+                        )
+                    },
+                ),
+                "layer_name": (
+                    "STRING",
+                    {
+                        "default": "ComfyUI refined",
+                        "tooltip": "Name for the new layer in Photoshop.",
+                    },
+                ),
             },
         }
 

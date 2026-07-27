@@ -163,7 +163,7 @@ function findOrCreateReopenButton(node) {
   button.tooltip =
     'Reopen this annotation’s Instructions PSD in Photoshop, with your ' +
     'painted strokes intact — same as the "Photoshop Edits" sidebar ' +
-    'gallery’s Re-open action.'
+    'gallery’s Open action.'
   return button
 }
 

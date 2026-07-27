@@ -649,4 +649,4 @@ class TestLivePreview:
         assert live_module.PhotoshopLivePreview.OUTPUT_NODE is True
         assert live_module.PhotoshopLivePreview.RETURN_TYPES == ()
         spec = live_module.PhotoshopLivePreview.INPUT_TYPES()
-        assert spec["required"]["image"] == ("IMAGE",)
+        assert spec["required"]["image"][0] == "IMAGE"

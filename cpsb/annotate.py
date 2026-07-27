@@ -872,27 +872,99 @@ class PhotoshopAnnotate:
     # "IMAGE" in the graph) -- ComfyUI does not require RETURN_NAMES to
     # match RETURN_TYPES's length semantics any differently.
     RETURN_NAMES = ("image", "mask", "instruction", "annotated")
+    OUTPUT_TOOLTIPS = (
+        "The resolved image: unchanged in Pass through mode, or the composite of every "
+        "layer except Instructions once Photoshop supplies an edit.",
+        "The marked region (1.0 = marked, 0.0 = not) -- from the connected mask input in "
+        "Pass through mode, or your painted strokes on the Instructions layer otherwise.",
+        "The instruction text, unchanged.",
+        "The image with the annotation visible on it: a red box around the masked area "
+        "(if box_composite is on), or your actual painted strokes (if off).",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Pairs a typed instruction with a mask marking where it applies -- the two "
+        "inputs an editing model like Kontext or Qwen-Image-Edit expects, without you "
+        "having to draw shapes or write text onto the pixels yourself. Works with "
+        "ComfyUI alone in Pass through mode using a connected mask input. Switch to "
+        "'Wait for first save' or 'Re-run on every save' to instead mark up the region "
+        "by painting on an Instructions layer inside Photoshop -- installing the "
+        "Photoshop panel plugin makes that round trip instant instead of file-based."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image": ("IMAGE",),
-                "instruction": ("STRING", {"multiline": True, "default": ""}),
+                "image": ("IMAGE", {"tooltip": "The image to annotate."}),
+                "instruction": (
+                    "STRING",
+                    {
+                        "multiline": True,
+                        "default": "",
+                        "tooltip": (
+                            "What you want changed, in plain words. Passed through as-is "
+                            "to whatever model or node reads the instruction output -- "
+                            "never drawn onto the image."
+                        ),
+                    },
+                ),
                 "mode": (
                     [
                         AnnotateMode.PASS_THROUGH,
                         AnnotateMode.WAIT_FIRST_SAVE,
                         AnnotateMode.RERUN_EVERY_SAVE,
                     ],
-                    {"default": AnnotateMode.PASS_THROUGH},
+                    {
+                        "default": AnnotateMode.PASS_THROUGH,
+                        "tooltip": (
+                            "How to get the mask. 'Pass through' uses the connected mask "
+                            "input (or an empty mask) and never opens Photoshop. 'Wait "
+                            "for first save' opens Photoshop with an editable "
+                            "Instructions layer and pauses the workflow until you paint "
+                            "on it and save. 'Re-run on every save' opens the same "
+                            "Instructions layer without waiting, and re-queues the "
+                            "workflow automatically each time you save."
+                        ),
+                    },
                 ),
-                "box_composite": ("BOOLEAN", {"default": False}),
-                "timeout_seconds": ("INT", {"default": 1800, "min": 10, "max": 86400}),
+                "box_composite": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "When on, the annotated output draws a red box around the "
+                            "masked area instead of showing your painted strokes. When "
+                            "off (default), it shows the image with your actual painted "
+                            "strokes on top."
+                        ),
+                    },
+                ),
+                "timeout_seconds": (
+                    "INT",
+                    {
+                        "default": 1800,
+                        "min": 10,
+                        "max": 86400,
+                        "tooltip": (
+                            "How long to wait for you to save in Photoshop before giving "
+                            "up and stopping the workflow, in seconds. Only used by "
+                            "'Wait for first save'."
+                        ),
+                    },
+                ),
             },
             "optional": {
-                "mask": ("MASK",),
+                "mask": (
+                    "MASK",
+                    {
+                        "tooltip": (
+                            "A mask to use directly, when mode is 'Pass through'. "
+                            "Ignored once Photoshop supplies a mask from the "
+                            "Instructions layer."
+                        )
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",

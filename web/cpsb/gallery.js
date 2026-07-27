@@ -644,6 +644,7 @@ function buildCard(meta) {
       ui.el('button', {
         className: 'cpsb-card-action',
         text: 'Open',
+        attrs: { title: 'Reopen the same Photoshop document, with your edits so far intact.' },
         on: { click: () => reopenInPhotoshop(meta) }
       })
     )
@@ -653,6 +654,9 @@ function buildCard(meta) {
       ui.el('button', {
         className: 'cpsb-card-action',
         text: 'Open',
+        attrs: {
+          title: 'Start a new edit from the original image — any previous edit here is not reused.'
+        },
         on: { click: () => openFreshCopy(meta) }
       })
     )
@@ -662,6 +666,7 @@ function buildCard(meta) {
       ui.el('button', {
         className: 'cpsb-card-action',
         text: 'Add',
+        attrs: { title: 'Add the latest edit as a new Load Image node in the workflow.' },
         on: { click: () => addAsNode(meta) }
       })
     )
@@ -726,9 +731,18 @@ function buildConnectionPill() {
   const summary = tierInfo.tier2Connected
     ? `Photoshop: Connected${tierInfo.psVersion ? ` (${tierInfo.psVersion})` : ''}`
     : 'Photoshop: Not connected'
+  // This pill reflects only the OPTIONAL Tier-2 plugin's connection state --
+  // spell that out, since a same-machine, no-plugin (Tier 1) setup is a
+  // normal, fully-working configuration that would otherwise permanently
+  // read "Not connected" with nothing clarifying Photoshop still opens fine.
+  const title = tierInfo.tier2Connected
+    ? 'The Photoshop panel plugin is connected — round trips to Photoshop are instant.'
+    : 'The Photoshop panel plugin is not connected. Photoshop can still open directly ' +
+      '(no plugin required) — this only affects instant round trips and live drawing.'
   return ui.el('div', {
     className: `cpsb-pill ${tierInfo.tier2Connected ? 'cpsb-pill-connected' : 'cpsb-pill-disconnected'}`,
-    text: summary
+    text: summary,
+    attrs: { title }
   })
 }
 

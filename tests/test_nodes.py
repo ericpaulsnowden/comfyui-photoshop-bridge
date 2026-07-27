@@ -83,15 +83,15 @@ class TestContractShape:
         in the constant's own definition would still fail this test.
         """
         spec = nodes_module.PhotoshopBridge.INPUT_TYPES()
-        assert spec["required"]["image"] == ("IMAGE",)
-        assert spec["required"]["mode"] == (
-            ["Wait for first save", "Re-run on every save", "Open only (don't wait)"],
-            {"default": "Wait for first save"},
-        )
-        assert spec["required"]["timeout_seconds"] == (
-            "INT",
-            {"default": 1800, "min": 10, "max": 86400},
-        )
+        assert spec["required"]["image"][0] == "IMAGE"
+        options, config = spec["required"]["mode"]
+        assert options == ["Wait for first save", "Re-run on every save", "Open only (don't wait)"]
+        assert config["default"] == "Wait for first save"
+        timeout_type, timeout_config = spec["required"]["timeout_seconds"]
+        assert timeout_type == "INT"
+        assert timeout_config["default"] == 1800
+        assert timeout_config["min"] == 10
+        assert timeout_config["max"] == 86400
         assert spec["hidden"] == {
             "unique_id": "UNIQUE_ID",
             "prompt": "PROMPT",

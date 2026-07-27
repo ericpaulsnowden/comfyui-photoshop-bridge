@@ -495,7 +495,11 @@ export function getNodeMenuItems(node) {
       : undefined
   const tierInfo = state.getTierInfo()
   const unavailable = !tierInfo.tier1Effective && !tierInfo.tier2Connected
-  const suffix = unavailable ? ' (unavailable)' : ''
+  // tier1EffectiveReason (state.js) is built specifically for this: a
+  // human-readable reason, guaranteed non-empty whenever tier1Effective is
+  // false, which `unavailable` above requires -- so a disabled item names
+  // WHY instead of just "(unavailable)" with no explanation.
+  const suffix = unavailable ? ` (unavailable — ${tierInfo.tier1EffectiveReason})` : ''
 
   const count = node.imgs?.length ?? 0
   const batchItem =

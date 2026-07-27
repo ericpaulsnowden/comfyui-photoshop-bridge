@@ -88,13 +88,15 @@ export const SETTINGS = [
     defaultValue: true,
     category: ['Photoshop Bridge', 'General', 'Re-queue after edit'],
     tooltip:
-      'When on: as soon as an edit comes back from Photoshop, the workflow ' +
-      'automatically re-queues — ComfyUI’s own caching means only the ' +
+      'When on: an edit from a Load Image or Load PSD node automatically ' +
+      're-queues the workflow — ComfyUI’s own caching means only the ' +
       'changed node and whatever is downstream of it actually re-run, not ' +
       'the whole graph. When off: the edit still lands on the node right ' +
       'away, but silently — nothing re-runs until you queue the workflow ' +
-      'yourself. Applies to Load Image nodes and Photoshop Bridge nodes; ' +
-      'has no effect for output-only (terminal) nodes.'
+      'yourself. Has no effect on Photoshop Bridge, Annotate for Edit, or ' +
+      'Compose Layers to PSD nodes — those re-queue automatically only ' +
+      'when their own mode widget is set to "Re-run on every save", ' +
+      'independent of this setting.'
   },
   {
     id: 'cpsb.showUpgradeBanner',

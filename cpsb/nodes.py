@@ -339,18 +339,58 @@ class PhotoshopBridge:
 
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("IMAGE", "MASK")
+    OUTPUT_TOOLTIPS = (
+        "The edited image once you save in Photoshop, or the unchanged input if this "
+        "mode doesn't wait for a save.",
+        "Marks any transparent area of the edit (1.0 = transparent, 0.0 = opaque). All "
+        "zero when there's no edit yet, or the edit has no transparency.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Round-trips the input image through Photoshop: opens it for editing and returns "
+        "whatever comes back. Works with ComfyUI alone -- it launches Photoshop and "
+        "watches for a save -- and becomes instant and more reliable once the Photoshop "
+        "panel plugin is installed and connected. Use this whenever a workflow needs a "
+        "manual touch-up step, like retouching a generated image or fixing a detail "
+        "before continuing. The mode widget controls whether the workflow waits for that "
+        "first save, re-queues itself automatically on every save, or just opens "
+        "Photoshop and moves on without waiting."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image": ("IMAGE",),
+                "image": ("IMAGE", {"tooltip": "The image to send to Photoshop."}),
                 "mode": (
                     [BridgeMode.WAIT_FIRST_SAVE, BridgeMode.RERUN_EVERY_SAVE, BridgeMode.OPEN_ONLY],
-                    {"default": BridgeMode.WAIT_FIRST_SAVE},
+                    {
+                        "default": BridgeMode.WAIT_FIRST_SAVE,
+                        "tooltip": (
+                            "How the workflow reacts once Photoshop opens. 'Wait for "
+                            "first save' pauses the workflow here until you save, then "
+                            "continues with your edit. 'Re-run on every save' opens "
+                            "Photoshop once and re-queues the workflow automatically each "
+                            "time you save, so you can keep iterating without touching "
+                            "ComfyUI. 'Open only (don't wait)' opens Photoshop and "
+                            "continues immediately, passing the original image through "
+                            "unchanged."
+                        ),
+                    },
                 ),
-                "timeout_seconds": ("INT", {"default": 1800, "min": 10, "max": 86400}),
+                "timeout_seconds": (
+                    "INT",
+                    {
+                        "default": 1800,
+                        "min": 10,
+                        "max": 86400,
+                        "tooltip": (
+                            "How long to wait for you to save in Photoshop before giving "
+                            "up and stopping the workflow, in seconds. Only used by "
+                            "'Wait for first save'."
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",

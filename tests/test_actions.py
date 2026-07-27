@@ -234,13 +234,16 @@ class TestRegistration:
 class TestContractShape:
     def test_input_types(self):
         spec = actions_module.PhotoshopAction.INPUT_TYPES()
-        assert spec["required"]["image"] == ("IMAGE",)
-        assert spec["required"]["action_name"] == ("STRING", {"default": ""})
-        assert spec["required"]["action_set"] == ("STRING", {"default": ""})
-        assert spec["required"]["timeout_seconds"] == (
-            "INT",
-            {"default": 1800, "min": 10, "max": 86400},
-        )
+        assert spec["required"]["image"][0] == "IMAGE"
+        assert spec["required"]["action_name"][0] == "STRING"
+        assert spec["required"]["action_name"][1]["default"] == ""
+        assert spec["required"]["action_set"][0] == "STRING"
+        assert spec["required"]["action_set"][1]["default"] == ""
+        timeout_type, timeout_config = spec["required"]["timeout_seconds"]
+        assert timeout_type == "INT"
+        assert timeout_config["default"] == 1800
+        assert timeout_config["min"] == 10
+        assert timeout_config["max"] == 86400
         assert spec["hidden"] == {"unique_id": "UNIQUE_ID"}
 
     def test_node_attributes(self):

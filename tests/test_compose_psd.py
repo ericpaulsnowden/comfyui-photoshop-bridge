@@ -201,12 +201,16 @@ class TestContractShape:
     def test_input_types_shape(self):
         spec = ComposePSD.INPUT_TYPES()
         assert "filename_prefix" not in spec["required"]  # removed widget
-        assert spec["required"]["group_name"] == ("STRING", {"default": "ComfyUI Layers"})
+        group_type, group_config = spec["required"]["group_name"]
+        assert group_type == "STRING"
+        assert group_config["default"] == "ComfyUI Layers"
         # `layer_name` (a single base-name textbox) is REMOVED (product owner:
         # "Remove the separate layer name textbox") -- `layer_names` (hidden,
         # per-slot JSON) replaces it at the same required position.
         assert "layer_name" not in spec["required"]
-        assert spec["required"]["layer_names"] == ("STRING", {"default": ""})
+        names_type, names_config = spec["required"]["layer_names"]
+        assert names_type == "STRING"
+        assert names_config["default"] == ""
         assert spec["hidden"] == {"unique_id": "UNIQUE_ID"}
 
     def test_mode_combo_is_the_three_protocol_strings(self):
@@ -221,17 +225,18 @@ class TestContractShape:
             "Re-run on every save",
             "Don't open (composite only)",
         ]
-        assert config == {"default": WAIT}
+        assert config["default"] == WAIT
         # The third string is NOT the bridge node's OPEN_ONLY ("Open only (don't
         # wait)") -- different text, different behavior (PROTOCOL.md §6c).
         assert DONT_OPEN != nodes_module.BridgeMode.OPEN_ONLY
 
     def test_timeout_seconds_input(self):
         spec = ComposePSD.INPUT_TYPES()
-        assert spec["required"]["timeout_seconds"] == (
-            "INT",
-            {"default": 1800, "min": 10, "max": 86400},
-        )
+        timeout_type, timeout_config = spec["required"]["timeout_seconds"]
+        assert timeout_type == "INT"
+        assert timeout_config["default"] == 1800
+        assert timeout_config["min"] == 10
+        assert timeout_config["max"] == 86400
 
     def test_optional_images_generous_and_all_image_type(self):
         spec = ComposePSD.INPUT_TYPES()
@@ -239,7 +244,7 @@ class TestContractShape:
         assert len(optional) == compose_module.MAX_IMAGE_INPUTS
         assert "image_1" in optional
         assert f"image_{compose_module.MAX_IMAGE_INPUTS}" in optional
-        assert all(value == ("IMAGE",) for value in optional.values())
+        assert all(value[0] == "IMAGE" for value in optional.values())
 
 
 class TestSanitizeFilenamePrefix:
@@ -2574,7 +2579,9 @@ class TestAppendWidgetsShape:
 
     def test_defaults(self):
         required = ComposePSD.INPUT_TYPES()["required"]
-        assert required["existing_psd_path"] == ("STRING", {"default": ""})
+        path_type, path_config = required["existing_psd_path"]
+        assert path_type == "STRING"
+        assert path_config["default"] == ""
         assert "append_to_existing" not in required  # removed widget
         assert "existing_psd" not in required  # removed widget
 

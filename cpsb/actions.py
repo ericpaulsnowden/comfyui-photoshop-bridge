@@ -133,16 +133,63 @@ class PhotoshopAction:
 
     CATEGORY = "image/photoshop"
     RETURN_TYPES = ("IMAGE", "MASK")
+    OUTPUT_TOOLTIPS = (
+        "The image after the Photoshop Action ran.",
+        "Marks any transparent area of the result (1.0 = transparent, 0.0 = opaque). All "
+        "zero if the result has no transparency.",
+    )
     FUNCTION = "execute"
+    DESCRIPTION = (
+        "Opens the input image in Photoshop and plays back a saved Photoshop Action on "
+        "it automatically, then returns the result -- no manual clicking required. "
+        "Requires the Photoshop panel plugin to be installed and connected; there's no "
+        "file-only fallback, because only the plugin can reach Photoshop's Actions "
+        "panel. Type the exact Action and Action Set names as they appear in "
+        "Photoshop's Actions panel. Disable any 'show dialog' step toggles in the "
+        "Action itself, or a step's dialog box can stall Photoshop until you dismiss it "
+        "by hand."
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
         return {
             "required": {
-                "image": ("IMAGE",),
-                "action_name": ("STRING", {"default": ""}),
-                "action_set": ("STRING", {"default": ""}),
-                "timeout_seconds": ("INT", {"default": 1800, "min": 10, "max": 86400}),
+                "image": (
+                    "IMAGE",
+                    {"tooltip": "The image to open in Photoshop and run the Action on."},
+                ),
+                "action_name": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "The exact Action name, as it appears in Photoshop's Actions "
+                            "panel."
+                        ),
+                    },
+                ),
+                "action_set": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": (
+                            "The exact Action Set name that contains the Action, as it "
+                            "appears in Photoshop's Actions panel."
+                        ),
+                    },
+                ),
+                "timeout_seconds": (
+                    "INT",
+                    {
+                        "default": 1800,
+                        "min": 10,
+                        "max": 86400,
+                        "tooltip": (
+                            "How long to wait for the Action to finish before giving up "
+                            "and stopping the workflow, in seconds."
+                        ),
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",

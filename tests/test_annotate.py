@@ -312,18 +312,23 @@ class TestImportability:
 class TestContractShape:
     def test_input_types_match_protocol(self):
         spec = annotate_module.PhotoshopAnnotate.INPUT_TYPES()
-        assert spec["required"]["image"] == ("IMAGE",)
-        assert spec["required"]["instruction"] == ("STRING", {"multiline": True, "default": ""})
-        assert spec["required"]["mode"] == (
-            ["Pass through", "Wait for first save", "Re-run on every save"],
-            {"default": "Pass through"},
-        )
-        assert spec["required"]["box_composite"] == ("BOOLEAN", {"default": False})
-        assert spec["required"]["timeout_seconds"] == (
-            "INT",
-            {"default": 1800, "min": 10, "max": 86400},
-        )
-        assert spec["optional"] == {"mask": ("MASK",)}
+        assert spec["required"]["image"][0] == "IMAGE"
+        instruction_type, instruction_config = spec["required"]["instruction"]
+        assert instruction_type == "STRING"
+        assert instruction_config["multiline"] is True
+        assert instruction_config["default"] == ""
+        mode_options, mode_config = spec["required"]["mode"]
+        assert mode_options == ["Pass through", "Wait for first save", "Re-run on every save"]
+        assert mode_config["default"] == "Pass through"
+        box_type, box_config = spec["required"]["box_composite"]
+        assert box_type == "BOOLEAN"
+        assert box_config["default"] is False
+        timeout_type, timeout_config = spec["required"]["timeout_seconds"]
+        assert timeout_type == "INT"
+        assert timeout_config["default"] == 1800
+        assert timeout_config["min"] == 10
+        assert timeout_config["max"] == 86400
+        assert spec["optional"]["mask"][0] == "MASK"
         assert spec["hidden"] == {"unique_id": "UNIQUE_ID"}
 
     def test_mode_widget_matches_bridge_node_options_exactly(self):
@@ -341,7 +346,7 @@ class TestContractShape:
             nodes_module.BridgeMode.WAIT_FIRST_SAVE,
             nodes_module.BridgeMode.RERUN_EVERY_SAVE,
         ]
-        assert config == {"default": annotate_module.AnnotateMode.PASS_THROUGH}
+        assert config["default"] == annotate_module.AnnotateMode.PASS_THROUGH
         wait_first_save = annotate_module.AnnotateMode.WAIT_FIRST_SAVE
         rerun_every_save = annotate_module.AnnotateMode.RERUN_EVERY_SAVE
         assert wait_first_save == nodes_module.BridgeMode.WAIT_FIRST_SAVE

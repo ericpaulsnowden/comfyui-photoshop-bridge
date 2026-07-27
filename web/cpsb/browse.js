@@ -196,7 +196,13 @@ export function openBrowseDialog(node, pathWidget) {
   // header, and PhotoshopComposePSD.execute's own documented "point at a
   // file that isn't there yet is a first-run convenience" behavior) --
   // the real file is written later, when the node actually runs.
-  const newButton = ui.el('button', { className: 'cpsb-browse-new-button', text: 'Use This Name' })
+  const newButton = ui.el('button', {
+    className: 'cpsb-browse-new-button',
+    text: 'Use This Name',
+    attrs: {
+      title: "Set this as the target path — the file itself isn't created until the node runs."
+    }
+  })
   const closeButton = ui.el('button', { className: 'cpsb-browse-close', text: 'Close (Esc)' })
 
   const dialog = ui.el('div', {
