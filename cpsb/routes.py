@@ -28,7 +28,7 @@ import platform
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import aiohttp
 from aiohttp import web
@@ -52,7 +52,16 @@ from .locality import is_request_local
 from .psd_io import read_edited_psd, write_psd
 from .raster_io import TIFF_EXTENSIONS, decode_to_rgb8
 from .version import __version__
-from .watcher import CpsbWatcher
+
+if TYPE_CHECKING:
+    # Type-only: `cpsb.watcher` imports `watchdog`, a TIER-1-ONLY dependency.
+    # Importing it for real here would make the whole pack fail to load when
+    # watchdog isn't installed -- which is exactly wrong on a headless/remote
+    # ComfyUI (Linux box, container), where Tier 1 can't work anyway because
+    # there is no local Photoshop, and the user is on Tier 2 for everything.
+    # `install()` already accepts `watcher=None` and every call site guards
+    # for it, so a watcher-less server is a fully supported, working state.
+    from .watcher import CpsbWatcher
 
 logger = logging.getLogger("cpsb")
 
@@ -312,7 +321,10 @@ _APP_KEY_LIVE_RENDER: web.AppKey[_LiveRenderSlot] = web.AppKey(
     "cpsb_live_render", _LiveRenderSlot
 )
 _APP_KEY_REFINE: web.AppKey[_RefineSlot] = web.AppKey("cpsb_refine", _RefineSlot)
-_APP_KEY_WATCHER: web.AppKey[CpsbWatcher | None] = web.AppKey("cpsb_watcher", CpsbWatcher)
+#: No runtime type argument: `CpsbWatcher` is a TYPE_CHECKING-only import
+#: (watchdog is Tier-1-only and may not be installed), and AppKey's
+#: optional second argument is purely a runtime type check.
+_APP_KEY_WATCHER: web.AppKey[CpsbWatcher | None] = web.AppKey("cpsb_watcher")
 
 
 def install(

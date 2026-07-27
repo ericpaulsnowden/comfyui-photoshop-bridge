@@ -229,6 +229,10 @@ The round trip, the eleven nodes, the gallery, and cross-machine editing all wor
 
 ## Troubleshooting
 
+**ComfyUI logs `ModuleNotFoundError: No module named 'watchdog'` (or `psd_tools`, `PIL`, …) at startup.** The pack's dependencies aren't installed in the **same Python that runs ComfyUI**. Install them with that interpreter — from the pack's folder, `pip install -r requirements.txt` (portable Windows: `python_embeded\python.exe -m pip install -r ...`; a venv/conda ComfyUI: activate it first). If the log *also* shows a confusing `No module named 'cpsb'` right after, ignore that second one — it's a fallback import path failing; the first error is the real cause.
+
+Note that a missing **`watchdog` alone no longer stops the pack from loading** (v0.5.63+): every node, the gallery, and the whole Tier-2 plugin keep working, and only automatic **Tier-1** save detection is disabled — which is the right trade on a headless or remote ComfyUI (a Linux box or container), where Tier 1 can't work anyway because there's no local Photoshop to open the file in. The startup log says so explicitly.
+
 **Photoshop asks about Maximize Compatibility on every save.** Set Preferences → File Handling → Maximize PSD Compatibility to **Always** (see Quick Start / [docs/INSTALL.md](docs/INSTALL.md)).
 
 **My edit never comes back into ComfyUI.** Most likely you Save-As'd to a different file or location, which breaks the automatic link (see Limitations) — the card just sits at "Editing" with no chip to flag it, so drag-and-drop the saved-elsewhere image onto that card in the sidebar gallery to import it manually. Also confirm you actually saved, and give it a second to settle.

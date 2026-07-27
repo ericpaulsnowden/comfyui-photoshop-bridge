@@ -138,6 +138,70 @@ class TestImportability:
         assert result.stdout.strip() == "False", result.stderr
 
 
+class TestImportsWithoutWatchdog:
+    """The pack must load when `watchdog` is missing (reported from a Linux
+    install, 2026-07-26). watchdog is a TIER-1-ONLY dependency: on a
+    headless/remote ComfyUI there is no local Photoshop for Tier 1 to open a
+    file in anyway, and every round trip goes through the Tier-2 plugin -- so
+    losing all eleven nodes, the gallery and Tier 2 over a dependency none of
+    them use is the wrong failure. Only automatic Tier-1 save detection
+    degrades.
+    """
+
+    _BLOCKER = """
+import importlib.util, sys
+
+class BlockWatchdog:
+    def find_spec(self, name, path=None, target=None):
+        if name == "watchdog" or name.startswith("watchdog."):
+            raise ModuleNotFoundError("No module named '%s'" % name, name=name)
+        return None
+
+sys.meta_path.insert(0, BlockWatchdog())
+for m in list(sys.modules):
+    if m == "watchdog" or m.startswith("watchdog."):
+        del sys.modules[m]
+
+spec = importlib.util.spec_from_file_location("cpsb_pack_no_watchdog", "__init__.py")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(len(mod.NODE_CLASS_MAPPINGS))
+"""
+
+    def test_all_nodes_register_without_watchdog(self):
+        result = subprocess.run(
+            [sys.executable, "-c", self._BLOCKER],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "11", result.stdout
+
+    def test_routes_import_without_watchdog(self):
+        """`cpsb.routes` is the module that used to hard-import the watcher."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                'import sys\n'
+                'class B:\n'
+                '    def find_spec(self, name, path=None, target=None):\n'
+                '        if name.split(".")[0] == "watchdog":\n'
+                '            raise ModuleNotFoundError("blocked", name=name)\n'
+                '        return None\n'
+                'sys.meta_path.insert(0, B())\n'
+                'import cpsb.routes as r\n'
+                'print(r.install is not None)',
+            ],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "True"
+
+
 class TestIsChanged:
     """The cache key is a CONTENT HASH of the frame bytes, not the frame
     counter -- the counter restarts per plugin connection, so a counter key

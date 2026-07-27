@@ -18,16 +18,31 @@ try:
     from .cpsb import live as _cpsb_live
     from .cpsb import load_psd as _cpsb_load_psd
     from .cpsb import nodes as _cpsb_nodes
-except ImportError:
+except ImportError as _relative_import_error:
     # Imported without package context (e.g. pytest's rootdir Package setup,
     # or tooling that loads node-pack entry files flat). ComfyUI itself always
     # loads this file as a package, taking the relative-import branch above.
-    from cpsb import actions as _cpsb_actions
-    from cpsb import annotate as _cpsb_annotate
-    from cpsb import compose_psd as _cpsb_compose_psd
-    from cpsb import live as _cpsb_live
-    from cpsb import load_psd as _cpsb_load_psd
-    from cpsb import nodes as _cpsb_nodes
+    try:
+        from cpsb import actions as _cpsb_actions
+        from cpsb import annotate as _cpsb_annotate
+        from cpsb import compose_psd as _cpsb_compose_psd
+        from cpsb import live as _cpsb_live
+        from cpsb import load_psd as _cpsb_load_psd
+        from cpsb import nodes as _cpsb_nodes
+    except ImportError:
+        # Both branches failed. Re-raise the FIRST error, not this one: when
+        # the real cause is a missing third-party dependency, the fallback
+        # fails with a misleading "No module named 'cpsb'" that buries it
+        # (reported from a Linux install, 2026-07-26, where the real error
+        # was a missing `watchdog`). Name the actual missing module and the
+        # fix instead.
+        raise ImportError(
+            f"comfyui-photoshop-bridge could not be imported: {_relative_import_error}. "
+            "If that names a third-party module, this pack's dependencies are not "
+            "installed in the SAME Python that runs ComfyUI -- install them with: "
+            "pip install -r requirements.txt  (from the pack's folder, using "
+            "ComfyUI's own Python/venv)."
+        ) from _relative_import_error
 
 logger = logging.getLogger("cpsb")
 
@@ -93,7 +108,6 @@ def _wire_into_comfyui() -> None:
     from .cpsb import routes as cpsb_routes
     from .cpsb.context import CpsbContext, load_settings
     from .cpsb.handoff import HandoffManager
-    from .cpsb.watcher import CpsbWatcher
 
     server = PromptServer.instance
     user_dir = Path(folder_paths.get_user_directory())
@@ -113,13 +127,39 @@ def _wire_into_comfyui() -> None:
     )
     manager = HandoffManager(context)
 
-    watcher = CpsbWatcher(context, manager)
+    # The Tier-1 save watcher is OPTIONAL, in two independent ways.
+    #
+    # 1. Its `watchdog` dependency may not be installed. That is a normal
+    #    state on a headless/remote ComfyUI (a Linux box or container), where
+    #    Tier 1 could never work anyway -- there is no local Photoshop to open
+    #    a file in -- and every round trip goes through the Tier-2 plugin over
+    #    the network. Failing the whole pack to import there would take all
+    #    eleven nodes, the gallery, and Tier 2 down over a dependency none of
+    #    them use (reported from a Linux install, 2026-07-26).
+    # 2. Even when importable, `start()` can fail (e.g. inotify watch limits).
+    #
+    # `routes.install()` accepts `watcher=None` and every call site guards for
+    # it, so a watcher-less server is a fully supported, working state --
+    # only automatic Tier-1 save detection is unavailable.
+    watcher = None
     try:
-        watcher.start()
-    except OSError as exc:
-        # E.g. inotify watch limits. Tier 1 save detection degrades, but the
-        # routes, node, and Tier 2 all still work -- keep the pack alive.
-        logger.warning("cpsb: could not start the input/cpsb watcher: %s", exc)
+        from .cpsb.watcher import CpsbWatcher
+    except ImportError as exc:
+        logger.warning(
+            "cpsb: Tier-1 save detection is OFF -- the file watcher could not be "
+            "imported (%s). Everything else (all nodes, the gallery, and the Tier-2 "
+            "Photoshop plugin) works normally. To enable it, install this pack's "
+            "dependencies into ComfyUI's own Python: pip install -r requirements.txt",
+            exc,
+        )
+    else:
+        watcher = CpsbWatcher(context, manager)
+        try:
+            watcher.start()
+        except OSError as exc:
+            # E.g. inotify watch limits. Tier 1 save detection degrades, but the
+            # routes, node, and Tier 2 all still work -- keep the pack alive.
+            logger.warning("cpsb: could not start the input/cpsb watcher: %s", exc)
 
     # Custom nodes load before PromptServer.add_routes()/run, so adding to
     # the app's router here lands our routes on ComfyUI's own port. We must
