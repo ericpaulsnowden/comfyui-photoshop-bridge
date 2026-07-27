@@ -1,10 +1,10 @@
 # Contributing to comfyui-photoshop-bridge
 
-Thanks for taking a look. This project is pre-release — we're in M0, verifying the riskiest technical assumptions ([docs/SPIKES.md](docs/SPIKES.md)) before writing the M1 implementation. Right now, the most valuable contribution is picking up an unclaimed spike and reporting real, hands-on results. Once M1 lands, this file governs day-to-day code contributions.
+Thanks for taking a look. This project is pre-1.0, actively developed — the core round trip and the nodes described in the README work today and are used day to day (see the status note at the top of the README). This file governs day-to-day code contributions. [docs/SPIKES.md](docs/SPIKES.md) is a historical record of the pre-implementation spikes that de-risked the original design, kept for reference rather than as an open task list.
 
 ## Repo layout
 
-As of M0, only `docs/` exists. This is the layout M1 introduces:
+This is the current layout:
 
 - **`cpsb/`** — the Python backend: the ComfyUI node pack itself (`__init__.py`, node classes, server routes registered on `PromptServer`, the watchdog file-watcher, PSD read/write).
 - **`web/`** — the ComfyUI frontend extension (`WEB_DIRECTORY`): the context-menu hook, the sidebar gallery tab, and paste-back logic, all in JS.

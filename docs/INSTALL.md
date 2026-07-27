@@ -30,6 +30,8 @@ git clone https://github.com/ericpaulsnowden/comfyui-photoshop-bridge.git comfyu
 pip install -r comfyui-photoshop-bridge/requirements.txt
 ```
 
+Run that `pip install` with the same Python ComfyUI itself uses — its venv/conda env, or `python_embeded\python.exe -m pip install -r ...` on the portable Windows build — not an unrelated virtual environment, or the node pack won't import when ComfyUI starts.
+
 Restart ComfyUI. No further configuration is required — Tier 1 works out of the box on any machine that has both ComfyUI and Photoshop installed locally (see the README's Limitations for the remote-ComfyUI caveat).
 
 ### Recommended one-time preference: Maximize PSD Compatibility
@@ -59,6 +61,8 @@ The plugin currently installs as an unpackaged UXP developer plugin loaded throu
 4. The **ComfyUI** panel appears under Photoshop's **Plugins** menu. It connects to `localhost:8188` automatically — no manual "connect" step for the local case. The panel's pill reads **Connected** when it's talking to ComfyUI.
 
 **Editing across machines:** open the panel's **Advanced → ComfyUI server (host:port)**, enter the other machine's address (that ComfyUI must be started with `--listen`), and press **Apply / Connect**. ComfyUI keeps a single plugin slot, so if two machines run the plugin against the same server the latest to connect wins and the other **stands by** — use the panel's **Connect / Disconnect** button to pick the active machine.
+
+This bridge's `/cpsb/*` routes live on ComfyUI's own server process, so `--listen` exposes them exactly as it exposes the rest of ComfyUI's API — no separate authentication layer — so only do this on a network you'd already trust with ComfyUI itself.
 
 **After updating:** `git pull`, then reload the plugin in UDT to pick up the new version. The panel's Advanced section shows the plugin and server versions so you can confirm they're in sync.
 

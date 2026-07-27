@@ -146,6 +146,8 @@ Expect about a second from stroke to re-render on a strong GPU: live iteration, 
 
 ## Quick Start (Tier 1)
 
+**Requirements:** ComfyUI with the current Vue-based frontend (anything from 2025 onward — the one with `registerSidebarTab` and the Settings API), and Photoshop 2025 (v26) or later for the round trip itself. See [docs/INSTALL.md](docs/INSTALL.md) for the full breakdown.
+
 **Install**
 
 - Via ComfyUI Manager: open Manager → **Install via Git URL** → paste this repository's URL. (Not yet in the searchable Registry — that's planned.)
@@ -155,6 +157,7 @@ Expect about a second from stroke to re-render on a strong GPU: live iteration, 
   git clone https://github.com/ericpaulsnowden/comfyui-photoshop-bridge.git comfyui-photoshop-bridge
   pip install -r comfyui-photoshop-bridge/requirements.txt
   ```
+  Run that `pip install` with the same Python ComfyUI itself uses — its venv/conda env, or `python_embeded\python.exe -m pip install -r ...` on the portable Windows build — not an unrelated virtual environment, or the node pack won't import when ComfyUI starts.
 - Restart ComfyUI.
 
 **Use it**
@@ -189,6 +192,8 @@ To edit on one computer while ComfyUI runs on another:
 1. Start ComfyUI on the server machine with `--listen` (so it's reachable over the network) and note its address.
 2. In the plugin panel, open **Advanced → ComfyUI server (host:port)**, enter the server's address (e.g. `192.168.1.50:8188` or a Tailscale address), and press **Apply / Connect**.
 3. Open an image from ComfyUI — it opens in Photoshop on *your* machine, and a plain Cmd/Ctrl+S sends the edit back. The PSD download and the edit upload both ride the same WebSocket connection (chunked), so the whole round trip works over the network, not just the connection.
+
+This bridge's `/cpsb/*` routes live on ComfyUI's own server process, so `--listen` exposes them exactly as it exposes the rest of ComfyUI's API — no separate authentication layer — so only do this on a network you'd already trust with ComfyUI itself.
 
 Only **one Photoshop holds the connection at a time** (ComfyUI keeps a single plugin slot). If you have Photoshop+plugin running on two machines pointed at the same ComfyUI, the most recent one to connect wins and the other **stands by** — no fighting. Use the panel's **Connect / Disconnect** button to choose which machine is active, or to bow out.
 

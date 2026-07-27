@@ -225,6 +225,22 @@ latest edit's filename, no new edit recorded.
 Returns `source.psd` bytes (`Content-Type: image/vnd.adobe.photoshop`). Used by the
 plugin in remote mode. 404 for unknown id or non-active status.
 
+### GET `/cpsb/psd_preview`
+Flattens a `.psd`/`.psb`/`.tif`/`.tiff` into a cached, ComfyUI-addressable preview PNG —
+what the Load PSD node's on-node preview calls (§6b), with no Photoshop involved. Query
+params mirror `/view`: `filename` (required), `subfolder` (default `""`), `type` (default
+`"input"` — unlike `/view`'s own `"output"` default, since every file the Load PSD combo
+can hold lives under `input/`). The path is resolved the same way `/cpsb/open`'s
+psd-native path does, rejecting anything that escapes its base directory or isn't
+`.psd`/`.psb`/`.tif`/`.tiff`. The flattened PNG is cached content-addressed by the source
+file's sha256 under `<temp_dir>/cpsb/psdpreview_<hash>.png`; a repeat request for
+unchanged bytes is served from that cache without re-flattening.
+Success **200**: `{"filename": "...", "subfolder": "cpsb", "type": "temp"}`, addressable
+via ComfyUI's own `/view`. Always 200 even when flattening itself fails —
+`{"filename": null, "subfolder": null, "type": "temp"}`, logged as a warning, never a
+500. **400** missing `filename` or an invalid `type`/extension; **404** file not found or
+a path that escapes its base directory.
+
 ### GET `/cpsb/fs/list`
 Server-side directory listing backing the Compose node's `existing_psd_path` **Browse
 dialog** (v0.5.27 as `/cpsb/browse`; renamed + reshaped to the shared cross-pack contract
