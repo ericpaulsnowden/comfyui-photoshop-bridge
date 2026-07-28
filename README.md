@@ -31,7 +31,13 @@ The rule behind that table: **anything that can work without the plugin, does.**
 
 ## The nodes
 
-Right-clicking any image and choosing **Open in Photoshop** is the core action, and it needs no node at all — it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds eleven nodes, organized under **Photoshop Bridge** in the node browser: **Handoffs** for the round-trip nodes, **Live Rendering** for the live drawing loop.
+Right-clicking any image and choosing **Open in Photoshop** is the core action, and it needs no node at all — it works on `LoadImage`-style nodes, generated previews, and saved outputs. On top of that, the pack adds eleven nodes, organized under **Photoshop Bridge** in the node browser — and the grouping tells you what you need before you place a node:
+
+| Node-browser group | What's in it |
+|---|---|
+| **Handoffs** | Runs entirely on the ComfyUI machine — **Photoshop not required at all**: Load PSD, Compose Layers to PSD. |
+| **Handoffs (requires Photoshop)** | Needs Photoshop installed to do its job: Edit in Photoshop, Annotate for Edit, Run Photoshop Action. |
+| **Live Rendering (requires Photoshop)** | The live drawing loop and refine pass — the six `Photoshop Live…` / refine nodes. The loop as a whole needs the plugin (Live Canvas captures your canvas); a few of its helper nodes fall back to their own widgets, as each node's own section notes. |
 
 ### Edit in Photoshop
 

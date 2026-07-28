@@ -337,7 +337,7 @@ class PhotoshopBridge:
     all-zero mask alongside the unchanged input image.
     """
 
-    CATEGORY = "Photoshop Bridge/Handoffs"
+    CATEGORY = "Photoshop Bridge/Handoffs (requires Photoshop)"
     RETURN_TYPES = ("IMAGE", "MASK")
     OUTPUT_TOOLTIPS = (
         "The edited image once you save in Photoshop, or the unchanged input if this "

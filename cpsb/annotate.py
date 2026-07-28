@@ -866,7 +866,7 @@ class PhotoshopAnnotate:
     migration shim is provided.
     """
 
-    CATEGORY = "Photoshop Bridge/Handoffs"
+    CATEGORY = "Photoshop Bridge/Handoffs (requires Photoshop)"
     RETURN_TYPES = ("IMAGE", "MASK", "STRING", "IMAGE")
     # Purely cosmetic (two IMAGE sockets would otherwise both just say
     # "IMAGE" in the graph) -- ComfyUI does not require RETURN_NAMES to

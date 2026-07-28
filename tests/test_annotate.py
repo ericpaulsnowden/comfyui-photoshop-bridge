@@ -354,7 +354,7 @@ class TestContractShape:
 
     def test_node_attributes(self):
         node_cls = annotate_module.PhotoshopAnnotate
-        assert node_cls.CATEGORY == "Photoshop Bridge/Handoffs"
+        assert node_cls.CATEGORY == "Photoshop Bridge/Handoffs (requires Photoshop)"
         assert node_cls.RETURN_TYPES == ("IMAGE", "MASK", "STRING", "IMAGE")
         assert node_cls.FUNCTION == "execute"
 

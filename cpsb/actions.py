@@ -131,7 +131,7 @@ class PhotoshopAction:
     without reopening Photoshop or resending ``run_action``.
     """
 
-    CATEGORY = "Photoshop Bridge/Handoffs"
+    CATEGORY = "Photoshop Bridge/Handoffs (requires Photoshop)"
     RETURN_TYPES = ("IMAGE", "MASK")
     OUTPUT_TOOLTIPS = (
         "The image after the Photoshop Action ran.",

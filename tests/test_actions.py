@@ -248,7 +248,7 @@ class TestContractShape:
 
     def test_node_attributes(self):
         node = actions_module.PhotoshopAction
-        assert node.CATEGORY == "Photoshop Bridge/Handoffs"
+        assert node.CATEGORY == "Photoshop Bridge/Handoffs (requires Photoshop)"
         assert node.RETURN_TYPES == ("IMAGE", "MASK")
         assert node.FUNCTION == "execute"
 
