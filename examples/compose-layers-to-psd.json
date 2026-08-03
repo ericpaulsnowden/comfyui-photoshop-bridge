@@ -1,0 +1,509 @@
+{
+  "last_node_id": 11,
+  "last_link_id": 8,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "EmptyImage",
+      "pos": [
+        40,
+        460
+      ],
+      "size": [
+        280,
+        130
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptyImage"
+      },
+      "title": "Backdrop — a flat 1024×1024 blue",
+      "widgets_values": [
+        1024,
+        1024,
+        1,
+        2245768
+      ]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        660
+      ],
+      "size": [
+        330,
+        340
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2,
+            3
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "Photo — swap this for your own",
+      "widgets_values": [
+        "example.png"
+      ]
+    },
+    {
+      "id": 3,
+      "type": "ImageInvert",
+      "pos": [
+        440,
+        860
+      ],
+      "size": [
+        250,
+        30
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageInvert"
+      }
+    },
+    {
+      "id": 4,
+      "type": "ImageScaleBy",
+      "pos": [
+        440,
+        940
+      ],
+      "size": [
+        280,
+        90
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ImageScaleBy"
+      },
+      "title": "…at half size, so you can see it centre",
+      "widgets_values": [
+        "lanczos",
+        0.5
+      ]
+    },
+    {
+      "id": 5,
+      "type": "PhotoshopComposePSD",
+      "pos": [
+        800,
+        460
+      ],
+      "size": [
+        380,
+        330
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image_1",
+          "type": "IMAGE",
+          "link": 1,
+          "label": "Backdrop"
+        },
+        {
+          "name": "image_2",
+          "type": "IMAGE",
+          "link": 2,
+          "label": "Photo"
+        },
+        {
+          "name": "image_3",
+          "type": "IMAGE",
+          "link": 5,
+          "label": "Inverted inset"
+        },
+        {
+          "name": "image_4",
+          "type": "IMAGE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            6
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        },
+        {
+          "name": "filename",
+          "type": "STRING",
+          "links": [
+            8
+          ],
+          "slot_index": 2
+        },
+        {
+          "name": "layers",
+          "type": "IMAGE",
+          "links": [
+            7
+          ],
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopComposePSD"
+      },
+      "title": "Compose Layers to PSD (no Photoshop needed)",
+      "widgets_values": [
+        "Demo Layers",
+        "{\"image_1\": \"Backdrop\", \"image_2\": \"Photo\", \"image_3\": \"Inverted inset\"}",
+        "Don't open (composite only)",
+        1800,
+        64,
+        ""
+      ]
+    },
+    {
+      "id": 6,
+      "type": "PreviewImage",
+      "pos": [
+        1240,
+        440
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 6
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "image — the flattened composite"
+    },
+    {
+      "id": 7,
+      "type": "PreviewImage",
+      "pos": [
+        1240,
+        820
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 7
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "layers — step through all three"
+    },
+    {
+      "id": 8,
+      "type": "PreviewAny",
+      "pos": [
+        1240,
+        1200
+      ],
+      "size": [
+        330,
+        120
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source",
+          "type": "*",
+          "link": 8
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewAny"
+      },
+      "title": "filename — what got written"
+    },
+    {
+      "id": 9,
+      "type": "MarkdownNote",
+      "pos": [
+        40,
+        -300
+      ],
+      "size": [
+        560,
+        660
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "START HERE",
+      "properties": {},
+      "widgets_values": [
+        "# Compose Layers to PSD — build a layered file out of ComfyUI\n\nThree different images go in; one **layered .psd** comes out, written into\n`ComfyUI/input/` as `compose_00001.psd`. Open that file in Photoshop and all\nthree are separate, editable layers.\n\n**This demo runs with no Photoshop at all.** `mode` is set to **Don't open\n(composite only)**, so the node writes the file and hands the result straight\nback — nothing launches, nothing waits, no model is loaded. Queue it and watch.\n\n**Try it:**\n\n1. Queue it as-is and look at the three previews on the right.\n2. Open `ComfyUI/input/compose_00001.psd` in Photoshop and check the Layers\n   panel — three layers, named.\n3. Now switch `mode` to **Wait for first save** and queue again. This time it\n   opens the PSD for you and the run waits until you save.\n\n`example.png` is the image ComfyUI ships with. Swap it for your own — any size\nworks, see the note about the canvas.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        640,
+        -300
+      ],
+      "size": [
+        520,
+        660
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Layer order, size and names",
+      "properties": {},
+      "widgets_values": [
+        "# The layer stack\n\n`image_1` is the **bottom** layer, `image_2` sits on top of it, and so on up.\nConnect as many as you want — the node always keeps one empty socket waiting\nand grows to twenty.\n\n**The canvas is sized to the biggest input.** Here the blue backdrop is\n1024×1024, the photo is 768×768, and the inverted copy is 384×384 — so the PSD\nis 1024×1024 and the two smaller ones land **centred**. Nothing is ever scaled\nto fit. Change the numbers on **Empty Image** and you'll see the canvas follow.\n\n**Name your layers:** double-click an `image_N` socket and type a name. That\nname becomes the layer's name in the PSD. The three sockets here are already\nnamed *Backdrop*, *Photo* and *Inverted inset* — open the file in Photoshop and\nyou'll see exactly those in the Layers panel. Rename one and queue again.\n\n**One growing review document:** the **Browse…** button on the node points\n`existing_psd_path` at a PSD you already have. Every run then appends a new\ngroup to that one file instead of writing a fresh file each time.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 11,
+      "type": "MarkdownNote",
+      "pos": [
+        1200,
+        -300
+      ],
+      "size": [
+        520,
+        660
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "What comes back out",
+      "properties": {},
+      "widgets_values": [
+        "# The four outputs\n\n**image** — the flattened composite: exactly what the PSD looks like with every\nlayer visible. Top preview.\n\n**mask** — marks any part of the canvas that no layer covers. All black in this\ndemo, because the backdrop covers the whole thing. Shrink the backdrop and\nyou'll see it light up.\n\n**layers** — one image per layer, each sitting where it really lands on the\nshared canvas. That's the middle preview: three frames you can step through.\nThe `image` output only ever shows the flattened version, so this is how you\nlook at layers individually.\n\n**filename** — the name of the file that was written, relative to\n`ComfyUI/input/`. Shown as text at the bottom. Copy that name into a **Load\nPSD** node's `psd` widget and you've chained this demo into\n`load-psd-start-a-workflow.json`. You do that by hand on purpose — `psd` is a\ndropdown, so there's no socket to run a wire into.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      5,
+      1,
+      "IMAGE"
+    ],
+    [
+      3,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      3,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      4,
+      0,
+      5,
+      2,
+      "IMAGE"
+    ],
+    [
+      6,
+      5,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ],
+    [
+      7,
+      5,
+      3,
+      7,
+      0,
+      "IMAGE"
+    ],
+    [
+      8,
+      5,
+      2,
+      8,
+      0,
+      "STRING"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "1 · Three images to stack",
+      "bounding": [
+        20,
+        400,
+        700,
+        680
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "2 · Write the layered PSD",
+      "bounding": [
+        760,
+        400,
+        440,
+        450
+      ],
+      "color": "#8A8",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "3 · What comes back",
+      "bounding": [
+        1220,
+        380,
+        380,
+        960
+      ],
+      "color": "#b58b2a",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.5,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}

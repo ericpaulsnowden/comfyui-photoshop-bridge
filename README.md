@@ -4,6 +4,8 @@ Right-click any image in ComfyUI, choose **Open in Photoshop**, make your edit, 
 
 > **Project status: pre-1.0, actively developed.** The core round trip and the nodes below work today and are used day to day; expect rough edges and occasional breaking changes before 1.0. See the [releases/tags](https://github.com/ericpaulsnowden/comfyui-photoshop-bridge/tags) for the current version — the backend, frontend, and Photoshop plugin all report their version, and the ComfyUI sidebar shows an amber "update available" hint when they drift out of sync.
 
+**Want to see it working first?** Every workflow in [examples/](examples/) is annotated on the canvas and ready to load — seven files between them cover all eleven nodes, from a no-Photoshop-required PSD compose to the full realtime drawing loop. See [examples/README.md](examples/README.md) for which need Photoshop and which don't.
+
 ## How it works
 
 comfyui-photoshop-bridge ships as a single ComfyUI custom node pack with two tiers. You use the same right-click workflow either way — the tier just changes what happens under the hood.
@@ -28,6 +30,8 @@ This pack is one ComfyUI custom node pack with two tiers (see [How it works](#ho
 | **Required to be useful** | **Photoshop Live Preview** · **Photoshop Add Layer** · **Send to ComfyUI** · the whole **ComfyUI Preview panel** (prompt, creativity, Refine, Add as a layer) — these deliver *into* Photoshop, so without the plugin they run but have nowhere to land (a logged no-op, never a failed render). |
 
 The rule behind that table: **anything that can work without the plugin, does.** The plugin exists to make things better, not to gate the basics — the only hard exceptions are the two things that are genuinely impossible otherwise.
+
+Two different questions, so don't read one table for the other: this table is about **the plugin**, while the node-browser groups below are labelled for **Photoshop the application**. That's why nodes like *Photoshop Live Prompt* and *Photoshop Refine Source* appear as "not needed at all" here yet still sit in a group marked *(requires Photoshop)* — they need no plugin and fall back to their own widgets, but the loop they belong to is pointless without Photoshop open.
 
 ## The nodes
 
@@ -65,16 +69,20 @@ After a run the node shows **`Written: <filename>`** with a **Copy Path** button
 
 ### Annotate for Edit
 
-> **Plugin: optional** — Tier 1 handles it.
+> **Plugin: optional** — and in this node's default mode, Photoshop isn't involved at all.
 
-Hands an image to Photoshop, which opens it with an auto-created empty transparent **"Instructions"** layer. Paint on that layer with any brush, any color, to mark a region; you can edit the base image too. Save, and you get back four outputs covering the three useful views of the result:
+Pairs a typed **instruction** with a **mask** marking where it applies — the two inputs an editing model like Kontext or Qwen-Image-Edit expects — without you having to draw shapes or write text onto the pixels yourself.
+
+In the default **Pass through** mode it never opens Photoshop: it reads the optional **`mask`** input socket (or hands back an empty mask when nothing is connected) and passes the image along unchanged, so any mask source already in your graph works.
+
+Switch **`mode`** to **Wait for first save** or **Re-run on every save** to draw the mask in Photoshop instead. Either one hands the image over, and Photoshop opens it with an auto-created empty transparent **"Instructions"** layer. Paint on that layer with any brush, any color, to mark a region; you can edit the base image too. Save, and you get back four outputs covering the three useful views of the result:
 
 - **`image`** — everything *but* your marks (your base edits baked in). Pair with `mask` for inpainting / mask-driven models.
-- **`mask`** — your marks alone.
+- **`mask`** — your marks alone (in **Pass through**, whatever you connected to the `mask` input).
 - **`annotated`** — image *and* marks combined, for visual-prompt edit models that take no mask ("edit what I circled"). The `box_composite` toggle picks the form: off = your real strokes, on = a tidy red box at their bounding box (what Kontext / Qwen-Image-Edit respond to).
 - **`instruction`** — your text, verbatim.
 
-Rename or delete the Instructions layer and it's treated as a plain edited image. The **`mode`** widget matches the other nodes (*Wait for first save*, *Re-run on every save*, *Pass through*), and a **Re-open in Photoshop** button gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
+Rename or delete the Instructions layer and it's treated as a plain edited image. The two Photoshop modes are the same ones **Edit in Photoshop** offers, so you iterate the same way in either node — but unlike every other node here, this one *defaults* to **Pass through**. A **Re-open in Photoshop** button gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
 
 ### Run Photoshop Action
 
@@ -189,7 +197,7 @@ Today the plugin installs as an **unpackaged developer plugin** (a packaged, one
 
 Once installed, a plain Cmd/Ctrl+S sends your edit back automatically — the panel's "Send" button (one per open document) is just a manual fallback for saves that don't fire a normal save event (e.g. Export As).
 
-The plugin **sets Maximize PSD Compatibility to Always for you** the first time it connects (v0.5.31) — so you can skip the manual Tier-1 step above. It only writes the preference if it isn't already Always, logs what it did in the panel, and never blocks connecting if it can't. You can turn this off in the panel's **Advanced** section if you'd rather manage the preference yourself.
+The plugin **sets Maximize PSD Compatibility to Always for you** the first time it connects — so you can skip the manual Tier-1 step above. It only writes the preference if it isn't already Always, logs what it did in the panel, and never blocks connecting if it can't. You can turn this off in the panel's **Advanced** section if you'd rather manage the preference yourself.
 
 ### Editing across two machines
 
@@ -237,7 +245,7 @@ The round trip, the eleven nodes, the gallery, and cross-machine editing all wor
 
 **ComfyUI logs `ModuleNotFoundError: No module named 'watchdog'` (or `psd_tools`, `PIL`, …) at startup.** The pack's dependencies aren't installed in the **same Python that runs ComfyUI**. Install them with that interpreter — from the pack's folder, `pip install -r requirements.txt` (portable Windows: `python_embeded\python.exe -m pip install -r ...`; a venv/conda ComfyUI: activate it first). If the log *also* shows a confusing `No module named 'cpsb'` right after, ignore that second one — it's a fallback import path failing; the first error is the real cause.
 
-Note that a missing **`watchdog` alone no longer stops the pack from loading** (v0.5.63+): every node, the gallery, and the whole Tier-2 plugin keep working, and only automatic **Tier-1** save detection is disabled — which is the right trade on a headless or remote ComfyUI (a Linux box or container), where Tier 1 can't work anyway because there's no local Photoshop to open the file in. The startup log says so explicitly.
+Note that a missing **`watchdog` alone does not stop the pack from loading**: every node, the gallery, and the whole Tier-2 plugin keep working, and only automatic **Tier-1** save detection is disabled — which is the right trade on a headless or remote ComfyUI (a Linux box or container), where Tier 1 can't work anyway because there's no local Photoshop to open the file in. The startup log says so explicitly.
 
 **Photoshop asks about Maximize Compatibility on every save.** Set Preferences → File Handling → Maximize PSD Compatibility to **Always** (see Quick Start / [docs/INSTALL.md](docs/INSTALL.md)).
 
@@ -288,6 +296,7 @@ Both tiers converge on the same backend ingest step, so the rest of ComfyUI (cac
 
 ## Documentation
 
+- **[examples/README.md](examples/README.md)** — the example workflows index: which of the seven files need Photoshop, which need the plugin, and what each one teaches.
 - **[docs/INSTALL.md](docs/INSTALL.md)** — detailed install steps and the Maximize Compatibility walkthrough.
 - **[docs/PROTOCOL.md](docs/PROTOCOL.md)** — the interface contract (routes, WebSocket protocol, file schemas). Start here if you're building against this project or contributing code.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup, code style, and PR expectations.

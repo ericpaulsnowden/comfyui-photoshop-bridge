@@ -130,8 +130,7 @@
         }
       },
       "widgets_values": [
-        "image_qwen_image_edit_input_image.png",
-        "image"
+        "image_qwen_image_edit_input_image.png"
       ]
     },
     {
@@ -355,11 +354,11 @@
       "type": "MarkdownNote",
       "pos": [
         100,
-        500
+        510
       ],
       "size": [
-        420,
-        230
+        560,
+        580
       ],
       "flags": {},
       "order": 7,
@@ -409,7 +408,47 @@
       "IMAGE"
     ]
   ],
-  "groups": [],
+  "groups": [
+    {
+      "id": 1,
+      "title": "1 · Load Image → Annotate for Edit",
+      "bounding": [
+        -260,
+        -20,
+        345,
+        990
+      ],
+      "color": "#3f789e",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "2 · Qwen-Image-Edit (subgraph)",
+      "bounding": [
+        90,
+        -20,
+        430,
+        510
+      ],
+      "color": "#8A8",
+      "font_size": 24,
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "3 · Save the result",
+      "bounding": [
+        530,
+        -20,
+        580,
+        490
+      ],
+      "color": "#b58b2a",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
   "definitions": {
     "subgraphs": [
       {

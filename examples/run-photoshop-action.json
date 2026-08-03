@@ -1,0 +1,225 @@
+{
+  "last_node_id": 5,
+  "last_link_id": 3,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        660
+      ],
+      "size": [
+        330,
+        340
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "Load Image (swap this for your own)",
+      "widgets_values": [
+        "example.png"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PhotoshopAction",
+      "pos": [
+        440,
+        660
+      ],
+      "size": [
+        340,
+        140
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2,
+            3
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopAction"
+      },
+      "title": "Run Photoshop Action (fill these in!)",
+      "widgets_values": [
+        "",
+        "",
+        1800
+      ]
+    },
+    {
+      "id": 3,
+      "type": "PreviewImage",
+      "pos": [
+        880,
+        620
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "After the Action ran"
+    },
+    {
+      "id": 4,
+      "type": "SaveImage",
+      "pos": [
+        880,
+        1000
+      ],
+      "size": [
+        330,
+        340
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "title": "Keep a copy",
+      "widgets_values": [
+        "photoshop_action"
+      ]
+    },
+    {
+      "id": 5,
+      "type": "MarkdownNote",
+      "pos": [
+        40,
+        -310
+      ],
+      "size": [
+        700,
+        840
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "START HERE",
+      "properties": {},
+      "widgets_values": [
+        "# Run Photoshop Action — read this before you queue\n\nThis node opens the image in Photoshop, **plays one of your saved Actions on it\nautomatically**, and hands the result back. No clicking, no waiting on you.\n\n## Fill in the two blank fields first\n\nThey ship empty on purpose — an Action name we invented wouldn't exist on your\nmachine. Queue this as-is and there is nothing for it to run.\n\n- **`action_name`** — the Action's name, typed **exactly** as it appears in\n  Photoshop's Actions panel. Capitals, spaces, brackets and all.\n- **`action_set`** — the folder that Action lives in, again exactly.\n\nIf your Actions panel still has Photoshop's stock set loaded, try\n`Sepia Toning (layer)` in `Default Actions` as a first test.\n\n## Two things that will bite you\n\n1. **This one genuinely needs the Photoshop panel plugin.** There's no\n   file-only fallback, because only the plugin can reach Photoshop's Actions\n   panel. If the plugin isn't installed and connected, this node can't work —\n   every other node in this pack has a plugin-free path, this one doesn't.\n\n2. **Turn off every \"show dialog\" toggle inside the Action.** That's the little\n   square next to a step in the Actions panel. Leave one switched on and\n   Photoshop stops on a dialog box waiting for a human — your run just sits\n   there until `timeout_seconds` runs out.\n\nThe run blocks while the Action plays, so keep `timeout_seconds` comfortably\nlonger than the Action actually takes. 1800 is half an hour.\n\n## What to try\n\nPoint **Load Image** at something of your own, run a colour-grade Action on it,\nthen swap `action_name` for a different one and queue again. The **Save Image**\nnode writes each result to `ComfyUI/output/` prefixed `photoshop_action`, so you\ncan line them up afterwards.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      2,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Image in · Action plays in Photoshop · image back",
+      "bounding": [
+        20,
+        570,
+        1220,
+        820
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}

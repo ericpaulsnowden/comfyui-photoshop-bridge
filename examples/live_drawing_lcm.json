@@ -1,5 +1,5 @@
 {
-  "last_node_id": 19,
+  "last_node_id": 23,
   "last_link_id": 25,
   "nodes": [
     {
@@ -417,32 +417,6 @@
       "title": "Photoshop Live Prompt (type in the PS panel)"
     },
     {
-      "id": 11,
-      "type": "Note",
-      "pos": [
-        960,
-        500
-      ],
-      "size": {
-        "0": 480,
-        "1": 420
-      },
-      "flags": {},
-      "order": 10,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "properties": {
-        "text": ""
-      },
-      "widgets_values": [
-        "REALTIME DRAWING - quickstart\n\n1) Point the Checkpoint at a FAST few-step model. A PLAIN model\n   (v1-5-pruned, SDXL base, DreamShaper/Juggernaut with NO\n   LCM/Turbo/Lightning/Hyper in the name) will NOT work - it barely\n   denoises at 4 steps, so the output stays ~99% your drawing.\n   Recommended:\n   - SD1.5 zero-setup drop-in (works with THIS graph as-is):\n     DreamShaper8_LCM.safetensors  (HF: Lykon/dreamshaper-8-lcm)\n   - SDXL, best quality (10GB+ VRAM): sdxl_lightning_4step.safetensors\n     (HF: ByteDance/SDXL-Lightning) - then set the KSampler to\n     sampler=euler, scheduler=sgm_uniform, CFG 1.0, do NOT add an\n     LCM LoRA (Lightning is already few-step), and set the plugin\n     panel's CAPTURE SIZE to 1024 (SDXL's native size - sharper).\n\n2) In Photoshop: open the ComfyUI Bridge panel, Start Live, and draw.\n\n3) The PROMPT and CREATIVITY controls are in the 'ComfyUI Preview'\n   panel (Plugins > ComfyUI Bridge > ComfyUI Preview), under the image:\n   - PROMPT box drives the 'Photoshop Live Prompt' node here.\n   - CREATIVITY (Low / Medium / High buttons) drives the 'Photoshop\n     Live Creativity' node, which sets this KSampler's denoise. Low =\n     hug your drawing, High = reinterpret it. That is the fix for\n     'looks like my drawing': effective work ~= steps x denoise, so at\n     4 steps favor Medium/High. The panel shows the exact denoise each\n     level maps to. How far the levels reach is the main panel's\n     CREATIVITY RANGE (Subtle / Balanced / Bold), remembered PER CAPTURE\n     SIZE - the same denoise behaves very differently at 512 vs 1024\n     depending on the model, so tune it once per size (drop to Subtle\n     if High looks chaotic at that size).\n\nYou never have to edit this graph to change the prompt or adherence -\ndo it from the Photoshop panel.\n\nREFINE (new): the bottom branch is the refine pass and its\n'Photoshop Refine Source' node ships MUTED - the live loop never runs\nit. Hover the preview image and click REFINE (under 'Add as a layer'): your document uploads\nat full quality, this branch runs ONCE (2x lanczos upscale + an 8-step\nlow-denoise polish), live re-renders pause meanwhile, and the result\ngoes to BOTH the preview pane and a 'ComfyUI refined' document layer\n(the 'Photoshop Add Layer' node; Stack/Replace is in the main panel).\nDelete either output node to route to just one. You can also un-mute\nthe source and press Queue to run it manually - no plugin needed."
-      ],
-      "title": "READ ME \u2014 realtime drawing quickstart",
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
       "id": 12,
       "type": "PhotoshopLiveCreativity",
       "pos": [
@@ -475,7 +449,7 @@
         0.4,
         0.85
       ],
-      "title": "Photoshop Live Creativity (slider in the PS preview panel)"
+      "title": "Photoshop Live Creativity (Low/Medium/High in the PS preview panel)"
     },
     {
       "id": 13,
@@ -749,6 +723,102 @@
         "ComfyUI refined"
       ],
       "title": "Refined \u2192 document layer"
+    },
+    {
+      "id": 20,
+      "type": "MarkdownNote",
+      "pos": [
+        20,
+        -330
+      ],
+      "size": [
+        460,
+        440
+      ],
+      "flags": {},
+      "order": 20,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "READ ME \u2014 realtime drawing quickstart",
+      "properties": {},
+      "widgets_values": [
+        "# Realtime drawing \u2014 quickstart\n\nDraw in Photoshop and ComfyUI re-renders continuously in a panel beside your canvas. This graph is the whole loop: live capture on the left, sampling in the middle, the result back into Photoshop on the right, and a one-shot refine pass along the bottom.\n\nRead the three notes alongside this one, in order, before you queue: pick a fast model, then how to draw and steer from the Photoshop panel, then what the refine pass does.\n\nYou never have to edit this graph to change the prompt or how much a render adheres to your drawing \u2014 both are driven live from the Photoshop panel."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 21,
+      "type": "MarkdownNote",
+      "pos": [
+        500,
+        -430
+      ],
+      "size": [
+        460,
+        540
+      ],
+      "flags": {},
+      "order": 21,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "1 \u00b7 Pick a fast model",
+      "properties": {},
+      "widgets_values": [
+        "# 1 \u00b7 Pick a fast model\n\nPoint the Checkpoint loader at a fast, few-step model. A plain model (v1-5-pruned, SDXL base, DreamShaper/Juggernaut with no LCM/Turbo/Lightning/Hyper in the name) will not work \u2014 it barely denoises at 4 steps, so the output stays about 99% your drawing.\n\n**Recommended:**\n\n- **SD1.5, zero-setup drop-in** (works with this graph as-is): `DreamShaper8_LCM.safetensors` (HF `Lykon/dreamshaper-8-lcm`).\n- **SDXL, best quality** (10 GB+ VRAM): `sdxl_lightning_4step.safetensors` (HF `ByteDance/SDXL-Lightning`) \u2014 then set the KSampler to `sampler=euler`, `scheduler=sgm_uniform`, CFG 1.0, do **not** add an LCM LoRA (Lightning is already few-step), and set the plugin panel's Capture Size to 1024 (SDXL's native size \u2014 sharper)."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 22,
+      "type": "MarkdownNote",
+      "pos": [
+        980,
+        -570
+      ],
+      "size": [
+        460,
+        680
+      ],
+      "flags": {},
+      "order": 22,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "2 \u00b7 Draw and steer from the Photoshop panel",
+      "properties": {},
+      "widgets_values": [
+        "# 2 \u00b7 Draw and steer from the Photoshop panel\n\nIn Photoshop, open the ComfyUI panel (Plugins \u2192 ComfyUI Bridge \u2192 ComfyUI), click **Start Live**, and draw.\n\nThe Prompt and Creativity controls live in the **ComfyUI Preview** panel (Plugins \u2192 ComfyUI Bridge \u2192 ComfyUI Preview), under the image:\n\n- The **Prompt** box drives the **Photoshop Live Prompt** node here.\n- **Creativity** (Low / Medium / High buttons) drives **Photoshop Live Creativity**, which sets this KSampler's denoise. Low hugs your drawing; High reinterprets it \u2014 the fix for \"looks like my drawing\": effective work \u2248 steps \u00d7 denoise, so at 4 steps favor Medium/High. The panel names the exact denoise each level maps to.\n\nHow far the levels reach is the main panel's **Creativity Range** (Subtle / Balanced / Bold), remembered per capture size \u2014 the same denoise behaves very differently at 512 vs 1024, so tune it once per size (drop to Subtle if High looks chaotic there)."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 23,
+      "type": "MarkdownNote",
+      "pos": [
+        1460,
+        -380
+      ],
+      "size": [
+        460,
+        490
+      ],
+      "flags": {},
+      "order": 23,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "3 \u00b7 The refine pass",
+      "properties": {},
+      "widgets_values": [
+        "# 3 \u00b7 The refine pass\n\nThe bottom branch is the one-shot refine pass. Its **Photoshop Refine Source** node ships muted, so the live loop never runs it.\n\nHover the preview image and click **Refine** (under \"Add as a layer\"): your document uploads at full quality, this branch runs once \u2014 a 2\u00d7 lanczos upscale plus an 8-step low-denoise polish \u2014 live re-renders pause meanwhile, and the result goes to both the preview pane and a **\"ComfyUI refined\"** document layer (the **Photoshop Add Layer** node; Stack/Replace is set in the main panel).\n\nDelete either output node to route to just one. You can also un-mute the source and press Queue to run it manually \u2014 no plugin needed."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
     }
   ],
   "links": [
@@ -953,7 +1023,56 @@
       "IMAGE"
     ]
   ],
-  "groups": [],
+  "groups": [
+    {
+      "id": 1,
+      "title": "1 \u00b7 Live input \u2014 Photoshop canvas, checkpoint, prompt & creativity",
+      "bounding": [
+        20,
+        150,
+        360,
+        670
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "2 \u00b7 Sample \u2014 encode, KSampler, decode",
+      "bounding": [
+        540,
+        150,
+        980,
+        440
+      ],
+      "color": "#8A8",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "3 \u00b7 Back to Photoshop \u2014 live preview",
+      "bounding": [
+        1520,
+        170,
+        420,
+        480
+      ],
+      "color": "#b58b2a",
+      "flags": {}
+    },
+    {
+      "id": 4,
+      "title": "4 \u00b7 Refine \u2014 one-shot high-quality pass",
+      "bounding": [
+        20,
+        860,
+        1980,
+        300
+      ],
+      "color": "#a1309b",
+      "flags": {}
+    }
+  ],
   "config": {},
   "extra": {},
   "version": 0.4

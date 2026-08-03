@@ -93,10 +93,11 @@ export const SETTINGS = [
       'changed node and whatever is downstream of it actually re-run, not ' +
       'the whole graph. When off: the edit still lands on the node right ' +
       'away, but silently — nothing re-runs until you queue the workflow ' +
-      'yourself. Has no effect on Photoshop Bridge, Annotate for Edit, or ' +
-      'Compose Layers to PSD nodes — those re-queue automatically only ' +
-      'when their own mode widget is set to "Re-run on every save", ' +
-      'independent of this setting.'
+      'yourself. Has no effect on Edit in Photoshop, Annotate for Edit, or ' +
+      'Compose Layers to PSD — those re-queue automatically only when their ' +
+      'own mode widget is set to "Re-run on every save", independent of this ' +
+      'setting. Run Photoshop Action has no mode widget and always waits for ' +
+      'the Action to finish, so this setting does not affect it either.'
   },
   {
     id: 'cpsb.showUpgradeBanner',

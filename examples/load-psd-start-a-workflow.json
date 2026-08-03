@@ -1,0 +1,261 @@
+{
+  "last_node_id": 6,
+  "last_link_id": 3,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "PhotoshopLoadPSD",
+      "pos": [
+        40,
+        540
+      ],
+      "size": [
+        340,
+        140
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [
+            2
+          ],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopLoadPSD"
+      },
+      "title": "Load PSD (pick your file here)",
+      "widgets_values": [
+        "",
+        false,
+        "Re-run workflow"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PreviewImage",
+      "pos": [
+        460,
+        500
+      ],
+      "size": [
+        330,
+        320
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "The flattened PSD"
+    },
+    {
+      "id": 3,
+      "type": "MaskToImage",
+      "pos": [
+        460,
+        930
+      ],
+      "size": [
+        230,
+        30
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "mask",
+          "type": "MASK",
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MaskToImage"
+      }
+    },
+    {
+      "id": 4,
+      "type": "PreviewImage",
+      "pos": [
+        760,
+        910
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "The MASK, made visible"
+    },
+    {
+      "id": 5,
+      "type": "MarkdownNote",
+      "pos": [
+        40,
+        40
+      ],
+      "size": [
+        560,
+        400
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "START HERE",
+      "properties": {},
+      "widgets_values": [
+        "# Load PSD — start a workflow from a layered file\n\n**Load PSD** reads a `.psd`, `.psb`, `.tif` or `.tiff` out of `ComfyUI/input/`,\nflattens it, and hands it to the rest of the graph. No Photoshop needed just to\nload a file — this half runs anywhere.\n\n**The `psd` dropdown is empty until there's a file to pick.** Three ways to\nfill it:\n\n- Click **Upload Photoshop File** on the node and choose one.\n- Drag a `.psd` straight onto the node.\n- Drop a file into `ComfyUI/input/` yourself, then reload the page.\n\nNo PSD handy? Queue the **`compose-layers-to-psd.json`** demo once — it needs\nno Photoshop and writes `compose_00001.psd` into exactly the right folder. It\nwill be in this dropdown the next time you look.\n\nThe node ships with `psd` deliberately blank, because whatever we typed in here\nwouldn't exist on your machine. Pick your file, then queue.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 6,
+      "type": "MarkdownNote",
+      "pos": [
+        640,
+        -220
+      ],
+      "size": [
+        560,
+        660
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "edit_original and on_save",
+      "properties": {},
+      "widgets_values": [
+        "# Sending it back to Photoshop\n\nRight-click the node and choose **Open in Photoshop** to push the file back for\nediting. With the panel plugin connected that's instant; without it, the node\nopens the file and watches for your save. Either way works.\n\n**`edit_original`** — off (the default) means your original file is **never\ntouched**: your edit is saved to a working copy alongside it. Turn it on to\nedit the file in place. Leave it off unless you really mean it.\n\n**`on_save`** — what happens the moment you save in Photoshop:\n\n- **Re-run workflow** — the whole workflow queues again with your edit. Good\n  for \"tweak, look, tweak again.\"\n- **Update only (don't re-run)** — the node quietly picks up the new version;\n  nothing runs until you queue it yourself.\n- **Ignore (do nothing)** — saves are ignored entirely.\n\n**The lower branch** turns the MASK output into something you can actually look\nat. It marks transparency in the file: white where the flattened image has\nnothing in it, black where it has pixels. A PSD with a full background layer\ngives you an all-black mask — that's right, not broken.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      1,
+      1,
+      3,
+      0,
+      "MASK"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "1 · Pick a layered file",
+      "bounding": [
+        20,
+        480,
+        400,
+        260
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "2 · Flattened, ready for the workflow",
+      "bounding": [
+        440,
+        460,
+        380,
+        390
+      ],
+      "color": "#8A8",
+      "flags": {}
+    },
+    {
+      "id": 3,
+      "title": "3 · The MASK, made visible",
+      "bounding": [
+        440,
+        870,
+        680,
+        420
+      ],
+      "color": "#b58b2a",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.6,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}

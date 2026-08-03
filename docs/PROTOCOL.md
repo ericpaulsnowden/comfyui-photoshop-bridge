@@ -418,7 +418,8 @@ Plugin → server:
   plugin — the node's own widgets define the band exactly as before.
   The server clamps it to `0.0..1.0` and holds the newest in ONE keep-latest slot
   (`PluginConnection.live_creativity`); `PhotoshopLiveCreativity` (§6f) maps it onto a
-  denoise band, falling back to its own widget when the slider was never touched. A
+  denoise band, falling back to its own widget when no Creativity button was ever
+  pressed. A
   non-numeric value is dropped with a log line. Emits `cpsb.livecreativity` (§5).
   Fire-and-forget, never a handoff, dies with the connection.
 - `{"type": "refine_push", "refine_id": "...", "seq": 0, "total": 3, "data_b64": "..."}` —
@@ -1183,7 +1184,17 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   unblocking the waiter with `WaitOutcome.ERROR` rather than spinning to timeout. The plugin's
   existing generic dispatch forwards these; `connection.js` needed no change.
 
-### 6f. Photoshop Live Canvas node (realtime drawing M1)
+### 6f. Live Rendering nodes (realtime drawing M1–M3)
+
+All six nodes in this section are registered under
+`CATEGORY = "Photoshop Bridge/Live Rendering (requires Photoshop)"` — the third and last
+node-browser bucket, alongside §6's `Photoshop Bridge/Handoffs` and
+`Photoshop Bridge/Handoffs (requires Photoshop)`. The `(requires Photoshop)` suffix is
+about **Photoshop the application** (the loop is pointless without a canvas to draw on),
+NOT about the Tier-2 plugin: `PhotoshopLivePrompt`, `PhotoshopLiveCreativity` and
+`PhotoshopRefineSource` are explicitly not Tier-2-gated, as noted per node below.
+Renaming a CATEGORY string moves the node in every user's node browser, so treat these
+three strings as binding the same way node ids are.
 
 `PhotoshopLiveCanvas` (`cpsb/live.py`; docs/roadmap/realtime-drawing.md) serves the newest
 save-free canvas snapshot the plugin's Live Mode streams (`live_frame`, §3) as
@@ -1218,7 +1229,8 @@ plugin is connected or no frame has streamed yet.
   is spike S-A, owner-verified via the checklist).
 - **`PhotoshopLivePrompt`** (same module): serves the prompt the user typed in the
   preview panel's **PROMPT** field (`live_prompt`, §3) as its `STRING` output — wire it into
-  a `CLIPTextEncode` `text` input (convert the widget to an input) so the render is
+  a `CLIPTextEncode` `text` input (drag onto the socket — since frontend 1.16 every
+  widget-backed input already has one, so there is no "convert to input" step) so the render is
   steered from inside Photoshop. **NOT Tier-2-gated** (unlike Live Canvas): a prompt is
   just text, not save-free capture, so the node ALWAYS returns a usable value — it falls
   back to its own multiline `prompt` widget whenever the panel field is empty or no plugin
@@ -1227,7 +1239,7 @@ plugin is connected or no frame has streamed yet.
   streamed panel text (or `"no-live-prompt"`), so a panel edit busts the cache; the
   widget's own value is diffed natively by ComfyUI.
 - **`PhotoshopLiveCreativity`** (same module): a `FLOAT` output for the KSampler's
-  `denoise` input (convert that widget to an input). The preview panel's Creativity control
+  `denoise` input (drag onto the socket — no "convert to input" step). The preview panel's Creativity control
   (**Low/Medium/High** buttons — a continuous slider was too granular to read) streams
   `0.0..1.0` (`live_creativity`, §3) — the levels land on the band's min/mid/max; the node
   maps it onto a denoise band
@@ -1238,7 +1250,7 @@ plugin is connected or no frame has streamed yet.
   different band re-runs the graph. Denoise is the single most effective adherence control at a fixed
   few-step count (it is the fix for "the render looks 99% like my drawing": effective work
   ≈ steps × denoise). **NOT Tier-2-gated**: falls back to its own `creativity` widget when
-  the slider was never touched, so ComfyUI-only works. `IS_CHANGED` surfaces the streamed
+  no Creativity button was ever pressed, so ComfyUI-only works. `IS_CHANGED` surfaces the streamed
   value (namespaced `live:`, same anti-alias as the prompt node).
 - **`PhotoshopLivePreview`** (M3, same module): the loop's feedback surface. An OUTPUT
   node (IMAGE in, no return sockets) that JPEG-encodes each render (quality 85) and

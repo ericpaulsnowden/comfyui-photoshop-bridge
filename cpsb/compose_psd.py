@@ -1284,7 +1284,11 @@ class PhotoshopComposePSD:
     workflow that never renames anything looks exactly like the pre-rename
     build.
 
-    Outputs: ``(IMAGE, MASK, STRING)``. IMAGE is the deterministic flattened
+    Outputs: ``(IMAGE, MASK, STRING, IMAGE)`` -- ``image``, ``mask``,
+    ``filename``, ``layers`` (see ``RETURN_NAMES``). ``layers`` is a batch
+    carrying one frame per written layer, bottom-up, so a Preview node can
+    show each layer individually instead of only the flat result.
+    IMAGE is the deterministic flattened
     composite of exactly what was written (:func:`_flatten_placements`, not
     a re-read of the saved file); MASK is ``1 - alpha`` of that composite
     (canvas regions no input covers), else zeros, via the same
@@ -1459,9 +1463,18 @@ class PhotoshopComposePSD:
 
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, Any]:
-        """``filename_prefix``/``group_name``/``mode``/``timeout_seconds`` + up
-        to :data:`MAX_IMAGE_INPUTS` optional ``image_N`` sockets + hidden
+        """``group_name``/``layer_names``/``mode``/``timeout_seconds``/
+        ``max_layers``/``existing_psd_path`` + up to
+        :data:`MAX_IMAGE_INPUTS` optional ``image_N`` sockets + hidden
         ``unique_id`` (PROTOCOL.md §6c).
+
+        There is deliberately NO ``filename_prefix`` widget: the prefix is a
+        Python-only :meth:`execute` kwarg defaulting to
+        :data:`DEFAULT_FILENAME_PREFIX`. ``layer_names`` IS declared here and
+        DOES serialize, but the frontend hides it on canvas
+        (``web/cpsb/compose.js``) and rewrites it from the ``image_N`` socket
+        labels on every graph configure -- so it is a derived widget, never
+        one the user types into.
 
         ``mode`` is a COMBO of the SAME three strings the "Edit in Photoshop"
         node uses -- the first two reuse :class:`cpsb.nodes.BridgeMode`'s
@@ -1697,7 +1710,7 @@ class PhotoshopComposePSD:
         existing_psd_path: str = "",
         **kwargs: Any,
     ) -> tuple[Any, Any, str]:
-        """Compose (or consume) and return ``(IMAGE, MASK, STRING)`` (PROTOCOL.md §6c).
+        """Compose (or consume) and return ``(IMAGE, MASK, STRING, IMAGE)`` (PROTOCOL.md §6c).
 
         Serves a consumable active edit first (the class docstring's "Consume
         semantics" paragraph -- this runs for EVERY mode, so an already-saved
@@ -1767,7 +1780,8 @@ class PhotoshopComposePSD:
                 multi-image batch), whichever subset ComfyUI passed.
 
         Returns:
-            ``(IMAGE, MASK, STRING)`` -- see the class docstring.
+            ``(IMAGE, MASK, STRING, IMAGE)`` -- ``image``, ``mask``,
+            ``filename``, ``layers``; see the class docstring.
 
         Raises:
             ValueError: No ``image_N`` input is connected -- there is

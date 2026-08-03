@@ -1,0 +1,356 @@
+{
+  "id": "00000000-0000-0000-0000-000000000000",
+  "revision": 0,
+  "last_node_id": 8,
+  "last_link_id": 5,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        420
+      ],
+      "size": [
+        330,
+        340
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "Load Image (swap this for your own)",
+      "widgets_values": [
+        "example.png"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "SolidMask",
+      "pos": [
+        40,
+        800
+      ],
+      "size": [
+        280,
+        130
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "SolidMask"
+      },
+      "title": "Solid Mask (stand-in for any mask source)",
+      "widgets_values": [
+        0.5,
+        768,
+        768
+      ]
+    },
+    {
+      "id": 3,
+      "type": "PhotoshopAnnotate",
+      "pos": [
+        440,
+        420
+      ],
+      "size": [
+        360,
+        320
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "shape": 7,
+          "link": 2
+        }
+      ],
+      "outputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "links": [
+            3
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "mask",
+          "type": "MASK",
+          "links": [
+            4
+          ],
+          "slot_index": 1
+        },
+        {
+          "name": "instruction",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 2
+        },
+        {
+          "name": "annotated",
+          "type": "IMAGE",
+          "links": [],
+          "slot_index": 3
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopAnnotate"
+      },
+      "title": "Annotate for Edit (Pass through — no Photoshop)",
+      "widgets_values": [
+        "describe the edit you want here — Pass through relays this text untouched, it never inspects it",
+        "Pass through",
+        false,
+        1800
+      ],
+      "color": "#322",
+      "bgcolor": "#533"
+    },
+    {
+      "id": 4,
+      "type": "PreviewImage",
+      "pos": [
+        860,
+        380
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 3
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "image — passed through unchanged"
+    },
+    {
+      "id": 5,
+      "type": "MaskToImage",
+      "pos": [
+        860,
+        760
+      ],
+      "size": [
+        230,
+        30
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "mask",
+          "type": "MASK",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            5
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MaskToImage"
+      }
+    },
+    {
+      "id": 6,
+      "type": "PreviewImage",
+      "pos": [
+        1160,
+        740
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 5
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "mask — exactly what you connected"
+    },
+    {
+      "id": 7,
+      "type": "MarkdownNote",
+      "pos": [
+        40,
+        -330
+      ],
+      "size": [
+        560,
+        650
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "START HERE",
+      "properties": {},
+      "widgets_values": [
+        "# Annotate for Edit — the mask pass-through path\n\n**Annotate for Edit**'s default mode is **Pass through**, and in Pass through it never opens Photoshop at all — it just reads whatever you have wired into its **`mask`** input and hands it along, unchanged, alongside your image. This is the plugin-free, ComfyUI-only side of the node.\n\n**Try it:**\n\n1. Queue it as-is. Nothing launches, nothing waits — the node reads the `mask` input (here, a **Solid Mask** standing in for any real mask source) and passes it straight through.\n2. Look at the two previews: the image is untouched, and the mask preview shows exactly the gray you set on **Solid Mask** — proof the mask passed through unmodified.\n3. Swap **Solid Mask** for any real mask node — an inpaint mask, a segmentation output, hand-painted strokes — and requeue. Anything already in your graph works here.\n\n**No Photoshop, no plugin, no model.** For the Photoshop-driven version of this same node — painting a mask by hand on an Instructions layer — see `annotate-qwen-image-edit.json`, which sets `mode` to *Wait for first save* instead."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 8,
+      "type": "MarkdownNote",
+      "pos": [
+        640,
+        -330
+      ],
+      "size": [
+        560,
+        650
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "Why this demo exists",
+      "properties": {},
+      "widgets_values": [
+        "# Why this demo exists\n\nThis pack's rule is that anything that *can* work without Photoshop, does. **Annotate for Edit** is one of the clearest cases — its default mode needs no plugin and no Photoshop — but until now every demo of this node used the Photoshop path (`mode = Wait for first save`), which made Pass through easy to miss.\n\n**What `mode` does here:** left at its default, **Pass through**. The other two values — *Wait for first save* and *Re-run on every save* — open Photoshop with an editable \"Instructions\" layer instead; this file deliberately uses neither.\n\n**The `mask` input is optional.** Leave it unconnected and the node hands back an empty mask instead of failing — **Solid Mask** is wired here only to make the pass-through visible in the second preview, not because it's required.\n\nThe **`instruction`** and **`annotated`** outputs behave the same in every mode. They are not wired here because this demo is only about the `image` + `mask` pair, but both are available whenever you need them."
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      1,
+      "MASK"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "IMAGE"
+    ],
+    [
+      4,
+      3,
+      1,
+      5,
+      0,
+      "MASK"
+    ],
+    [
+      5,
+      5,
+      0,
+      6,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "Pass through: no Photoshop, no plugin",
+      "bounding": [
+        20,
+        360,
+        1500,
+        610
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.7,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}

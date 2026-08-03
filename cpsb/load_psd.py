@@ -358,13 +358,14 @@ class PhotoshopLoadPSD:
     )
     FUNCTION = "execute"
     DESCRIPTION = (
-        "Loads a .psd, .psb, or .tiff file from ComfyUI's input folder and flattens it "
-        "into an image the rest of the workflow can use. Works with ComfyUI alone -- no "
-        "Photoshop plugin is required just to load a file. Right-click the node and "
-        "choose 'Open in Photoshop' to send the file back for editing -- the Photoshop "
-        "panel plugin, if connected, makes that round trip instant instead of "
-        "file-based. The edit_original and on_save widgets control where an edit is "
-        "saved and whether saving it re-runs the workflow."
+        "Loads a .psd, .psb, .tif, or .tiff file from ComfyUI's input folder and "
+        "flattens it into an image the rest of the workflow can use. Works with ComfyUI "
+        "alone -- no Photoshop plugin is required just to load a file. Right-click the "
+        "node and choose 'Open in Photoshop' (or 'Edit Original in Photoshop' once an "
+        "edit is in progress and edit_original is on) to send the file back for "
+        "editing -- the Photoshop panel plugin, if connected, makes that round trip "
+        "instant instead of file-based. The edit_original and on_save widgets control "
+        "where an edit is saved and whether saving it re-runs the workflow."
     )
 
     @classmethod
@@ -412,8 +413,8 @@ class PhotoshopLoadPSD:
                     files,
                     {
                         "tooltip": (
-                            "The .psd, .psb, or .tiff file to load, from ComfyUI's input "
-                            "folder."
+                            "The .psd, .psb, .tif, or .tiff file to load, from "
+                            "ComfyUI's input folder."
                         )
                     },
                 ),

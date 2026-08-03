@@ -1,0 +1,325 @@
+{
+  "last_node_id": 8,
+  "last_link_id": 4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        460
+      ],
+      "size": [
+        330,
+        340
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            1
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "title": "Load Image (swap this for your own)",
+      "widgets_values": [
+        "example.png"
+      ]
+    },
+    {
+      "id": 2,
+      "type": "PhotoshopBridge",
+      "pos": [
+        430,
+        460
+      ],
+      "size": [
+        340,
+        120
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "IMAGE",
+          "link": 1
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2
+          ],
+          "slot_index": 0
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": [
+            3
+          ],
+          "slot_index": 1
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "PhotoshopBridge"
+      },
+      "title": "Edit in Photoshop (the run waits here)",
+      "widgets_values": [
+        "Wait for first save",
+        1800
+      ]
+    },
+    {
+      "id": 3,
+      "type": "PreviewImage",
+      "pos": [
+        860,
+        460
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 2
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "What came back from Photoshop"
+    },
+    {
+      "id": 4,
+      "type": "MaskToImage",
+      "pos": [
+        860,
+        920
+      ],
+      "size": [
+        230,
+        30
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "mask",
+          "type": "MASK",
+          "link": 3
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "MaskToImage"
+      }
+    },
+    {
+      "id": 5,
+      "type": "PreviewImage",
+      "pos": [
+        1160,
+        900
+      ],
+      "size": [
+        330,
+        330
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 4
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "The MASK, made visible"
+    },
+    {
+      "id": 6,
+      "type": "MarkdownNote",
+      "pos": [
+        40,
+        -180
+      ],
+      "size": [
+        520,
+        560
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "START HERE",
+      "properties": {},
+      "widgets_values": [
+        "# Edit in Photoshop — the round trip\n\nThis is the simplest thing this pack does: hand an image to Photoshop, edit it\nby hand, and let the workflow carry on with whatever you saved.\n\n**Try it:**\n\n1. Pick an image in **Load Image**. It's set to `example.png`, the one ComfyUI\n   ships with — swap it for anything of your own.\n2. Hit **Queue**. The run stops at **Edit in Photoshop**.\n3. Photoshop opens the image. Paint on it, retouch it, do whatever you like.\n4. **Save** (Ctrl/Cmd+S). Not Save As — just save, over the file it opened.\n5. The run picks up again and your edited image lands in the preview.\n\n**What you need:** Photoshop. That's it — no plugin. The node opens the file\nand watches for your save. Installing the Photoshop panel plugin makes the same\nround trip instant instead of file-based, but nothing here depends on it.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 7,
+      "type": "MarkdownNote",
+      "pos": [
+        600,
+        -180
+      ],
+      "size": [
+        520,
+        560
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "The three modes",
+      "properties": {},
+      "widgets_values": [
+        "# The `mode` widget\n\n**Wait for first save** — *what this demo uses.* The run pauses at this node\nuntil you save once in Photoshop, then continues with your edit. Use it when\nthe manual step is part of the picture.\n\n**Re-run on every save** — the run does *not* pause. It passes the image\nstraight through, and every time you save in Photoshop it queues the workflow\nagain with the new version. Use it when you want to keep painting and watch the\ndownstream result update as you go.\n\n**Open only (don't wait)** — opens the image in Photoshop and moves on\nimmediately, passing the unchanged image through. Use it when you just want the\nfile in front of you and the workflow shouldn't care what you do to it.\n\n`timeout_seconds` is how long **Wait for first save** sits there before giving\nup. 1800 is half an hour. Turn it down if you'd rather a forgotten run bail out\nsooner.\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 8,
+      "type": "MarkdownNote",
+      "pos": [
+        1160,
+        0
+      ],
+      "size": [
+        520,
+        380
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "About that MASK output",
+      "properties": {},
+      "widgets_values": [
+        "# The second output is a MASK — here's what it marks\n\nIt is **not** a selection you made in Photoshop. It marks **transparency**:\n1.0 wherever your saved edit has nothing in it, 0.0 wherever it has pixels.\n\n**To see it do something:** in Photoshop, take the eraser to a chunk of the\nimage, save, and watch that region come back white in the lower preview. If you\nnever erase anything the mask is all black — that's correct, not a bug.\n\nWhy you'd want it: feed it to an inpaint node and you have \"erase the bit you\nwant regenerated, save, let ComfyUI fill it back in.\"\n"
+      ],
+      "color": "#432",
+      "bgcolor": "#653"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      2,
+      0,
+      "IMAGE"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      0,
+      "IMAGE"
+    ],
+    [
+      3,
+      2,
+      1,
+      4,
+      0,
+      "MASK"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [
+    {
+      "id": 1,
+      "title": "1 · Out to Photoshop, back again",
+      "bounding": [
+        20,
+        400,
+        1200,
+        440
+      ],
+      "color": "#3f789e",
+      "flags": {}
+    },
+    {
+      "id": 2,
+      "title": "2 · The MASK output: where you erased",
+      "bounding": [
+        820,
+        860,
+        700,
+        420
+      ],
+      "color": "#8A8",
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.55,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}

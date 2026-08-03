@@ -208,8 +208,10 @@ class PhotoshopLivePrompt:
     """Serves the prompt the user typed in the plugin panel's Live Mode field.
 
     The realtime companion to :class:`PhotoshopLiveCanvas`: wire its ``STRING``
-    output into a ``CLIPTextEncode`` ``text`` input (convert the widget to an
-    input) so the user can drive the prompt from INSIDE Photoshop -- change the
+    output into a ``CLIPTextEncode`` ``text`` input (drag onto the socket; since
+    frontend 1.16 every widget-backed input already has one, so there is no
+    "convert to input" step) so the user can drive the prompt from INSIDE
+    Photoshop -- change the
     words in the panel, the live loop re-renders with them, no tabbing to the
     ComfyUI graph. The panel streams each edit as a ``live_prompt`` message
     (PROTOCOL.md §3); the server keeps the newest in one slot
@@ -297,17 +299,22 @@ class PhotoshopLivePrompt:
 class PhotoshopLiveCreativity:
     """A "creativity" knob for the live loop, driven from the preview panel.
 
-    Outputs a ``FLOAT`` to wire into the KSampler's ``denoise`` input (convert
-    that widget to an input). The preview panel's Creativity slider streams
-    ``0.0..1.0`` (``live_creativity``, PROTOCOL.md §3); this node maps it onto
-    a denoise band ``[min_denoise, max_denoise]`` so the user tunes how much
-    the AI re-imagines their drawing WITHOUT opening ComfyUI. Low creativity =
-    hug the sketch (low denoise); high = reinterpret it (high denoise).
+    Outputs a ``FLOAT`` to wire into the KSampler's ``denoise`` input (drag
+    onto the socket -- no "convert to input" step since frontend 1.16). The
+    preview panel's Creativity control is a **Low/Medium/High** segmented
+    button row, NOT a continuous slider (``photoshop_plugin/previewPanel.js``
+    ``CREATIVITY_LEVELS``: the 0-100 slider was too granular to read); each
+    level streams ``0.0``/``0.5``/``1.0`` (``live_creativity``, PROTOCOL.md
+    §3), which this node maps onto a denoise band ``[min_denoise,
+    max_denoise]`` -- so the three buttons land on the band's min, midpoint
+    and max -- letting the user tune how much the AI re-imagines their drawing
+    WITHOUT opening ComfyUI. Low creativity = hug the sketch (low denoise);
+    high = reinterpret it (high denoise).
 
     Denoise is the single most effective adherence control for img2img (and,
     at a fixed few-step count, the fix for "the render looks 99% like my
-    drawing"). It is the one setting exposed here; the slider could later
-    drive more (CFG, steps) -- see the roadmap.
+    drawing"). It is the one setting exposed here; the Creativity control
+    could later drive more (CFG, steps) -- see the roadmap.
 
     **NOT Tier-2-gated** (like :class:`PhotoshopLivePrompt`): falls back to its
     own ``creativity`` widget when the panel isn't driving it, so the
@@ -323,15 +330,15 @@ class PhotoshopLiveCreativity:
     )
     FUNCTION = "execute"
     DESCRIPTION = (
-        "Turns a single 'creativity' level into a denoise value for a sampler, so a "
-        "slider in the Photoshop panel controls how closely a live render sticks to "
-        "your sketch versus reinterpreting it. Works with ComfyUI alone using this "
-        "node's own creativity widget as a fallback; connecting the Photoshop panel "
-        "plugin lets its Creativity slider drive the value live instead. Wire the "
-        "denoise output into a KSampler's denoise input (convert that widget to an "
-        "input first). Use min_denoise/max_denoise to set the range the slider maps "
-        "onto -- low creativity stays close to the drawing, high creativity "
-        "reinterprets it more freely."
+        "Turns a single 'creativity' level into a denoise value for a sampler, so the "
+        "Low / Medium / High buttons in the Photoshop panel control how closely a live "
+        "render sticks to your sketch versus reinterpreting it. Works with ComfyUI "
+        "alone using this node's own creativity widget as a fallback; connecting the "
+        "Photoshop panel plugin lets its Creativity buttons drive the value live "
+        "instead. Wire the denoise output into a KSampler's denoise input. Use "
+        "min_denoise/max_denoise to set the range creativity maps onto: Low lands on "
+        "min_denoise, Medium halfway between, High on max_denoise -- low creativity "
+        "stays close to the drawing, high creativity reinterprets it more freely."
     )
 
     @classmethod
@@ -348,7 +355,8 @@ class PhotoshopLiveCreativity:
                         "tooltip": (
                             "Fallback creativity level (0 = hug the drawing, 1 = "
                             "reinterpret it freely), used when the Photoshop panel's "
-                            "Creativity slider isn't driving this node."
+                            "Low / Medium / High Creativity buttons aren't driving "
+                            "this node."
                         ),
                     },
                 ),
@@ -360,9 +368,9 @@ class PhotoshopLiveCreativity:
                         "max": 1.0,
                         "step": 0.01,
                         "tooltip": (
-                            "Denoise value creativity=0 maps to -- how little the "
-                            "sampler changes your drawing at the lowest creativity "
-                            "setting."
+                            "Denoise that creativity 0 maps to -- the panel's Low "
+                            "button. How little the sampler changes your drawing at "
+                            "the lowest creativity setting."
                         ),
                     },
                 ),
@@ -374,9 +382,9 @@ class PhotoshopLiveCreativity:
                         "max": 1.0,
                         "step": 0.01,
                         "tooltip": (
-                            "Denoise value creativity=1 maps to -- how much the sampler "
-                            "can reinterpret your drawing at the highest creativity "
-                            "setting."
+                            "Denoise that creativity 1 maps to -- the panel's High "
+                            "button. How much the sampler can reinterpret your drawing "
+                            "at the highest creativity setting."
                         ),
                     },
                 ),

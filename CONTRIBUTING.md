@@ -8,7 +8,7 @@ This is the current layout:
 
 - **`cpsb/`** — the Python backend: the ComfyUI node pack itself (`__init__.py`, node classes, server routes registered on `PromptServer`, the watchdog file-watcher, PSD read/write).
 - **`web/`** — the ComfyUI frontend extension (`WEB_DIRECTORY`): the context-menu hook, the sidebar gallery tab, and paste-back logic, all in JS.
-- **`photoshop_plugin/`** — the UXP plugin source for Tier 2 (manifest, panel UI, `batchPlay` export, WebSocket client), built into the `.ccx` that users install separately.
+- **`photoshop_plugin/`** — the UXP plugin source for Tier 2 (manifest, panel UI, `batchPlay` export, WebSocket client), loaded today as an unpackaged UXP developer plugin through Adobe's UXP Developer Tool; a packaged `.ccx` is on the roadmap.
 
 `photoshop_plugin/` uses CommonJS (`require`) — UXP's documented module system; do not convert to ES modules.
 
