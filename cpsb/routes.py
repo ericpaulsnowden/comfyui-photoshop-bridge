@@ -647,9 +647,11 @@ def _resolve_psd_native_source(
 
     Returns ``(resolved, None)`` on success or ``(None, response)`` with a
     ready-to-return error: **404** if the file doesn't exist, **400** if it
-    exists but isn't a ``.psd``/``.psb`` (checked by extension, matching
-    :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s own combo filter -- neither
-    this route nor that node sniffs file content).
+    exists but isn't a ``.psd``/``.psb`` (checked by extension, never by
+    sniffing file content). Deliberately NARROWER than
+    :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s combo filter, which also
+    lists TIFF: only PSD-native files round-trip through this open route
+    today (PROTOCOL.md §6b, "Non-PSD formats").
     """
     source_path = _resolve_source_path(
         context, fields["filename"], fields["subfolder"], fields["type"]
@@ -2304,13 +2306,13 @@ def get_live_prompt(app: web.Application) -> str | None:
 def _handle_live_creativity(
     context: CpsbContext, connection: PluginConnection, msg: dict[str, Any]
 ) -> None:
-    """Handle one `live_creativity` (realtime creativity slider, PROTOCOL.md §3).
+    """Handle one `live_creativity` (realtime creativity level, PROTOCOL.md §3).
 
-    Stores the preview panel's slider value (clamped to 0.0..1.0) and emits
-    `cpsb.livecreativity` so the frontend live loop re-queues -- a slider drag
-    re-renders exactly like a stroke or a prompt edit. A non-numeric value is
-    dropped with a log line (fire-and-forget, keep-latest). The node reads the
-    slot at execute time and maps it onto its denoise band.
+    Stores the preview panel's Low/Medium/High level (clamped to 0.0..1.0) and
+    emits `cpsb.livecreativity` so the frontend live loop re-queues -- a level
+    click re-renders exactly like a stroke or a prompt edit. A non-numeric
+    value is dropped with a log line (fire-and-forget, keep-latest). The node
+    reads the slot at execute time and maps it onto its denoise band.
     """
     try:
         value = float(msg.get("value"))
@@ -2336,7 +2338,7 @@ def _handle_live_creativity(
 def get_live_creativity(app: web.Application) -> float | None:
     """The newest panel creativity value (0.0..1.0), or ``None`` when unset.
 
-    ``None`` (no plugin, not ready, or slider never touched) tells
+    ``None`` (no plugin, not ready, or no level ever chosen) tells
     `PhotoshopLiveCreativity` to use its own node widget instead. Same
     accessor convention as :func:`get_live_prompt`.
     """

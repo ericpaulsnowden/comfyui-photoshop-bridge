@@ -345,7 +345,7 @@ async function openInPhotoshop(node, mode, imageIndex = node.imageIndex ?? 0) {
       severity: 'error',
       summary: 'Could not open in Photoshop',
       detail: loadpsd.isLoadPsdNode(node)
-        ? 'Upload a PSD/PSB file to this node first.'
+        ? 'Upload a .psd, .psb, .tif, or .tiff file to this node first.'
         : compose.isComposePsdNode(node)
           ? 'Run this node at least once first.'
           : 'This image has no resolvable file reference.'

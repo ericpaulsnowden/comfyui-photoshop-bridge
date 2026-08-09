@@ -257,7 +257,7 @@ Note that a missing **`watchdog` alone does not stop the pack from loading**: ev
 
 **Two machines keep swapping the connection.** Update to the latest plugin — the displaced Photoshop now stands by instead of fighting. Use the panel's **Connect / Disconnect** button to pick the active machine.
 
-**Photoshop won't launch, or the wrong version opens.** Either Photoshop isn't installed, or multiple versions are and discovery picked one you didn't expect. Set an explicit Photoshop executable path in this node pack's settings.
+**Photoshop won't launch, or the wrong version opens.** Either Photoshop isn't installed, or multiple versions are and discovery picked one you didn't expect. Set an explicit Photoshop executable path via the pack's `photoshop_path` setting — there's no settings-panel row for it yet, so either send it to the running server (`curl -X POST http://<comfyui-host>:8188/cpsb/settings -d '{"photoshop_path": "<full path to Photoshop>"}'`, effective immediately), or add the same key to the `cpsb.json` file in ComfyUI's user directory (e.g. `user/default/cpsb.json`) and restart ComfyUI.
 
 ## Architecture
 

@@ -2,7 +2,7 @@
  * @file The realtime-drawing live loop (docs/roadmap/realtime-drawing.md M2):
  * every `cpsb.live` event (a new frame in the server's keep-latest slot), every
  * `cpsb.liveprompt` event (the prompt field changed) and every
- * `cpsb.livecreativity` event (the creativity slider moved) can queue ONE
+ * `cpsb.livecreativity` event (the creativity level changed) can queue ONE
  * coalesced re-run of the current workflow, so re-renders track the user's
  * strokes, prompt tweaks AND creativity changes with no busy-looping and no
  * queue pileup.

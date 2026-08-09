@@ -1601,9 +1601,10 @@ class PhotoshopComposePSD:
                         "min": 1,
                         "max": 512,
                         "tooltip": (
-                            "Maximum number of images that become layers. Extra images "
-                            "beyond this cap are dropped (oldest first) rather than "
-                            "growing the document without limit."
+                            "Maximum number of images that become layers. Images "
+                            "beyond this cap are dropped from the end (the first "
+                            "images/frames are kept) rather than growing the document "
+                            "without limit."
                         ),
                     },
                 ),

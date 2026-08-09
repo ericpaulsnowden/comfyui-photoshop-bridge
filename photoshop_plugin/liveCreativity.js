@@ -1,24 +1,25 @@
 /**
  * @file Live creativity control (realtime drawing,
- * docs/roadmap/realtime-drawing.md): streams the preview panel's Creativity
- * slider (0.0..1.0) to the server as `live_creativity` messages
- * (PROTOCOL.md §3), debounced so a slider drag sends at most one message per
- * idle window. The ComfyUI-side `PhotoshopLiveCreativity` node maps the value
- * onto a denoise band (falling back to its own widget when the slider was
- * never touched), and the frontend live loop re-renders on each change
- * (`cpsb.livecreativity`) — so the user tunes how much the AI reinterprets
- * their drawing from inside Photoshop, without opening ComfyUI.
+ * docs/roadmap/realtime-drawing.md): streams the preview panel's Low/Medium/
+ * High Creativity buttons (as 0.0..1.0 levels) to the server as
+ * `live_creativity` messages (PROTOCOL.md §3), debounced so a rapid run of
+ * clicks sends at most one message per idle window. The ComfyUI-side
+ * `PhotoshopLiveCreativity` node maps the value onto a denoise band (falling
+ * back to its own widget when no level was ever chosen), and the frontend
+ * live loop re-renders on each change (`cpsb.livecreativity`) — so the user
+ * tunes how much the AI reinterprets their drawing from inside Photoshop,
+ * without opening ComfyUI.
  *
  * Same fire-and-forget, keep-latest posture as `livePrompt.js`: only the
  * final value matters, the socket-not-open case drops silently, and the next
- * drag re-sends.
+ * click re-sends.
  */
 
 const { connection } = require('./connection.js')
 const { getCreativityRange } = require('./prefs.js')
 const { getCaptureSize } = require('./liveMode.js')
 
-/** Idle window before a slider drag is flushed as one message. */
+/** Idle window before a run of level clicks is flushed as one message. */
 const LIVE_CREATIVITY_DEBOUNCE_MS = 120
 
 let timer = /** @type {ReturnType<typeof setTimeout> | null} */ (null)
@@ -29,8 +30,8 @@ let pendingValue = 0.5
 let hasValue = false
 
 /**
- * Queues the current creativity value (0.0..1.0) for sending. Coalesces a
- * rapid drag into one `live_creativity` per idle window; the trailing send
+ * Queues the current creativity value (0.0..1.0) for sending. Coalesces
+ * rapid clicks into one `live_creativity` per idle window; the trailing send
  * always carries the LATEST value. Non-finite input is ignored.
  * @param {number} value
  * @returns {void}

@@ -280,14 +280,14 @@ def _find_matching_active_handoff(
 
 
 class PhotoshopLoadPSD:
-    """Loads and flattens a ``.psd``/``.psb`` (or TIFF/``.ai``/raw) from
+    """Loads and flattens a ``.psd``/``.psb`` (or TIFF) from
     ComfyUI's input dir (PROTOCOL.md §6b).
 
     The ``psd`` COMBO input lists every currently-accepted file in ComfyUI's
     input directory (:func:`_list_psd_files`/:func:`_accepted_extensions`):
-    ``.psd``/``.psb`` always, plus TIFF/``.ai``/camera-raw since 2026-07-19
-    (whichever of the latter two's optional libraries actually import on
-    this interpreter -- see :mod:`cpsb.raster_io`); the frontend additionally
+    ``.psd``/``.psb`` always, plus TIFF since 2026-07-19 (``.ai``/camera-raw
+    are deliberately NOT decoded in-process -- they moved to the Tier-2
+    "Open via Photoshop" route; see :mod:`cpsb.raster_io`); the frontend additionally
     offers a hand-rolled upload widget for those extensions (out of this
     package's scope -- see this module's own docstring). Outputs are
     ``(IMAGE, MASK)``: a PSD-native file is flattened via
@@ -307,7 +307,7 @@ class PhotoshopLoadPSD:
     for a PSD-native selection: ``cpsb.routes``' handoff-creation route
     (``POST /cpsb/open``, out of this change's scope) still gates
     ``origin_kind: "load_psd"`` on its own ``_PSD_NATIVE_EXTENSIONS``
-    (``.psd``/``.psb`` only), so selecting a newly-supported TIFF/``.ai``/raw
+    (``.psd``/``.psb`` only), so selecting a newly-supported TIFF
     file and right-clicking "Open in Photoshop" is not yet wired up end to
     end -- this node's own :meth:`execute`/:meth:`IS_CHANGED` below are
     written format-agnostically (any consumable active edit is served
@@ -362,10 +362,11 @@ class PhotoshopLoadPSD:
         "flattens it into an image the rest of the workflow can use. Works with ComfyUI "
         "alone -- no Photoshop plugin is required just to load a file. Right-click the "
         "node and choose 'Open in Photoshop' (or 'Edit Original in Photoshop' once an "
-        "edit is in progress and edit_original is on) to send the file back for "
-        "editing -- the Photoshop panel plugin, if connected, makes that round trip "
-        "instant instead of file-based. The edit_original and on_save widgets control "
-        "where an edit is saved and whether saving it re-runs the workflow."
+        "edit is in progress) to send a .psd/.psb back for editing -- .tif/.tiff files "
+        "can be loaded but not yet round-tripped. The Photoshop panel plugin, if "
+        "connected, makes that round trip instant instead of file-based. The "
+        "edit_original and on_save widgets control where an edit is saved and whether "
+        "saving it re-runs the workflow."
     )
 
     @classmethod
@@ -467,8 +468,8 @@ class PhotoshopLoadPSD:
         """Friendly upfront check, mirroring ``LoadImage.VALIDATE_INPUTS``.
 
         Confirms the selected file still exists and has an accepted
-        extension (:func:`_accepted_extensions` -- PSD-native plus whichever
-        of TIFF/``.ai``/raw are decodable on this interpreter right now)
+        extension (:func:`_accepted_extensions` -- PSD-native plus TIFF;
+        ``.ai``/camera-raw moved to the Tier-2 "Open via Photoshop" route)
         before the prompt is queued, rather than surfacing a raw
         ``FileNotFoundError``/decode error mid-run. A no-op (``True``) when
         unconfigured, for the same tooling-without-a-live-backend reason as
@@ -556,7 +557,8 @@ class PhotoshopLoadPSD:
         :func:`cpsb.psd_io.read_edited_psd` for a PSD-native
         (:data:`PSD_EXTENSIONS`) file (full composite/recomposite fidelity
         logic), or :func:`cpsb.raster_io.decode_to_rgb8` for anything else
-        this node's combo now also accepts (2026-07-19: TIFF/``.ai``/raw).
+        this node's combo now also accepts (2026-07-19: TIFF; ``.ai``/
+        camera-raw moved to the Tier-2 "Open via Photoshop" route).
 
         Args:
             psd: The selected combo filename.

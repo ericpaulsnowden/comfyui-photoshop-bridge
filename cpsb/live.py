@@ -325,8 +325,9 @@ class PhotoshopLiveCreativity:
     RETURN_TYPES = ("FLOAT",)
     RETURN_NAMES = ("denoise",)
     OUTPUT_TOOLTIPS = (
-        "The creativity level mapped onto the min_denoise..max_denoise range -- wire "
-        "this into a KSampler's denoise input.",
+        "The creativity level mapped onto a denoise range (the Photoshop panel's "
+        "CREATIVITY RANGE when it is connected, else min_denoise..max_denoise) -- "
+        "wire this into a KSampler's denoise input.",
     )
     FUNCTION = "execute"
     DESCRIPTION = (
@@ -335,10 +336,11 @@ class PhotoshopLiveCreativity:
         "render sticks to your sketch versus reinterpreting it. Works with ComfyUI "
         "alone using this node's own creativity widget as a fallback; connecting the "
         "Photoshop panel plugin lets its Creativity buttons drive the value live "
-        "instead. Wire the denoise output into a KSampler's denoise input. Use "
-        "min_denoise/max_denoise to set the range creativity maps onto: Low lands on "
-        "min_denoise, Medium halfway between, High on max_denoise -- low creativity "
-        "stays close to the drawing, high creativity reinterprets it more freely."
+        "instead. Wire the denoise output into a KSampler's denoise input. "
+        "min_denoise/max_denoise are the fallback range creativity maps onto (Low "
+        "lands on min_denoise, Medium halfway between, High on max_denoise), used "
+        "only when the panel isn't supplying its own -- with the panel connected, "
+        "its per-capture-size CREATIVITY RANGE setting overrides these widgets."
     )
 
     @classmethod
@@ -368,9 +370,11 @@ class PhotoshopLiveCreativity:
                         "max": 1.0,
                         "step": 0.01,
                         "tooltip": (
-                            "Denoise that creativity 0 maps to -- the panel's Low "
-                            "button. How little the sampler changes your drawing at "
-                            "the lowest creativity setting."
+                            "Denoise that creativity 0 maps to when the Photoshop "
+                            "panel isn't supplying its own range -- how little the "
+                            "sampler changes your drawing at the lowest creativity "
+                            "setting. With the panel connected, its per-capture-size "
+                            "CREATIVITY RANGE setting overrides this."
                         ),
                     },
                 ),
@@ -382,9 +386,11 @@ class PhotoshopLiveCreativity:
                         "max": 1.0,
                         "step": 0.01,
                         "tooltip": (
-                            "Denoise that creativity 1 maps to -- the panel's High "
-                            "button. How much the sampler can reinterpret your drawing "
-                            "at the highest creativity setting."
+                            "Denoise that creativity 1 maps to when the Photoshop "
+                            "panel isn't supplying its own range -- how much the "
+                            "sampler can reinterpret your drawing at the highest "
+                            "creativity setting. With the panel connected, its "
+                            "per-capture-size CREATIVITY RANGE setting overrides this."
                         ),
                     },
                 ),

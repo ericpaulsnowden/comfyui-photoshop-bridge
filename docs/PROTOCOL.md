@@ -732,10 +732,12 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 
 - Class `PhotoshopLoadPSD` (unique id — plain "LoadPSD" collides with other packs),
   display name "Load PSD", category `Photoshop Bridge/Handoffs`.
-- Inputs: `psd` (COMBO of `.psd`/`.psb` files in the input directory, refreshed like
-  LoadImage's combo) — the frontend adds a custom upload widget (accept `.psd,.psb`,
-  hand-rolled input + POST to ComfyUI's own `/upload/image`; the stock IMAGEUPLOAD
-  widget hardcodes png/jpeg/webp). Hidden: `unique_id`.
+- Inputs: `psd` (COMBO of `.psd`/`.psb`/`.tif`/`.tiff` files in the input directory,
+  refreshed like LoadImage's combo) — the frontend adds a custom upload widget (accept
+  `.psd,.psb,.tif,.tiff`, matching `loadpsd.js`'s `ACCEPTED_EXTENSIONS`; hand-rolled
+  input + POST to ComfyUI's own `/upload/image`; the stock IMAGEUPLOAD widget hardcodes
+  png/jpeg/webp). Hidden: `unique_id`. TIFF decode and round-trip caveats: the
+  "Non-PSD formats" bullet below.
 - Outputs: (IMAGE, MASK) — §4 read path (embedded composite → recomposite fallback,
   RGB8 normalize); MASK = `1 - alpha` of the flattened image, else zeros.
 - Round trip: right-click → Open in Photoshop creates a `load_psd` handoff (§2 copy

@@ -1015,9 +1015,14 @@ function setWrittenDisplay(node, ref) {
   textWidget.label = writtenLabel(ref)
   // Opportunistic — not every widget-rendering path shows a tooltip, but
   // when it does, this reiterates the same "(on ComfyUI machine)" clarity
-  // the label already carries (build brief item 3: "tooltip OR label"). No
-  // "click to copy" wording here anymore -- this row isn't clickable.
-  textWidget.tooltip = `${ref.filename} — on the ComfyUI machine's input folder.`
+  // the label already carries (build brief item 3: "tooltip OR label"). An
+  // existing_psd_path append target can land OUTSIDE the input folder, so
+  // prefer the recorded absolute path; only a record predating `path` falls
+  // back to the input-folder wording. No "click to copy" wording here
+  // anymore -- this row isn't clickable.
+  textWidget.tooltip = ref.path
+    ? `${ref.path} — on the ComfyUI machine.`
+    : `${ref.filename} — in the ComfyUI machine's input folder.`
 
   let copyPathWidget = getCopyPathWidget(node)
   if (!copyPathWidget) {

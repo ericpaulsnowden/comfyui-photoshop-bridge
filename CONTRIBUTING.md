@@ -6,7 +6,7 @@ Thanks for taking a look. This project is pre-1.0, actively developed — the co
 
 This is the current layout:
 
-- **`cpsb/`** — the Python backend: the ComfyUI node pack itself (`__init__.py`, node classes, server routes registered on `PromptServer`, the watchdog file-watcher, PSD read/write).
+- **`cpsb/`** — the Python backend: node classes, server routes registered on `PromptServer`, the watchdog file-watcher, PSD read/write. (The ComfyUI entry point, `__init__.py`, lives at the repo root, not inside `cpsb/`.)
 - **`web/`** — the ComfyUI frontend extension (`WEB_DIRECTORY`): the context-menu hook, the sidebar gallery tab, and paste-back logic, all in JS.
 - **`photoshop_plugin/`** — the UXP plugin source for Tier 2 (manifest, panel UI, `batchPlay` export, WebSocket client), loaded today as an unpackaged UXP developer plugin through Adobe's UXP Developer Tool; a packaged `.ccx` is on the roadmap.
 
@@ -25,7 +25,7 @@ This is the current layout:
    pip install -r requirements.txt
    pip install pytest ruff
    ```
-   Runtime dependencies are intentionally minimal: `watchdog` (file-watching for Tier 1), `psd-tools` (PSD read/write), `Pillow` (image conversion).
+   Runtime dependencies are intentionally minimal: `watchdog` (file-watching for Tier 1), `psd-tools` (PSD read/write), `Pillow` (image conversion), `numpy` (image tensor <-> PIL conversion).
 4. For work on `photoshop_plugin/`, you'll also need the UXP Developer Tool to load the plugin into Photoshop without going through the `.ccx` install flow — see [docs/SPIKES.md](docs/SPIKES.md)'s prerequisites for version requirements.
 
 ## The protocol is binding

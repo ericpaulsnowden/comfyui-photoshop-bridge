@@ -8,7 +8,7 @@ This page covers both tiers in detail. If you just want the short version, see t
 
 - **ComfyUI**: a reasonably current build of the Vue-based frontend (the one that provides `registerSidebarTab`, `getNodeMenuItems`, and the Settings API — anything from 2025 onward). No hard version pin exists yet; [docs/SPIKES.md](SPIKES.md) tracks the exact minimum once verified.
 - **Photoshop**: 2025 (v26) or later. Earlier versions may work but are outside the supported/tested range.
-- **Python dependencies** (installed automatically from `requirements.txt`): `watchdog` (filesystem watching for Tier 1), `psd-tools` (reading and writing PSD files), `Pillow` (image conversion). Nothing else.
+- **Python dependencies** (installed automatically from `requirements.txt`): `watchdog` (filesystem watching for Tier 1), `psd-tools` (reading and writing PSD files), `Pillow` (image conversion), `numpy` (image tensor conversion). Nothing else.
 - **Tier 2 only**: Adobe's free **UXP Developer Tool (UDT)**, used to load the plugin (today's developer-plugin install). A packaged `.ccx` install via the Creative Cloud desktop app is planned but not available yet.
 
 ## Tier 1 — file hand-off
