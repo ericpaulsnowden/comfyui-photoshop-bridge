@@ -1,8 +1,9 @@
 {
   "manifestVersion": 5,
-  "id": "com.cpsb.comfyui-bridge",
-  "name": "ComfyUI Bridge",
-  "version": "0.5.72",
+  "id": "com.epsnowden.comfyui-photoshop-bridge",
+  "name": "ComfyUI for Photoshop",
+  "shortname": "comfyui-ps",
+  "version": "0.5.73",
   "main": "panel.html",
   "host": {
     "app": "PS",

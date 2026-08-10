@@ -284,7 +284,7 @@ class PhotoshopAction:
                 "cpsb action: node %s: no Tier-2 plugin connected -- a saved Photoshop "
                 "Action can only be run through the Photoshop panel plugin (Tier 1's "
                 "OS-launch-and-watch has no way to trigger one). Install/connect the "
-                "plugin (ComfyUI Bridge panel in Photoshop) and try again.",
+                "plugin (ComfyUI for Photoshop panel) and try again.",
                 node_id,
             )
             nodes._raise_interrupt()

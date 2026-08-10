@@ -102,7 +102,7 @@ async function showSendPicker() {
   document.body.appendChild(dialog)
 
   try {
-    const result = await dialog.uxpShowModal({ title: 'ComfyUI Bridge', resize: 'none' })
+    const result = await dialog.uxpShowModal({ title: 'ComfyUI for Photoshop', resize: 'none' })
     return result === 'layer' || result === 'document' ? result : null
   } finally {
     dialog.remove()
@@ -150,7 +150,7 @@ async function showConnectPrompt() {
   document.body.appendChild(dialog)
 
   try {
-    const result = await dialog.uxpShowModal({ title: 'ComfyUI Bridge', resize: 'none' })
+    const result = await dialog.uxpShowModal({ title: 'ComfyUI for Photoshop', resize: 'none' })
     return result === 'connect'
   } finally {
     dialog.remove()

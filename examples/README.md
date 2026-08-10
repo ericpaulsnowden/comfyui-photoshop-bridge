@@ -185,6 +185,6 @@ the panel's REFINE button fires.
 - **Point the Checkpoint loader at your own model.** The value saved in the
   file won't exist on your machine.
 - **Expect:** nothing until you hit **Start Live** in Photoshop's *ComfyUI*
-  panel (Plugins → ComfyUI Bridge → ComfyUI). Prompt and Creativity are driven
+  panel (Plugins → ComfyUI for Photoshop → ComfyUI). Prompt and Creativity are driven
   from the *ComfyUI Preview* panel, not from the graph — you never have to edit
   this workflow to change them.

@@ -172,7 +172,7 @@ class PhotoshopLiveCanvas:
             logger.warning(
                 "cpsb live: no Tier-2 plugin connected -- live drawing requires the "
                 "Photoshop panel plugin (there is no save-free capture without it). "
-                "Connect the ComfyUI Bridge panel in Photoshop and toggle Live Mode."
+                "Connect the ComfyUI for Photoshop panel and toggle Live Mode."
             )
             nodes._raise_interrupt()
 

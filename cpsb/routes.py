@@ -908,7 +908,7 @@ async def _warn_if_tier2_open_unconfirmed(manager: HandoffManager, handoff_id: s
             "cpsb: Tier-2 open for handoff %s still unconfirmed after %.0fs -- the "
             "plugin sent no 'opened'/'open_failed' reply. If Photoshop did not open, "
             "its UXP plugin may be backgrounded or wedged: bring Photoshop to the "
-            "foreground (or reconnect the ComfyUI Bridge panel), then re-queue.",
+            "foreground (or reconnect the ComfyUI for Photoshop panel), then re-queue.",
             handoff_id,
             _TIER2_OPEN_CONFIRM_GRACE_SECONDS,
         )
