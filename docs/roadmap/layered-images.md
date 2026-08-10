@@ -1,6 +1,6 @@
 # Roadmap — Layered images: ComfyUI's new LAYERS system × the Photoshop bridge
 
-**Status:** PLAN ONLY (research + hands-on verification done 2026-08-09; nothing built)
+**Status:** DECIDED — building L1–L3 (Eric's decisions recorded 2026-08-09, below); L4 stays roadmap-only
 **Ask (Eric, 2026-08-09):** ComfyUI shipped three new nodes around layered images ([PR #15317](https://github.com/Comfy-Org/ComfyUI/pull/15317)) — check the new build, look into the nodes, plan how they could benefit our Photoshop plugins.
 **Verdict up front:** this is the biggest external gift this project has ever received. Core ComfyUI now has a first-class layered-image type — and **no PSD import**, and only a browser-download PSD export. Our pack owns the PSD/Photoshop seam. Two focused changes (Load PSD emits layers; Compose accepts layers) dissolve the README's oldest limitation — *"layers don't round-trip into the graph"* — and make this pack the Photoshop leg of ComfyUI's new layer system.
 
@@ -66,9 +66,9 @@ And the mapping is good: **24 of Photoshop's 27 blend modes map 1:1 by name** (d
 
 ### L1 — Load PSD emits LAYERS ("PSD in") — the opening move
 Add a **`layers` (LAYERS) output** to Load PSD — appended at the END of the output tuple (outputs are positional; append-only is this repo's hard rule). Each PSD layer becomes a LayerItem: `topil()` → RGBA tensor, `left/top` → x/y, name, `opacity/255`, blend mode via the 24-map (fallbacks logged), `visible`, z from stack order; canvas from the PSD's size; the PSD's **layer masks** map to per-item `mask` (inverted to the 1=transparent convention). Non-raster content (adjustment layers, fill layers) is skipped-with-log; text layers and smart objects arrive rasterized (what `topil()` yields) — stated honestly in the tooltip.
-- **Groups:** a `layer_grouping` widget — *Leaf layers* (descend; preserves editability; group opacity/visibility composed onto leaves) vs *Flatten groups* (one layer per top-level entry). LAYERS has no group concept, so this is a real projection either way.
+- **Groups (decided):** a `flatten_groups` BOOLEAN checkbox, default **off** = a flat list of every leaf layer (descend into groups; group opacity/visibility composed onto leaves — preserves per-layer editability); **on** = one layer per top-level entry (groups composited to single layers). LAYERS has no group concept, so this is a real projection either way.
 - Runs fully server-side (psd-tools) → stays in the plain **Handoffs** bucket: no Photoshop required.
-- Cap honesty: >50 layers → clear error naming the PSD and the cap.
+- Cap honesty: >50 layers → **warning, not error** (decision 1 forbids breaking today's use cases — a 60-layer PSD flattens fine today and must keep loading; the 50 cap is core's *compositor* limit, enforced by core at consume time, so we log that Create Layered Image will reject the stack and move on).
 - Spiked already (evidence #3) — this phase is de-risked.
 
 ### L2 — Compose Layers to PSD accepts LAYERS ("PSD out") — the flagship
@@ -94,10 +94,10 @@ L1+L2 compose into: PSD → LAYERS → (rearrange in ComfyUI's editor, or proces
 - All three core nodes are **experimental** — schema drift is possible. Our exposure is only the LayerItem dict keys; pin them in one `cpsb/layers.py` module with a version check on `doc["version"] == 1`, and cover with tests against `document_items()` when the rig has ≥0.31 (skip otherwise).
 - Naming adjacency: core's "Add Layer" vs our "Photoshop Add Layer" (pushes INTO the PS document). Distinct ids and buckets; add a cross-referencing sentence to both tooltips.
 
-## Decision points (Eric's)
-1. **Extend existing nodes vs new nodes** — plan assumes extend (Load PSD output + Compose input): fewer nodes, discoverable where users already are. Alternative: a dedicated "PSD → Layers" / "Layers → PSD" pair in the plain Handoffs bucket.
-2. **Group handling default** in L1 (leaf-descend vs flatten).
-3. **Scope of L4** — which (if any) get pulled forward.
+## Decision points — DECIDED (Eric, 2026-08-09, verbatim)
+1. **Extend existing nodes vs new nodes** — *"Extend existing nodes, but don't break older builds or current use cases."* → Load PSD gains an output, Compose gains an input; every existing output/widget/behavior stays byte-identical. Concretely: new outputs append at the END of the output tuple (outputs are positional), new widgets append LAST (widget values restore by position), defaults reproduce today's behavior exactly, and the pack keeps loading on pre-0.31 ComfyUI.
+2. **Group handling** — *"Create an option to pick between these. Showing all layers in a flat list should be default, with a checkbox to flatten each group."* → `flatten_groups` BOOLEAN, default off (flat leaf-layer list), on = one layer per top-level group.
+3. **Scope of L4** — *"Add all of these to the roadmap doc, but don't do them yet."* → every L4 item stays recorded below; none are built in this round.
 
 ## Sequencing & effort
 L1 and L2 are each a contained, test-friendly change (the heavy machinery — psd-tools, the managed-PSD writer, handoffs — already exists and is validated). L3 is docs + one example. Recommended order: **L2 first** if forced to choose (it's the visible wow: model-separated layers landing in Photoshop as a real PSD), but L1+L2 together are what changes the story. Rig stays on v0.31.1 for development (rollback point: v0.28.0 @ 700821e1).
