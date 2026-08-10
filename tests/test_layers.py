@@ -1,6 +1,6 @@
-"""cpsb.layers (PSD → LAYERS, docs/roadmap/layered-images.md L1) + the Load
-PSD node's appended ``layers`` output and TAIL-positioned ``flatten_groups``
-widget.
+"""cpsb.layers (PSD ⇄ LAYERS, docs/roadmap/layered-images.md L1+L2) + the
+Load PSD node's appended ``layers`` output and TAIL-positioned
+``flatten_groups`` widget + the Compose node's optional ``layers`` input.
 
 Every PSD fixture is authored with psd-tools itself (``create_pixel_layer``'s
 "later index stacks on top" order is this repo's own verified convention,
@@ -371,3 +371,281 @@ class TestLoadPsdLayersOutput:
         assert doc == {"version": 1, "layers": []}
         assert image.shape[3] == 3  # flat output unharmed
         assert "layers output is empty" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# L2: LAYERS → PSD (prepare_stack + the Compose node's `layers` input)
+# ---------------------------------------------------------------------------
+
+
+def solid_item(
+    color: tuple[int, int, int],
+    size: tuple[int, int] = (8, 8),
+    alpha: int | None = None,
+    batch: int = 1,
+    **props,
+):
+    """A LayerItem dict with a solid-color image tensor (core's shape:
+    ``(B, H, W, 3|4)`` float 0..1)."""
+    import numpy as np
+    import torch
+
+    width, height = size
+    pixel = list(color) + ([alpha] if alpha is not None else [])
+    array = np.tile(
+        np.array(pixel, dtype=np.float32) / 255.0, (batch, height, width, 1)
+    )
+    return {"type": "raster", "image": torch.from_numpy(array), **props}
+
+
+class TestPrepareStack:
+    def test_sorts_by_z_index_and_applies_defaults(self):
+        doc = {
+            "version": 1,
+            "layers": [
+                solid_item((255, 0, 0), z_index=1, name="upper"),
+                solid_item((0, 255, 0), z_index=0, name="lower", x=3, y=4),
+            ],
+        }
+        prepared = layers_module.prepare_stack(doc, source="test")
+        assert [layer.name for layer in prepared] == ["lower", "upper"]
+        lower = prepared[0]
+        assert (lower.left, lower.top) == (3, 4)
+        assert lower.opacity == 1.0
+        assert lower.blend_mode == BlendMode.NORMAL
+        assert lower.visible is True
+
+    def test_batch_expands_one_layer_per_frame(self):
+        doc = {"version": 1, "layers": [solid_item((9, 9, 9), batch=3, name="b")]}
+        prepared = layers_module.prepare_stack(doc, source="test")
+        assert len(prepared) == 3
+        assert all(layer.name == "b" for layer in prepared)
+        assert layers_module.stack_frame_count(doc) == 3
+
+    def test_mask_multiplies_alpha(self):
+        import torch
+
+        item = solid_item((0, 0, 255), size=(4, 4))
+        item["mask"] = torch.full((1, 4, 4), 0.5)  # 1 = transparent convention
+        doc = {"version": 1, "layers": [item]}
+        (prepared,) = layers_module.prepare_stack(doc, source="test")
+        assert prepared.image.getpixel((0, 0))[3] == pytest.approx(128, abs=2)
+
+    def test_flips_resize_and_rotation_bake_into_pixels(self, caplog):
+        import math
+
+        item = solid_item((10, 20, 30), size=(4, 2), x=10, y=10, w=8, h=4)
+        item["rotation"] = math.pi / 2  # quarter turn clockwise
+        item["flip_h"] = True
+        doc = {"version": 1, "layers": [item]}
+        with caplog.at_level(logging.INFO, logger="cpsb"):
+            (prepared,) = layers_module.prepare_stack(doc, source="test")
+        # Display size 8x4 rotated 90deg -> 4x8; placed_bounds about the
+        # display box's center (10..18, 10..14): cx=14, cy=12 -> new
+        # top-left (12, 8).
+        assert prepared.image.size == (4, 8)
+        assert (prepared.left, prepared.top) == (12, 8)
+        assert "baking display size" in caplog.text
+        assert "baking horizontal flip" in caplog.text
+        assert "rad rotation" in caplog.text
+
+    def test_gimp_only_blend_degrades_to_normal(self, caplog):
+        doc = {
+            "version": 1,
+            "layers": [solid_item((1, 1, 1), blend_mode="grain-merge", name="g")],
+        }
+        with caplog.at_level(logging.INFO, logger="cpsb"):
+            (prepared,) = layers_module.prepare_stack(doc, source="test")
+        assert prepared.blend_mode == BlendMode.NORMAL
+        assert "no Photoshop equivalent" in caplog.text
+
+    def test_reverse_blend_map_round_trips(self):
+        for psd_mode, name in layers_module.PSD_TO_LAYERS_BLEND.items():
+            assert layers_module.LAYERS_TO_PSD_BLEND[name] == psd_mode
+
+    def test_bad_version_type_and_tensor_raise(self):
+        with pytest.raises(ValueError, match="version"):
+            layers_module.prepare_stack({"version": 2, "layers": []}, source="test")
+        with pytest.raises(ValueError, match="not supported yet"):
+            layers_module.prepare_stack(
+                {"version": 1, "layers": [{"type": "text", "image": None}]}, source="test"
+            )
+        with pytest.raises(ValueError, match="tensor"):
+            layers_module.prepare_stack(
+                {"version": 1, "layers": [{"type": "raster", "image": "nope"}]}, source="test"
+            )
+        with pytest.raises(ValueError, match="dict"):
+            layers_module.prepare_stack("nope", source="test")
+
+    def test_stack_digest_tracks_content(self):
+        doc_a = {"version": 1, "layers": [solid_item((5, 5, 5), name="a")]}
+        doc_b = {"version": 1, "layers": [solid_item((5, 5, 5), name="a")]}
+        assert layers_module.stack_digest(doc_a) == layers_module.stack_digest(doc_b)
+        doc_b["layers"][0]["opacity"] = 0.5
+        assert layers_module.stack_digest(doc_a) != layers_module.stack_digest(doc_b)
+        doc_c = {"version": 1, "layers": [solid_item((6, 5, 5), name="a")]}
+        assert layers_module.stack_digest(doc_a) != layers_module.stack_digest(doc_c)
+
+    def test_stack_extent_prefers_declared_canvas(self):
+        doc = {"version": 1, "canvas": (100, 50), "layers": [solid_item((1, 1, 1))]}
+        prepared = layers_module.prepare_stack(doc, source="test")
+        assert layers_module.stack_extent(prepared, doc) == (100, 50)
+        no_canvas = {"version": 1, "layers": [solid_item((1, 1, 1), size=(8, 8), x=10, y=20)]}
+        prepared = layers_module.prepare_stack(no_canvas, source="test")
+        assert layers_module.stack_extent(prepared, no_canvas) == (18, 28)
+
+
+class TestComposeLayersInput:
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_stack_writes_real_layer_properties(self, context, configured):
+        import cpsb.compose_psd as compose_module
+
+        doc = {
+            "version": 1,
+            "canvas": (32, 24),
+            "layers": [
+                solid_item((255, 0, 0), size=(32, 24), name="base", z_index=0),
+                solid_item(
+                    (0, 255, 0), size=(8, 6), name="tint", z_index=1,
+                    x=4, y=5, opacity=0.5, blend_mode="multiply",
+                ),
+                solid_item((0, 0, 255), size=(4, 4), name="ghost", z_index=2, visible=False),
+            ],
+        }
+        node = compose_module.PhotoshopComposePSD()
+        _image, _mask, filename, layers_batch = node.execute(
+            group_name="Stack Run",
+            mode=compose_module.MODE_DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            layers=doc,
+        )
+        written = context.input_dir / filename
+        reopened = PSDImage.open(written)
+        assert reopened.size == (32, 24)  # the doc's declared canvas
+        group = reopened[0]
+        assert group.name == "Stack Run"
+        base, tint, ghost = list(group)
+        assert base.name == "base"
+        assert (tint.left, tint.top) == (4, 5)
+        assert tint.opacity == 128
+        assert tint.blend_mode == BlendMode.MULTIPLY
+        assert tint.visible is True
+        assert ghost.visible is False
+        # One preview frame per written layer, invisible ones included.
+        assert layers_batch.shape[0] == 3
+
+    def test_stack_sits_below_image_inputs(self, context, configured):
+        import numpy as np
+        import torch
+
+        import cpsb.compose_psd as compose_module
+
+        doc = {"version": 1, "layers": [solid_item((1, 2, 3), size=(16, 16), name="stacked")]}
+        image_1 = torch.from_numpy(
+            np.full((1, 8, 8, 3), 0.5, dtype=np.float32)
+        )
+        node = compose_module.PhotoshopComposePSD()
+        _image, _mask, filename, layers_batch = node.execute(
+            group_name="Combined",
+            mode=compose_module.MODE_DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            layers=doc,
+            image_1=image_1,
+        )
+        reopened = PSDImage.open(context.input_dir / filename)
+        group = reopened[0]
+        names = [layer.name for layer in group]
+        assert names == ["stacked", "Layer 1"]  # stack bottom, image above
+        assert layers_batch.shape[0] == 2
+
+    def test_combined_cap_counts_stack_first(self, context, configured, caplog):
+        import numpy as np
+        import torch
+
+        import cpsb.compose_psd as compose_module
+
+        doc = {
+            "version": 1,
+            "layers": [
+                solid_item((1, 1, 1), name="s1", z_index=0),
+                solid_item((2, 2, 2), name="s2", z_index=1),
+            ],
+        }
+        image = torch.from_numpy(np.zeros((1, 4, 4, 3), dtype=np.float32))
+        node = compose_module.PhotoshopComposePSD()
+        with caplog.at_level(logging.WARNING, logger="cpsb"):
+            _image, _mask, filename, layers_batch = node.execute(
+                group_name="Capped",
+                mode=compose_module.MODE_DONT_OPEN,
+                timeout_seconds=1800,
+                unique_id="1",
+                max_layers=3,
+                layers=doc,
+                image_1=image,
+                image_2=image,
+            )
+        reopened = PSDImage.open(context.input_dir / filename)
+        assert len(list(reopened[0])) == 3  # 2 stack + first image
+        assert "exceed max_layers" in caplog.text
+        assert layers_batch.shape[0] == 3
+
+    def test_is_changed_folds_stack_and_stays_stable_without(self, context, configured):
+        import cpsb.compose_psd as compose_module
+
+        base_kwargs = dict(
+            group_name="G",
+            mode=compose_module.MODE_DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+        )
+        doc = {"version": 1, "layers": [solid_item((5, 5, 5), name="a")]}
+        without = compose_module.PhotoshopComposePSD.IS_CHANGED(**base_kwargs, layers=None)
+        with_stack = compose_module.PhotoshopComposePSD.IS_CHANGED(**base_kwargs, layers=doc)
+        assert len(without) == 64
+        assert with_stack != without
+        doc2 = {"version": 1, "layers": [solid_item((5, 5, 5), name="a", opacity=0.4)]}
+        assert compose_module.PhotoshopComposePSD.IS_CHANGED(
+            **base_kwargs, layers=doc2
+        ) != with_stack
+
+    def test_malformed_stack_fails_the_queue_loudly(self, context, configured):
+        import cpsb.compose_psd as compose_module
+
+        node = compose_module.PhotoshopComposePSD()
+        with pytest.raises(ValueError, match="version"):
+            node.execute(
+                group_name="G",
+                mode=compose_module.MODE_DONT_OPEN,
+                timeout_seconds=1800,
+                unique_id="1",
+                layers={"version": 99, "layers": []},
+            )
+
+    def test_flat_output_applies_stack_opacity_and_visibility(self, context, configured):
+        import cpsb.compose_psd as compose_module
+
+        doc = {
+            "version": 1,
+            "layers": [
+                solid_item((255, 0, 0), size=(8, 8), name="base", z_index=0),
+                solid_item((0, 0, 255), size=(8, 8), name="hidden", z_index=1, visible=False),
+            ],
+        }
+        node = compose_module.PhotoshopComposePSD()
+        image, _mask, _filename, _batch = node.execute(
+            group_name="G",
+            mode=compose_module.MODE_DONT_OPEN,
+            timeout_seconds=1800,
+            unique_id="1",
+            layers=doc,
+        )
+        pixel = (image[0, 0, 0].numpy() * 255.0).round()
+        # The hidden blue layer must not contribute -- the flat preview
+        # shows the red base only.
+        assert pixel[0] == 255
+        assert pixel[2] == 0

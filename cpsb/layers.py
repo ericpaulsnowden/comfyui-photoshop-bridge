@@ -1,4 +1,4 @@
-"""PSD → ``LAYERS`` document mapping (docs/roadmap/layered-images.md, L1).
+"""PSD ⇄ ``LAYERS`` document mapping (docs/roadmap/layered-images.md, L1+L2).
 
 ComfyUI v0.31.0 shipped a first-class layered-image socket type, ``LAYERS``
 (``io.Layers``, backend PR #15317): a plain dict any custom node can construct
@@ -432,3 +432,350 @@ def empty_document() -> dict[str, Any]:
     1). Deliberately version-stamped so core still validates it cleanly.
     """
     return {"version": LAYERS_VERSION, "layers": []}
+
+
+# ---------------------------------------------------------------------------
+# LAYERS → PSD (L2): preparing an incoming stack for the Compose writer.
+# ---------------------------------------------------------------------------
+
+#: LAYERS blend names → psd-tools blend modes, the exact reverse of
+#: :data:`PSD_TO_LAYERS_BLEND` (24 modes both ways, asserted by test) plus
+#: the two GIMP-only modes core has and Photoshop doesn't
+#: (``grain-extract``/``grain-merge``) -- those degrade to NORMAL with a log
+#: line in :func:`_psd_blend_mode`, the write-side mirror of the read side's
+#: dissolve/darker-color/lighter-color loss.
+LAYERS_TO_PSD_BLEND: dict[str, BlendMode] = {
+    name: mode for mode, name in PSD_TO_LAYERS_BLEND.items()
+}
+
+#: The GIMP-only LAYERS modes with no Photoshop counterpart.
+GIMP_ONLY_BLEND_MODES = frozenset({"grain-extract", "grain-merge"})
+
+
+class PreparedLayer:
+    """One write-ready layer from an incoming LAYERS stack.
+
+    Everything PSD cannot express as a live property is already BAKED into
+    ``image`` (flips, display-size resize, rotation -- PSD has no
+    non-destructive transform this pack could emit; docs/roadmap/
+    layered-images.md L2), while everything PSD CAN express stays a
+    property: ``left``/``top``/``name``/``opacity``/``blend_mode``/
+    ``visible``. A deliberately plain attribute holder (the
+    ``OnSaveMode``-style class convention, not a dataclass import for one
+    struct).
+    """
+
+    __slots__ = ("blend_mode", "image", "left", "name", "opacity", "top", "visible")
+
+    def __init__(
+        self,
+        image: Image.Image,
+        left: int,
+        top: int,
+        name: str | None,
+        opacity: float,
+        blend_mode: BlendMode,
+        visible: bool,
+    ) -> None:
+        self.image = image
+        self.left = left
+        self.top = top
+        self.name = name
+        self.opacity = opacity
+        self.blend_mode = blend_mode
+        self.visible = visible
+
+
+def _psd_blend_mode(name: Any, layer_label: str, source: str) -> BlendMode:
+    """The psd-tools blend mode for a LAYERS blend *name*, degrading loudly.
+
+    Mirrors :func:`_blend_name`'s never-raise contract in the write
+    direction: an absent name means core's own default (``"normal"``), the
+    GIMP-only pair logs at info, anything unrecognized logs a warning --
+    a stack that composites in core must always still WRITE, just with the
+    closest blend Photoshop has.
+    """
+    if name is None:
+        return BlendMode.NORMAL
+    direct = LAYERS_TO_PSD_BLEND.get(name)
+    if direct is not None:
+        return direct
+    if name in GIMP_ONLY_BLEND_MODES:
+        logger.info(
+            "cpsb layers: %s: layer %r blend mode %r has no Photoshop equivalent, "
+            "writing 'normal'",
+            source, layer_label, name,
+        )
+        return BlendMode.NORMAL
+    logger.warning(
+        "cpsb layers: %s: layer %r has unrecognized blend mode %r, writing 'normal'",
+        source, layer_label, name,
+    )
+    return BlendMode.NORMAL
+
+
+def _int_or(value: Any, default: int) -> int:
+    """Core's own ``_int`` coercion, mirrored: int/float pass (bool is NOT a
+    number here), anything else takes *default*."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return default
+
+
+def _frame_rgba(tensor_frame: Any) -> Image.Image:
+    """One ``(H, W, 3|4)`` float tensor frame as an ``"RGBA"`` PIL image."""
+    import numpy as np
+
+    array = tensor_frame.detach().cpu().numpy()
+    array = (np.clip(array, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    if array.shape[-1] == 3:
+        alpha = np.full((*array.shape[:2], 1), 255, dtype=np.uint8)
+        array = np.concatenate([array, alpha], axis=-1)
+    return Image.fromarray(array, mode="RGBA")
+
+
+def _mask_frame_for(mask: Any, index: int) -> Any | None:
+    """Core's ``_item_mask_frame`` batch semantics, mirrored verbatim: a
+    single-frame mask covers every image frame; a batched mask pairs
+    per-index and runs out silently."""
+    import torch
+
+    if not isinstance(mask, torch.Tensor):
+        return None
+    if mask.shape[0] == 1:
+        return mask[0]
+    if index < mask.shape[0]:
+        return mask[index]
+    return None
+
+
+def _apply_stack_mask(rgba: Image.Image, mask_frame: Any, layer_label: str, source: str):
+    """*rgba* with a LAYERS ``mask`` frame (1 = transparent, the LoadImage
+    convention) multiplied into alpha. A size-mismatched mask is resized
+    with a log line rather than rejected -- this is a WRITER, and a
+    best-effort mask beats a failed queue."""
+    import numpy as np
+
+    mask_array = mask_frame.detach().cpu().numpy()
+    if mask_array.shape[:2] != (rgba.height, rgba.width):
+        logger.info(
+            "cpsb layers: %s: layer %r mask is %sx%s but the image is %sx%s; resizing "
+            "the mask to fit",
+            source, layer_label,
+            mask_array.shape[1], mask_array.shape[0], rgba.width, rgba.height,
+        )
+        mask_pil = Image.fromarray(
+            (np.clip(mask_array, 0.0, 1.0) * 255.0).round().astype(np.uint8), mode="L"
+        ).resize(rgba.size, Image.BILINEAR)
+        mask_array = np.array(mask_pil, dtype=np.float32) / 255.0
+    array = np.array(rgba, dtype=np.float32)
+    array[..., 3] *= 1.0 - np.clip(mask_array, 0.0, 1.0)
+    return Image.fromarray(array.astype(np.uint8), mode="RGBA")
+
+
+def _bake_transforms(
+    rgba: Image.Image,
+    item: dict[str, Any],
+    left: int,
+    top: int,
+    layer_label: str,
+    source: str,
+) -> tuple[Image.Image, int, int]:
+    """Flips, display-size resize, and rotation baked into pixels.
+
+    PSD has no non-destructive transform this pack could emit
+    (docs/roadmap/layered-images.md L2), so the write path renders them --
+    in core's own order (resize to display size, flips, then rotation),
+    with the rotated layer's new top-left recomputed by the exact
+    ``placed_bounds`` math core renders with (``compositor_blend.py``, read
+    verbatim from the rig at v0.31.1: rotation is RADIANS CLOCKWISE about
+    the layer's center; the axis-aligned bounds floor the rotated
+    corners). Every applied bake logs at info, naming the layer.
+    """
+    import math
+
+    width = _int_or(item.get("w"), 0)
+    height = _int_or(item.get("h"), 0)
+    if width > 0 and height > 0 and (width, height) != rgba.size:
+        logger.info(
+            "cpsb layers: %s: baking display size %dx%d into layer %r (native %dx%d)",
+            source, width, height, layer_label, rgba.width, rgba.height,
+        )
+        rgba = rgba.resize((width, height), Image.LANCZOS)
+    if bool(item.get("flip_h", False)):
+        logger.info("cpsb layers: %s: baking horizontal flip into layer %r", source, layer_label)
+        rgba = rgba.transpose(Image.FLIP_LEFT_RIGHT)
+    if bool(item.get("flip_v", False)):
+        logger.info("cpsb layers: %s: baking vertical flip into layer %r", source, layer_label)
+        rgba = rgba.transpose(Image.FLIP_TOP_BOTTOM)
+
+    rotation = item.get("rotation")
+    rotation = float(rotation) if isinstance(rotation, (int, float)) and not isinstance(
+        rotation, bool
+    ) else 0.0
+    if rotation:
+        logger.info(
+            "cpsb layers: %s: baking %.4f rad rotation into layer %r", source, rotation, layer_label
+        )
+        # placed_bounds mirror: center of the pre-rotation box, corners
+        # rotated clockwise, floored min = the baked layer's new top-left.
+        display_width, display_height = rgba.size
+        center_x = left + display_width / 2
+        center_y = top + display_height / 2
+        cos, sin = math.cos(rotation), math.sin(rotation)
+        half_width, half_height = display_width / 2, display_height / 2
+        corners = (
+            (-half_width, -half_height), (half_width, -half_height),
+            (half_width, half_height), (-half_width, half_height),
+        )
+        xs = [center_x + dx * cos - dy * sin for dx, dy in corners]
+        ys = [center_y + dx * sin + dy * cos for dx, dy in corners]
+        left = math.floor(min(xs))
+        top = math.floor(min(ys))
+        # PIL rotates counter-clockwise for positive angles; LAYERS rotation
+        # is clockwise, so negate. expand=True grows the frame to the same
+        # axis-aligned bounds placed_bounds describes.
+        rgba = rgba.rotate(-math.degrees(rotation), expand=True, resample=Image.BICUBIC)
+    return rgba, left, top
+
+
+def prepare_stack(doc: Any, source: str) -> list[PreparedLayer]:
+    """Write-ready layers from an incoming LAYERS *doc*, bottom-to-top.
+
+    The consume-side twin of :func:`document_from_psd`, mirroring core's
+    own ``document_items``/``expand_item_frames`` semantics (read verbatim
+    from the rig at v0.31.1): stable-sort by ``z_index`` (default 0),
+    ``type`` must be ``"raster"``, batched images expand one layer per
+    frame (each sharing the item's name/properties), masks pair per-frame,
+    defaults per core (position 0,0 / opacity 1 / normal / visible).
+
+    Raises ``ValueError`` -- mirroring core's wording -- for a wrong
+    document version, a non-raster item type, or an item image that isn't
+    a ``(B, H, W, 3|4)`` tensor: an incompatible stack wired into the
+    node's socket should fail the queue loudly, exactly as it would wired
+    into core's compositor. Per-item DEGRADABLE trouble (blend names,
+    mask sizes) degrades loudly instead -- see :func:`_psd_blend_mode` /
+    :func:`_apply_stack_mask`.
+    """
+    import torch
+
+    if not isinstance(doc, dict):
+        raise ValueError("LAYERS input is not a layer document (expected a dict)")
+    version = doc.get("version")
+    if version is not None and version != LAYERS_VERSION:
+        raise ValueError(f"LAYERS document version {version!r} is not supported")
+    items = [item for item in doc.get("layers") or [] if isinstance(item, dict)]
+    items.sort(key=lambda item: _int_or(item.get("z_index"), 0))
+
+    prepared: list[PreparedLayer] = []
+    for item in items:
+        item_type = item.get("type", "raster")
+        if item_type != "raster":
+            raise ValueError(f"LAYERS item type {item_type!r} is not supported yet")
+        image = item.get("image")
+        if not isinstance(image, torch.Tensor) or image.dim() != 4 or image.shape[-1] not in (3, 4):
+            raise ValueError(
+                "LAYERS item image must be a (batch, height, width, 3|4) tensor"
+            )
+        name = item.get("name") if isinstance(item.get("name"), str) else None
+        label = name if name is not None else f"layer {len(prepared) + 1}"
+        left = _int_or(item.get("x"), 0)
+        top = _int_or(item.get("y"), 0)
+        opacity = item.get("opacity", 1.0)
+        opacity = float(opacity) if isinstance(opacity, (int, float)) and not isinstance(
+            opacity, bool
+        ) else 1.0
+        opacity = min(1.0, max(0.0, opacity))
+        blend = _psd_blend_mode(item.get("blend_mode"), label, source)
+        visible = bool(item.get("visible", True))
+        for index in range(image.shape[0]):
+            rgba = _frame_rgba(image[index])
+            mask_frame = _mask_frame_for(item.get("mask"), index)
+            if mask_frame is not None:
+                rgba = _apply_stack_mask(rgba, mask_frame, label, source)
+            baked, baked_left, baked_top = _bake_transforms(rgba, item, left, top, label, source)
+            prepared.append(
+                PreparedLayer(baked, baked_left, baked_top, name, opacity, blend, visible)
+            )
+    return prepared
+
+
+def stack_extent(prepared: list[PreparedLayer], doc: Any) -> tuple[int, int]:
+    """The canvas a *prepared* stack needs: the document's own ``canvas``
+    when it carries a valid one (core's ``document_canvas`` coercion,
+    mirrored), else the max ``(left + width, top + height)`` over the
+    prepared layers -- floored at 1x1 so an empty or fully-negative stack
+    still yields a writable document."""
+    if isinstance(doc, dict):
+        canvas = doc.get("canvas")
+        if isinstance(canvas, (tuple, list)) and len(canvas) == 2:
+            width, height = _int_or(canvas[0], 0), _int_or(canvas[1], 0)
+            if width > 0 and height > 0:
+                return width, height
+    width = max((layer.left + layer.image.width for layer in prepared), default=1)
+    height = max((layer.top + layer.image.height for layer in prepared), default=1)
+    return max(1, width), max(1, height)
+
+
+def stack_frame_count(doc: Any) -> int:
+    """How many layers :func:`prepare_stack` would produce for *doc*, with
+    NO pixel work (each valid raster item contributes its batch size).
+
+    Exists for :meth:`cpsb.compose_psd.PhotoshopComposePSD.IS_CHANGED`,
+    which must mirror ``execute``'s post-cap layer accounting exactly
+    (identity hashes computed in both places have to match, or an arriving
+    edit stops re-triggering the graph) without re-running the full
+    prepare -- both for cost and because prepare LOGS its bakes, which
+    would double every message on every queue. Never raises: a malformed
+    item counts 0 here and ``execute``'s own :func:`prepare_stack` raises
+    the real error before any identity is recorded.
+    """
+    import torch
+
+    if not isinstance(doc, dict):
+        return 0
+    count = 0
+    for item in doc.get("layers") or []:
+        image = item.get("image") if isinstance(item, dict) else None
+        if isinstance(image, torch.Tensor) and image.dim() == 4 and image.shape[-1] in (3, 4):
+            count += int(image.shape[0])
+    return count
+
+
+def stack_digest(doc: Any) -> str:
+    """A deterministic sha256 fingerprint of a LAYERS *doc*, for cache keys.
+
+    Folds every consumed field -- scalar properties verbatim plus the raw
+    image/mask tensor bytes -- so any change that would alter the written
+    PSD changes the digest (the ``IS_CHANGED``/identity-hash contract
+    :mod:`cpsb.compose_psd` hangs on it). Digests the RAW document, before
+    :func:`prepare_stack`'s baking: cheaper, and bake output is a pure
+    function of these bytes anyway. Never raises on a malformed doc --
+    validation is :func:`prepare_stack`'s job; a digest of garbage is
+    still a stable digest of that garbage.
+    """
+    import hashlib
+
+    import torch
+
+    hasher = hashlib.sha256()
+    if not isinstance(doc, dict):
+        hasher.update(repr(doc).encode("utf-8", "replace"))
+        return hasher.hexdigest()
+    hasher.update(repr(doc.get("version")).encode("ascii", "replace"))
+    hasher.update(repr(doc.get("canvas")).encode("ascii", "replace"))
+    layers = doc.get("layers")
+    for item in layers if isinstance(layers, list) else []:
+        if not isinstance(item, dict):
+            hasher.update(b"<non-dict>")
+            continue
+        for key in ("type", "name", "x", "y", "z_index", "opacity", "blend_mode",
+                    "visible", "rotation", "w", "h", "flip_h", "flip_v"):
+            hasher.update(f"{key}={item.get(key)!r};".encode("utf-8", "replace"))
+        for key in ("image", "mask"):
+            tensor = item.get(key)
+            if isinstance(tensor, torch.Tensor):
+                hasher.update(f"{key}{tuple(tensor.shape)}".encode("ascii"))
+                hasher.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+        hasher.update(b"\x00")
+    return hasher.hexdigest()

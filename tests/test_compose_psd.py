@@ -241,10 +241,15 @@ class TestContractShape:
     def test_optional_images_generous_and_all_image_type(self):
         spec = ComposePSD.INPUT_TYPES()
         optional = spec["optional"]
-        assert len(optional) == compose_module.MAX_IMAGE_INPUTS
+        # MAX_IMAGE_INPUTS image sockets + the optional LAYERS stack socket
+        # (docs/roadmap/layered-images.md L2).
+        assert len(optional) == compose_module.MAX_IMAGE_INPUTS + 1
         assert "image_1" in optional
         assert f"image_{compose_module.MAX_IMAGE_INPUTS}" in optional
-        assert all(value[0] == "IMAGE" for value in optional.values())
+        assert optional["layers"][0] == "LAYERS"
+        assert all(
+            value[0] == "IMAGE" for name, value in optional.items() if name != "layers"
+        )
 
 
 class TestSanitizeFilenamePrefix:

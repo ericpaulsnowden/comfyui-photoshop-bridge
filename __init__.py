@@ -178,6 +178,26 @@ def _wire_into_comfyui() -> None:
 
     _cpsb_nodes.configure(context, manager, server.app, server.loop)
 
+    # Layered-images interop note (docs/roadmap/layered-images.md
+    # "Compatibility & gating"): our PSD⇄LAYERS surfaces work on ANY
+    # ComfyUI -- "LAYERS" is just a socket type string, and Load PSD's
+    # output links into Compose's input fine on pre-0.31 builds -- but
+    # CORE's own layer nodes (Create Layered Image / Add Layer, ComfyUI
+    # 0.31.0+) only exist on newer builds, so say which world this server
+    # is in rather than leaving "the node isn't in the search" a mystery.
+    try:
+        import nodes as _comfy_nodes  # ComfyUI's own top-level module
+
+        if "ImageCompositor" not in getattr(_comfy_nodes, "NODE_CLASS_MAPPINGS", {}):
+            logger.info(
+                "cpsb: this ComfyUI has no core layer nodes (added in 0.31.0) -- "
+                "Load PSD's layers output and Compose's layers input still work "
+                "with each other; only core's Create Layered Image / Add Layer "
+                "are unavailable"
+            )
+    except Exception:  # pragma: no cover -- purely informational
+        pass
+
     logger.info("cpsb: Photoshop bridge ready (watching %s)", context.cpsb_input_dir)
 
 

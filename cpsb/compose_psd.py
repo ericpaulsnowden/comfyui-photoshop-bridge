@@ -61,6 +61,7 @@ from PIL import Image
 from psd_tools import PSDImage
 from psd_tools.constants import ColorMode
 
+from . import layers as layers_io
 from . import nodes
 from .context import CpsbContext
 from .handoff import HandoffManager, HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
@@ -412,6 +413,7 @@ def _compute_identity_hash(
     group_name: str,
     layer_names: str = "",
     append_target: str = "",
+    stack_key: str = "",
 ) -> str:
     """The handoff's source IDENTITY -- deliberately mode/prefix-FREE.
 
@@ -464,6 +466,15 @@ def _compute_identity_hash(
             ``existing_psd_path`` widget value -- ``""`` when it is blank
             (this run writes a fresh auto-numbered file; the old, unchanged
             default behavior), non-empty when it names an append target.
+        stack_key: :func:`cpsb.layers.stack_digest` of the connected
+            ``layers`` stack (docs/roadmap/layered-images.md L2), or ``""``
+            when none is connected -- the empty default keeps every
+            no-stack identity byte-identical to what this function has
+            always produced, so upgrading the pack never supersedes an
+            in-flight handoff by itself. A connected stack's pixels and
+            properties are document content exactly like ``pil_images``,
+            so any change to them must change the identity (and supersede
+            a stale handoff) the same way a changed input image does.
 
     Returns:
         A 64-char lowercase hex sha256 digest.
@@ -476,6 +487,9 @@ def _compute_identity_hash(
     hasher.update(layer_names.encode("utf-8"))
     hasher.update(b"\x00")
     hasher.update(append_target.encode("utf-8"))
+    if stack_key:
+        hasher.update(b"\x00")
+        hasher.update(stack_key.encode("ascii"))
     return hasher.hexdigest()
 
 
@@ -486,6 +500,7 @@ def _compute_inputs_hash(
     mode: str,
     layer_names: str = "",
     append_target: str = "",
+    stack_key: str = "",
 ) -> str:
     """A deterministic sha256 identity for "these inputs, these params, this mode".
 
@@ -524,11 +539,17 @@ def _compute_inputs_hash(
             verbatim, same rationale).
         append_target: :func:`_append_target_key` of the current
             ``existing_psd_path`` widget value.
+        stack_key: :func:`cpsb.layers.stack_digest` of the connected
+            ``layers`` stack, or ``""`` (see
+            :func:`_compute_identity_hash` -- folded there, so it reaches
+            this value too).
 
     Returns:
         A 64-char lowercase hex sha256 digest.
     """
-    identity_hash = _compute_identity_hash(pil_images, group_name, layer_names, append_target)
+    identity_hash = _compute_identity_hash(
+        pil_images, group_name, layer_names, append_target, stack_key
+    )
     hasher = hashlib.sha256()
     hasher.update(identity_hash.encode("ascii"))
     hasher.update(b"\x00")
@@ -698,6 +719,71 @@ def _layers_batch_tensor(
     return torch.cat(frames, dim=0)
 
 
+def _stack_display_placements(
+    prepared: list[layers_io.PreparedLayer],
+) -> list[tuple[Image.Image, int, int]]:
+    """``(display_pil, left, top)`` per prepared stack layer, for the node's
+    IMAGE/MASK/layers outputs.
+
+    The PSD gets each layer's RAW pixels with opacity/visibility as live
+    layer PROPERTIES; the flat outputs can't carry properties, so this
+    display twin bakes them: alpha is multiplied by the layer's opacity,
+    and an invisible layer's alpha is zeroed (it exists in the document but
+    contributes nothing to the composite -- exactly what Photoshop would
+    show). Blend modes are NOT approximated here -- the flatten is plain
+    alpha-over (:func:`_flatten_placements`), stated honestly in the
+    tooltip; the authoritative render is the PSD in Photoshop.
+    """
+    import numpy as np
+
+    placements: list[tuple[Image.Image, int, int]] = []
+    for layer in prepared:
+        display = layer.image
+        factor = layer.opacity if layer.visible else 0.0
+        if factor < 1.0:
+            array = np.array(display, dtype=np.float32)
+            array[..., 3] *= factor
+            display = Image.fromarray(array.astype(np.uint8), mode="RGBA")
+        placements.append((display, layer.left, layer.top))
+    return placements
+
+
+def _stack_layer_names(prepared: list[layers_io.PreparedLayer], start_index: int) -> list[str]:
+    """Each stack layer's written name: its own item name verbatim, else the
+    long-standing ``"Layer <N>"`` numbering continued across the run's
+    combined bottom-to-top sequence (stack layers first, ``image_N`` above
+    -- *start_index* is 1 for the stack since it sits at the bottom)."""
+    names = []
+    for offset, layer in enumerate(prepared):
+        names.append(
+            layer.name if layer.name else f"{DEFAULT_LAYER_NAME} {start_index + offset}"
+        )
+    return names
+
+
+def _create_stack_layers_in_psd(
+    psd: PSDImage, prepared: list[layers_io.PreparedLayer], names: list[str]
+) -> list[Any]:
+    """One real pixel layer per prepared stack entry, at its ABSOLUTE
+    position (never centered -- a stack carries real coordinates), with
+    opacity/blend/visibility written as live layer properties
+    (psd-tools 1.17.4: settable post-``create_pixel_layer``, verified in
+    the roadmap's pre-build spike). Not saved here."""
+    layers = []
+    for name, layer in zip(names, prepared, strict=True):
+        pixel_layer = psd.create_pixel_layer(
+            layer.image,
+            name=name,
+            top=layer.top,
+            left=layer.left,
+            opacity=round(layer.opacity * 255),
+        )
+        pixel_layer.blend_mode = layer.blend_mode
+        pixel_layer.visible = layer.visible
+        layers.append(pixel_layer)
+    return layers
+
+
 def _create_layers_in_psd(
     psd: PSDImage,
     pil_images: list[Image.Image],
@@ -748,23 +834,55 @@ def _create_layers_in_psd(
     return layers, placements
 
 
+def _fresh_canvas_size(
+    pil_images: list[Image.Image],
+    stack: list[layers_io.PreparedLayer] | None,
+    stack_canvas: tuple[int, int] | None,
+) -> tuple[int, int]:
+    """A fresh document's canvas: the max across every ``image_N`` input's
+    native size, the incoming stack's own declared canvas (the LAYERS doc's
+    ``canvas``, already coerced by :func:`cpsb.layers.stack_extent`'s
+    caller), and the stack's placed extent -- so neither source is clipped.
+    Floored at 1x1 (both sources can legitimately be empty-ish; the caller
+    guarantees at least one layer exists overall)."""
+    width = max((image.width for image in pil_images), default=1)
+    height = max((image.height for image in pil_images), default=1)
+    if stack_canvas is not None:
+        width = max(width, stack_canvas[0])
+        height = max(height, stack_canvas[1])
+    for layer in stack or []:
+        width = max(width, layer.left + layer.image.width)
+        height = max(height, layer.top + layer.image.height)
+    return max(1, width), max(1, height)
+
+
 def _build_group_psd(
     pil_images: list[Image.Image],
     group_name: str,
     layer_names: list[str] | None = None,
+    stack: list[layers_io.PreparedLayer] | None = None,
+    stack_canvas: tuple[int, int] | None = None,
 ) -> tuple[PSDImage, int, int, list[tuple[Image.Image, int, int]]]:
     """Build the in-memory grouped PSD document (PROTOCOL.md §6c).
 
-    Canvas is ``(max width, max height)`` across every input; each image is
+    Canvas is ``(max width, max height)`` across every input (folding in
+    the incoming stack's canvas/extent when one is connected --
+    :func:`_fresh_canvas_size`); each image is
     centered at its own native resolution (never rescaled) via
     :func:`_centered_offset`; ``pil_images[0]`` (``image_1``) becomes the
     bottom layer, later indices stack on top -- the exact order
     ``create_pixel_layer``/``create_group`` preserve, verified empirically
-    against psd-tools 1.17.4 (this module's own docstring).
+    against psd-tools 1.17.4 (this module's own docstring). An incoming
+    LAYERS *stack* (docs/roadmap/layered-images.md L2) sits BELOW every
+    ``image_N`` layer inside the same run group, each stack layer at its
+    own ABSOLUTE position with opacity/blend/visibility written as live
+    properties (:func:`_create_stack_layers_in_psd`).
 
     Args:
-        pil_images: Decoded inputs, in ``image_1..image_N`` order. Must be
-            non-empty.
+        pil_images: Decoded inputs, in ``image_1..image_N`` order. May be
+            empty when (and only when) *stack* is non-empty.
+        stack: Prepared incoming LAYERS layers (bottom-to-top), or ``None``.
+        stack_canvas: The LAYERS document's own declared canvas, if any.
         group_name: Name for the single group every layer is placed inside.
         layer_names: The name for each layer, parallel to *pil_images* (same
             order, same length) -- :meth:`PhotoshopComposePSD.execute` passes
@@ -784,8 +902,7 @@ def _build_group_psd(
         (``"RGBA"`` when the source carried alpha) so the flatten sees the
         transparency the PSD layers were written with.
     """
-    canvas_width = max(image.width for image in pil_images)
-    canvas_height = max(image.height for image in pil_images)
+    canvas_width, canvas_height = _fresh_canvas_size(pil_images, stack, stack_canvas)
     # The document mode stays "RGB": an RGB-mode PSD holds RGB *layers* that each
     # carry their own per-pixel transparency (create_pixel_layer from an RGBA PIL
     # yields a transparent layer, verified empirically against psd-tools 1.17.4),
@@ -794,11 +911,18 @@ def _build_group_psd(
     resolved_names = (
         layer_names if layer_names is not None else _default_layer_names(len(pil_images))
     )
+    stack = stack or []
+    stack_layers = _create_stack_layers_in_psd(psd, stack, _stack_layer_names(stack, 1))
     layers, placements = _create_layers_in_psd(
         psd, pil_images, resolved_names, canvas_width, canvas_height
     )
-    psd.create_group(layer_list=layers, name=group_name)
-    return psd, canvas_width, canvas_height, placements
+    psd.create_group(layer_list=stack_layers + layers, name=group_name)
+    return (
+        psd,
+        canvas_width,
+        canvas_height,
+        _stack_display_placements(stack) + placements,
+    )
 
 
 def _append_run_into_psd(
@@ -806,6 +930,7 @@ def _append_run_into_psd(
     pil_images: list[Image.Image],
     run_group_name: str,
     layer_names: list[str] | None = None,
+    stack: list[layers_io.PreparedLayer] | None = None,
 ) -> tuple[list[tuple[Image.Image, int, int]], int, int]:
     """Add *pil_images* as a NEW top-level group onto *psd* -- the "append to
     existing document" feature's own write step (build brief items 1/6).
@@ -847,11 +972,32 @@ def _append_run_into_psd(
     resolved_names = (
         layer_names if layer_names is not None else _default_layer_names(len(pil_images))
     )
+    stack = stack or []
+    for layer in stack:
+        # CONSTRAINT 1 applies to the stack too: an existing target's canvas
+        # cannot grow, so a stack layer placed beyond it is clipped -- warn
+        # (the same no-silent-clipping stance _log_canvas_mismatch_if_needed
+        # takes for image_N inputs, which are CENTERED and need different
+        # math than these absolute positions).
+        if (
+            layer.left + layer.image.width > canvas_width
+            or layer.top + layer.image.height > canvas_height
+            or layer.left < 0
+            or layer.top < 0
+        ):
+            logger.warning(
+                "cpsb compose_psd: stack layer %r at (%d, %d) size %dx%d extends beyond "
+                "the existing document's %dx%d canvas and will be clipped (psd-tools "
+                "cannot grow an existing canvas)",
+                layer.name or "?", layer.left, layer.top,
+                layer.image.width, layer.image.height, canvas_width, canvas_height,
+            )
+    stack_layers = _create_stack_layers_in_psd(psd, stack, _stack_layer_names(stack, 1))
     layers, placements = _create_layers_in_psd(
         psd, pil_images, resolved_names, canvas_width, canvas_height
     )
-    psd.create_group(layer_list=layers, name=run_group_name)
-    return placements, canvas_width, canvas_height
+    psd.create_group(layer_list=stack_layers + layers, name=run_group_name)
+    return _stack_display_placements(stack) + placements, canvas_width, canvas_height
 
 
 def _flatten_placements(
@@ -1452,7 +1598,10 @@ class PhotoshopComposePSD:
     FUNCTION = "execute"
     DESCRIPTION = (
         "Combines multiple connected images into one multi-layer .psd file, one layer "
-        "per input, written to ComfyUI's input folder. Works with ComfyUI alone, "
+        "per input, written to ComfyUI's input folder. Also accepts a layer stack "
+        "(LAYERS) -- from Load PSD or ComfyUI 0.31+'s layer nodes -- and writes it as "
+        "real PSD layers with names, positions, opacity, blend modes, and visibility. "
+        "Works with ComfyUI alone, "
         "including opening the result in Photoshop and waiting for your edits -- "
         "installing the Photoshop panel plugin makes that round trip instant instead of "
         "file-based. Double-click an image input's socket to rename it; that name "
@@ -1520,18 +1669,44 @@ class PhotoshopComposePSD:
         docstring's "WIDGET-POSITION BREAKING CHANGE" note.)
         """
         optional = {
-            f"image_{i}": (
-                "IMAGE",
+            # docs/roadmap/layered-images.md L2 (Eric's decision 1: extend
+            # this node, break nothing): an optional LAYERS socket. Optional
+            # INPUTS restore by NAME, not position, so its placement here is
+            # cosmetic (first, above the image_N run) -- and the frontend's
+            # socket auto-grow (web/cpsb/compose.js) only ever touches
+            # sockets matching /^image_(\d+)$/, so it leaves this one alone
+            # (verified against its removeImageInputByName call sites).
+            "layers": (
+                "LAYERS",
                 {
                     "tooltip": (
-                        "One image layer. image_1 is the bottom layer; each "
-                        "higher-numbered socket stacks above it. Double-click the socket "
-                        "to rename it -- that name becomes the layer's name in the "
-                        "written PSD."
+                        "Optional layer stack (LAYERS) -- from this pack's Load PSD "
+                        "node or ComfyUI 0.31+'s layer nodes (Add Layer, Create "
+                        "Layered Image, or a layer-splitting model). Every layer is "
+                        "written into the PSD with its own name, position, opacity, "
+                        "blend mode, and visibility, below any connected image "
+                        "inputs. Rotation, flips, and display size are baked into "
+                        "the pixels (PSD has no non-destructive transforms). The "
+                        "node's image output previews the result with simple "
+                        "alpha blending -- open the PSD in Photoshop for the "
+                        "authoritative render."
                     )
                 },
-            )
-            for i in range(1, MAX_IMAGE_INPUTS + 1)
+            ),
+            **{
+                f"image_{i}": (
+                    "IMAGE",
+                    {
+                        "tooltip": (
+                            "One image layer. image_1 is the bottom layer; each "
+                            "higher-numbered socket stacks above it. Double-click the "
+                            "socket to rename it -- that name becomes the layer's name "
+                            "in the written PSD."
+                        )
+                    },
+                )
+                for i in range(1, MAX_IMAGE_INPUTS + 1)
+            },
         }
         return {
             "required": {
@@ -1641,6 +1816,7 @@ class PhotoshopComposePSD:
         layer_names: str = "",
         filename_prefix: str = DEFAULT_FILENAME_PREFIX,
         existing_psd_path: str = "",
+        layers: Any = None,
         **kwargs: Any,
     ) -> str:
         """:func:`_compute_inputs_hash`, folded with the latest-edit hash when consumable.
@@ -1675,12 +1851,29 @@ class PhotoshopComposePSD:
         reason: renaming an ``image_N`` slot must re-execute this node even
         with pixel-identical inputs, so a stale composite (with the OLD
         layer names) is never served after a rename.
+
+        A connected ``layers`` stack (docs/roadmap/layered-images.md L2) is
+        folded in via :func:`cpsb.layers.stack_digest` -- its pixels and
+        properties are document content exactly like the ``image_N``
+        inputs. Unconnected, the empty digest key keeps this value
+        byte-identical to every pre-stack build's.
         """
         pil_images, _, _ = _collect_layer_images(kwargs, max_layers)
+        # MIRROR of execute()'s combined-cap accounting, or the identity
+        # hashes computed here and there diverge and an arriving edit stops
+        # re-triggering the graph: the stack occupies max_layers slots
+        # first (stack_frame_count -- prepare_stack minus the pixel work),
+        # and the stack key carries the post-cap count.
+        stack_key = ""
+        if layers is not None:
+            stack_frames = min(layers_io.stack_frame_count(layers), max_layers)
+            stack_key = f"{layers_io.stack_digest(layers)}:{stack_frames}"
+            allowed_images = max(0, max_layers - stack_frames)
+            pil_images = pil_images[:allowed_images]
         prefix = _sanitize_filename_prefix(filename_prefix)
         append_target = _append_target_key(existing_psd_path)
         inputs_hash = _compute_inputs_hash(
-            pil_images, prefix, group_name, mode, layer_names, append_target
+            pil_images, prefix, group_name, mode, layer_names, append_target, stack_key
         )
 
         state = nodes._state_if_configured()
@@ -1691,7 +1884,9 @@ class PhotoshopComposePSD:
         # that function's docstring), not the mode-sensitive inputs_hash
         # above (which stays mode-sensitive here only so a mode/prefix change
         # alone still forces THIS node to re-execute).
-        identity_hash = _compute_identity_hash(pil_images, group_name, layer_names, append_target)
+        identity_hash = _compute_identity_hash(
+            pil_images, group_name, layer_names, append_target, stack_key
+        )
         active = _find_matching_active_handoff(state.manager, str(unique_id), identity_hash)
         if active is not None:
             edit_hash = state.manager.latest_edit_hash(active.handoff_id)
@@ -1709,6 +1904,7 @@ class PhotoshopComposePSD:
         layer_names: str = "",
         filename_prefix: str = DEFAULT_FILENAME_PREFIX,
         existing_psd_path: str = "",
+        layers: Any = None,
         **kwargs: Any,
     ) -> tuple[Any, Any, str]:
         """Compose (or consume) and return ``(IMAGE, MASK, STRING, IMAGE)`` (PROTOCOL.md §6c).
@@ -1777,6 +1973,17 @@ class PhotoshopComposePSD:
                 -- not valid JSON, so :func:`_parse_layer_names` drops it and
                 every layer just gets the default ``"Layer <N>"`` name,
                 exactly as that old workflow always produced; it never raises.
+            layers: An optional connected LAYERS stack
+                (docs/roadmap/layered-images.md L2). ``None`` (nothing
+                connected) is the exact pre-existing behavior. Connected,
+                the stack's layers are written into the run's group BELOW
+                any ``image_N`` layers, each at its own absolute position
+                with name/opacity/blend-mode/visibility as live layer
+                properties and rotation/flips/display-size baked into
+                pixels (:func:`cpsb.layers.prepare_stack`, which raises
+                ``ValueError`` on an incompatible document -- loud, like
+                core's own compositor would). The ``max_layers`` cap
+                applies to the COMBINED count, stack first.
             **kwargs: The connected ``image_N`` tensors (each possibly a
                 multi-image batch), whichever subset ComfyUI passed.
 
@@ -1801,18 +2008,46 @@ class PhotoshopComposePSD:
         node_id = str(unique_id)
 
         pil_images, total_available, origins = _collect_layer_images(kwargs, max_layers)
-        if not pil_images:
-            raise ValueError("PhotoshopComposePSD needs at least one connected image_N input")
-        if total_available > len(pil_images):
+        # -- optional incoming LAYERS stack (docs/roadmap/layered-images.md
+        # L2) -- prepared FIRST because it occupies the bottom of the run's
+        # group, so the max_layers cap counts it first too (drops still come
+        # off the END of the combined bottom-to-top sequence, exactly the
+        # widget tooltip's long-standing "dropped from the end" contract).
+        prepared_stack = (
+            layers_io.prepare_stack(layers, source=f"compose node {node_id}")
+            if layers is not None
+            else []
+        )
+        stack_total = len(prepared_stack)
+        if stack_total > max_layers:
+            prepared_stack = prepared_stack[:max_layers]
+        allowed_images = max(0, max_layers - len(prepared_stack))
+        if len(pil_images) > allowed_images:
+            pil_images = pil_images[:allowed_images]
+            origins = origins[:allowed_images]
+        if not pil_images and not prepared_stack:
+            raise ValueError(
+                "PhotoshopComposePSD needs at least one connected image_N input or a "
+                "connected layers stack"
+            )
+        # The stack's own canvas claim (the doc's declared canvas, else its
+        # placed extent) -- folded into fresh-document sizing and the
+        # consume path's canvas reconstruction alike.
+        stack_canvas = (
+            layers_io.stack_extent(prepared_stack, layers) if prepared_stack else None
+        )
+        combined_available = total_available + stack_total
+        combined_used = len(pil_images) + len(prepared_stack)
+        if combined_available > combined_used:
             # No silent truncation: a batch bigger than the cap loses layers, so
             # say so in the log (the user's lever is the max_layers widget).
             logger.warning(
-                "cpsb compose_psd: node %s: %d input image(s) exceed max_layers=%d; "
+                "cpsb compose_psd: node %s: %d input layer(s) exceed max_layers=%d; "
                 "using the first %d as layers (raise max_layers to include more)",
                 node_id,
-                total_available,
+                combined_available,
                 max_layers,
-                len(pil_images),
+                combined_used,
             )
 
         # Per-layer names (class docstring's rename paragraph): a slot's own
@@ -1843,8 +2078,18 @@ class PhotoshopComposePSD:
         # could never match again, stranding it as a live, unreachable
         # Photoshop document while a second one got created underneath it.
         # append_target IS folded in here, unlike mode -- see
-        # _compute_identity_hash's own docstring for why.
-        identity_hash = _compute_identity_hash(pil_images, group_name, layer_names, append_target)
+        # _compute_identity_hash's own docstring for why. The stack key
+        # digests the RAW connected doc plus the post-cap count (so a
+        # max_layers change that truncates the stack differently changes
+        # the identity the same way it changes pil_images' length).
+        stack_key = (
+            f"{layers_io.stack_digest(layers)}:{len(prepared_stack)}"
+            if layers is not None
+            else ""
+        )
+        identity_hash = _compute_identity_hash(
+            pil_images, group_name, layer_names, append_target, stack_key
+        )
 
         # -- reuse / supersede (mirrors cpsb.nodes.PhotoshopBridge.execute,
         # cpsb/nodes.py:402-432, and cpsb.annotate's analogous block,
@@ -1897,12 +2142,16 @@ class PhotoshopComposePSD:
                             consume_target, pil_images
                         )
                     else:
-                        canvas_width = max(image.width for image in pil_images)
-                        canvas_height = max(image.height for image in pil_images)
+                        canvas_width, canvas_height = _fresh_canvas_size(
+                            pil_images, prepared_stack, stack_canvas
+                        )
                 except Exception:
-                    canvas_width = max(image.width for image in pil_images)
-                    canvas_height = max(image.height for image in pil_images)
-                placements = _compute_placements(pil_images, canvas_width, canvas_height)
+                    canvas_width, canvas_height = _fresh_canvas_size(
+                        pil_images, prepared_stack, stack_canvas
+                    )
+                placements = _stack_display_placements(prepared_stack) + _compute_placements(
+                    pil_images, canvas_width, canvas_height
+                )
                 layers_tensor = _layers_batch_tensor(placements, canvas_width, canvas_height)
                 return image_tensor, mask_tensor, active.source.filename, layers_tensor
             # Filesystem race: the edit file vanished. `active` stays set so
@@ -1933,7 +2182,9 @@ class PhotoshopComposePSD:
                     target_path,
                 )
                 canvas_width, canvas_height = _peek_target_canvas(target_path, pil_images)
-                placements = _compute_placements(pil_images, canvas_width, canvas_height)
+                placements = _stack_display_placements(prepared_stack) + _compute_placements(
+                    pil_images, canvas_width, canvas_height
+                )
             elif target_path.is_file():
                 psd = PSDImage.open(target_path)
                 _ensure_rgb_target(psd, target_path)
@@ -1945,13 +2196,13 @@ class PhotoshopComposePSD:
                     "cpsb compose_psd: node %s: appending %d layer(s) into %s as group %r "
                     "(mode=%r)",
                     node_id,
-                    len(pil_images),
+                    len(pil_images) + len(prepared_stack),
                     target_path,
                     run_group_name,
                     mode,
                 )
                 placements, canvas_width, canvas_height = _append_run_into_psd(
-                    psd, pil_images, run_group_name, resolved_layer_names
+                    psd, pil_images, run_group_name, resolved_layer_names, prepared_stack
                 )
                 _atomic_save(psd, target_path)
                 # Own-write suppression (cpsb.handoff.HandoffManager.
@@ -1978,12 +2229,12 @@ class PhotoshopComposePSD:
                     "yet, creating it fresh with %d layer(s) as group %r (mode=%r)",
                     node_id,
                     target_path,
-                    len(pil_images),
+                    len(pil_images) + len(prepared_stack),
                     run_group_name,
                     mode,
                 )
                 psd, canvas_width, canvas_height, placements = _build_group_psd(
-                    pil_images, run_group_name, resolved_layer_names
+                    pil_images, run_group_name, resolved_layer_names, prepared_stack, stack_canvas
                 )
                 _atomic_save(psd, target_path)
                 # Same own-write suppression as the "append into an existing
@@ -1998,12 +2249,12 @@ class PhotoshopComposePSD:
             logger.info(
                 "cpsb compose_psd: node %s: composing %d layer(s) into group %r (mode=%r)",
                 node_id,
-                len(pil_images),
+                len(pil_images) + len(prepared_stack),
                 group_name,
                 mode,
             )
             psd, canvas_width, canvas_height, placements = _build_group_psd(
-                pil_images, group_name, resolved_layer_names
+                pil_images, group_name, resolved_layer_names, prepared_stack, stack_canvas
             )
             output_path = _allocate_output_path(state.context.input_dir, prefix)
             psd.save(output_path)
