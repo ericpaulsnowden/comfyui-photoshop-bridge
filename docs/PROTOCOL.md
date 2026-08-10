@@ -738,14 +738,35 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   input + POST to ComfyUI's own `/upload/image`; the stock IMAGEUPLOAD widget hardcodes
   png/jpeg/webp). Hidden: `unique_id`. TIFF decode and round-trip caveats: the
   "Non-PSD formats" bullet below.
-- Outputs: (IMAGE, MASK) — §4 read path (embedded composite → recomposite fallback,
-  RGB8 normalize); MASK = `1 - alpha` of the flattened image, else zeros.
+- Outputs: (IMAGE, MASK, LAYERS) — §4 read path (embedded composite → recomposite
+  fallback, RGB8 normalize); MASK = `1 - alpha` of the flattened image, else zeros.
+  **LAYERS (v0.5.70, appended at the END — output links restore by slot position)**:
+  the file's actual layer stack as ComfyUI 0.31's layer-document dict
+  (`{"version": 1, "canvas": (w, h), "layers": [<item>…]}`, `cpsb/layers.py` — the ONE
+  module pinning the item key set against core's `document_items`/`expand_item_frames`).
+  Per layer: RGBA pixels (layer masks BAKED into alpha — psd-tools stores RGBA-created
+  layers' transparency as a mask with opaque `topil()`, so skipping masks would drop
+  the transparency of PSDs this pack itself writes), name, absolute x/y, z bottom-to-top,
+  opacity 0..1, blend mode (24 of 27 map 1:1; dissolve/darker-color/lighter-color →
+  nearest neighbor, logged), visibility. A `flatten_groups` BOOLEAN widget (v0.5.70,
+  appended LAST — widget values restore by position) picks the group projection:
+  False (default) = flat leaf list, group opacity multiplied / visibility ANDed onto
+  leaves; True = one layer per top-level entry (groups composited via psd-tools, sRGB,
+  with the group's own opacity/visibility/mask kept OUT of the pixels and carried as
+  item properties — composite() would otherwise bake them in, verified empirically).
+  Non-raster layers (adjustment/fill) are skipped with a log; text/smart objects arrive
+  rasterized. >50 layers warns (core's consume-time compositor cap) but the full stack
+  is still emitted. Extraction failure degrades to an EMPTY stack with a log — never a
+  node error (a file that flattened yesterday must keep loading). The LAYERS output
+  always reflects the file on disk, even when IMAGE/MASK serve a newer saved-back edit
+  (an edit is a flat PNG — nothing to decompose).
 - Round trip: right-click → Open in Photoshop creates a `load_psd` handoff (§2 copy
   semantics). While an ACTIVE handoff for this node has a matching `source_hash` and
   edits, execute() returns the latest edit (and its mask) instead of re-flattening the
   original — the PhotoshopBridge consume pattern. `IS_CHANGED`: sha256 of the PSD
   file's raw bytes, combined with the latest edit hash when an active matching handoff
-  exists.
+  exists; `flatten_groups=True` appends a `:flatten` suffix (the False default keeps
+  the historical key byte-identical, so a pack upgrade alone never re-runs a graph).
 - **Edit-original option**: the node carries a BOOLEAN widget `edit_original` (default
   False). Default (False) = the current copy-to-handoff behavior (non-destructive). When
   True, `/cpsb/open` for this node does NOT copy — the handoff's watched target IS the
@@ -839,6 +860,26 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   carries a ComfyUI IMAGE, which may be a multi-image BATCH (e.g. a VAE Decode emitting
   several images) — every image in every batch becomes its own layer (frames expanded in
   batch order within a socket, sockets in `image_1..image_N` order).
+- **Optional `layers` (LAYERS) input (v0.5.71)**: an incoming ComfyUI 0.31 layer stack
+  (from Load PSD's LAYERS output, core's Add Layer / Create Layered Image, or a
+  layer-splitting model) written as REAL PSD layers. `cpsb/layers.py::prepare_stack`
+  mirrors core's consume semantics (z stable-sort, batch expansion, per-frame masks
+  multiplied into alpha, defaults per `expand_item_frames`); each layer lands at its
+  ABSOLUTE x/y (never centered) with name/opacity/blend/visibility as live layer
+  properties — rotation, flips, and display size are BAKED into pixels (PSD has no
+  non-destructive transform), logged per bake, rotated top-left recomputed by core's
+  own `placed_bounds` math. Stack layers sit BELOW every `image_N` layer inside the
+  same run group; `max_layers` caps the COMBINED count, stack first. grain-extract/
+  grain-merge (GIMP-only) degrade to normal with a log; a malformed document raises
+  `ValueError` (loud, like core). Fresh-document canvas folds in the stack's declared
+  canvas/extent; append mode keeps the target's fixed canvas and warns on clipping.
+  The stack is folded into `IS_CHANGED` AND the handoff identity hash (via
+  `stack_digest` + post-cap count, computed identically in both — divergence would
+  stop arriving edits from re-triggering); unconnected, every hash stays
+  byte-identical to the pre-stack build. The socket auto-grow frontend only touches
+  `/^image_(\d+)$/` names, so it never prunes this socket. The flat
+  IMAGE/MASK/`layers`-batch outputs include the stack with opacity/visibility applied
+  (blends preview as plain alpha-over; the PSD in Photoshop is authoritative).
 - **Renamable `image_N` INPUT SLOTS name the layers (v0.5.38, product owner verbatim: "you
   should be able to change the names of the input nodes by double clicking on them. The
   name of the node should become the layer names. Remove the separate layer name

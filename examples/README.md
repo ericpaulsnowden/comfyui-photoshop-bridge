@@ -1,6 +1,6 @@
 # Example workflows
 
-Seven workflows, simplest first. **Every one of them is annotated on the canvas** —
+Eight workflows, simplest first. **Every one of them is annotated on the canvas** —
 drag the `.json` in, read the yellow notes, and you shouldn't need this page at
 all. This is here for picking which one to open.
 
@@ -15,10 +15,11 @@ drag the `.json` onto the ComfyUI canvas.
 | 1 | [`annotate-mask-passthrough.json`](#1-annotate-mask-passthroughjson) | no | no | none |
 | 2 | [`compose-layers-to-psd.json`](#2-compose-layers-to-psdjson) | no | no | none |
 | 3 | [`load-psd-start-a-workflow.json`](#3-load-psd-start-a-workflowjson) | only to send it back | no | none |
-| 4 | [`edit-in-photoshop-roundtrip.json`](#4-edit-in-photoshop-roundtripjson) | **yes** | optional | none |
-| 5 | [`run-photoshop-action.json`](#5-run-photoshop-actionjson) | **yes** | **required** | none |
-| 6 | [`annotate-qwen-image-edit.json`](#6-annotate-qwen-image-editjson) | **yes** | optional | Qwen-Image-Edit (multi-GB) |
-| 7 | [`live_drawing_lcm.json`](#7-live_drawing_lcmjson) | **yes** | **required** | a fast few-step checkpoint |
+| 4 | [`layered-roundtrip.json`](#4-layered-roundtripjson) | to edit the result | no | none |
+| 5 | [`edit-in-photoshop-roundtrip.json`](#5-edit-in-photoshop-roundtripjson) | **yes** | optional | none |
+| 6 | [`run-photoshop-action.json`](#6-run-photoshop-actionjson) | **yes** | **required** | none |
+| 7 | [`annotate-qwen-image-edit.json`](#7-annotate-qwen-image-editjson) | **yes** | optional | Qwen-Image-Edit (multi-GB) |
+| 8 | [`live_drawing_lcm.json`](#8-live_drawing_lcmjson) | **yes** | **required** | a fast few-step checkpoint |
 
 ---
 
@@ -83,7 +84,28 @@ branch turns the MASK output into an image you can actually look at.
   three `on_save` behaviours, plus the right-click **Open in Photoshop** route
   back out.
 
-## 4. `edit-in-photoshop-roundtrip.json`
+## 4. `layered-roundtrip.json`
+
+**The layer round trip: a PSD's actual layers, through the graph and back into
+a real layered PSD.**
+
+```
+Load PSD ──LAYERS──▶ Compose ──▶ layered .psd ──▶ opens in Photoshop, waits for your save
+    └────IMAGE────▶ Preview        └layers──▶ Preview (one frame per layer)
+```
+
+- **Needs:** a layered `.psd` in `ComfyUI/input/` (queue
+  `compose-layers-to-psd.json` once if you don't have one). Photoshop only to
+  edit the written result — flip Compose's `mode` to *Don't open (composite
+  only)* and it runs with nothing but ComfyUI.
+- **Expect:** a new `.psd` whose layers keep their names, positions, opacity,
+  blend modes, and visibility; on ComfyUI 0.31+ you can insert core's **Create
+  Layered Image** editor between the two nodes (the canvas note explains).
+- Uses only bridge nodes, so the file loads on any ComfyUI version.
+
+---
+
+## 5. `edit-in-photoshop-roundtrip.json`
 
 **The pack's hello world.** Load an image → **Edit in Photoshop** → preview
 what came back. The run pauses at the node, Photoshop opens the image, and the
@@ -98,7 +120,7 @@ moment you save it carries on with your edit.
   every save / open and move on), and what the MASK output actually marks —
   transparency in your edit, not a selection.
 
-## 5. `run-photoshop-action.json`
+## 6. `run-photoshop-action.json`
 
 Load an image → **Run Photoshop Action** plays one of your saved Photoshop
 Actions on it automatically → preview and save the result.
@@ -112,7 +134,7 @@ Actions on it automatically → preview and save the result.
   a modal and your run waits out `timeout_seconds`.
 - **Expect:** nothing at all until those two fields are filled in.
 
-## 6. `annotate-qwen-image-edit.json`
+## 7. `annotate-qwen-image-edit.json`
 
 ComfyUI's native **Qwen-Image-Edit** template with this pack's **Annotate for
 Edit** (`PhotoshopAnnotate`) spliced into the image path, so you mark up the
@@ -149,7 +171,7 @@ to route it somewhere else.)
   never opens Photoshop and reads a connected `mask` input instead. This file
   deliberately uses the Photoshop path.
 
-## 7. `live_drawing_lcm.json`
+## 8. `live_drawing_lcm.json`
 
 **The realtime one.** You draw in Photoshop, ComfyUI re-renders continuously,
 and the result streams back into the panel's preview pane. A second, muted

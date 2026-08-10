@@ -1,0 +1,131 @@
+{
+ "last_node_id": 7,
+ "last_link_id": 4,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "PhotoshopLoadPSD",
+   "pos": [40, 560],
+   "size": [360, 170],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {"name": "IMAGE", "type": "IMAGE", "links": [2], "slot_index": 0},
+    {"name": "MASK", "type": "MASK", "links": [], "slot_index": 1},
+    {"name": "LAYERS", "type": "LAYERS", "links": [1], "slot_index": 2}
+   ],
+   "properties": {"Node name for S&R": "PhotoshopLoadPSD"},
+   "title": "Load PSD (pick a layered file here)",
+   "widgets_values": ["", false, "Re-run workflow", false]
+  },
+  {
+   "id": 2,
+   "type": "PhotoshopComposePSD",
+   "pos": [500, 560],
+   "size": [380, 260],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [
+    {"name": "layers", "type": "LAYERS", "link": 1},
+    {"name": "image_1", "type": "IMAGE", "link": null}
+   ],
+   "outputs": [
+    {"name": "image", "type": "IMAGE", "links": [3], "slot_index": 0},
+    {"name": "mask", "type": "MASK", "links": [], "slot_index": 1},
+    {"name": "filename", "type": "STRING", "links": [], "slot_index": 2},
+    {"name": "layers", "type": "IMAGE", "links": [4], "slot_index": 3}
+   ],
+   "properties": {"Node name for S&R": "PhotoshopComposePSD"},
+   "title": "Compose → layered PSD → Photoshop",
+   "widgets_values": ["Round Trip", "", "Wait for first save", 1800, 64, ""]
+  },
+  {
+   "id": 3,
+   "type": "PreviewImage",
+   "pos": [960, 380],
+   "size": [330, 300],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [{"name": "images", "type": "IMAGE", "link": 3}],
+   "outputs": [],
+   "properties": {"Node name for S&R": "PreviewImage"},
+   "title": "Your edit, back in the graph"
+  },
+  {
+   "id": 4,
+   "type": "PreviewImage",
+   "pos": [960, 740],
+   "size": [330, 300],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [{"name": "images", "type": "IMAGE", "link": 4}],
+   "outputs": [],
+   "properties": {"Node name for S&R": "PreviewImage"},
+   "title": "Every written layer (one frame each)"
+  },
+  {
+   "id": 5,
+   "type": "PreviewImage",
+   "pos": [40, 800],
+   "size": [330, 300],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [{"name": "images", "type": "IMAGE", "link": 2}],
+   "outputs": [],
+   "properties": {"Node name for S&R": "PreviewImage"},
+   "title": "The flattened original"
+  },
+  {
+   "id": 6,
+   "type": "MarkdownNote",
+   "pos": [40, 40],
+   "size": [620, 470],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "START HERE — the layer round trip",
+   "properties": {},
+   "widgets_values": [
+    "# Layers in, layers out\n\nThis demo round-trips a PSD's **actual layers** through the graph:\n\n1. **Load PSD** reads your file and emits its real layer stack on the new\n   **LAYERS** output — every layer's pixels, name, position, opacity, blend\n   mode, and visibility. (The `psd` dropdown is empty until `ComfyUI/input/`\n   has a file — click **Upload Photoshop File**, or queue\n   `compose-layers-to-psd.json` once to make one.)\n2. **Compose** writes that stack back out as a **real layered `.psd`** — same\n   layer names, positions, opacity, blend modes, visibility — and, in *Wait\n   for first save* mode, opens it in Photoshop and pauses the queue.\n3. Edit in Photoshop, **save**, and your edit lands back in the graph in the\n   top preview.\n\nNo Photoshop installed right now? Flip Compose's `mode` to **Don't open\n(composite only)** — the layered file is still written into\n`ComfyUI/input/` and both previews still work.\n\n**`flatten_groups`** (Load PSD's last checkbox): off = every layer\nindividually in one flat list (group opacity/visibility applied to its\nlayers); on = each top-level group collapses to a single layer.\n"
+   ],
+   "color": "#432",
+   "bgcolor": "#653"
+  },
+  {
+   "id": 7,
+   "type": "MarkdownNote",
+   "pos": [700, 40],
+   "size": [620, 470],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [],
+   "title": "ComfyUI 0.31+ layer nodes & honesty notes",
+   "properties": {},
+   "widgets_values": [
+    "# Using ComfyUI's own layer editor (0.31+)\n\nOn **ComfyUI 0.31.0 or newer** you can put core's layer nodes *between* the\ntwo bridge nodes:\n\n```\nLoad PSD ─LAYERS▶ Create Layered Image ─LAYERS▶ Compose ─▶ Photoshop\n```\n\n**Create Layered Image** opens a full-screen layer editor (move, rotate,\nreorder, blend, opacity) — it needs the **Node 2.0** frontend mode; in\nclassic mode the widget shows \"Compositor: Node 2.0 only\". **Add Layer**\n(core) appends one layer to a stack — different from this pack's\n**Photoshop Add Layer**, which pushes a rendered image into the open\nPhotoshop document. Model nodes that output LAYERS (layer-splitting models)\nwire straight into Compose the same way.\n\nThis file itself uses **only bridge nodes**, so it loads on any ComfyUI\nversion.\n\n### Honesty notes\n- ComfyUI composites blends/opacity in linear space; Photoshop in sRGB.\n  Arrangement is identical; partially-transparent and non-normal-blend\n  pixels render *close to*, not identical to, Photoshop. The written PSD in\n  Photoshop is the authoritative render.\n- The preview here flattens with plain alpha blending (blend modes not\n  simulated). Text and smart-object layers arrive rasterized; adjustment\n  layers are skipped.\n- ComfyUI's compositor caps stacks at 50 layers; Compose has no such cap.\n"
+   ],
+   "color": "#432",
+   "bgcolor": "#653"
+  }
+ ],
+ "links": [
+  [1, 1, 2, 2, 0, "LAYERS"],
+  [2, 1, 0, 5, 0, "IMAGE"],
+  [3, 2, 0, 3, 0, "IMAGE"],
+  [4, 2, 3, 4, 0, "IMAGE"]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {},
+ "version": 0.4
+}

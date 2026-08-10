@@ -14,7 +14,7 @@ comfyui-photoshop-bridge ships as a single ComfyUI custom node pack with two tie
 
 **Tier 2 — Photoshop plugin (optional, one-time install).** A small UXP panel keeps a persistent connection to ComfyUI's own server. Instead of watching the filesystem, it listens for Photoshop's native save event and pushes a flattened export back over HTTP the instant you save — no file-watch delay, higher-fidelity pixels, and it works even when **ComfyUI runs on a different machine than Photoshop**, because the plugin fetches and returns images over the network. You point it at a ComfyUI address right in the panel.
 
-Neither tier syncs individual Photoshop layers back into the ComfyUI graph — a ComfyUI image is a flat RGB tensor, so this is a whole-image round trip, not a layer-level bridge. (Your layers are preserved *in Photoshop* on the local/edit-in-place paths; they just don't flow into the graph as layers.)
+The *edit* round trip itself is whole-image: what returns after a Photoshop save is the saved composite, as a flat image. But layers themselves now flow through the graph too — **Load PSD emits a file's actual layer stack, and Compose writes a layer stack back out as a real layered PSD** (names, positions, opacity, blend modes, visibility). See [Layered images](#layered-images-psd-layers-in-and-out-of-the-graph) below.
 
 ## Do I need the Photoshop plugin?
 
@@ -53,7 +53,7 @@ Opens its input image in Photoshop and, in the default **Wait for first save** m
 
 > **Plugin: not needed** — the preview is rendered server-side, with no Photoshop involved.
 
-Starts a workflow *from* a `.psd`/`.psb` — or a **`.tif`/`.tiff`** — sitting in ComfyUI's input folder. Shows an on-node **preview** and outputs IMAGE + MASK. An optional **edit the original in place** mode opens that very file in Photoshop and takes your saves back (that part uses Tier 1 or the plugin).
+Starts a workflow *from* a `.psd`/`.psb` — or a **`.tif`/`.tiff`** — sitting in ComfyUI's input folder. Shows an on-node **preview** and outputs IMAGE + MASK — plus a **`layers` (LAYERS) output**: the file's actual layer stack, every layer with its pixels, name, position, opacity, blend mode, and visibility, ready for ComfyUI 0.31+'s layer nodes or this pack's own Compose node (see [Layered images](#layered-images-psd-layers-in-and-out-of-the-graph)). A **`flatten_groups`** checkbox picks the group projection: off (default) lists every layer individually in one flat list, with group opacity/visibility applied to its layers; on collapses each top-level group into a single layer. An optional **edit the original in place** mode opens that very file in Photoshop and takes your saves back (that part uses Tier 1 or the plugin).
 
 An **`on_save`** widget controls what a save in Photoshop actually does: *Re-run workflow* (default), *Update only* (take the edit, don't re-run), or *Ignore* (saving does nothing). Set it to Ignore when you want to open a PSD, shuffle layers, push one back and close, without the graph firing on every save. It's enforced on the server, so it governs the plugin's **Send** button too, not just automatic saves.
 
@@ -62,6 +62,8 @@ An **`on_save`** widget controls what a save in Photoshop actually does: *Re-run
 > **Plugin: not needed** to write the PSD; opening it in Photoshop uses Tier 1 or the plugin.
 
 Stacks multiple images into one **layered, grouped PSD**, then (by default) opens it in Photoshop and blocks until you save. Outputs the flattened composite, the written PSD's filename, and a **`layers`** batch — one frame per layer — so a Preview node shows every layer individually instead of just the flat result.
+
+It also accepts an optional **`layers` (LAYERS) input** — from Load PSD, ComfyUI 0.31+'s layer nodes, or any layer-splitting model — and writes that stack as **real PSD layers**: each layer's name, absolute position, opacity, blend mode, and visibility land in the document as live, editable properties (rotation, flips, and display size are baked into the pixels — PSD has no non-destructive transforms — with a log line per bake). Stack layers sit below any connected `image_N` inputs inside the same run group, and the `max_layers` cap counts the combined total.
 
 Leave the target empty and every run writes a fresh numbered PSD; **Browse…** to any PSD on the ComfyUI machine (or name a new one right in the dialog) and runs **accumulate into that single reviewable document**, each in its own numbered group. Writes are atomic, so a failed run can never truncate the document you've been collecting into — and it's safe to point at a file another node in this pack already has open (e.g. a Load PSD "edit original" target): a compose write is never mistaken for a Photoshop save on that other node's side.
 
@@ -128,7 +130,21 @@ The input side of the **refine pass**. Two IMAGE outputs, and your refine workfl
 
 > **Plugin: required to be useful** — it delivers *into* Photoshop; without it, a logged no-op.
 
-Ends a chain by pushing the result **straight into your open Photoshop document as a layer**, scaled to the document bounds (pixels capped at 4096px on the long side). A **REFINED LAYER** control in the main panel picks whether repeated refines **Stack** new layers or **Replace** the previous one.
+Ends a chain by pushing the result **straight into your open Photoshop document as a layer**, scaled to the document bounds (pixels capped at 4096px on the long side). A **REFINED LAYER** control in the main panel picks whether repeated refines **Stack** new layers or **Replace** the previous one. (Not the same as ComfyUI 0.31+'s own **Add Layer** node, which appends a layer to a LAYERS stack *inside the graph* — this one delivers pixels to the live Photoshop document.)
+
+## Layered images: PSD layers in and out of the graph
+
+ComfyUI 0.31 introduced a first-class layered-image type — the **LAYERS** socket — with its own layer nodes and a full-screen layer editor. Core has **no PSD import** and only a browser-download export; this pack owns the Photoshop seam on both sides:
+
+```
+your .psd ─▶ Load PSD ─LAYERS▶ (rearrange / process / generate) ─LAYERS▶ Compose ─▶ layered .psd ─▶ Photoshop
+```
+
+- **Works with ComfyUI alone, on any version.** `Load PSD → Compose` round-trips layers with nothing else installed — LAYERS is just a socket type, so the pair links up even on pre-0.31 builds (a startup log line tells you when core's own layer nodes aren't available).
+- **On ComfyUI 0.31+**, core's **Create Layered Image** node sits between the two: a PSD-style editor (move, rotate, reorder, per-layer blend and opacity) for the stack before it's written back. The editor itself needs the **Node 2.0** frontend mode — in classic mode its widget shows "Compositor: Node 2.0 only". Core's **Add Layer** builds stacks node-by-node (not to be confused with this pack's **Photoshop Add Layer**, which pushes pixels into the open Photoshop document). Layer-splitting model nodes that output LAYERS wire straight into Compose.
+- **Try it:** [`examples/layered-roundtrip.json`](examples/layered-roundtrip.json) — annotated on the canvas, uses only bridge nodes so it loads anywhere.
+
+**Honesty notes.** ComfyUI composites blends/opacity in linear (per-mode perceptual) space, Photoshop in sRGB: arrangement carries over exactly, but partial-opacity and non-normal-blend pixels render *close to*, not identical to, Photoshop — the written PSD in Photoshop is always the authoritative render, and this pack never promises pixel parity. 24 of Photoshop's 27 blend modes map 1:1 by name; dissolve, darker-color, and lighter-color fall back to their nearest neighbor (logged). Text and smart-object layers arrive rasterized; adjustment layers are skipped (logged). ComfyUI's compositor caps stacks at 50 layers — Load PSD warns past that but still emits the full stack (Compose has no such cap).
 
 ## Realtime drawing: draw in Photoshop, watch it re-render
 
@@ -235,7 +251,7 @@ The round trip, the eleven nodes, the gallery, and cross-machine editing all wor
 
 ## Limitations
 
-- **Layers don't round-trip into the graph.** A ComfyUI image is flat RGB, so what returns to the node is always a flattened raster. Your layers survive in Photoshop (and on the edit-in-place path, in the file), but aren't exposed as layers in ComfyUI.
+- **The *edit* round trip returns a flat composite.** What comes back after a Photoshop save is the saved composite as a flat image — an edit isn't decomposed back into a layer stack. (Layers themselves *do* flow through the graph now — Load PSD's `layers` output and Compose's `layers` input, see [Layered images](#layered-images-psd-layers-in-and-out-of-the-graph) — with their own honesty notes: blending semantics differ slightly from Photoshop, text/smart-object layers arrive rasterized, adjustment layers are skipped.)
 - **16-bit and non-RGB images are converted to RGB8.** CMYK, Grayscale, Lab, or 16-bit sources are converted on the way in — a plain, non-color-managed conversion (a CMYK PSD loads as recognizable RGB, not a colorimetric match). Full-fidelity high-bit-depth or color-managed round-tripping is out of scope. (Compose's *append-to-existing* is stricter: it refuses a non-RGB target outright rather than silently converting your artwork.)
 - **`.tif`/`.tiff` load out of the box** in the Load PSD node (no extra dependency); no third-party image decoders are bundled. Illustrator `.ai` and camera raw/`.dng` open through Photoshop itself, via a dedicated Tier-2 "Open via Photoshop" node (see the roadmap).
 - **Save-As to a different file or format breaks the automatic link.** The watcher only watches the exact managed hand-off path. If you Save As elsewhere, the document stays open in Photoshop — so it never shows as "Closed without saving" either — but no edit ever arrives at the card, which just sits at "Editing" with nothing to tell you why. Recover with drag-and-drop: drop the saved-elsewhere image onto that card in the sidebar gallery to import it manually.

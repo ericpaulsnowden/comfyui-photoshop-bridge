@@ -719,7 +719,9 @@ class PhotoshopAddLayer:
         "plugin to actually deliver the layer; without it connected, this node quietly "
         "does nothing rather than stopping the workflow, since the image is already "
         "visible in ComfyUI either way. Set layer_name to control the name Photoshop "
-        "gives the new layer."
+        "gives the new layer. Not the same as ComfyUI 0.31+'s own 'Add Layer' node, "
+        "which appends a layer to a LAYERS stack inside the graph -- this one delivers "
+        "pixels to the live Photoshop document."
     )
 
     @classmethod
