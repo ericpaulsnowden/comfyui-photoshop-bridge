@@ -86,6 +86,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from . import layers as layers_io
 from . import nodes, raster_io, routes
 from .context import CpsbContext
 from .handoff import HandoffManager, HandoffMeta
@@ -221,6 +222,46 @@ def _resolve_psd_path(context: CpsbContext, psd: str) -> Path | None:
     return routes._resolve_source_path(context, psd, "", "input")
 
 
+def _layers_document(psd_path: Path, flatten_groups: bool) -> dict[str, Any]:
+    """The node's ``layers`` output for *psd_path*, degrade-guarded.
+
+    Dispatches like :meth:`PhotoshopLoadPSD.execute`'s own flatten: a
+    PSD-native file's real layer stack via
+    :func:`cpsb.layers.document_from_psd` (opened fresh with psd-tools --
+    :func:`cpsb.psd_io.read_edited_psd`'s embedded-composite machinery has
+    no layer-stack concept to reuse), anything else as the honest
+    single-layer stack (:func:`cpsb.layers.document_from_flat_image`).
+
+    DEGRADE GUARD (Eric's decision 1, 2026-08-09: "don't break older builds
+    or current use cases"): layer extraction failing on a file whose flat
+    decode succeeds must cost the ``layers`` output only, never the node --
+    every exception here is logged and swallowed into
+    :func:`cpsb.layers.empty_document`. Broad ``except Exception``
+    deliberately: psd-tools raises assorted types on exotic/corrupt
+    documents, and this output is auxiliary to the IMAGE/MASK contract the
+    node has always honored (the UnicodeDecodeError-in-a-degrade-guard
+    lesson: guard by intent -- "anything short of KeyboardInterrupt" -- not
+    by an exception-type guess).
+    """
+    try:
+        if psd_path.suffix.lower() in PSD_EXTENSIONS:
+            from psd_tools import PSDImage
+
+            return layers_io.document_from_psd(
+                PSDImage.open(psd_path), flatten_groups=flatten_groups, source=psd_path.name
+            )
+        return layers_io.document_from_flat_image(
+            raster_io.decode_to_rgb8(psd_path), psd_path.stem
+        )
+    except Exception:
+        logger.exception(
+            "cpsb load_psd: extracting layers from %s failed; the layers output is empty "
+            "this run (image/mask outputs are unaffected)",
+            psd_path,
+        )
+        return layers_io.empty_document()
+
+
 def _consume_active_edit(manager: HandoffManager, handoff_id: str) -> tuple[Any, Any] | None:
     """``(IMAGE, MASK)`` tensors for *handoff_id*'s latest edit, if any.
 
@@ -350,23 +391,38 @@ class PhotoshopLoadPSD:
     """
 
     CATEGORY = "Photoshop Bridge/Handoffs"
-    RETURN_TYPES = ("IMAGE", "MASK")
+    # `layers` appended at the END (docs/roadmap/layered-images.md L1, Eric's
+    # decision 1): ComfyUI restores a saved workflow's output LINKS by slot
+    # position, so IMAGE/MASK must keep slots 0/1 forever -- new outputs are
+    # append-only, the same positional rule INPUT_TYPES' docstring pins for
+    # widgets.
+    RETURN_TYPES = ("IMAGE", "MASK", "LAYERS")
     OUTPUT_TOOLTIPS = (
         "The flattened image, or the latest edit if one has been saved back.",
         "Marks any transparent area of the image (1.0 = transparent, 0.0 = opaque). All "
         "zero when the image has no transparency.",
+        "The file's actual layers as a ComfyUI layer stack (LAYERS): every layer's "
+        "pixels, name, position, opacity, blend mode, and visibility. Connect it to "
+        "ComfyUI's Create Layered Image node (ComfyUI 0.31+) to rearrange layers in its "
+        "editor, or to this pack's Compose node to write a layered PSD. Always reflects "
+        "the file on disk -- text and smart-object layers arrive rasterized, and "
+        "adjustment layers are skipped. Blending in ComfyUI's compositor looks close "
+        "to, but not identical to, Photoshop.",
     )
     FUNCTION = "execute"
     DESCRIPTION = (
         "Loads a .psd, .psb, .tif, or .tiff file from ComfyUI's input folder and "
-        "flattens it into an image the rest of the workflow can use. Works with ComfyUI "
-        "alone -- no Photoshop plugin is required just to load a file. Right-click the "
-        "node and choose 'Open in Photoshop' (or 'Edit Original in Photoshop' once an "
-        "edit is in progress) to send a .psd/.psb back for editing -- .tif/.tiff files "
-        "can be loaded but not yet round-tripped. The Photoshop panel plugin, if "
-        "connected, makes that round trip instant instead of file-based. The "
-        "edit_original and on_save widgets control where an edit is saved and whether "
-        "saving it re-runs the workflow."
+        "flattens it into an image the rest of the workflow can use -- and also emits "
+        "the file's individual layers as a LAYERS stack for ComfyUI 0.31+'s layer nodes "
+        "or this pack's Compose node. Works with ComfyUI alone -- no Photoshop plugin "
+        "is required just to load a file. Right-click the node and choose 'Open in "
+        "Photoshop' (or 'Edit Original in Photoshop' once an edit is in progress) to "
+        "send a .psd/.psb back for editing -- .tif/.tiff files can be loaded but not "
+        "yet round-tripped. The Photoshop panel plugin, if connected, makes that round "
+        "trip instant instead of file-based. The edit_original and on_save widgets "
+        "control where an edit is saved and whether saving it re-runs the workflow; "
+        "flatten_groups controls whether the layers output lists every layer "
+        "individually or collapses each top-level group into one layer."
     )
 
     @classmethod
@@ -440,9 +496,10 @@ class PhotoshopLoadPSD:
                     },
                 ),
                 # On-save trigger policy (product-owner requirement
-                # 2026-07-18): MUST stay the last required entry -- see this
-                # method's own docstring above for why. Default RERUN keeps
-                # every existing saved workflow's behavior byte-identical.
+                # 2026-07-18): appended after edit_original under the same
+                # positional TAIL rule this method's docstring pins. Default
+                # RERUN keeps every existing saved workflow's behavior
+                # byte-identical.
                 "on_save": (
                     [OnSaveMode.RERUN, OnSaveMode.UPDATE_ONLY, OnSaveMode.IGNORE],
                     {
@@ -454,6 +511,28 @@ class PhotoshopLoadPSD:
                             "(gallery and badges update) but leaves the workflow alone "
                             "until you queue it yourself. 'Ignore (do nothing)' skips "
                             "the save entirely, as if this node weren't watching it."
+                        ),
+                    },
+                ),
+                # Layers-output group handling (docs/roadmap/layered-images.md
+                # L1; Eric's decision 2, 2026-08-09, verbatim: "Showing all
+                # layers in a flat list should be default, with a checkbox to
+                # flatten each group"). NOW the last required entry, under
+                # the same append-at-TAIL positional rule as on_save before
+                # it (this method's docstring): a workflow saved before this
+                # widget existed never reaches its widgets_values index, so
+                # it stays at this default -- and False produces the flat
+                # leaf-layer list, the decided default projection.
+                "flatten_groups": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "How the layers output treats layer groups. Off (default): "
+                            "every layer appears individually in one flat list, with "
+                            "group opacity and visibility applied to its layers. On: "
+                            "each top-level group is flattened into a single layer. "
+                            "Does not affect the image output."
                         ),
                     },
                 ),
@@ -487,7 +566,12 @@ class PhotoshopLoadPSD:
 
     @classmethod
     def IS_CHANGED(
-        cls, psd: str, unique_id: str, edit_original: bool = False, on_save: str = OnSaveMode.RERUN
+        cls,
+        psd: str,
+        unique_id: str,
+        edit_original: bool = False,
+        on_save: str = OnSaveMode.RERUN,
+        flatten_groups: bool = False,
     ) -> str:
         """sha256 of *psd*'s raw bytes, folding in the latest edit hash when consumable.
 
@@ -523,6 +607,17 @@ class PhotoshopLoadPSD:
         for this cache key to react to beyond what it already does. Defaults
         to :data:`OnSaveMode.RERUN` so every pre-existing caller keeps
         working unchanged.
+
+        *flatten_groups* (docs/roadmap/layered-images.md L1), unlike those
+        two, IS folded in: toggling it genuinely changes what
+        :meth:`execute` produces -- the ``layers`` output's whole
+        projection -- so a cached result from the other setting must never
+        be served. Folded as a ``:flatten`` suffix appended ONLY when
+        ``True``: the default (``False``) value's key stays byte-identical
+        to what this method has always returned, so upgrading the pack
+        never invalidates an existing workflow's cached result by itself.
+        Defaults ``False`` (the widget's own default) so every pre-existing
+        caller keeps working unchanged.
         """
         state = nodes._require_state()
         psd_path = _resolve_psd_path(state.context, psd)
@@ -533,13 +628,14 @@ class PhotoshopLoadPSD:
             # rather than silently keeping a stale cached result forever.
             return psd
         file_hash = hashlib.sha256(psd_path.read_bytes()).hexdigest()
+        grouping = ":flatten" if flatten_groups else ""
 
         active = _find_matching_active_handoff(state.manager, str(unique_id), file_hash)
         if active is not None:
             edit_hash = state.manager.latest_edit_hash(active.handoff_id)
             if edit_hash is not None:
-                return f"{file_hash}:{edit_hash}"
-        return file_hash
+                return f"{file_hash}:{edit_hash}{grouping}"
+        return f"{file_hash}{grouping}"
 
     def execute(
         self,
@@ -547,8 +643,9 @@ class PhotoshopLoadPSD:
         unique_id: str,
         edit_original: bool = False,
         on_save: str = OnSaveMode.RERUN,
-    ) -> tuple[Any, Any]:
-        """``(IMAGE, MASK)`` for the selected file (PROTOCOL.md §6b).
+        flatten_groups: bool = False,
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        """``(IMAGE, MASK, LAYERS)`` for the selected file (PROTOCOL.md §6b).
 
         Serves a consumable active edit first (see the class docstring's
         "Round trip" paragraph -- format-agnostic: an ingested edit is
@@ -583,9 +680,22 @@ class PhotoshopLoadPSD:
                 any edit reaches this node's consume path below. Defaults
                 to :data:`OnSaveMode.RERUN` so every pre-existing caller
                 keeps working unchanged.
+            flatten_groups: The layers-output group projection
+                (docs/roadmap/layered-images.md L1; Eric's decision 2):
+                ``False`` (default) = flat leaf-layer list, ``True`` = one
+                layer per top-level group. Only the ``layers`` output reads
+                it -- IMAGE/MASK are identical either way.
 
         Returns:
-            ``(IMAGE, MASK)`` tensors.
+            ``(IMAGE, MASK, LAYERS)`` -- the flat tensors exactly as
+            always, plus the file's layer stack
+            (:func:`_layers_document`). The LAYERS document ALWAYS
+            reflects the file currently on disk, even when IMAGE/MASK
+            serve a newer saved-back edit (an ingested edit is a flat PNG
+            -- there is no layer stack to decompose it into; with
+            ``edit_original`` on, in-place saves land in the file itself,
+            so the stack tracks those). Degrades to an empty stack, never
+            an error, if layer extraction fails (Eric's decision 1).
 
         Raises:
             FileNotFoundError: *psd* no longer resolves to a file (deleted
@@ -603,6 +713,8 @@ class PhotoshopLoadPSD:
             raise FileNotFoundError(f"PSD file not found: {psd}")
         source_hash = hashlib.sha256(psd_path.read_bytes()).hexdigest()
 
+        layers_doc = _layers_document(psd_path, flatten_groups)
+
         active = _find_matching_active_handoff(manager, node_id, source_hash)
         if active is not None:
             consumed = _consume_active_edit(manager, active.handoff_id)
@@ -612,11 +724,11 @@ class PhotoshopLoadPSD:
                     node_id,
                     active.handoff_id,
                 )
-                return consumed
+                return (*consumed, layers_doc)
 
         logger.info("cpsb load_psd: node %s: flattening %s", node_id, psd_path)
         if psd_path.suffix.lower() in PSD_EXTENSIONS:
             image, _fidelity = read_edited_psd(psd_path)
         else:
             image = raster_io.decode_to_rgb8(psd_path)
-        return nodes._tensors_from_image(image)
+        return (*nodes._tensors_from_image(image), layers_doc)

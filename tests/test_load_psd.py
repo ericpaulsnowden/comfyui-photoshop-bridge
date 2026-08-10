@@ -87,7 +87,7 @@ class TestContractShape:
     def test_node_attributes(self):
         node = load_psd_module.PhotoshopLoadPSD
         assert node.CATEGORY == "Photoshop Bridge/Handoffs"
-        assert node.RETURN_TYPES == ("IMAGE", "MASK")
+        assert node.RETURN_TYPES == ("IMAGE", "MASK", "LAYERS")
         assert node.FUNCTION == "execute"
 
     def test_input_types_hidden_shape(self, configured):
@@ -164,21 +164,22 @@ class TestContractShape:
         assert update_only in pasteback
         assert ignore in pasteback
 
-    def test_on_save_is_the_last_required_input(self, configured):
+    def test_widget_order_is_append_only(self, configured):
         """Critical for backward compatibility: ComfyUI's frontend restores
         a saved workflow's serialized widget values BY POSITION (index into
         `widgets_values`, zipped against `node.widgets` in INPUT_TYPES
-        declaration order), not by name. Appending `on_save` last means a
-        workflow saved before this change (whose `widgets_values` only has
-        two entries) never touches this widget's slot at all, leaving it at
-        its own default -- inserting it anywhere else would instead shift
-        every already-serialized value after that point onto the wrong
-        widget for every existing saved workflow.
+        declaration order), not by name. Every widget addition appends at
+        the TAIL (`on_save` 2026-07-18, `flatten_groups` 2026-08-09): a
+        workflow saved before a widget existed never reaches its slot at
+        all, leaving it at its own default -- inserting anywhere else would
+        instead shift every already-serialized value after that point onto
+        the wrong widget for every existing saved workflow. This exact
+        ORDER is therefore frozen: prepends/inserts/reorders must fail
+        here.
         """
         spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
         required_names = list(spec["required"].keys())
-        assert required_names == ["psd", "edit_original", "on_save"]
-        assert required_names[-1] == "on_save"
+        assert required_names == ["psd", "edit_original", "on_save", "flatten_groups"]
 
 
 class TestEditOriginalParam:
@@ -205,7 +206,9 @@ class TestEditOriginalParam:
         write_test_psd(psd_path, color=(40, 80, 120), size=(12, 8))
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, _mask = node.execute(psd="flat.psd", unique_id="1", edit_original=True)
+        image_tensor, _mask, _layers = node.execute(
+            psd="flat.psd", unique_id="1", edit_original=True
+        )
 
         array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         assert tuple(array[0, 0]) == (40, 80, 120)
@@ -232,7 +235,9 @@ class TestEditOriginalParam:
         manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (200, 150, 100)), "plugin")
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, _mask = node.execute(psd="sample.psd", unique_id="1", edit_original=True)
+        image_tensor, _mask, _layers = node.execute(
+            psd="sample.psd", unique_id="1", edit_original=True
+        )
 
         array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         assert tuple(array[0, 0]) == (200, 150, 100)
@@ -279,7 +284,7 @@ class TestOnSaveParam:
         write_test_psd(psd_path, color=(40, 80, 120), size=(12, 8))
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, _mask = node.execute(
+        image_tensor, _mask, _layers = node.execute(
             psd="flat.psd", unique_id="1", on_save=load_psd_module.OnSaveMode.IGNORE
         )
 
@@ -522,7 +527,7 @@ class TestExecuteFlatten:
         write_test_psd(psd_path, color=source_color, size=(12, 8))
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, mask_tensor = node.execute(psd="flat.psd", unique_id="1")
+        image_tensor, mask_tensor, _layers = node.execute(psd="flat.psd", unique_id="1")
 
         array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         assert array.shape == (8, 12, 3)  # (height, width, channels)
@@ -543,7 +548,7 @@ class TestExecuteFlatten:
         write_test_cmyk_psd(psd_path, (0, 127, 255, 0), size=(8, 8))
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, _mask_tensor = node.execute(psd="cmyk.psd", unique_id="1")
+        image_tensor, _mask_tensor, _layers = node.execute(psd="cmyk.psd", unique_id="1")
 
         array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         red, green, blue = (int(v) for v in array[0, 0])
@@ -578,7 +583,7 @@ class TestExecuteBroadenedFormats:
         tifffile.imwrite(tiff_path, array, photometric="rgb")
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, mask_tensor = node.execute(psd="photo.tif", unique_id="1")
+        image_tensor, mask_tensor, _layers = node.execute(psd="photo.tif", unique_id="1")
 
         pixels = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         assert pixels.shape == (8, 12, 3)
@@ -605,7 +610,7 @@ class TestExecuteMaskChain:
         write_test_psd(psd_path, color=(3, 3, 3), size=(6, 6))
 
         node = load_psd_module.PhotoshopLoadPSD()
-        _, mask_tensor = node.execute(psd="plain.psd", unique_id="1")
+        _, mask_tensor, _layers = node.execute(psd="plain.psd", unique_id="1")
 
         assert mask_tensor.shape == (1, 6, 6)
         assert torch.count_nonzero(mask_tensor).item() == 0
@@ -617,7 +622,7 @@ class TestExecuteMaskChain:
         write_psd(psd_path, Image.new("RGBA", (6, 6), (1, 2, 3, 64)))
 
         node = load_psd_module.PhotoshopLoadPSD()
-        _, mask_tensor = node.execute(psd="alpha.psd", unique_id="1")
+        _, mask_tensor, _layers = node.execute(psd="alpha.psd", unique_id="1")
 
         expected = 1.0 - 64 / 255.0
         assert torch.allclose(mask_tensor, torch.full((1, 6, 6), expected), atol=1e-3)
@@ -653,7 +658,7 @@ class TestExecuteConsumePath:
         monkeypatch.setattr(load_psd_module, "read_edited_psd", _must_not_be_called)
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, _mask_tensor = node.execute(psd="sample.psd", unique_id="1")
+        image_tensor, _mask_tensor, _layers = node.execute(psd="sample.psd", unique_id="1")
 
         array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         assert tuple(array[0, 0]) == (200, 150, 100)  # the EDIT's pixels, not the original
@@ -675,7 +680,7 @@ class TestExecuteConsumePath:
         manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (200, 150, 100)), "plugin")
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, _mask_tensor = node.execute(psd="sample.psd", unique_id="1")
+        image_tensor, _mask_tensor, _layers = node.execute(psd="sample.psd", unique_id="1")
 
         array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         assert tuple(array[0, 0]) == (9, 9, 9)  # flattened fresh, not the stale edit
@@ -695,7 +700,7 @@ class TestExecuteConsumePath:
         )  # pending: no edit ingested yet
 
         node = load_psd_module.PhotoshopLoadPSD()
-        image_tensor, _mask_tensor = node.execute(psd="sample.psd", unique_id="1")
+        image_tensor, _mask_tensor, _layers = node.execute(psd="sample.psd", unique_id="1")
 
         array = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
         assert tuple(array[0, 0]) == (7, 7, 7)
