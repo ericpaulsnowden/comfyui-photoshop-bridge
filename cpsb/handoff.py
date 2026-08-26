@@ -1097,7 +1097,27 @@ class HandoffManager:
             active (both are silent no-ops by design, not errors: they cover
             the watchdog and plugin racing to report the same save, and a
             stale save landing after the user cancelled).
+
+        Lock-scope note (2026-08-26 event-loop-blocking audit): every
+        ``routes.py`` caller now runs this whole method through
+        ``asyncio.to_thread`` (owner report: "saving can take 10-20 s while
+        a workflow runs" -- this was on ComfyUI's event loop before), which
+        already keeps ComfyUI's loop free regardless of what happens under
+        ``self._lock`` -- ``self._lock`` is a plain :class:`threading.Lock`,
+        so a worker thread blocking briefly on it just makes that ONE upload
+        wait its turn, never the loop. Even so, the PNG encode below is
+        deliberately done BEFORE acquiring the lock: it is pure CPU work on
+        *image* alone (no shared manager state), so there is no reason to
+        serialize it against every other manager call -- a concurrent
+        ``ingest_edit`` for a DIFFERENT handoff (the Tier 1 watcher thread
+        and a Tier 2 websocket upload can genuinely land at the same
+        moment), or a plain ``.get()`` -- for however long a multi-hundred-
+        MB layered PSD's flattened composite takes to encode. Everything
+        that actually reads or mutates shared state -- the dedup-hash
+        comparison against the previous edit, and the edit/sibling/meta
+        writes -- stays inside ``with self._lock:``, unchanged.
         """
+        png_bytes = _encode_png(image)
         with self._lock:
             meta = self._handoffs.get(handoff_id)
             if meta is None:
@@ -1119,7 +1139,7 @@ class HandoffManager:
                 )
                 return None
 
-            edit = self._append_edit_locked(meta, image, fidelity)
+            edit = self._append_edit_locked(meta, png_bytes, fidelity)
             if edit is None:
                 return None
             self._unblock_waiter_locked(handoff_id)
@@ -1129,10 +1149,13 @@ class HandoffManager:
         return edit
 
     def _append_edit_locked(
-        self, meta: HandoffMeta, image: Image.Image, fidelity: Fidelity
+        self, meta: HandoffMeta, png_bytes: bytes, fidelity: Fidelity
     ) -> EditRecord | None:
+        """Assumes the lock is held AND *png_bytes* is already the encoded
+        PNG -- see :meth:`ingest_edit`'s own lock-scope note (2026-08-26)
+        for why encoding happens before this is called rather than in here.
+        """
         folder = self._ctx.input_dir / self.managed_dir_for(meta) / meta.handoff_id
-        png_bytes = _encode_png(image)
         new_hash = _hash_bytes(png_bytes)
         if meta.edits:
             previous_path = folder / meta.edits[-1].filename

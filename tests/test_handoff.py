@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -261,6 +262,83 @@ class TestDedup:
         third = manager.ingest_edit(meta.handoff_id, make_image((51, 60, 70)), "composite")
         assert third is not None
         assert third.filename == "edit_002.png"
+
+
+class TestIngestEditLockScope:
+    """2026-08-26 event-loop-blocking audit: ``ingest_edit`` now PNG-encodes
+    OUTSIDE ``self._lock`` (pure CPU work on the caller's own image, no
+    shared state) and only acquires the lock for the parts that actually
+    read/mutate shared state -- the dedup-hash comparison against the
+    previous edit, and the edit/sibling/meta writes (see ``ingest_edit``'s
+    own docstring for the full rationale). These are structural regression
+    guards for that specific split; ``TestDedup`` above already covers
+    dedup's observable, end-to-end behavior and is untouched by the split
+    (the encode/lock reordering is invisible from the public API).
+    """
+
+    def test_encode_runs_with_the_lock_free(self, manager, monkeypatch):
+        meta = create_handoff(manager)
+        observed_locked: list[bool] = []
+        original_encode = handoff_module._encode_png
+
+        def _spy_encode(image):
+            observed_locked.append(manager._lock.locked())
+            return original_encode(image)
+
+        monkeypatch.setattr(handoff_module, "_encode_png", _spy_encode)
+
+        edit = manager.ingest_edit(meta.handoff_id, make_image((2, 2, 2)), "plugin")
+
+        assert edit is not None
+        assert observed_locked == [False]
+
+    def test_meta_write_still_runs_with_the_lock_held(self, manager, monkeypatch):
+        """The write side of the split -- unlike encode -- touches shared
+        state (`meta.edits`, `meta.json` on disk) and must stay serialized
+        under the lock exactly as before this refactor.
+        """
+        meta = create_handoff(manager)
+        observed_locked: list[bool] = []
+        original_write_meta = manager._write_meta_locked
+
+        def _spy_write_meta(meta_arg):
+            observed_locked.append(manager._lock.locked())
+            return original_write_meta(meta_arg)
+
+        monkeypatch.setattr(manager, "_write_meta_locked", _spy_write_meta)
+
+        manager.ingest_edit(meta.handoff_id, make_image((3, 3, 3)), "plugin")
+
+        assert observed_locked == [True]
+
+    def test_dedup_comparison_still_runs_with_the_lock_held(self, manager, context):
+        """The dedup-hash comparison reads `meta.edits` -- shared state --
+        so it must still happen inside the lock. Verified indirectly: a
+        concurrent-looking ingest for the SAME handoff (called back-to-back
+        here, single-threaded) still dedups correctly, which would only be
+        true if the comparison sees a consistent, lock-protected view of
+        `meta.edits` rather than racing the write it's comparing against.
+        """
+        meta = create_handoff(manager)
+        first = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "plugin")
+        duplicate = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "plugin")
+        assert first is not None
+        assert duplicate is None
+        assert len(manager.get(meta.handoff_id).edits) == 1
+
+    def test_lock_holding_methods_stay_plain_synchronous_callables(self):
+        """Structural pin: `self._lock` is a plain `threading.Lock`, and
+        holding one across an `await` is a real hazard (routes.py's fix is
+        to run these whole synchronous methods via `asyncio.to_thread`
+        rather than making them `async def`). As long as `ingest_edit`,
+        `create`, and `_append_edit_locked` stay ordinary (non-async)
+        callables, none of them can ever suspend mid-lock -- this guards
+        against a future edit accidentally introducing an `await` under the
+        lock.
+        """
+        assert not inspect.iscoroutinefunction(HandoffManager.ingest_edit)
+        assert not inspect.iscoroutinefunction(HandoffManager.create)
+        assert not inspect.iscoroutinefunction(HandoffManager._append_edit_locked)
 
 
 class TestSiblingOutputs:

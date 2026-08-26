@@ -116,6 +116,31 @@ class LaunchRecorder:
         return self.result
 
 
+class OffLoopRecorder:
+    """Wraps a callable to record, per call, whether it ran on a thread with
+    a running event loop -- the same ``on_event_loop`` convention as
+    :class:`LaunchRecorder` above, generalized for the 2026-08-26 event-
+    loop-blocking audit's other ``asyncio.to_thread`` call sites
+    (``HandoffManager.ingest_edit``/``create``, ``_open_psd_native_source``,
+    ``_ingest_psd_upload``, ``_read_and_chunk_psd``, ``_resolve_psd_preview``,
+    ``_fs_list_probe_and_scan``). ``False`` means "ran off the loop" -- i.e.
+    genuinely dispatched through a worker thread -- exactly like
+    ``LaunchRecorder``'s own polarity.
+    """
+
+    def __init__(self, original) -> None:
+        self._original = original
+        self.on_event_loop: list[bool] = []
+
+    def __call__(self, *args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+            self.on_event_loop.append(True)
+        except RuntimeError:
+            self.on_event_loop.append(False)
+        return self._original(*args, **kwargs)
+
+
 @pytest.fixture
 def manager(context: CpsbContext) -> HandoffManager:
     return HandoffManager(context)
@@ -294,6 +319,24 @@ class TestOpen:
         assert (folder / SOURCE_PSD_FILENAME).is_file()
         assert (folder / "orig_thumb.png").is_file()
         assert (folder / "meta.json").is_file()
+
+    async def test_manager_create_runs_off_the_event_loop(
+        self, client, manager, context, source_image, launches, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: `HandoffManager.create` does
+        synchronous I/O under its own lock (mkdir, an orig_thumb.png
+        encode+resize, a meta.json write) -- confirms `POST /cpsb/open` now
+        dispatches it through `asyncio.to_thread`, for every origin_kind
+        (not just psd-native -- see TestOpenPsdNative for that call site's
+        own equivalent test).
+        """
+        recorder = OffLoopRecorder(manager.create)
+        monkeypatch.setattr(manager, "create", recorder)
+
+        response = await client.post("/cpsb/open", json=open_body())
+
+        assert response.status == 200
+        assert recorder.on_event_loop == [False]
 
     async def test_managed_filename_derives_from_the_source_and_is_launched_on(
         self, client, manager, context, launches
@@ -698,6 +741,24 @@ class TestOpenPsdNative:
         response = await client.post("/cpsb/open", json=open_body_psd(filename="never-created.psd"))
         assert response.status == 404  # got past body validation to file resolution
 
+    async def test_read_and_flatten_runs_off_the_event_loop(
+        self, client, context, launches, tmp_path, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: `_open_psd_native_source`
+        does a synchronous `read_bytes()` of the whole PSD/PSB plus a full
+        psd-tools flatten -- for a multi-hundred-MB layered file that's
+        seconds of blocking work. Confirms `POST /cpsb/open` (psd-native)
+        now dispatches it through `asyncio.to_thread`.
+        """
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path))
+        recorder = OffLoopRecorder(routes_module._open_psd_native_source)
+        monkeypatch.setattr(routes_module, "_open_psd_native_source", recorder)
+
+        response = await client.post("/cpsb/open", json=open_body_psd())
+
+        assert response.status == 200
+        assert recorder.on_event_loop == [False]
+
 
 class TestPsdPreview:
     """``GET /cpsb/psd_preview`` -- not part of PROTOCOL.md, a pure frontend
@@ -840,6 +901,26 @@ class TestPsdPreview:
         assert not (context.temp_dir / "cpsb").exists() or not list(
             (context.temp_dir / "cpsb").glob("*.png")
         )
+
+    async def test_miss_path_runs_off_the_event_loop(
+        self, client, context, tmp_path, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: hashing the source file
+        (needed even on a cache hit, since the hash IS the cache key) and,
+        on a miss, flattening it and writing the cached preview PNG are both
+        blocking work for a large PSD. Confirms this now runs off the loop
+        via `asyncio.to_thread` -- the content-hash cache scheme itself
+        (see `test_cache_hit_does_not_reflatten_on_second_call` above) is
+        unchanged.
+        """
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path, color=(3, 4, 5)))
+        recorder = OffLoopRecorder(routes_module._resolve_psd_preview)
+        monkeypatch.setattr(routes_module, "_resolve_psd_preview", recorder)
+
+        response = await client.get("/cpsb/psd_preview", params={"filename": "sample.psd"})
+
+        assert response.status == 200
+        assert recorder.on_event_loop == [False]
 
 
 class TestFsList:
@@ -995,6 +1076,73 @@ class TestFsList:
         response = await client.get("/cpsb/fs/list", params={"dir": "ROOTS"})
 
         assert response.status == 200
+
+    async def test_scan_runs_off_the_event_loop(self, client, tmp_path, monkeypatch):
+        """2026-08-26 event-loop-blocking audit: confirms a real (non-ROOTS)
+        directory listing now runs the `is_dir()` probe + `_fs_list_scan`
+        sweep through `asyncio.to_thread`, not directly on the loop.
+        """
+        target = tmp_path / "off_loop_target"
+        target.mkdir()
+        (target / "a.psd").write_bytes(b"psd")
+        recorder = OffLoopRecorder(routes_module._fs_list_probe_and_scan)
+        monkeypatch.setattr(routes_module, "_fs_list_probe_and_scan", recorder)
+
+        response = await client.get("/cpsb/fs/list", params={"dir": str(target)})
+
+        assert response.status == 200
+        assert recorder.on_event_loop == [False]
+
+    async def test_slow_directory_scan_times_out_with_a_degrade_response(
+        self, client, tmp_path, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: a directory listing that
+        hangs (a dead NAS/UNC mount, simulated here as a slow `_fs_list_scan`)
+        must answer a clean 400 within `_FS_IO_TIMEOUT_SECONDS` rather than
+        stalling the request for the OS's own SMB timeout -- ported from
+        cprb's own proven `asyncio.to_thread` + `asyncio.wait_for` fs-browse
+        pattern (../STANDARD-fs-browse.md), same degrade-response wording.
+        The timeout constant is shrunk here so the test itself stays fast;
+        the underlying fake work still outlives it, proving the wait_for
+        actually gives up early rather than merely finishing quickly.
+        """
+        monkeypatch.setattr(routes_module, "_FS_IO_TIMEOUT_SECONDS", 0.15)
+
+        def _slow_scan(directory, extensions):
+            time.sleep(0.6)
+            return [], [], False
+
+        monkeypatch.setattr(routes_module, "_fs_list_scan", _slow_scan)
+
+        target = tmp_path / "slow_share"
+        target.mkdir()
+
+        started = time.monotonic()
+        response = await client.get("/cpsb/fs/list", params={"dir": str(target)})
+        elapsed = time.monotonic() - started
+
+        assert response.status == 400
+        data = await response.json()
+        assert "took longer than" in data["error"]
+        assert "unreachable share" in data["error"]
+        # Answered well before the fake work's own 0.6s sleep would finish --
+        # the whole point of asyncio.wait_for over a plain await.
+        assert elapsed < 0.5
+
+    async def test_fast_scan_is_unaffected_by_the_timeout_wrapper(self, client, tmp_path):
+        """Regression guard alongside the timeout test above: an ordinary,
+        fast listing must still return normally (not spuriously time out)
+        with the SAME response shape as every other TestFsList assertion.
+        """
+        target = tmp_path / "fast_target"
+        target.mkdir()
+        (target / "quick.psd").write_bytes(b"psd")
+
+        response = await client.get("/cpsb/fs/list", params={"dir": str(target)})
+
+        assert response.status == 200
+        data = await response.json()
+        assert [entry["name"] for entry in data["files"]] == ["quick.psd"]
 
 
 class TestOpenPsdEditInPlace:
@@ -1599,6 +1747,27 @@ class TestUpload:
         data = await response.json()
         assert data["subfolder"] == f"folder-a/{handoff_id}"
         assert (context.input_dir / "folder-a" / handoff_id / data["filename"]).is_file()
+
+    async def test_ingest_edit_runs_off_the_event_loop(
+        self, client, manager, context, source_image, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: `ingest_edit` PNG-encodes +
+        does dedup-hash/edit/meta file I/O under HandoffManager's own lock --
+        owner report: "saving can take 10-20 s while a workflow runs" was
+        this exact call sitting on ComfyUI's event loop before. Confirms
+        `POST /cpsb/upload` now dispatches it through `asyncio.to_thread`.
+        """
+        handoff_id = await self.create_handoff(client)
+        recorder = OffLoopRecorder(manager.ingest_edit)
+        monkeypatch.setattr(manager, "ingest_edit", recorder)
+
+        response = await client.post(
+            "/cpsb/upload", data=upload_form(handoff_id, png_bytes((1, 2, 3)))
+        )
+
+        assert response.status == 200
+        assert recorder.on_event_loop == [False]
+        assert manager.get(handoff_id).status == "edited"  # the real call still ran
 
 
 class TestTriggerPolicyGate:
@@ -2304,6 +2473,37 @@ class TestPluginWebsocketFileTransfer:
             assert reassembled == expected
             assert reassembled.startswith(b"8BPS")  # PSD magic
 
+    async def test_request_file_read_and_encode_runs_off_the_event_loop(
+        self, client, context, manager, source_image, launches, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: `_read_and_chunk_psd` (the
+        `read_bytes()` + whole-file base64 encode behind `request_file`) is
+        real I/O/CPU on the ONE serial plugin websocket loop for a large PSD.
+        Confirms it now runs through `asyncio.to_thread`.
+        """
+        recorder = OffLoopRecorder(routes_module._read_and_chunk_psd)
+        monkeypatch.setattr(routes_module, "_read_and_chunk_psd", recorder)
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            await ws.send_json({"type": "request_file", "handoff_id": handoff_id})
+
+            total = None
+            chunks_seen = 0
+            while total is None or chunks_seen < total:
+                msg = await ws.receive_json(timeout=5)
+                assert msg["type"] == "file_chunk"
+                total = msg["total"]
+                chunks_seen += 1
+
+        assert recorder.on_event_loop == [False]
+
     async def test_request_file_unknown_handoff_gets_file_error(self, client, context, launches):
         async with client.ws_connect("/cpsb/ws") as ws:
             await _connect_tier2_plugin(ws, context, local_mode=False)
@@ -2381,6 +2581,41 @@ class TestPluginWebsocketFileTransfer:
             edit_path = context.cpsb_input_dir / handoff_id / meta.edits[0].filename
             with Image.open(edit_path) as edited:
                 assert edited.getpixel((0, 0))[:3] == (222, 33, 44)
+
+    async def test_upload_edit_flat_png_ingest_runs_off_the_event_loop(
+        self, client, context, manager, source_image, launches, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: `_handle_upload_edit_chunk`
+        runs on the ONE serial plugin websocket loop, so a blocking
+        `ingest_edit` there stalls every OTHER handoff's traffic on this
+        connection too. Confirms it now runs through `asyncio.to_thread`.
+        """
+        recorder = OffLoopRecorder(manager.ingest_edit)
+        monkeypatch.setattr(manager, "ingest_edit", recorder)
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            payload = png_bytes((11, 22, 33))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+
+        assert recorder.on_event_loop == [False]
 
     async def test_upload_edit_ignore_policy_does_not_ingest(
         self, client, context, manager, source_image, launches
@@ -2644,6 +2879,53 @@ class TestPluginWebsocketFileTransfer:
             assert mask[3:6, 3:6].min() > 0.9  # the painted region
             assert mask[0, 0] == 0  # untouched corner
             assert image.size == (16, 16)
+
+    async def test_upload_edit_psd_kind_ingest_runs_off_the_event_loop(
+        self, client, context, manager, launches, tmp_path, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit: `_ingest_psd_upload` does a
+        `PSDImage.open()` validation, a `write_bytes()` of the whole layered
+        PSD, and a full `read_edited_psd()` flatten -- multi-hundred-MB
+        documents make this seconds of blocking work on the one serial
+        plugin websocket loop. Also fixes the plugin's own 60s client-side
+        save timeout falsely reporting a failed save on a big PSD (the ack
+        was just stuck behind this blocking call, not actually failing) --
+        no plugin-side change needed. Confirms it now runs through
+        `asyncio.to_thread`.
+        """
+        recorder = OffLoopRecorder(routes_module._ingest_psd_upload)
+        monkeypatch.setattr(routes_module, "_ingest_psd_upload", recorder)
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            meta = manager.create(
+                origin_node_id="43",
+                origin_kind="bridge_node",
+                workflow_name="",
+                source=SourceRef(filename="annotate_43.png", subfolder="", type="temp"),
+                original_image=Image.new("RGB", (8, 8), (2, 2, 2)),
+                wants_layered_psd=True,
+            )
+            handoff_id = meta.handoff_id
+
+            payload = layered_psd_bytes(tmp_path, base_color=(2, 2, 2))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "psd",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+
+        assert recorder.on_event_loop == [False]
 
     async def test_upload_edit_malformed_psd_kind_gets_upload_error_and_recovers(
         self, client, context, manager, launches, tmp_path
@@ -3493,3 +3775,162 @@ class TestRequestRender:
             round_tripped = Image.open(io.BytesIO(png))
             assert round_tripped.size == (24, 16)
             assert round_tripped.convert("RGB").getpixel((0, 0)) == (200, 100, 50)
+
+
+class TestOffLoopPlumbingIsTransparent:
+    """2026-08-26 event-loop-blocking audit: every route wrapped in
+    `asyncio.to_thread` this round (findings #1-#7 -- `HandoffManager.
+    ingest_edit`/`create`, `_open_psd_native_source`, `_ingest_psd_upload`,
+    `_read_and_chunk_psd`, `_resolve_psd_preview`, `_fs_list_probe_and_scan`)
+    must return EXACTLY the same payload it did before: only WHERE the work
+    runs changed, never WHAT it returns. This class monkeypatches
+    `asyncio.to_thread` itself to run its target function INLINE
+    (synchronously, on the calling task, no executor hop at all) and re-runs
+    a representative slice of each affected route's own pre-existing
+    behavioral assertions -- if the wrapping introduced any observable
+    difference, it would show up here even with the off-loop dispatch
+    itself neutralized.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _inline_to_thread(self, monkeypatch):
+        async def _run_inline(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(routes_module.asyncio, "to_thread", _run_inline)
+
+    async def test_open_psd_native_still_copies_bytes_verbatim(
+        self, client, context, manager, launches, tmp_path
+    ):
+        original = psd_bytes(tmp_path, color=(11, 22, 33))
+        (context.input_dir / "sample.psd").write_bytes(original)
+
+        response = await client.post("/cpsb/open", json=open_body_psd())
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        meta = manager.get(handoff_id)
+        assert meta.psd_filename == "sample.psd"
+        assert manager.psd_path(meta).read_bytes() == original
+        assert meta.source_hash == hashlib.sha256(original).hexdigest()
+
+    async def test_open_still_creates_folder_meta_and_thumbnail(
+        self, client, manager, context, source_image, launches
+    ):
+        response = await client.post("/cpsb/open", json=open_body())
+
+        assert response.status == 200
+        handoff_id = (await response.json())["handoff_id"]
+        assert manager.get(handoff_id).status == "editing"
+        folder = context.cpsb_input_dir / handoff_id
+        assert (folder / SOURCE_PSD_FILENAME).is_file()
+        assert (folder / "orig_thumb.png").is_file()
+        assert (folder / "meta.json").is_file()
+
+    async def test_upload_still_ingests_edit_with_the_same_payload_shape(
+        self, client, manager, context, source_image
+    ):
+        handoff_id = (await (await client.post("/cpsb/open", json=open_body())).json())[
+            "handoff_id"
+        ]
+
+        response = await client.post(
+            "/cpsb/upload", data=upload_form(handoff_id, png_bytes((200, 0, 0)))
+        )
+
+        assert response.status == 200
+        assert await response.json() == {
+            "ok": True,
+            "filename": "edit_001.png",
+            "subfolder": f"{DEFAULT_MANAGED_FOLDER_NAME}/{handoff_id}",
+            "type": "input",
+        }
+        meta = manager.get(handoff_id)
+        assert meta.status == "edited"
+        assert meta.edits[0].fidelity == "plugin"
+
+    async def test_psd_preview_still_returns_the_cached_temp_png_shape(
+        self, client, context, tmp_path
+    ):
+        (context.input_dir / "sample.psd").write_bytes(
+            psd_bytes(tmp_path, color=(50, 60, 70), size=(24, 12))
+        )
+
+        response = await client.get(
+            "/cpsb/psd_preview", params={"filename": "sample.psd", "subfolder": "", "type": "input"}
+        )
+
+        assert response.status == 200
+        data = await response.json()
+        assert data["type"] == "temp"
+        assert data["subfolder"] == "cpsb"
+        assert data["filename"].startswith("psdpreview_")
+        png_path = context.temp_dir / "cpsb" / data["filename"]
+        with Image.open(png_path) as preview:
+            preview.load()
+            assert preview.size == (24, 12)
+            assert preview.getpixel((0, 0))[:3] == (50, 60, 70)
+
+    async def test_fs_list_still_lists_directory_filtered_and_sorted(self, client, tmp_path):
+        target = tmp_path / "inline_browse_target"
+        target.mkdir()
+        (target / "cover.psd").write_bytes(b"not real psd bytes, extension-only test")
+        (target / "notes.txt").write_bytes(b"not a psd")
+
+        response = await client.get("/cpsb/fs/list", params={"dir": str(target)})
+
+        assert response.status == 200
+        data = await response.json()
+        assert [entry["name"] for entry in data["files"]] == ["cover.psd"]
+
+    async def test_upload_edit_ws_still_ingests_with_the_same_ack_shape(
+        self, client, context, manager, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            payload = png_bytes((222, 33, 44))
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+
+            ack = await ws.receive_json(timeout=5)
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+            assert manager.get(handoff_id).status == "edited"
+
+    async def test_request_file_ws_still_streams_the_same_bytes(
+        self, client, context, manager, source_image, launches
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+            expected = manager.psd_path(manager.get(handoff_id)).read_bytes()
+
+            await ws.send_json({"type": "request_file", "handoff_id": handoff_id})
+
+            chunks: dict[int, str] = {}
+            total = None
+            while total is None or len(chunks) < total:
+                msg = await ws.receive_json(timeout=5)
+                assert msg["type"] == "file_chunk"
+                total = msg["total"]
+                chunks[msg["seq"]] = msg["data_b64"]
+
+            reassembled = base64.b64decode("".join(chunks[i] for i in range(total)))
+            assert reassembled == expected

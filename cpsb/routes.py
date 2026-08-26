@@ -640,7 +640,7 @@ def _open_psd_native_source(source_path: Path) -> tuple[bytes, Image.Image]:
     return raw_bytes, image
 
 
-def _resolve_psd_native_source(
+async def _resolve_psd_native_source(
     context: CpsbContext, fields: dict[str, Any]
 ) -> tuple[ResolvedSource | None, web.Response | None]:
     """:class:`ResolvedSource` for an ``origin_kind: "load_psd"`` open (PROTOCOL.md §2).
@@ -652,6 +652,17 @@ def _resolve_psd_native_source(
     :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s combo filter, which also
     lists TIFF: only PSD-native files round-trip through this open route
     today (PROTOCOL.md §6b, "Non-PSD formats").
+
+    2026-08-26 event-loop-blocking audit: ``_open_psd_native_source`` is a
+    synchronous ``read_bytes()`` of the whole file plus a full psd-tools
+    flatten -- for a multi-hundred-MB layered PSD/PSB that's easily seconds
+    of blocking I/O and CPU, and this coroutine runs directly on ComfyUI's
+    event loop (``POST /cpsb/open``). Owner report: "saving can take 10-20 s
+    while a workflow runs" -- opening a large PSD had the identical shape.
+    Off to a worker thread (mirrors ``_handle_request_render``'s existing
+    ``run_in_executor`` PNG-encode a few hundred lines below, and cprb's own
+    ``asyncio.to_thread`` fs-browse pattern) so a busy prompt-worker GIL
+    never turns this open into a multi-second stall for every OTHER request.
     """
     source_path = _resolve_source_path(
         context, fields["filename"], fields["subfolder"], fields["type"]
@@ -661,7 +672,7 @@ def _resolve_psd_native_source(
     if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS:
         return None, _error(400, f"Not a .psd/.psb file: {fields['filename']}")
 
-    raw_bytes, thumbnail_image = _open_psd_native_source(source_path)
+    raw_bytes, thumbnail_image = await asyncio.to_thread(_open_psd_native_source, source_path)
     source_hash = hashlib.sha256(raw_bytes).hexdigest()
     return (
         ResolvedSource(
@@ -674,7 +685,7 @@ def _resolve_psd_native_source(
     )
 
 
-def _resolve_source(
+async def _resolve_source(
     context: CpsbContext, fields: dict[str, Any]
 ) -> tuple[ResolvedSource | None, web.Response | None]:
     """:class:`ResolvedSource` for any ``origin_kind`` (PROTOCOL.md §1/§2/§6b).
@@ -686,9 +697,14 @@ def _resolve_source(
     PSD by :func:`cpsb.psd_io.write_psd`. A single entry point here is what
     lets the 409-vs-auto-supersede comparison and the final handoff-creation
     step (both in :func:`open_handoff_route`) stay origin-agnostic.
+
+    ``async`` only because the psd-native branch is (2026-08-26 audit, see
+    :func:`_resolve_psd_native_source`) -- the plain-image branch below is
+    unchanged, still a direct (fast, small-file) Pillow decode on the loop,
+    out of this audit's scope.
     """
     if fields["origin_kind"] == "load_psd":
-        return _resolve_psd_native_source(context, fields)
+        return await _resolve_psd_native_source(context, fields)
     image, error_response = _open_source_image(context, fields)
     if error_response is not None:
         return None, error_response
@@ -750,7 +766,7 @@ async def open_handoff_route(request: web.Request) -> web.Response:
         # choice as the bridge node. `_resolve_source` picks the raw-bytes
         # (psd-native) vs. decoded-PNG hash scheme per `origin_kind`
         # (PROTOCOL.md §1/§2), so this comparison is correct either way.
-        resolved, error_response = _resolve_source(context, fields)
+        resolved, error_response = await _resolve_source(context, fields)
         if error_response is not None:
             return error_response
         if existing.source_hash is None or existing.source_hash == resolved.source_hash:
@@ -814,7 +830,7 @@ async def open_handoff_route(request: web.Request) -> web.Response:
             watcher.unwatch_original(existing.handoff_id)
 
     if resolved is None:
-        resolved, error_response = _resolve_source(context, fields)
+        resolved, error_response = await _resolve_source(context, fields)
         if error_response is not None:
             return error_response
 
@@ -825,7 +841,17 @@ async def open_handoff_route(request: web.Request) -> web.Response:
     edit_in_place = fields["edit_in_place"] and fields["origin_kind"] == "load_psd"
     original_path = str(resolved.original_path.resolve()) if edit_in_place else None
 
-    meta = manager.create(
+    # 2026-08-26 event-loop-blocking audit: HandoffManager.create() does
+    # synchronous I/O under its own lock (an mkdir, an orig_thumb.png
+    # encode+resize, a meta.json write) -- same off-loop treatment as
+    # `_resolve_source` above, so a busy prompt-worker never turns THIS
+    # part of an open into a stall for every other request either.
+    # `create()` itself stays synchronous and unchanged (annotate.py,
+    # actions.py, compose_psd.py, and nodes.py all call it directly from
+    # their own worker threads, never the loop, so it doesn't need to be --
+    # and can't safely be made -- async).
+    meta = await asyncio.to_thread(
+        manager.create,
         origin_node_id=origin_node_id,
         origin_kind=fields["origin_kind"],
         workflow_name=fields["workflow_name"],
@@ -1133,7 +1159,12 @@ async def upload_route(request: web.Request) -> web.Response:
     # already-flattened pixels with no PSD (re)compositing on our side, so
     # both map to fidelity "plugin" -- the PROTOCOL.md §1 enum value meaning
     # "authoritative pixels, not derived by us."
-    edit = manager.ingest_edit(handoff_id, image, "plugin")
+    # 2026-08-26 event-loop-blocking audit: ingest_edit PNG-encodes the
+    # image and does dedup-hash + edit/meta file I/O under its own lock --
+    # owner report: "saving can take 10-20 s while a workflow runs" was this
+    # exact call sitting on ComfyUI's event loop. Off to a worker thread so
+    # this HTTP handler never blocks the loop for it.
+    edit = await asyncio.to_thread(manager.ingest_edit, handoff_id, image, "plugin")
     if edit is None:
         # Either a duplicate of the most recent edit (idempotent -- the
         # watchdog and the plugin can both report the same save) or the
@@ -1198,6 +1229,50 @@ def _empty_psd_preview_response() -> web.Response:
     return web.json_response({"filename": None, "subfolder": None, "type": "temp"})
 
 
+def _resolve_psd_preview(context: CpsbContext, source_path: Path) -> str | None:
+    """Blocking half of :func:`psd_preview_route` (2026-08-26 event-loop-
+    blocking audit): hashes *source_path* -- needed even on a cache HIT,
+    since the hash IS the cache key, so this is unavoidably a full read of
+    the source file on every request -- and on a cache MISS, flattens it and
+    writes the cached preview PNG. The content-hash CACHE ITSELF is
+    unchanged (same :func:`_psd_preview_cache_path` scheme, same cache
+    file); only where this work runs moved.
+
+    Returns the cached PNG's filename (``psdpreview_<hash>.png``) on
+    success, or ``None`` if the flatten failed -- mirrors this route's own
+    "never fail the request over a preview" contract
+    (:func:`_empty_psd_preview_response`), the same broad-except posture as
+    :func:`_open_psd_native_source`'s placeholder-thumbnail fallback.
+    """
+    file_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    png_path = _psd_preview_cache_path(context, file_hash)
+
+    if png_path.is_file():
+        return png_path.name
+
+    try:
+        # TIFF flattens through the SAME raster decoder the Load PSD node's own
+        # execute() uses (raster_io.decode_to_rgb8, incl. its 16-bit/CMYK
+        # normalization); .psd/.psb go through read_edited_psd. Both return a
+        # ready-to-save PIL image, so the cache write below is identical.
+        # Without this branch, selecting a TIFF 400'd here and the on-node
+        # preview silently never refreshed (owner report 2026-07-22).
+        if source_path.suffix.lower() in TIFF_EXTENSIONS:
+            image = decode_to_rgb8(source_path)
+        else:
+            image, _fidelity = read_edited_psd(source_path)
+    except Exception:
+        # Deliberately broad, mirroring _open_psd_native_source: an
+        # unreadable or exotic file must not fail this request, only the
+        # preview it would have produced.
+        logger.warning("%s: could not flatten for a preview", source_path, exc_info=True)
+        return None
+
+    png_path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(png_path)
+    return png_path.name
+
+
 @routes.get("/cpsb/psd_preview")
 async def psd_preview_route(request: web.Request) -> web.Response:
     """Flatten a `.psd`/`.psb` (or a `.tif`/`.tiff`) into a cached, ComfyUI-addressable preview PNG.
@@ -1242,36 +1317,16 @@ async def psd_preview_route(request: web.Request) -> web.Response:
     if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS + TIFF_EXTENSIONS:
         return _error(400, f"Cannot preview (not .psd/.psb/.tif/.tiff): {filename}")
 
-    file_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    png_path = _psd_preview_cache_path(context, file_hash)
-
-    if png_path.is_file():
-        return web.json_response(
-            {"filename": png_path.name, "subfolder": _PSD_PREVIEW_SUBFOLDER, "type": "temp"}
-        )
-
-    try:
-        # TIFF flattens through the SAME raster decoder the Load PSD node's own
-        # execute() uses (raster_io.decode_to_rgb8, incl. its 16-bit/CMYK
-        # normalization); .psd/.psb go through read_edited_psd. Both return a
-        # ready-to-save PIL image, so the cache write below is identical.
-        # Without this branch, selecting a TIFF 400'd here and the on-node
-        # preview silently never refreshed (owner report 2026-07-22).
-        if source_path.suffix.lower() in TIFF_EXTENSIONS:
-            image = decode_to_rgb8(source_path)
-        else:
-            image, _fidelity = read_edited_psd(source_path)
-    except Exception:
-        # Deliberately broad, mirroring _open_psd_native_source: an
-        # unreadable or exotic file must not fail this request, only the
-        # preview it would have produced.
-        logger.warning("%s: could not flatten for a preview", source_path, exc_info=True)
+    # 2026-08-26 event-loop-blocking audit: hashing + a cache-miss flatten
+    # can be seconds of blocking I/O/CPU for a large PSD -- off to a worker
+    # thread. The cache HIT/MISS decision and the file layout are entirely
+    # inside _resolve_psd_preview, unchanged; this route only decides how to
+    # shape the response.
+    cached_filename = await asyncio.to_thread(_resolve_psd_preview, context, source_path)
+    if cached_filename is None:
         return _empty_psd_preview_response()
-
-    png_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(png_path)
     return web.json_response(
-        {"filename": png_path.name, "subfolder": _PSD_PREVIEW_SUBFOLDER, "type": "temp"}
+        {"filename": cached_filename, "subfolder": _PSD_PREVIEW_SUBFOLDER, "type": "temp"}
     )
 
 
@@ -1348,6 +1403,23 @@ _FS_LIST_ROOTS = "ROOTS"
 #: files never consumes a slot, since they were never going to be returned
 #: anyway.
 _FS_LIST_MAX_ENTRIES = 500
+
+#: Bound on the blocking filesystem work behind a REAL (non-ROOTS) directory
+#: listing -- the `is_dir()` probe and `_fs_list_scan`'s own iterdir/stat
+#: sweep -- once handed to a worker thread (2026-08-26 event-loop-blocking
+#: audit). `dir` is an arbitrary absolute path the caller supplies (the
+#: Browse dialog's placeholder invites a UNC/NAS path just like cprb's own
+#: picker), and a sleeping/dead mount would otherwise stall the whole
+#: aiohttp loop for the OS's own SMB timeout, not just this one request. On
+#: timeout the route answers 400 instead of hanging -- ported verbatim from
+#: cprb's own proven `_FS_IO_TIMEOUT_SECONDS` + `asyncio.wait_for` +
+#: `asyncio.to_thread` pattern (`comfyui-premiere-bridge/cprb/routes.py`,
+#: ../STANDARD-fs-browse.md), same 5.0s value and same degrade-response
+#: shape. The virtual ROOTS listing (`_fs_list_roots`) is deliberately left
+#: OUT of this timeout treatment -- cprb's own proven pattern doesn't cover
+#: it either, and it's a small, mostly-local sweep (drive letters / home
+#: dir / a labeled default), not the arbitrary-path case this exists for.
+_FS_IO_TIMEOUT_SECONDS = 5.0
 
 #: Label for the ComfyUI input directory when it's surfaced as a ROOTS entry
 #: (always present, regardless of platform) -- named explicitly rather than
@@ -1539,6 +1611,25 @@ def _fs_list_scan(
     return dirs, files, truncated
 
 
+def _fs_list_probe_and_scan(
+    directory: Path, extensions: tuple[str, ...]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool] | None:
+    """Blocking half of `fs_list_route`'s real-directory branch (2026-08-26
+    event-loop-blocking audit): the `is_dir()` probe AND `_fs_list_scan`'s
+    own iterdir/stat sweep, run together on ONE worker thread under the SAME
+    :data:`_FS_IO_TIMEOUT_SECONDS` window -- a dead NAS/UNC mount can hang
+    the probe just as easily as the sweep, so both need the off-loop
+    treatment, not just the scan. Returns ``None`` when *directory* doesn't
+    exist or isn't a directory (the route's own 400, unchanged), else
+    :func:`_fs_list_scan`'s own three-tuple verbatim -- `_fs_list_scan`'s
+    existing internal `OSError` handling (an unreadable directory degrades
+    to an empty listing rather than raising) is untouched by this wrapper.
+    """
+    if not directory.is_dir():
+        return None
+    return _fs_list_scan(directory, extensions)
+
+
 @routes.get("/cpsb/fs/list")
 async def fs_list_route(request: web.Request) -> web.Response:
     """A server-side directory listing, for the ``existing_psd_path`` Browse dialog.
@@ -1614,10 +1705,36 @@ async def fs_list_route(request: web.Request) -> web.Response:
             resolved = candidate.resolve()
         except (OSError, ValueError, RuntimeError) as exc:
             return _error(400, f"Invalid dir: {exc}")
-    if not resolved.is_dir():
+
+    # 2026-08-26 event-loop-blocking audit: the is_dir() probe AND the
+    # iterdir/stat sweep both run on a worker thread, bounded by
+    # _FS_IO_TIMEOUT_SECONDS (ported from cprb's own proven
+    # asyncio.to_thread + asyncio.wait_for fs-browse pattern) -- a dead
+    # NAS/UNC mount now answers a clean 400 in 5s instead of stalling the
+    # whole server for the OS's own SMB timeout. The success-path response
+    # shape below is byte-for-byte unchanged; only this new timeout branch
+    # is new, and it mirrors cprb's own degrade-response wording exactly.
+    try:
+        scan = await asyncio.wait_for(
+            asyncio.to_thread(_fs_list_probe_and_scan, resolved, extensions),
+            timeout=_FS_IO_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "cpsb: listing %s took longer than %.0fs (a slow or unreachable "
+            "share?) -- answering 400 instead of stalling the server",
+            resolved,
+            _FS_IO_TIMEOUT_SECONDS,
+        )
+        return _error(
+            400,
+            f"listing {resolved} took longer than "
+            f"{_FS_IO_TIMEOUT_SECONDS:.0f}s (a slow or unreachable share?)",
+        )
+    if scan is None:
         return _error(400, f"Not an existing directory: {raw_dir or resolved}")
 
-    dirs, files, truncated = _fs_list_scan(resolved, extensions)
+    dirs, files, truncated = scan
     parent = resolved.parent
     return web.json_response(
         {
@@ -1772,6 +1889,24 @@ def _split_b64(data_b64: str, chunk_size: int = _WS_CHUNK_CHARS) -> list[str]:
     return [data_b64[i : i + chunk_size] for i in range(0, len(data_b64), chunk_size)]
 
 
+def _read_and_chunk_psd(psd_path: Path) -> tuple[int, list[str]]:
+    """Blocking half of :func:`_send_requested_file` (2026-08-26 event-loop-
+    blocking audit): reads the whole PSD, base64-encodes it ONCE, and slices
+    that string into `_split_b64` chunks -- for a multi-hundred-MB layered
+    PSD that's real I/O plus real CPU, on what used to be the one serial
+    plugin websocket message loop. Returns `(raw byte count, chunks)` so the
+    caller can log/stream without re-touching the file or re-deriving the
+    count from the encoded string.
+
+    Split out to a module-level function (rather than inlined in a closure)
+    so it can run via `asyncio.to_thread` -- same seam convention as
+    `_ingest_psd_upload`/`_resolve_psd_preview` in this module.
+    """
+    raw_bytes = psd_path.read_bytes()
+    chunks = _split_b64(base64.b64encode(raw_bytes).decode("ascii"))
+    return len(raw_bytes), chunks
+
+
 async def _send_requested_file(
     connection: PluginConnection, manager: HandoffManager, handoff_id: str
 ) -> None:
@@ -1806,19 +1941,25 @@ async def _send_requested_file(
         )
         return
     try:
-        raw_bytes = psd_path.read_bytes()
+        # 2026-08-26 event-loop-blocking audit: read_bytes() + base64-encode
+        # of the ENTIRE file (before any chunking) is exactly the "10-20 s
+        # while a workflow runs" shape the owner reported -- off to a worker
+        # thread via _read_and_chunk_psd (the smaller-diff fix: chunking
+        # itself is cheap string slicing, so folding it into the same
+        # to_thread call is simpler than a per-chunk off-loop encode without
+        # leaving anything blocking on the loop).
+        raw_len, chunks = await asyncio.to_thread(_read_and_chunk_psd, psd_path)
     except OSError as exc:
         await connection.ws.send_json(
             {"type": "file_error", "handoff_id": handoff_id, "error": f"Could not read file: {exc}"}
         )
         return
 
-    chunks = _split_b64(base64.b64encode(raw_bytes).decode("ascii"))
     total = len(chunks)
     logger.info(
         "Streaming handoff %s (%d bytes, %d chunk(s)) to the plugin over websocket",
         handoff_id,
-        len(raw_bytes),
+        raw_len,
         total,
     )
     for seq, chunk in enumerate(chunks):
@@ -2044,7 +2185,21 @@ async def _handle_upload_edit_chunk(
         return
 
     if pending.kind == "psd":
-        edit, error_message, reason = _ingest_psd_upload(manager, meta, raw_bytes)
+        # 2026-08-26 event-loop-blocking audit: _ingest_psd_upload does a
+        # PSDImage.open() validation, a write_bytes() of the whole layered
+        # PSD, and a full psd_io.read_edited_psd() flatten -- multi-hundred-
+        # MB documents make this seconds of blocking work on the one serial
+        # plugin websocket loop. It also fixes a real symptom: the plugin's
+        # own 60 s client-side save timeout was firing on a big PSD because
+        # the ack was simply stuck behind this blocking call, not because
+        # the save had failed -- no plugin-side change needed.
+        # `_ingest_psd_upload` calls `manager.ingest_edit()` internally,
+        # synchronously -- that's correct as-is: the WHOLE function below is
+        # now running on a worker thread already, so there is no running
+        # event loop in that thread to hand a second `to_thread()` off to.
+        edit, error_message, reason = await asyncio.to_thread(
+            _ingest_psd_upload, manager, meta, raw_bytes
+        )
         if error_message is not None:
             await connection.ws.send_json(
                 {
@@ -2080,7 +2235,16 @@ async def _handle_upload_edit_chunk(
         # Both the HTTP and websocket upload paths deliver final, already-
         # flattened pixels with no PSD (re)compositing on our side, so both
         # map to fidelity "plugin" -- see upload_route's identical comment.
-        edit = manager.ingest_edit(handoff_id, image, "plugin")
+        # Off-loop for the same reason as upload_route's call (2026-08-26
+        # audit): this handler runs on the ONE serial plugin-websocket
+        # message loop, so a blocking ingest here stalls every OTHER
+        # handoff's traffic on this connection too, not just this upload.
+        # Awaiting `to_thread` still processes this connection's messages
+        # strictly in order -- the loop just isn't pinned to a thread doing
+        # disk I/O while this one is in flight (do NOT confuse this with
+        # `_handle_live_frame`, which stays synchronous/lean by design and
+        # is out of this audit's scope).
+        edit = await asyncio.to_thread(manager.ingest_edit, handoff_id, image, "plugin")
 
     await _finish_upload_edit_ack(connection, manager, handoff_id, edit)
 

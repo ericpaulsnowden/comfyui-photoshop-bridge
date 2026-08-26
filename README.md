@@ -263,6 +263,16 @@ The round trip, the eleven nodes, the gallery, and cross-machine editing all wor
 
 Note that a missing **`watchdog` alone does not stop the pack from loading**: every node, the gallery, and the whole Tier-2 plugin keep working, and only automatic **Tier-1** save detection is disabled — which is the right trade on a headless or remote ComfyUI (a Linux box or container), where Tier 1 can't work anyway because there's no local Photoshop to open the file in. The startup log says so explicitly.
 
+**A Photoshop save/open feels slow while a workflow is running.** Saving or
+opening a PSD does its file I/O and PNG/PSD encoding off ComfyUI's main
+thread (v0.5.74), so a busy workflow no longer blocks the rest of the server
+(other opens, other saves, the gallery) — but that save still shares the same
+CPU as the running workflow, so its own acknowledgment can lag a few seconds
+behind a real save rather than failing outright. Give it a moment before
+assuming a save failed, especially for a large layered PSD. Browsing to a
+folder on an unreachable network share now answers with a clear error after
+5 seconds instead of freezing the server for the OS timeout.
+
 **Photoshop asks about Maximize Compatibility on every save.** Set Preferences → File Handling → Maximize PSD Compatibility to **Always** (see Quick Start / [docs/INSTALL.md](docs/INSTALL.md)).
 
 **My edit never comes back into ComfyUI.** Most likely you Save-As'd to a different file or location, which breaks the automatic link (see Limitations) — the card just sits at "Editing" with no chip to flag it, so drag-and-drop the saved-elsewhere image onto that card in the sidebar gallery to import it manually. Also confirm you actually saved, and give it a second to settle.
