@@ -123,7 +123,9 @@ class OffLoopRecorder:
     loop-blocking audit's other ``asyncio.to_thread`` call sites
     (``HandoffManager.ingest_edit``/``create``, ``_open_psd_native_source``,
     ``_ingest_psd_upload``, ``_read_and_chunk_psd``, ``_resolve_psd_preview``,
-    ``_fs_list_probe_and_scan``). ``False`` means "ran off the loop" -- i.e.
+    ``_fs_list_probe_and_scan``, and the follow-up's
+    ``_write_managed_psd_copy`` + manual-push dispatches). ``False`` means
+    "ran off the loop" -- i.e.
     genuinely dispatched through a worker thread -- exactly like
     ``LaunchRecorder``'s own polarity.
     """
@@ -332,6 +334,23 @@ class TestOpen:
         """
         recorder = OffLoopRecorder(manager.create)
         monkeypatch.setattr(manager, "create", recorder)
+
+        response = await client.post("/cpsb/open", json=open_body())
+
+        assert response.status == 200
+        assert recorder.on_event_loop == [False]
+
+    async def test_managed_psd_write_runs_off_the_event_loop(
+        self, client, manager, context, source_image, launches, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit follow-up: the managed-copy
+        write (`write_psd` flatten-based here, since the source is a flat
+        PNG) ran directly on `POST /cpsb/open`'s coroutine even after
+        `manager.create` went off-loop -- confirms it now dispatches through
+        `asyncio.to_thread` via `_write_managed_psd_copy`.
+        """
+        recorder = OffLoopRecorder(routes_module._write_managed_psd_copy)
+        monkeypatch.setattr(routes_module, "_write_managed_psd_copy", recorder)
 
         response = await client.post("/cpsb/open", json=open_body())
 
@@ -753,6 +772,24 @@ class TestOpenPsdNative:
         (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path))
         recorder = OffLoopRecorder(routes_module._open_psd_native_source)
         monkeypatch.setattr(routes_module, "_open_psd_native_source", recorder)
+
+        response = await client.post("/cpsb/open", json=open_body_psd())
+
+        assert response.status == 200
+        assert recorder.on_event_loop == [False]
+
+    async def test_verbatim_managed_copy_runs_off_the_event_loop(
+        self, client, context, launches, tmp_path, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit follow-up: the verbatim
+        `write_bytes` of the psd-native managed copy -- a multi-hundred-MB
+        write for a big layered file -- ran directly on `POST /cpsb/open`'s
+        coroutine. Confirms it now dispatches through `asyncio.to_thread`
+        via `_write_managed_psd_copy`.
+        """
+        (context.input_dir / "sample.psd").write_bytes(psd_bytes(tmp_path))
+        recorder = OffLoopRecorder(routes_module._write_managed_psd_copy)
+        monkeypatch.setattr(routes_module, "_write_managed_psd_copy", recorder)
 
         response = await client.post("/cpsb/open", json=open_body_psd())
 
@@ -3072,6 +3109,45 @@ class TestManualPush:
             with Image.open(edit_path) as edited:
                 assert edited.getpixel((0, 0))[:3] == (10, 20, 30)
 
+    async def test_create_write_and_ingest_all_run_off_the_event_loop(
+        self, client, context, manager, monkeypatch
+    ):
+        """2026-08-26 event-loop-blocking audit follow-up:
+        `_handle_manual_push_chunk` ran `manager.create`, the managed-PSD
+        write, and `manager.ingest_edit` synchronously on the ONE serial
+        plugin-websocket message loop -- the exact calls already dispatched
+        through `asyncio.to_thread` at their other call sites. Confirms all
+        three now run off the loop here too.
+        """
+        create_recorder = OffLoopRecorder(manager.create)
+        monkeypatch.setattr(manager, "create", create_recorder)
+        write_recorder = OffLoopRecorder(routes_module._write_managed_psd_copy)
+        monkeypatch.setattr(routes_module, "_write_managed_psd_copy", write_recorder)
+        ingest_recorder = OffLoopRecorder(manager.ingest_edit)
+        monkeypatch.setattr(manager, "ingest_edit", ingest_recorder)
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            payload = png_bytes((10, 20, 30))
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-offloop",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "title": "Background (layer)",
+                }
+            )
+            ack = await ws.receive_json(timeout=5)
+            assert ack["type"] == "manual_push_ok"
+
+        assert create_recorder.on_event_loop == [False]
+        assert write_recorder.on_event_loop == [False]
+        assert ingest_recorder.on_event_loop == [False]
+
     async def test_writes_a_normal_reopenable_managed_psd(self, client, context, manager):
         """Unlike a bare bridge_node handoff, a push writes a real managed
         PSD copy -- so Open/Re-open works on a pushed card via the exact
@@ -3789,7 +3865,10 @@ class TestOffLoopPlumbingIsTransparent:
     a representative slice of each affected route's own pre-existing
     behavioral assertions -- if the wrapping introduced any observable
     difference, it would show up here even with the off-loop dispatch
-    itself neutralized.
+    itself neutralized. The follow-up sites (`_write_managed_psd_copy` and
+    `_handle_manual_push_chunk`'s create/write/ingest dispatches) get the
+    same treatment: the two open tests below exercise both of the write
+    helper's branches inline, and the manual-push test covers its handler.
     """
 
     @pytest.fixture(autouse=True)
@@ -3909,6 +3988,34 @@ class TestOffLoopPlumbingIsTransparent:
             ack = await ws.receive_json(timeout=5)
             assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
             assert manager.get(handoff_id).status == "edited"
+
+    async def test_manual_push_still_creates_the_same_edited_handoff(
+        self, client, context, manager
+    ):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            payload = png_bytes((10, 20, 30))
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-inline",
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(payload).decode("ascii"),
+                    "title": "Background (layer)",
+                }
+            )
+
+            ack = await ws.receive_json(timeout=5)
+            assert ack["type"] == "manual_push_ok"
+            assert ack["push_id"] == "push-inline"
+            meta = manager.get(ack["handoff_id"])
+            assert meta.origin_kind == "manual_send"
+            assert meta.status == "edited"
+            assert len(meta.edits) == 1
+            assert manager.psd_path(meta).is_file()
 
     async def test_request_file_ws_still_streams_the_same_bytes(
         self, client, context, manager, source_image, launches

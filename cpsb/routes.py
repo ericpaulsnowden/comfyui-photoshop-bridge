@@ -553,6 +553,36 @@ def _normalize_for_psd_write(image: Image.Image) -> Image.Image:
     return image.convert("RGB")
 
 
+def _write_managed_psd_copy(
+    psd_path: Path, raw_psd_bytes: bytes | None, image: Image.Image
+) -> None:
+    """Write a handoff's managed PSD copy (blocking -- call via ``asyncio.to_thread``).
+
+    2026-08-26 event-loop-blocking audit follow-up: split out of
+    ``open_handoff_route`` so the write itself runs off the event loop --
+    the verbatim ``write_bytes`` of a psd-native source can be a
+    multi-hundred-MB copy, and the ``write_psd`` flatten-based path encodes
+    a whole PSD; either is seconds of blocking work for a large document.
+    Shared with ``_handle_manual_push_chunk``'s flat write (which passes
+    ``raw_psd_bytes=None``), on the ONE serial plugin-websocket message
+    loop, where the same hazard also stalls every other handoff's traffic.
+
+    ``_normalize_for_psd_write`` is load-bearing on the flatten path:
+    ``write_psd`` is a bare ``PSDImage.frompil``, which raises
+    (AttributeError, verified against the shipped psd-tools) for
+    palette-mode "P" and 16-bit "I;16" images -- both real modes a source
+    PNG or pushed export can decode to. Skipping it crashed the manual-push
+    socket before it was normalized too.
+    """
+    if raw_psd_bytes is not None:
+        # psd-native (PROTOCOL.md §2): copy the user's own layered file
+        # verbatim -- never write_psd/frompil, which would flatten it.
+        psd_path.parent.mkdir(parents=True, exist_ok=True)
+        psd_path.write_bytes(raw_psd_bytes)
+    else:
+        write_psd(psd_path, _normalize_for_psd_write(image))
+
+
 def _open_source_image(
     context: CpsbContext, fields: dict[str, Any]
 ) -> tuple[Image.Image | None, web.Response | None]:
@@ -875,13 +905,13 @@ async def open_handoff_route(request: web.Request) -> web.Response:
             watcher.watch_original(meta.handoff_id, psd_path)
     else:
         psd_path = manager.psd_path(meta)
-        if resolved.raw_psd_bytes is not None:
-            # psd-native (PROTOCOL.md §2): copy the user's own layered file
-            # verbatim -- never write_psd/frompil, which would flatten it.
-            psd_path.parent.mkdir(parents=True, exist_ok=True)
-            psd_path.write_bytes(resolved.raw_psd_bytes)
-        else:
-            write_psd(psd_path, _normalize_for_psd_write(resolved.thumbnail_image))
+        # 2026-08-26 event-loop-blocking audit follow-up: this write still
+        # ran directly on the loop even after `manager.create` above went
+        # off-loop -- same hazard, same treatment (see
+        # `_write_managed_psd_copy`'s docstring for what makes it heavy).
+        await asyncio.to_thread(
+            _write_managed_psd_copy, psd_path, resolved.raw_psd_bytes, resolved.thumbnail_image
+        )
         manager.note_source_written(meta.handoff_id)
 
     return await _open_and_respond(request, context, manager, meta, psd_path)
@@ -2345,7 +2375,18 @@ async def _handle_manual_push_chunk(
 
     meta: HandoffMeta | None = None
     try:
-        meta = manager.create(
+        # 2026-08-26 event-loop-blocking audit follow-up: create() (mkdir +
+        # thumbnail encode/resize + meta.json write), the managed-PSD write,
+        # and ingest_edit() (PNG encode + dedup hash + edit/meta file I/O)
+        # are the same blocking calls already dispatched through
+        # `asyncio.to_thread` at their other call sites (`open_handoff_route`,
+        # `upload_route`, `_handle_upload_edit_chunk`) -- and THIS handler
+        # runs on the ONE serial plugin-websocket message loop, so blocking
+        # here stalls every other handoff's traffic on the connection too.
+        # Awaiting still processes this connection's messages strictly in
+        # order, exactly like `_handle_upload_edit_chunk`'s dispatches.
+        meta = await asyncio.to_thread(
+            manager.create,
             origin_node_id=f"ps-push:{push_id}",
             origin_kind="manual_send",
             workflow_name="",
@@ -2353,15 +2394,11 @@ async def _handle_manual_push_chunk(
             original_image=image,
         )
         psd_path = manager.psd_path(meta)
-        # _normalize_for_psd_write is load-bearing: write_psd is a bare
-        # PSDImage.frompil, which raises (AttributeError, verified against
-        # the shipped psd-tools) for palette-mode "P" and 16-bit "I;16"
-        # images -- both real PNG modes a pushed export can decode to. The
-        # /cpsb/open route already normalizes before its own write_psd call
-        # for exactly this reason; skipping it here crashed the socket.
-        write_psd(psd_path, _normalize_for_psd_write(image))
+        # `_write_managed_psd_copy`'s normalize step is load-bearing here --
+        # see its docstring ("P"/"I;16" pushes crashed the socket without it).
+        await asyncio.to_thread(_write_managed_psd_copy, psd_path, None, image)
         manager.note_source_written(meta.handoff_id)
-        manager.ingest_edit(meta.handoff_id, image, "plugin")
+        await asyncio.to_thread(manager.ingest_edit, meta.handoff_id, image, "plugin")
     except Exception:
         # Same never-let-it-escape-the-message-loop posture as the decode
         # above. If the handoff was already created, mark it errored rather
