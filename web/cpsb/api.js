@@ -191,6 +191,8 @@ export function warn(...args) {
  * @property {string | null} tier1_reason
  * @property {boolean} tier2_connected
  * @property {string | null} ps_version
+ * @property {string[]} [load_psd_extensions] - Extensions the Load PSD node
+ * accepts on this server (absent from backends older than v0.5.77).
  * @property {CpsbHandoffMeta[]} handoffs - Newest first, max 200.
  */
 

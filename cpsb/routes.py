@@ -50,7 +50,7 @@ from .handoff import (
 from .launcher import launch_photoshop, tier1_status
 from .locality import is_request_local
 from .psd_io import read_edited_psd, write_psd
-from .raster_io import TIFF_EXTENSIONS, decode_to_rgb8
+from .raster_io import available_extensions, decode_to_rgb8
 from .version import __version__
 
 if TYPE_CHECKING:
@@ -1281,13 +1281,14 @@ def _resolve_psd_preview(context: CpsbContext, source_path: Path) -> str | None:
         return png_path.name
 
     try:
-        # TIFF flattens through the SAME raster decoder the Load PSD node's own
-        # execute() uses (raster_io.decode_to_rgb8, incl. its 16-bit/CMYK
-        # normalization); .psd/.psb go through read_edited_psd. Both return a
+        # TIFF (and Pillow-native AVIF etc.) flattens through the SAME raster
+        # decoder the Load PSD node's own execute() uses
+        # (raster_io.decode_to_rgb8, incl. its 16-bit/CMYK normalization);
+        # .psd/.psb go through read_edited_psd. Both return a
         # ready-to-save PIL image, so the cache write below is identical.
         # Without this branch, selecting a TIFF 400'd here and the on-node
         # preview silently never refreshed (owner report 2026-07-22).
-        if source_path.suffix.lower() in TIFF_EXTENSIONS:
+        if source_path.suffix.lower() in available_extensions():
             image = decode_to_rgb8(source_path)
         else:
             image, _fidelity = read_edited_psd(source_path)
@@ -1305,7 +1306,7 @@ def _resolve_psd_preview(context: CpsbContext, source_path: Path) -> str | None:
 
 @routes.get("/cpsb/psd_preview")
 async def psd_preview_route(request: web.Request) -> web.Response:
-    """Flatten a `.psd`/`.psb` (or a `.tif`/`.tiff`) into a cached, ComfyUI-addressable preview PNG.
+    """Flatten a `.psd`/`.psb` (or TIFF/Pillow-native AVIF) into a cached, addressable preview PNG.
 
     Query params mirror ComfyUI's own ``GET /view``: ``filename`` (required),
     ``subfolder`` (default ``""``), ``type`` (default ``"input"`` -- unlike
@@ -1344,8 +1345,8 @@ async def psd_preview_route(request: web.Request) -> web.Response:
     source_path = _resolve_source_path(context, filename, subfolder, source_type)
     if source_path is None or not source_path.is_file():
         return _error(404, f"PSD not found: {filename}")
-    if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS + TIFF_EXTENSIONS:
-        return _error(400, f"Cannot preview (not .psd/.psb/.tif/.tiff): {filename}")
+    if source_path.suffix.lower() not in _load_psd_extensions():
+        return _error(400, f"Cannot preview (not a format Load PSD accepts): {filename}")
 
     # 2026-08-26 event-loop-blocking audit: hashing + a cache-miss flatten
     # can be seconds of blocking I/O/CPU for a large PSD -- off to a worker
@@ -1821,6 +1822,19 @@ async def discard_route(request: web.Request) -> web.Response:
 # -- GET /cpsb/status ----------------------------------------------------------
 
 
+def _load_psd_extensions() -> tuple[str, ...]:
+    """Every extension the Load PSD node accepts in this process.
+
+    Mirrors ``cpsb.load_psd._accepted_extensions`` (which imports this module,
+    so it can't be imported back): PSD-native plus whatever
+    :func:`cpsb.raster_io.available_extensions` decodes -- TIFF always, AVIF
+    and friends only while the installed Pillow decodes them natively.
+    Reported in ``GET /cpsb/status`` so the frontend's upload filter follows
+    the server's real Pillow instead of a hardcoded list.
+    """
+    return _PSD_NATIVE_EXTENSIONS + available_extensions()
+
+
 @routes.get("/cpsb/status")
 async def status_route(request: web.Request) -> web.Response:
     manager = _manager(request)
@@ -1834,6 +1848,7 @@ async def status_route(request: web.Request) -> web.Response:
             "tier1_reason": tier1.reason,
             "tier2_connected": is_tier2_connected,
             "ps_version": plugin.ps_version if is_tier2_connected and plugin else None,
+            "load_psd_extensions": list(_load_psd_extensions()),
             "handoffs": [m.to_dict() for m in manager.list_all(limit=200)],
         }
     )

@@ -65,6 +65,7 @@
 import { app } from '../../../scripts/app.js'
 import { api as rawApi } from '../../../scripts/api.js'
 import * as api from './api.js'
+import * as state from './state.js'
 import * as ui from './ui.js'
 
 /**
@@ -76,17 +77,39 @@ import * as ui from './ui.js'
 export const LOAD_PSD_NODE_TYPE = 'PhotoshopLoadPSD'
 
 /**
- * Extensions this widget accepts (PROTOCOL.md §6b). PSD-native plus TIFF --
- * every format `cpsb.load_psd._accepted_extensions()` can decode with no
- * optional dependency (TIFF rides Pillow, already a hard dep). Kept in lockstep
- * with that backend set: `.ai`/raw are deliberately NOT here -- they are not
- * decoded in-process at all anymore (removed with pypdfium2/rawpy) and instead
- * belong to the separate Tier-2 "Open via Photoshop" node.
+ * Extensions this widget accepts when the backend hasn't said (PROTOCOL.md
+ * §6b): PSD-native plus TIFF, the formats every backend decodes with no
+ * optional dependency. The live list comes from `GET /cpsb/status`'s
+ * `load_psd_extensions` (state.js `getLoadPsdExtensions`) -- the backend adds
+ * `.avif` etc. only when ITS Pillow decodes them natively, which this browser
+ * can't know -- so this constant only covers the window before that first
+ * response and an older backend that doesn't report it. `.ai`/raw are
+ * deliberately never here -- they belong to the separate Tier-2 "Open via
+ * Photoshop" node.
  */
-const ACCEPTED_EXTENSIONS = ['.psd', '.psb', '.tif', '.tiff']
+const FALLBACK_EXTENSIONS = ['.psd', '.psb', '.tif', '.tiff']
 
-/** `<input type="file" accept="...">` value, comma-joined per the HTML spec. */
-const ACCEPT_ATTR = ACCEPTED_EXTENSIONS.join(',')
+/** @returns {string[]} The extensions this widget accepts right now. */
+function acceptedExtensions() {
+  return state.getLoadPsdExtensions() ?? FALLBACK_EXTENSIONS
+}
+
+/**
+ * @param {string[]} extensions
+ * @returns {string} e.g. ".psd, .psb, .tif, and .tiff" for a toast.
+ */
+function formatExtensionList(extensions) {
+  if (extensions.length <= 1) return extensions.join('')
+  if (extensions.length === 2) return extensions.join(' and ')
+  return `${extensions.slice(0, -1).join(', ')}, and ${extensions.at(-1)}`
+}
+
+/** @returns {string} e.g. ".psd, .psb, .tif, or .tiff" for an instruction. */
+export function describeAcceptedExtensions() {
+  const extensions = acceptedExtensions()
+  if (extensions.length <= 1) return extensions.join('')
+  return `${extensions.slice(0, -1).join(', ')}, or ${extensions.at(-1)}`
+}
 
 /** Guards {@link init}'s capability warning so it is logged at most once. */
 let capabilityWarned = false
@@ -186,7 +209,7 @@ export function getOnSave(node) {
  */
 function hasAcceptedExtension(filename) {
   const lower = filename?.toLowerCase?.() ?? ''
-  return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext))
+  return acceptedExtensions().some((ext) => lower.endsWith(ext))
 }
 
 /**
@@ -223,7 +246,7 @@ async function ingestFile(node, psdWidget, uploadWidget, file) {
     ui.showToast({
       severity: 'error',
       summary: 'Unsupported file type',
-      detail: `"${file.name}" — Load PSD accepts .psd, .psb, .tif, and .tiff files.`
+      detail: `"${file.name}" — Load PSD accepts ${formatExtensionList(acceptedExtensions())} files.`
     })
     return
   }
@@ -284,7 +307,9 @@ async function ingestFile(node, psdWidget, uploadWidget, file) {
 function createFileInput(node, onSelect) {
   let fileInput = document.createElement('input')
   fileInput.type = 'file'
-  fileInput.accept = ACCEPT_ATTR
+  // `accept` is comma-joined per the HTML spec, and re-read on every open
+  // (below) so it follows the server's list once /cpsb/status lands.
+  fileInput.accept = acceptedExtensions().join(',')
   fileInput.onchange = () => {
     const file = fileInput?.files?.[0]
     // Reset so re-selecting the exact same filename still fires onchange
@@ -302,7 +327,11 @@ function createFileInput(node, onSelect) {
     return originalOnRemoved?.call(this)
   }
 
-  return () => fileInput?.click()
+  return () => {
+    if (!fileInput) return
+    fileInput.accept = acceptedExtensions().join(',')
+    fileInput.click()
+  }
 }
 
 /**

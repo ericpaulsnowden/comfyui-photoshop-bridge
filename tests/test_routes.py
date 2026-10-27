@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw
 from psd_tools import PSDImage
 
 import cpsb.annotate as annotate_module
+import cpsb.raster_io as raster_io_module
 import cpsb.routes as routes_module
 from cpsb.context import DEFAULT_MANAGED_FOLDER_NAME, CpsbContext
 from cpsb.handoff import HandoffManager, SourceRef, WaitOutcome, compute_source_hash
@@ -852,6 +853,34 @@ class TestPsdPreview:
             preview.load()
             assert preview.size == (20, 10)
             assert preview.getpixel((0, 0))[:3] == (12, 34, 56)
+
+    @pytest.mark.skipif(
+        not raster_io_module._pillow_native_decodes(".avif"),
+        reason="this Pillow build does not decode AVIF natively",
+    )
+    async def test_avif_previews_when_pillow_decodes_it(self, client, context):
+        Image.new("RGB", (20, 10), (12, 34, 56)).save(context.input_dir / "photo.avif", quality=100)
+
+        response = await client.get(
+            "/cpsb/psd_preview", params={"filename": "photo.avif", "type": "input"}
+        )
+
+        assert response.status == 200
+        data = await response.json()
+        png_path = context.temp_dir / "cpsb" / data["filename"]
+        with Image.open(png_path) as preview:
+            preview.load()
+            assert preview.size == (20, 10)
+
+    async def test_avif_refused_when_pillow_cannot(self, client, context, monkeypatch):
+        monkeypatch.setattr(raster_io_module, "_pillow_native_decodes", lambda _ext: False)
+        (context.input_dir / "photo.avif").write_bytes(b"x")
+
+        response = await client.get(
+            "/cpsb/psd_preview", params={"filename": "photo.avif", "type": "input"}
+        )
+
+        assert response.status == 400
 
     async def test_default_subfolder_and_type_are_empty_and_input(self, client, context, tmp_path):
         """``subfolder``/``type`` are optional query params -- default to
@@ -1993,6 +2022,11 @@ class TestCancelAndDiscard:
 
 
 class TestStatus:
+    async def test_status_load_psd_extensions_follow_pillow(self, client, monkeypatch):
+        monkeypatch.setattr(raster_io_module, "_pillow_native_decodes", lambda ext: ext == ".jxl")
+        data = await (await client.get("/cpsb/status")).json()
+        assert data["load_psd_extensions"] == [".psd", ".psb", ".tif", ".tiff", ".jxl"]
+
     async def test_status_shape_and_ordering(self, client, source_image, launches):
         first = (await (await client.post("/cpsb/open", json=open_body())).json())["handoff_id"]
         second = (
@@ -2008,6 +2042,12 @@ class TestStatus:
         assert data["server_version"] == CPSB_VERSION
         assert data["tier1_available"] is True
         assert data["tier1_reason"] is None
+        # The frontend's upload filter follows this list (state.js).
+        assert data["load_psd_extensions"] == [
+            ".psd",
+            ".psb",
+            *raster_io_module.available_extensions(),
+        ]
         assert data["tier2_connected"] is False
         assert data["ps_version"] is None
         ids = [h["handoff_id"] for h in data["handoffs"]]

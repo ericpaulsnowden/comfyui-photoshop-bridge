@@ -427,3 +427,139 @@ class TestAvailableExtensions:
         format is a valid Photoshop save target at all.
         """
         assert raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS == raster_io.TIFF_EXTENSIONS
+
+
+# ---------------------------------------------------------------------------
+# Pillow-native extras (AVIF today; JPEG XL/HEIC the day Pillow decodes them)
+# ---------------------------------------------------------------------------
+
+requires_native_avif = pytest.mark.skipif(
+    not raster_io._pillow_native_decodes(".avif"),
+    reason="this Pillow build does not decode AVIF natively",
+)
+
+
+def _close(actual, expected, tolerance=6):
+    """AVIF is lossy even at quality 100 -- compare channel-wise."""
+    return all(abs(a - e) <= tolerance for a, e in zip(actual, expected, strict=True))
+
+
+@requires_native_avif
+class TestDecodePillowNativeAvif:
+    def test_rgb_avif_decodes(self, tmp_path):
+        path = tmp_path / "photo.avif"
+        Image.new("RGB", (16, 8), (40, 120, 200)).save(path, quality=100)
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGB"
+        assert image.size == (16, 8)
+        assert _close(image.getpixel((4, 4)), (40, 120, 200))
+
+    def test_rgba_avif_keeps_alpha(self, tmp_path):
+        path = tmp_path / "cutout.avif"
+        Image.new("RGBA", (8, 8), (200, 100, 50, 128)).save(path, quality=100)
+        image = raster_io.decode_to_rgb8(path)
+        assert image.mode == "RGBA"
+        assert _close(image.getpixel((4, 4)), (200, 100, 50, 128))
+
+    def test_exif_orientation_applied_like_load_image(self, tmp_path):
+        """Pillow surfaces AVIF irot/imir as an EXIF orientation tag without
+        rotating the pixels; ComfyUI's LoadImage applies exif_transpose, so
+        must we, or a phone photo loads sideways.
+        """
+        path = tmp_path / "phone.avif"
+        exif = Image.Exif()
+        exif[0x0112] = 6  # rotate 90 CW to display
+        Image.new("RGB", (12, 4), (10, 200, 10)).save(path, exif=exif, quality=100)
+        image = raster_io.decode_to_rgb8(path)
+        assert image.size == (4, 12)
+
+    def test_animated_avif_uses_first_frame(self, tmp_path):
+        path = tmp_path / "anim.avif"
+        frames = [Image.new("RGB", (8, 8), color) for color in [(110, 0, 0), (0, 0, 220)]]
+        frames[0].save(path, save_all=True, append_images=frames[1:], quality=100)
+        image = raster_io.decode_to_rgb8(path)
+        assert _close(image.getpixel((4, 4)), (110, 0, 0))
+
+    def test_uppercase_extension_dispatches(self, tmp_path):
+        path = tmp_path / "SHOUT.AVIF"
+        Image.new("RGB", (8, 8), (90, 90, 90)).save(path, format="AVIF", quality=100)
+        assert _close(raster_io.decode_to_rgb8(path).getpixel((4, 4)), (90, 90, 90))
+
+    def test_avif_listed_in_available_extensions(self):
+        assert ".avif" in raster_io.available_extensions()
+
+
+class _ThirdPartyImageFile:
+    """Stands in for an opener a pip package (pillow-heif, ...) registered."""
+
+
+_ThirdPartyImageFile.__module__ = "pillow_jxl.JpegXLImagePlugin"
+
+
+class _NativeImageFile:
+    """Stands in for an opener living inside the PIL package itself."""
+
+
+_NativeImageFile.__module__ = "PIL.CpsbFakeNativePlugin"
+
+
+class TestPillowNativeGate:
+    """:func:`raster_io._pillow_native_decodes` -- Pillow's OWN plugins only."""
+
+    @pytest.fixture
+    def registry(self, monkeypatch):
+        Image.init()  # so registered_extensions() won't re-import over our entries
+
+        def register(extension, factory, *, supported=None):
+            monkeypatch.setitem(Image.EXTENSION, extension, "CPSBFAKE")
+            monkeypatch.setitem(Image.OPEN, "CPSBFAKE", (factory, None))
+            if supported is not None:
+                import sys
+                import types
+
+                module = types.ModuleType(factory.__module__)
+                module.SUPPORTED = supported
+                monkeypatch.setitem(sys.modules, factory.__module__, module)
+
+        return register
+
+    def test_unregistered_extension_is_not_native(self):
+        assert raster_io._pillow_native_decodes(".cpsb-nope") is False
+
+    def test_third_party_opener_is_not_honoured(self, registry):
+        registry(".jxl", _ThirdPartyImageFile)
+        assert raster_io._pillow_native_decodes(".jxl") is False
+        assert ".jxl" not in raster_io.available_extensions()
+
+    def test_native_opener_switches_the_format_on(self, registry):
+        """The JPEG XL future: a Pillow release with its own plugin."""
+        registry(".jxl", _NativeImageFile, supported=True)
+        assert raster_io._pillow_native_decodes(".jxl") is True
+        assert ".jxl" in raster_io.available_extensions()
+
+    def test_native_plugin_built_without_its_codec_is_off(self, registry):
+        """``SUPPORTED = False``: Pillow registered the plugin but was built
+        without the library, so every ``Image.open`` would fail."""
+        registry(".jxl", _NativeImageFile, supported=False)
+        assert raster_io._pillow_native_decodes(".jxl") is False
+
+    def test_probe_never_raises(self, monkeypatch):
+        def boom():
+            raise RuntimeError("pillow internals changed")
+
+        monkeypatch.setattr(Image, "registered_extensions", boom)
+        assert raster_io._pillow_native_decodes(".avif") is False
+        assert raster_io.available_extensions() == raster_io.TIFF_EXTENSIONS
+
+    def test_off_means_tiff_only_and_decode_refuses(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(raster_io, "_pillow_native_decodes", lambda _ext: False)
+        assert raster_io.available_extensions() == raster_io.TIFF_EXTENSIONS
+        path = tmp_path / "photo.avif"
+        path.write_bytes(b"x")
+        with pytest.raises(ValueError, match=r"\.avif"):
+            raster_io.decode_to_rgb8(path)
+
+    def test_candidates_never_edit_in_place(self):
+        assert not set(raster_io.PILLOW_NATIVE_CANDIDATES) & set(
+            raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS
+        )

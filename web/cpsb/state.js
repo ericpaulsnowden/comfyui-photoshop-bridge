@@ -31,6 +31,15 @@ const handoffsById = new Map()
  */
 let serverVersion = null
 
+/**
+ * Extensions the backend's Load PSD node accepts
+ * (`CpsbStatusResponse.load_psd_extensions`), or `null` before the first
+ * `/cpsb/status` response lands or when an older backend doesn't report
+ * them. See {@link getLoadPsdExtensions}.
+ * @type {string[] | null}
+ */
+let loadPsdExtensions = null
+
 // Optimistic defaults until the first /cpsb/status response lands: menu.js
 // only uses these to *disable* an item early as a courtesy (see menu.js),
 // and /cpsb/open remains the authoritative gate either way — so defaulting
@@ -72,6 +81,9 @@ function applyStatusResponse(
   tier.tier2Connected = !!response.tier2_connected
   tier.psVersion = response.ps_version ?? null
   serverVersion = response.server_version ?? null
+  loadPsdExtensions = Array.isArray(response.load_psd_extensions)
+    ? response.load_psd_extensions
+    : null
 }
 
 /**
@@ -244,6 +256,16 @@ export function isRemoteBrowsingLikely() {
  */
 export function getServerVersion() {
   return serverVersion
+}
+
+/**
+ * @returns {string[] | null} Lower-case extensions (with the dot) the
+ * backend's Load PSD node accepts — TIFF always, plus AVIF etc. only when the
+ * server's Pillow decodes them natively — or `null` until known. loadpsd.js
+ * falls back to its own static list on `null`.
+ */
+export function getLoadPsdExtensions() {
+  return loadPsdExtensions
 }
 
 /**

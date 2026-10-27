@@ -79,7 +79,9 @@ Either legacy `app.open(entry, CameraRAWOpenOptions, asSmartObject=false)` (pins
 - **Acceptance:** Eric confirms a real `.dng` opens headlessly without freezing and the output matches Photoshop's Camera Raw default develop.
 
 ### M4 — Extensions *(parking lot; not scheduled)*
-- Other PS-openable formats through the same node: `.eps`, multi-page `.pdf`, `.heic`, etc.
+- Other PS-openable formats through the same node: `.eps`, multi-page `.pdf`, `.heic`, `.jxl`, etc.
+  (v0.5.77: Load PSD itself already takes `.avif` — and `.jxl`/`.heic`/`.heif` the day
+  Pillow decodes them natively — so this node only needs them for Pillow builds that can't.)
 - `.dng` "as Smart Object" to carry/re-edit ACR settings; expose ACR-settings passthrough.
 - Multi-artboard `.ai` page selection (UXP has no page-count introspection — needs a manifest or Illustrator-side query).
 - Server-side thumbnail/preview for `.ai`/`.dng` before the round-trip (today none, since `raster_io` no longer decodes them — preview only appears after the node runs).

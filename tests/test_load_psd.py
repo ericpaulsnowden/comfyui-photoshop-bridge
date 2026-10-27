@@ -16,6 +16,7 @@ from psd_tools import PSDImage
 
 import cpsb.load_psd as load_psd_module
 import cpsb.nodes as nodes_module
+import cpsb.raster_io as raster_io_module
 from cpsb.context import CpsbContext
 from cpsb.handoff import HandoffManager, SourceRef
 from cpsb.psd_io import write_psd
@@ -360,6 +361,51 @@ class TestBroadenedFormatsListing:
         assert spec["required"]["psd"][0] == ["one.psd", "photo.tif"]
 
 
+class TestPillowNativeFormatsListing:
+    """AVIF (and JPEG XL/HEIC the day Pillow decodes them natively) join the
+    combo/``VALIDATE_INPUTS`` only while :func:`cpsb.raster_io._pillow_native_decodes`
+    says so -- never via a dependency this pack adds (Eric, 2026-10-26).
+    """
+
+    @pytest.fixture
+    def native(self, monkeypatch):
+        def set_native(*extensions):
+            monkeypatch.setattr(
+                raster_io_module, "_pillow_native_decodes", lambda ext: ext in extensions
+            )
+
+        return set_native
+
+    def test_avif_listed_when_pillow_decodes_it(self, context, configured, native):
+        native(".avif")
+        for name in ("one.psd", "pic.avif", "LOUD.AVIF", "later.jxl"):
+            (context.input_dir / name).write_bytes(b"x")
+        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
+        assert spec["required"]["psd"][0] == sorted(["one.psd", "pic.avif", "LOUD.AVIF"])
+
+    def test_avif_hidden_when_pillow_cannot(self, context, configured, native):
+        native()
+        (context.input_dir / "pic.avif").write_bytes(b"x")
+        spec = load_psd_module.PhotoshopLoadPSD.INPUT_TYPES()
+        assert spec["required"]["psd"][0] == []
+
+    def test_jxl_switches_on_with_no_change_here(self, context, configured, native):
+        native(".avif", ".jxl")
+        (context.input_dir / "later.jxl").write_bytes(b"x")
+        assert load_psd_module.PhotoshopLoadPSD.VALIDATE_INPUTS("later.jxl") is True
+
+    def test_validate_follows_the_gate(self, context, configured, native):
+        (context.input_dir / "pic.avif").write_bytes(b"x")
+        native(".avif")
+        assert load_psd_module.PhotoshopLoadPSD.VALIDATE_INPUTS("pic.avif") is True
+        native()
+        assert load_psd_module.PhotoshopLoadPSD.VALIDATE_INPUTS("pic.avif") is not True
+
+    def test_avif_is_not_psd_native(self):
+        """Round trip / edit-original stays PSD-only: AVIF never joins it."""
+        assert ".avif" not in load_psd_module.PSD_EXTENSIONS
+
+
 class TestBroadenedFormatsValidateInputs:
     def test_accepts_tiff(self, context, configured):
         (context.input_dir / "ok.tif").write_bytes(b"x")
@@ -589,6 +635,27 @@ class TestExecuteBroadenedFormats:
         assert pixels.shape == (8, 12, 3)
         assert tuple(pixels[0, 0]) == (40, 80, 120)
         assert mask_tensor.shape == (1, 8, 12)  # no alpha in a plain RGB TIFF -> zeros mask
+
+    @pytest.mark.skipif(
+        not raster_io_module._pillow_native_decodes(".avif"),
+        reason="this Pillow build does not decode AVIF natively",
+    )
+    def test_execute_decodes_avif(self, context, manager, configured):
+        avif_path = context.input_dir / "photo.avif"
+        transparent = Image.new("RGBA", (12, 8), (0, 0, 0, 0))
+        transparent.paste(Image.new("RGBA", (6, 8), (40, 80, 120, 255)), (0, 0))
+        transparent.save(avif_path, quality=100)
+
+        node = load_psd_module.PhotoshopLoadPSD()
+        image_tensor, mask_tensor, layers_doc = node.execute(psd="photo.avif", unique_id="1")
+
+        pixels = (image_tensor[0].numpy() * 255.0).round().astype("uint8")
+        assert pixels.shape == (8, 12, 3)
+        assert all(abs(int(a) - b) <= 6 for a, b in zip(pixels[4, 2], (40, 80, 120), strict=True))
+        mask = mask_tensor[0].numpy()
+        assert mask[4, 2] < 0.05  # opaque half -> mask 0
+        assert mask[4, 10] > 0.95  # transparent half -> mask 1
+        assert [layer["name"] for layer in layers_doc["layers"]] == ["photo"]
 
 
 class TestExecuteMaskChain:

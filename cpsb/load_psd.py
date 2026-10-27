@@ -114,8 +114,9 @@ def _accepted_extensions() -> tuple[str, ...]:
 
     :data:`PSD_EXTENSIONS` (handled via :func:`cpsb.psd_io.read_edited_psd`,
     with the full handoff/round-trip machinery) plus whatever
-    :func:`cpsb.raster_io.available_extensions` can decode (just TIFF -- no
-    optional library; ``.ai``/raw moved to the Tier-2 "Open via Photoshop"
+    :func:`cpsb.raster_io.available_extensions` can decode (TIFF, plus AVIF
+    and any other format the installed Pillow decodes natively -- no optional
+    library; ``.ai``/raw moved to the Tier-2 "Open via Photoshop"
     node) -- so the combo never lists, and
     ``VALIDATE_INPUTS`` never accepts, a file type that would error on
     selection (PROTOCOL.md-adjacent product requirement, 2026-07-19: "I
@@ -411,13 +412,14 @@ class PhotoshopLoadPSD:
     )
     FUNCTION = "execute"
     DESCRIPTION = (
-        "Loads a .psd, .psb, .tif, or .tiff file from ComfyUI's input folder and "
+        "Loads a .psd, .psb, .tif, or .tiff file -- or an .avif, when the image "
+        "library ComfyUI ships can read it -- from ComfyUI's input folder and "
         "flattens it into an image the rest of the workflow can use -- and also emits "
         "the file's individual layers as a LAYERS stack for ComfyUI 0.31+'s layer nodes "
         "or this pack's Compose node. Works with ComfyUI alone -- no Photoshop plugin "
         "is required just to load a file. Right-click the node and choose 'Open in "
         "Photoshop' (or 'Edit Original in Photoshop' once an edit is in progress) to "
-        "send a .psd/.psb back for editing -- .tif/.tiff files can be loaded but not "
+        "send a .psd/.psb back for editing -- the other formats can be loaded but not "
         "yet round-tripped. The Photoshop panel plugin, if connected, makes that round "
         "trip instant instead of file-based. The edit_original and on_save widgets "
         "control where an edit is saved and whether saving it re-runs the workflow; "
@@ -470,7 +472,8 @@ class PhotoshopLoadPSD:
                     files,
                     {
                         "tooltip": (
-                            "The .psd, .psb, .tif, or .tiff file to load, from "
+                            "The .psd, .psb, .tif, or .tiff file (or .avif, when "
+                            "ComfyUI's image library can read it) to load, from "
                             "ComfyUI's input folder."
                         )
                     },
@@ -654,8 +657,9 @@ class PhotoshopLoadPSD:
         :func:`cpsb.psd_io.read_edited_psd` for a PSD-native
         (:data:`PSD_EXTENSIONS`) file (full composite/recomposite fidelity
         logic), or :func:`cpsb.raster_io.decode_to_rgb8` for anything else
-        this node's combo now also accepts (2026-07-19: TIFF; ``.ai``/
-        camera-raw moved to the Tier-2 "Open via Photoshop" route).
+        this node's combo now also accepts (2026-07-19: TIFF; 2026-10-26:
+        Pillow-native AVIF/JPEG XL; ``.ai``/camera-raw moved to the Tier-2
+        "Open via Photoshop" route).
 
         Args:
             psd: The selected combo filename.

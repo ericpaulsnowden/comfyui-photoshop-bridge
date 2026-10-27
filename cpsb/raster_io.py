@@ -1,8 +1,10 @@
 """Non-PSD raster decoding for the Load PSD node's broadened file support.
 
-Today this means **TIFF only** -- the one non-PSD format this pack decodes
-in-process, because Pillow (already a hard dependency) reads it with no extra
-library. :func:`decode_to_rgb8` is the single dispatch point so both
+Today this means **TIFF**, plus whichever of :data:`PILLOW_NATIVE_CANDIDATES`
+(AVIF, JPEG XL, HEIC/HEIF) the installed Pillow decodes *natively* -- the
+non-PSD formats this pack decodes in-process, because Pillow (already a hard
+dependency) reads them with no extra library. :func:`decode_to_rgb8` is the
+single dispatch point so both
 :class:`cpsb.load_psd.PhotoshopLoadPSD`'s IMAGE/MASK output and a future
 server-side preview can share one decode path, mirroring how both already
 share :func:`cpsb.psd_io.read_edited_psd` for ``.psd``/``.psb``.
@@ -17,6 +19,26 @@ this"). Photoshop itself opens both natively (``.ai`` through its PDF engine,
 routes the file through the connected plugin instead of decoding it in-process.
 Load PSD stays a ComfyUI-only loader: ``.psd``/``.psb`` plus TIFF, all readable
 with no plugin and no optional dependency.
+
+**Pillow-native extras (2026-10-26, Eric: "do option 3").** Beyond TIFF, Load
+PSD also accepts any of :data:`PILLOW_NATIVE_CANDIDATES` that the Pillow
+ComfyUI already ships can decode *by itself* -- gated per run by
+:func:`_pillow_native_decodes`, never by a dependency this pack adds. Measured
+on Pillow 12.3.0 (rig + this repo's venv): ``.avif`` yes (Pillow's own
+``PIL.AvifImagePlugin``, ``SUPPORTED`` true), ``.jxl``/``.heic``/``.heif`` not
+registered at all. So AVIF loads today and JPEG XL switches on by itself the
+day a Pillow release decodes it natively, with no change here. A third-party
+opener (``pillow-heif``, ``pillow-jxl-plugin``) that some OTHER node pack
+installs and registers is deliberately NOT honoured: the check requires the
+opener to live inside the ``PIL`` package, so the combo never depends on which
+other packs happen to be installed or the order they import in -- and the
+no-third-party-decoders rule above stays true for what this pack relies on.
+These formats decode through :func:`_decode_pillow_native`, which applies the
+EXIF orientation the same way ComfyUI's own ``LoadImage`` does
+(``ImageOps.exif_transpose``) -- Pillow's AVIF reader surfaces ``irot``/``imir``
+as an EXIF orientation tag rather than rotating the pixels (verified), so
+skipping it would load a phone photo sideways. Animated AVIF loads its first
+frame, like multi-page TIFF.
 
 TIFF feasibility (assessed empirically, not from docs alone -- the same
 verification standard :mod:`cpsb.psd_io` holds itself to):
@@ -62,10 +84,11 @@ value, so this hands off cleanly to those existing ones.
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .psd_io import normalize_to_rgb8
 
@@ -89,17 +112,56 @@ TIFF_EXTENSIONS: tuple[str, ...] = (".tif", ".tiff")
 #: re-derive it.
 EDIT_IN_PLACE_CAPABLE_EXTENSIONS: tuple[str, ...] = TIFF_EXTENSIONS
 
+#: Extensions Load PSD accepts ONLY while the installed Pillow decodes them
+#: natively (:func:`_pillow_native_decodes`; module docstring). Order is the
+#: order they are appended to :func:`available_extensions`. NOT in
+#: :data:`EDIT_IN_PLACE_CAPABLE_EXTENSIONS`: Photoshop can open these but not
+#: re-save them in place.
+PILLOW_NATIVE_CANDIDATES: tuple[str, ...] = (".avif", ".jxl", ".heic", ".heif")
+
+
+def _pillow_native_decodes(extension: str) -> bool:
+    """Whether Pillow's OWN plugin can decode *extension* in this process.
+
+    Three conditions, all required: Pillow maps the extension to a format;
+    that format's opener lives inside the ``PIL`` package (not a third-party
+    plugin another node pack registered -- see the module docstring); and the
+    plugin module doesn't report its codec missing (``SUPPORTED = False`` is
+    how ``PIL.AvifImagePlugin`` says "registered, but Pillow was built without
+    libavif" -- in that state ``Image.open`` fails on every file). Never
+    raises: anything unexpected about Pillow's internals reads as "no".
+    """
+    try:
+        image_format = Image.registered_extensions().get(extension)
+        if image_format is None or image_format not in Image.OPEN:
+            return False
+        factory = Image.OPEN[image_format][0]
+        module_name = getattr(factory, "__module__", "") or ""
+        if not module_name.startswith("PIL."):
+            return False
+        module = sys.modules.get(module_name)
+        return bool(getattr(module, "SUPPORTED", True))
+    except Exception:
+        logger.debug("cpsb raster_io: probing Pillow for %s failed", extension, exc_info=True)
+        return False
+
+
+def pillow_native_extensions() -> tuple[str, ...]:
+    """The subset of :data:`PILLOW_NATIVE_CANDIDATES` this Pillow decodes."""
+    return tuple(ext for ext in PILLOW_NATIVE_CANDIDATES if _pillow_native_decodes(ext))
+
 
 def available_extensions() -> tuple[str, ...]:
-    """Extensions :func:`decode_to_rgb8` can decode.
+    """Extensions :func:`decode_to_rgb8` can decode in this process.
 
-    Just :data:`TIFF_EXTENSIONS` -- there is no optional dependency to gate on
-    anymore (``.ai``/raw moved to the Tier-2 "Open via Photoshop" node, see the
-    module docstring). Kept as a function rather than inlining the constant so
-    :mod:`cpsb.load_psd`'s combo/``VALIDATE_INPUTS`` call site stays stable if a
-    future no-dependency format is ever added the same way TIFF was.
+    :data:`TIFF_EXTENSIONS` always, then :func:`pillow_native_extensions`
+    (AVIF on today's Pillow) -- no optional dependency is ever gated on
+    (``.ai``/raw moved to the Tier-2 "Open via Photoshop" node, see the module
+    docstring). Evaluated on every call rather than cached: it is cheap after
+    Pillow's one-time plugin import, and :mod:`cpsb.load_psd`'s combo,
+    ``VALIDATE_INPUTS`` and ``GET /cpsb/status`` then always agree.
     """
-    return TIFF_EXTENSIONS
+    return TIFF_EXTENSIONS + pillow_native_extensions()
 
 
 def decode_to_rgb8(path: Path) -> Image.Image:
@@ -113,9 +175,8 @@ def decode_to_rgb8(path: Path) -> Image.Image:
     its CMYK fix) rather than duplicating it.
 
     Args:
-        path: The source file. Must have one of :data:`TIFF_EXTENSIONS` as its
-            suffix -- callers are expected to have already checked
-            :func:`available_extensions`.
+        path: The source file. Must have one of :func:`available_extensions`
+            as its suffix -- callers are expected to have already checked.
 
     Returns:
         An 8-bit ``"RGB"`` or ``"RGBA"`` PIL image.
@@ -127,6 +188,8 @@ def decode_to_rgb8(path: Path) -> Image.Image:
     suffix = path.suffix.lower()
     if suffix in TIFF_EXTENSIONS:
         return _decode_tiff(path)
+    if suffix in PILLOW_NATIVE_CANDIDATES and _pillow_native_decodes(suffix):
+        return _decode_pillow_native(path)
     raise ValueError(f"{path}: unsupported file extension {suffix!r}")
 
 
@@ -136,6 +199,21 @@ def _decode_tiff(path: Path) -> Image.Image:
         source.seek(0)  # multi-page TIFF: always the first/flattened page
         source.load()
         image = source
+        if image.mode.startswith("I;16"):
+            image = _scale_16bit_grayscale_to_l8(image)
+        return normalize_to_rgb8(image)
+
+
+def _decode_pillow_native(path: Path) -> Image.Image:
+    """AVIF (etc.) via Pillow's own plugin -- see module docstring.
+
+    First frame only (animated AVIF), then EXIF orientation applied exactly
+    as ComfyUI's ``LoadImage`` does, then the shared mode normalization.
+    """
+    with Image.open(path) as source:
+        source.seek(0)
+        source.load()
+        image = ImageOps.exif_transpose(source)
         if image.mode.startswith("I;16"):
             image = _scale_16bit_grayscale_to_l8(image)
         return normalize_to_rgb8(image)

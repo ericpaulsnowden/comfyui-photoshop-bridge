@@ -226,13 +226,14 @@ Returns `source.psd` bytes (`Content-Type: image/vnd.adobe.photoshop`). Used by 
 plugin in remote mode. 404 for unknown id or non-active status.
 
 ### GET `/cpsb/psd_preview`
-Flattens a `.psd`/`.psb`/`.tif`/`.tiff` into a cached, ComfyUI-addressable preview PNG —
+Flattens a `.psd`/`.psb`/`.tif`/`.tiff` (or a Pillow-native `.avif` etc. — the same set the
+Load PSD combo accepts) into a cached, ComfyUI-addressable preview PNG —
 what the Load PSD node's on-node preview calls (§6b), with no Photoshop involved. Query
 params mirror `/view`: `filename` (required), `subfolder` (default `""`), `type` (default
 `"input"` — unlike `/view`'s own `"output"` default, since every file the Load PSD combo
 can hold lives under `input/`). The path is resolved the same way `/cpsb/open`'s
-psd-native path does, rejecting anything that escapes its base directory or isn't
-`.psd`/`.psb`/`.tif`/`.tiff`. The flattened PNG is cached content-addressed by the source
+psd-native path does, rejecting anything that escapes its base directory or isn't a
+format Load PSD accepts in this process. The flattened PNG is cached content-addressed by the source
 file's sha256 under `<temp_dir>/cpsb/psdpreview_<hash>.png`; a repeat request for
 unchanged bytes is served from that cache without re-flattening.
 Success **200**: `{"filename": "...", "subfolder": "cpsb", "type": "temp"}`, addressable
@@ -290,6 +291,7 @@ Gallery "Remove" for any handoff: same as cancel but sets `discarded`. 200/404.
   "tier1_reason": null,            // or "headless-server" | "no-photoshop" | ...
   "tier2_connected": false,
   "ps_version": null,               // e.g. "26.5" when plugin connected
+  "load_psd_extensions": [".psd", ".psb", ".tif", ".tiff", ".avif"],  // v0.5.77+; see §6b
   "handoffs": [ <meta.json objects, newest first, max 200> ]
 }
 ```
@@ -732,9 +734,11 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 
 - Class `PhotoshopLoadPSD` (unique id — plain "LoadPSD" collides with other packs),
   display name "Load PSD", category `Photoshop Bridge/Handoffs`.
-- Inputs: `psd` (COMBO of `.psd`/`.psb`/`.tif`/`.tiff` files in the input directory,
-  refreshed like LoadImage's combo) — the frontend adds a custom upload widget (accept
-  `.psd,.psb,.tif,.tiff`, matching `loadpsd.js`'s `ACCEPTED_EXTENSIONS`; hand-rolled
+- Inputs: `psd` (COMBO of `.psd`/`.psb`/`.tif`/`.tiff` — plus Pillow-native `.avif` etc.,
+  below — files in the input directory, refreshed like LoadImage's combo) — the frontend
+  adds a custom upload widget (accept = `GET /cpsb/status`'s `load_psd_extensions`, falling
+  back to `loadpsd.js`'s `FALLBACK_EXTENSIONS` `.psd,.psb,.tif,.tiff` before that response
+  lands or against a pre-0.5.77 backend; hand-rolled
   input + POST to ComfyUI's own `/upload/image`; the stock IMAGEUPLOAD widget hardcodes
   png/jpeg/webp). Hidden: `unique_id`. TIFF decode and round-trip caveats: the
   "Non-PSD formats" bullet below.
@@ -820,6 +824,14 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   in the mode — the pack's convention; reuses `psd_io.normalize_to_rgb8` for
   16-bit/CMYK/grayscale, plus a 16-bit-grayscale scale fix Pillow doesn't do itself).
   `edit_original` stays PSD/TIFF-only (`raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS`).
+  **Pillow-native extras (v0.5.77):** `raster_io.PILLOW_NATIVE_CANDIDATES`
+  (`.avif`, `.jxl`, `.heic`, `.heif`) join the accept-list only while
+  `raster_io._pillow_native_decodes` passes — Pillow maps the extension, the opener lives
+  in the `PIL` package (a third-party plugin another pack registered is ignored, so the
+  combo never depends on install/import order), and the plugin module doesn't report
+  `SUPPORTED = False`. Pillow 12.3.0: `.avif` on, the rest unregistered. Decoded via
+  `_decode_pillow_native` (first frame, `ImageOps.exif_transpose` like core `LoadImage`,
+  then `normalize_to_rgb8`). Never PSD-native, never edit-in-place.
   Illustrator `.ai` and camera raw/`.dng` are NOT decoded in-process (v0.5.40 removed the
   optional `pypdfium2`/`rawpy` path — the pack bundles no third-party decoders); Photoshop
   opens them natively, so they belong to a dedicated Tier-2 "Open via Photoshop" node — see
