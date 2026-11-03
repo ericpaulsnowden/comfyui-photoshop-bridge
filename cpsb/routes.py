@@ -26,6 +26,7 @@ import logging
 import os
 import platform
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -75,6 +76,23 @@ _SERVER_VERSION = __version__
 
 _PING_INTERVAL_SECONDS = 30
 _PONG_TIMEOUT_SECONDS = 15
+#: How often `_wait_for_pong` re-checks for the pong (and for the busy state
+#: below) while it waits. A module constant only so tests can shrink it.
+_PONG_POLL_SECONDS = 0.5
+#: Hard ceiling on how long ONE ping may go unanswered while the connection
+#: is busy (PROTOCOL.md §3 keepalive). The pong deadline is not enforced while
+#: the websocket reader is suspended inside a message handler -- a large
+#: layered-PSD ingest, a manual push, a `request_file` stream -- or while an
+#: inbound chunked transfer is still arriving: in both cases the client's pong
+#: is queued behind work the SERVER is doing (or behind the client's own
+#: upload chunks on the wire), so a missing pong is not evidence the client
+#: is dead. Without this, a slow ingest got the plugin disconnected mid-save
+#: (review item 7, 2026-09-13; verified: socket closed at 1.3 s with a 1 s
+#: test timeout while the client answered every ping). The ceiling still
+#: drops a truly dead client that happens to die during a busy stretch: ten
+#: minutes is far beyond any real ingest, and a dead plugin costs nothing
+#: meanwhile (a reconnect replaces the old socket anyway).
+_KEEPALIVE_BUSY_CEILING_SECONDS = 600
 
 #: Chunk size, in base64 CHARACTERS, for both `file_chunk` (download) and
 #: `upload_edit` (upload) websocket frames (PROTOCOL.md §3, cross-machine
@@ -97,6 +115,47 @@ _WS_CHUNK_CHARS = 700_000
 #: future client sending an oversized chunk, not a value chunking is tuned
 #: to fit exactly.
 _WS_MAX_MSG_SIZE_BYTES = 8 * 1024 * 1024
+
+# -- Inbound chunked-transfer bounds (PROTOCOL.md §3, "Transfer limits") ------
+#
+# One shared guard (`_accept_transfer_chunk`) enforces these for all three
+# INBOUND chunked transfers -- `upload_edit`, `manual_push`, `refine_push` --
+# so a misbehaving or hostile client can no longer grow a reassembly buffer
+# without bound (review item 10, 2026-09-13). Buffers stay in memory on
+# purpose (no disk spooling): the bounds below make the worst case explicit
+# instead: `_TRANSFER_MAX_PENDING * _TRANSFER_MAX_B64_CHARS` per connection.
+
+#: Largest `total` (declared chunk count) a transfer may announce. With the
+#: standard `_WS_CHUNK_CHARS` (~700K-character) chunks the byte cap below
+#: binds first (~1,534 chunks); this only stops a sender from splitting a
+#: transfer into a huge number of tiny frames.
+_TRANSFER_MAX_CHUNKS = 4096
+
+#: Largest cumulative `data_b64` size of ONE transfer, in base64 CHARACTERS
+#: (what the server actually buffers): 1 GiB of text = ~768 MiB of decoded
+#: file. Generous for real layered PSDs -- ~7.7x ComfyUI's own default
+#: 100 MB upload cap, and at or above the largest single string the
+#: plugin's JavaScript engine can build for its one-shot base64 encode
+#: anyway (V8 caps a string at 2^29-2^30 characters).
+_TRANSFER_MAX_B64_CHARS = 1024 * 1024 * 1024
+
+#: Most inbound transfers one connection may have partially reassembled at
+#: once, across all three kinds combined. The plugin sends each transfer's
+#: chunks back-to-back in one synchronous loop, so a real client never has
+#: more than one in flight; 4 is headroom, not a tuned value.
+_TRANSFER_MAX_PENDING = 4
+
+#: A partially reassembled transfer that receives no chunk for this long is
+#: discarded (checked on every inbound message AND on every keepalive tick).
+#: Time the server itself spends busy in a handler -- when nobody's chunks
+#: are being read -- does not count toward it. Twice the plugin's own 60 s
+#: transfer timeout: by then the sender has long since given up.
+_TRANSFER_IDLE_SECONDS = 120.0
+
+#: How many rejected transfer ids each kind remembers per connection (the
+#: "drop the rest of this burst" tombstones, see `_accept_transfer_chunk`),
+#: oldest evicted first.
+_TRANSFER_MAX_TOMBSTONES = 256
 
 _VALID_SOURCE_TYPES = ("input", "output", "temp")
 #: Kept in hand-sync with `cpsb.handoff.OriginKind` (this pack's established
@@ -147,22 +206,41 @@ def _error(status: int, message: str, **extra: Any) -> web.Response:
     return web.json_response({"error": message, **extra}, status=status)
 
 
-@dataclass
-class _PendingUpload:
+@dataclass(kw_only=True)
+class _PendingTransfer:
+    """Accounting every inbound chunked transfer shares (PROTOCOL.md §3).
+
+    Filled in by :func:`_accept_transfer_chunk`, the ONE guard all three
+    inbound transfer handlers use: `total` is the chunk count seq 0
+    declared (every later chunk must repeat it), `b64_chars` the running
+    buffered size checked against :data:`_TRANSFER_MAX_B64_CHARS`, and
+    `last_chunk_at`/`busy_mark` let :func:`_expire_idle_transfers` measure
+    idleness net of time the server spent busy (see
+    :func:`_reader_busy_seconds`).
+    """
+
+    chunks: list[str] = field(default_factory=list)
+    total: int = 0
+    b64_chars: int = 0
+    last_chunk_at: float = 0.0
+    busy_mark: float = 0.0
+
+
+@dataclass(kw_only=True)
+class _PendingUpload(_PendingTransfer):
     """In-progress `upload_edit` reassembly state for ONE handoff (PROTOCOL.md §3).
 
     `kind` is captured from the FIRST chunk of this upload (see
     :data:`_VALID_UPLOAD_KINDS`) and never re-validated against later
-    chunks -- mirrors `total`, which is likewise only ever read fresh off
-    each incoming message, not cross-checked chunk to chunk.
+    chunks. `total`, by contrast, IS cross-checked chunk to chunk by
+    :func:`_accept_transfer_chunk`.
     """
 
     kind: str
-    chunks: list[str] = field(default_factory=list)
 
 
-@dataclass
-class _PendingPush:
+@dataclass(kw_only=True)
+class _PendingPush(_PendingTransfer):
     """In-progress `manual_push` reassembly state for ONE Photoshop-initiated
     send (gallery overhaul, "send a layer/document to ComfyUI", 2026-07-23).
 
@@ -176,17 +254,14 @@ class _PendingPush:
     """
 
     title: str
-    chunks: list[str] = field(default_factory=list)
 
 
-@dataclass
-class _PendingRefine:
+@dataclass(kw_only=True)
+class _PendingRefine(_PendingTransfer):
     """In-progress `refine_push` reassembly state for ONE Refine click
     (refine pass R2, PROTOCOL.md §3): the full-quality canvas capture the
     plugin uploads with the request. Same in-order chunk convention as
     :class:`_PendingPush` (websocket delivery is ordered)."""
-
-    chunks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -200,6 +275,20 @@ class PluginConnection:
     local_mode: bool | None = None
     ready: bool = False
     last_pong: float = field(default_factory=time.monotonic)
+    #: Keepalive vs. slow handlers (PROTOCOL.md §3 keepalive, review item 7):
+    #: `busy` counts message handlers currently running on this connection's
+    #: websocket reader (`websocket_route` wraps every dispatch in
+    #: :func:`_reader_busy`). While it is non-zero the reader is NOT reading,
+    #: so the client's pong sits unread in the socket buffer --
+    #: `_wait_for_pong` stops enforcing its deadline (up to
+    #: :data:`_KEEPALIVE_BUSY_CEILING_SECONDS`). `busy_since` is when the
+    #: current busy stretch began (``None`` when idle) and `busy_seconds` the
+    #: total time spent busy on earlier stretches -- see
+    #: :func:`_reader_busy_seconds`, which the transfer idle expiry uses so a
+    #: transfer is never discarded for silence the server itself caused.
+    busy: int = 0
+    busy_since: float | None = None
+    busy_seconds: float = 0.0
     #: In-progress `upload_edit` reassembly buffers (PROTOCOL.md §3), keyed
     #: by `handoff_id`. A brand-new connection (a fresh `PluginConnection`,
     #: one per websocket) always starts with an empty dict, so a reconnect
@@ -207,22 +296,31 @@ class PluginConnection:
     #: socket -- the plugin simply restarts that upload's chunks from seq 0
     #: over the new connection.
     pending_uploads: dict[str, _PendingUpload] = field(default_factory=dict)
+    #: Tombstones for `upload_edit` transfers rejected mid-burst -- same role
+    #: as `rejected_push_ids` below (see `_accept_transfer_chunk`), except a
+    #: retry legitimately REUSES the handoff id, so a fresh seq-0 chunk
+    #: clears the tombstone and starts over.
+    rejected_upload_ids: dict[str, None] = field(default_factory=dict)
     #: In-progress `manual_push` reassembly buffers, keyed by the plugin's own
     #: `push_id` (see :class:`_PendingPush`) -- the "send a layer/document to
     #: ComfyUI" feature, 2026-07-23. Same reconnect-restarts-cleanly posture
     #: as `pending_uploads`.
     pending_pushes: dict[str, _PendingPush] = field(default_factory=dict)
     #: Tombstones for pushes that already got a `manual_push_error` mid-burst
-    #: (see `_handle_manual_push_chunk`'s malformed branch): the sender's
-    #: remaining chunks for that `push_id` are dropped instead of silently
-    #: recreating an unfinishable partial buffer. Per-connection and every
-    #: real client mints a fresh `push_id` per attempt, so this stays tiny;
-    #: freed with the connection like everything else here.
-    rejected_push_ids: set[str] = field(default_factory=set)
+    #: (see `_handle_manual_push_chunk`'s malformed branch and
+    #: `_accept_transfer_chunk`): the sender's remaining chunks for that
+    #: `push_id` are dropped instead of silently recreating an unfinishable
+    #: partial buffer (or drawing one error reply per remaining chunk). An
+    #: insertion-ordered dict used as a set, capped at
+    #: :data:`_TRANSFER_MAX_TOMBSTONES`; freed with the connection like
+    #: everything else here.
+    rejected_push_ids: dict[str, None] = field(default_factory=dict)
     #: In-progress `refine_push` reassembly buffers (refine pass R2), keyed by
     #: the plugin's own `refine_id`. Same reconnect-restarts-cleanly posture
     #: as `pending_pushes`.
     pending_refines: dict[str, _PendingRefine] = field(default_factory=dict)
+    #: Tombstones for rejected `refine_push` transfers (see `rejected_push_ids`).
+    rejected_refine_ids: dict[str, None] = field(default_factory=dict)
     #: Realtime drawing (docs/roadmap/realtime-drawing.md M1): the single
     #: keep-latest live-frame slot. `live_jpeg` is the newest JPEG the
     #: plugin's Live Mode captured (`live_frame` message) -- ONE frame, always
@@ -1134,6 +1232,44 @@ async def send_run_action(
 # -- POST /cpsb/upload --------------------------------------------------------
 
 
+def _decode_image_bytes(raw_bytes: bytes) -> Image.Image:
+    """Open AND fully decode *raw_bytes* (blocking -- worker threads only).
+
+    ``Image.open`` alone is lazy; ``load()`` is the real full-resolution
+    decode, which is what made these sites expensive on the event loop.
+    Raises whatever Pillow raises -- each caller keeps its own catch.
+    """
+    image = Image.open(io.BytesIO(raw_bytes))
+    image.load()
+    return image
+
+
+def _decode_and_ingest_upload(
+    manager: HandoffManager, handoff_id: str, image_bytes: bytes, source: str
+) -> tuple[EditRecord | None, str | None]:
+    """Blocking half of :func:`upload_route`: decode, then ingest -- ONE
+    ``asyncio.to_thread`` job (same seam convention as
+    :func:`_ingest_psd_upload`).
+
+    Returns ``(edit, None)`` -- *edit* being `ingest_edit`'s own return,
+    possibly ``None`` for a duplicate/inactive-race no-op -- or
+    ``(None, "Invalid image data: ...")`` when the bytes don't decode (the
+    route's 400). Only Pillow's ``(OSError, ValueError)`` are caught, exactly
+    as before the decode moved off the loop; an ingest failure still raises.
+    """
+    try:
+        image = _decode_image_bytes(image_bytes)
+    except (OSError, ValueError) as exc:
+        return None, f"Invalid image data: {exc}"
+
+    logger.info("Ingesting %s-sourced upload for handoff %s", source, handoff_id)
+    # Both the plugin and a manual gallery drag-and-drop deliver final,
+    # already-flattened pixels with no PSD (re)compositing on our side, so
+    # both map to fidelity "plugin" -- the PROTOCOL.md §1 enum value meaning
+    # "authoritative pixels, not derived by us."
+    return manager.ingest_edit(handoff_id, image, "plugin"), None
+
+
 @routes.post("/cpsb/upload")
 async def upload_route(request: web.Request) -> web.Response:
     manager = _manager(request)
@@ -1178,23 +1314,18 @@ async def upload_route(request: web.Request) -> web.Response:
         )
         return web.json_response({"ok": True, "ignored": True})
 
-    try:
-        image = Image.open(io.BytesIO(image_bytes))
-        image.load()
-    except (OSError, ValueError) as exc:
-        return _error(400, f"Invalid image data: {exc}")
-
-    logger.info("Ingesting %s-sourced upload for handoff %s", source, handoff_id)
-    # Both the plugin and a manual gallery drag-and-drop deliver final,
-    # already-flattened pixels with no PSD (re)compositing on our side, so
-    # both map to fidelity "plugin" -- the PROTOCOL.md §1 enum value meaning
-    # "authoritative pixels, not derived by us."
     # 2026-08-26 event-loop-blocking audit: ingest_edit PNG-encodes the
     # image and does dedup-hash + edit/meta file I/O under its own lock --
     # owner report: "saving can take 10-20 s while a workflow runs" was this
-    # exact call sitting on ComfyUI's event loop. Off to a worker thread so
-    # this HTTP handler never blocks the loop for it.
-    edit = await asyncio.to_thread(manager.ingest_edit, handoff_id, image, "plugin")
+    # exact call sitting on ComfyUI's event loop. The PNG decode in front of
+    # it (a full-resolution `Image.load()`) was left on the loop by that
+    # round (review 2026-09-13); both now run as ONE worker-thread job,
+    # `_decode_and_ingest_upload`, rather than a thread hop per step.
+    edit, decode_error = await asyncio.to_thread(
+        _decode_and_ingest_upload, manager, handoff_id, image_bytes, source
+    )
+    if decode_error is not None:
+        return _error(400, decode_error)
     if edit is None:
         # Either a duplicate of the most recent edit (idempotent -- the
         # watchdog and the plugin can both report the same save) or the
@@ -1750,7 +1881,8 @@ async def fs_list_route(request: web.Request) -> web.Response:
             asyncio.to_thread(_fs_list_probe_and_scan, resolved, extensions),
             timeout=_FS_IO_TIMEOUT_SECONDS,
         )
-    except TimeoutError:
+    # Py3.10: wait_for raises asyncio.TimeoutError, not yet an alias of TimeoutError (3.11+).
+    except (TimeoutError, asyncio.TimeoutError):
         logger.warning(
             "cpsb: listing %s took longer than %.0fs (a slow or unreachable "
             "share?) -- answering 400 instead of stalling the server",
@@ -1891,26 +2023,248 @@ async def update_settings_route(request: web.Request) -> web.Response:
 # -- GET /cpsb/ws (plugin websocket) -------------------------------------------
 
 
+@contextlib.contextmanager
+def _reader_busy(connection: PluginConnection) -> Iterator[None]:
+    """Marks *connection*'s websocket reader as busy for the ``with`` body.
+
+    `websocket_route` wraps every message dispatch in this: while a handler
+    runs, the receive loop is suspended inside it and cannot read the
+    client's pong -- moving the heavy work to a worker thread frees the event
+    loop but NOT this one reader (review item 7). The keepalive therefore
+    does not enforce its pong deadline while `busy` is non-zero (see
+    :func:`_wait_for_pong`). Fast handlers hold it for microseconds; the
+    ones that matter are a large ingest or an outbound file stream.
+    Re-entrant (a counter), and accumulates `busy_seconds` when the
+    outermost section ends.
+    """
+    if connection.busy == 0:
+        connection.busy_since = time.monotonic()
+    connection.busy += 1
+    try:
+        yield
+    finally:
+        connection.busy -= 1
+        if connection.busy == 0 and connection.busy_since is not None:
+            connection.busy_seconds += time.monotonic() - connection.busy_since
+            connection.busy_since = None
+
+
+def _reader_busy_seconds(connection: PluginConnection, now: float) -> float:
+    """Total time *connection*'s reader has spent busy so far, as of *now*
+    (including the current stretch, if one is in progress) -- the clock
+    :func:`_expire_idle_transfers` subtracts so silence the server caused
+    never counts against a transfer."""
+    total = connection.busy_seconds
+    if connection.busy_since is not None:
+        total += now - connection.busy_since
+    return total
+
+
+def _pending_transfers(
+    connection: PluginConnection,
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    """Every inbound transfer buffer on *connection*, labeled by message type."""
+    return (
+        ("upload_edit", connection.pending_uploads),
+        ("manual_push", connection.pending_pushes),
+        ("refine_push", connection.pending_refines),
+    )
+
+
+def _pending_transfer_count(connection: PluginConnection) -> int:
+    return sum(len(buffers) for _label, buffers in _pending_transfers(connection))
+
+
+def _connection_busy(connection: PluginConnection) -> bool:
+    """Whether a missing pong is NOT evidence the client is dead right now:
+    the reader is inside a handler, or an inbound chunked transfer is still
+    arriving (the client's pong is queued behind its own upload chunks)."""
+    return connection.busy > 0 or _pending_transfer_count(connection) > 0
+
+
+def _tombstone(tombstones: dict[str, None], key: str) -> None:
+    """Remember *key* as rejected (see `_accept_transfer_chunk`), bounded."""
+    tombstones.pop(key, None)
+    tombstones[key] = None
+    while len(tombstones) > _TRANSFER_MAX_TOMBSTONES:
+        del tombstones[next(iter(tombstones))]
+
+
+def _in_rejected_burst(tombstones: dict[str, None], key: str, seq: Any) -> bool:
+    """Whether this chunk is the tail of an already-rejected transfer.
+
+    The sender transmits every chunk back-to-back before any reply can reach
+    it, so after a rejection the REST of that burst still arrives; each
+    handler drops it silently (whatever its own shape) instead of drawing one
+    error reply per chunk or recreating an unfinishable buffer. A seq-0 chunk
+    is a fresh attempt -- an `upload_edit` retry reuses its handoff id -- so
+    it clears the tombstone and is processed normally.
+    """
+    if key not in tombstones:
+        return False
+    if seq == 0:
+        del tombstones[key]
+        return False
+    return True
+
+
+def _expire_idle_transfers(connection: PluginConnection, now: float | None = None) -> None:
+    """Discard every partially reassembled transfer that has gone idle.
+
+    Idle means no chunk for :data:`_TRANSFER_IDLE_SECONDS`, NET of time the
+    reader spent busy since that chunk (:func:`_reader_busy_seconds`):
+    while the server is inside a slow handler nobody's chunks are being
+    read, so that stretch is never blamed on the sender. Called on every
+    inbound message and on every keepalive tick (PROTOCOL.md §3, "Transfer
+    limits"). Silent towards the client -- a sender that later resumes the
+    transfer gets the ordinary out-of-order rejection on its next chunk.
+    """
+    now = time.monotonic() if now is None else now
+    busy_now = _reader_busy_seconds(connection, now)
+    for label, buffers in _pending_transfers(connection):
+        stale = [
+            key
+            for key, pending in buffers.items()
+            if (now - pending.last_chunk_at) - (busy_now - pending.busy_mark)
+            > _TRANSFER_IDLE_SECONDS
+        ]
+        for key in stale:
+            pending = buffers.pop(key)
+            logger.warning(
+                "cpsb: discarding stalled %s transfer %s (%d/%d chunks, no chunk for %ss)",
+                label,
+                key,
+                len(pending.chunks),
+                pending.total,
+                _TRANSFER_IDLE_SECONDS,
+            )
+
+
+def _accept_transfer_chunk(
+    connection: PluginConnection,
+    buffers: dict[str, Any],
+    tombstones: dict[str, None],
+    key: str,
+    seq: int,
+    total: int,
+    data_b64: str,
+    make_pending: Callable[[], _PendingTransfer],
+) -> tuple[_PendingTransfer | None, str | None, str | None]:
+    """The ONE resource guard every inbound chunked transfer goes through.
+
+    Used by `_handle_upload_edit_chunk`, `_handle_manual_push_chunk` and
+    `_handle_refine_push` after their own :func:`_in_rejected_burst` check
+    and per-field validation (so *seq*/*total* are ints, *total* >= 1,
+    *data_b64* is a str). Enforces, per
+    PROTOCOL.md §3 "Transfer limits": a declared *total* of at most
+    :data:`_TRANSFER_MAX_CHUNKS`; strictly in-order chunks
+    (``seq == len(chunks)`` -- a duplicate, a gap, or a seq that doesn't
+    start a new transfer at 0 is rejected); a *total* that never changes
+    mid-transfer; at most :data:`_TRANSFER_MAX_B64_CHARS` buffered per
+    transfer; and at most :data:`_TRANSFER_MAX_PENDING` partial transfers per
+    connection.
+
+    A rejection drops the partial buffer and tombstones *key* (see
+    :func:`_in_rejected_burst`), so the rest of that burst is dropped
+    silently.
+
+    Returns:
+        ``(pending, None, None)`` when this chunk COMPLETED the transfer
+        (already removed from *buffers*); ``(None, None, None)`` when it was
+        accepted and more are due; ``(None, error, reason)`` when it was
+        rejected -- the caller sends its own message type's error reply
+        carrying *error* and *reason* (PROTOCOL.md §3): ``"too_large"`` for
+        the two SIZE caps (deterministic for the same bytes -- a client must
+        not retry), ``"busy"`` for the pending-transfer cap (transient: it
+        clears as in-flight transfers finish or idle out, so retrying later
+        can succeed), ``"malformed"`` for everything about order/framing.
+    """
+    pending: _PendingTransfer | None = buffers.get(key)
+    error: str | None = None
+    reason = "malformed"
+    if total > _TRANSFER_MAX_CHUNKS:
+        error = f"Transfer declares {total} chunks; the limit is {_TRANSFER_MAX_CHUNKS}"
+        reason = "too_large"
+    elif pending is None:
+        if seq != 0:
+            error = f"Out-of-order chunk: expected seq 0 to start a transfer, got {seq}"
+        elif _pending_transfer_count(connection) >= _TRANSFER_MAX_PENDING:
+            error = (
+                f"Too many concurrent transfers on this connection (limit {_TRANSFER_MAX_PENDING})"
+            )
+            reason = "busy"
+    elif seq != len(pending.chunks):
+        error = f"Out-of-order or duplicate chunk: expected seq {len(pending.chunks)}, got {seq}"
+    elif total != pending.total:
+        error = f"Chunk total changed mid-transfer ({pending.total} -> {total})"
+    b64_chars = (pending.b64_chars if pending is not None else 0) + len(data_b64)
+    if error is None and b64_chars > _TRANSFER_MAX_B64_CHARS:
+        error = f"Transfer exceeds the {_TRANSFER_MAX_B64_CHARS}-character size limit"
+        reason = "too_large"
+    if error is not None:
+        buffers.pop(key, None)
+        _tombstone(tombstones, key)
+        return None, error, reason
+
+    now = time.monotonic()
+    if pending is None:
+        pending = make_pending()
+        pending.total = total
+        buffers[key] = pending
+    pending.chunks.append(data_b64)
+    pending.b64_chars = b64_chars
+    pending.last_chunk_at = now
+    pending.busy_mark = _reader_busy_seconds(connection, now)
+    if len(pending.chunks) < total:
+        return None, None, None
+    del buffers[key]
+    return pending, None, None
+
+
 async def _wait_for_pong(connection: PluginConnection, ping_sent_at: float, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    """Wait for a pong to the ping sent at *ping_sent_at* (PROTOCOL.md §3).
+
+    *timeout* is enforced only while the connection is NOT busy
+    (:func:`_connection_busy`): while it is, the deadline keeps sliding to
+    "now + *timeout*", so once the busy stretch ends the client still gets a
+    full *timeout* for its (by then usually already queued) pong to be read.
+    :data:`_KEEPALIVE_BUSY_CEILING_SECONDS` after the ping it gives up
+    regardless, so a client that dies during a busy stretch is still
+    dropped. Also sweeps idle transfers on every poll, so a stalled upload
+    can't hold the connection "busy" until the ceiling.
+    """
+    deadline = ping_sent_at + timeout
+    ceiling = ping_sent_at + max(timeout, _KEEPALIVE_BUSY_CEILING_SECONDS)
+    while True:
         if connection.last_pong >= ping_sent_at:
             return True
-        await asyncio.sleep(0.5)
-    return False
+        now = time.monotonic()
+        if now >= ceiling:
+            return False
+        _expire_idle_transfers(connection, now)
+        if _connection_busy(connection):
+            deadline = max(deadline, now + timeout)
+        elif now >= deadline:
+            return False
+        await asyncio.sleep(_PONG_POLL_SECONDS)
 
 
 async def _keepalive_loop(connection: PluginConnection) -> None:
-    """Ping every 30s; close if no pong within 15s (PROTOCOL.md §3)."""
+    """Ping every 30s; close if no pong within 15s of the connection being
+    free to read it (PROTOCOL.md §3 keepalive -- see :func:`_wait_for_pong`).
+    Each tick also discards idle inbound transfers."""
     try:
         while True:
             await asyncio.sleep(_PING_INTERVAL_SECONDS)
+            _expire_idle_transfers(connection)
             ping_sent_at = time.monotonic()
             await connection.ws.send_json({"type": "ping"})
             if not await _wait_for_pong(connection, ping_sent_at, _PONG_TIMEOUT_SECONDS):
                 logger.warning(
-                    "cpsb plugin did not pong within %ss, closing connection",
+                    "cpsb plugin did not pong within %ss (%ss while the connection was busy), "
+                    "closing connection",
                     _PONG_TIMEOUT_SECONDS,
+                    _KEEPALIVE_BUSY_CEILING_SECONDS,
                 )
                 await connection.ws.close(code=1000, message=b"ping timeout")
                 return
@@ -2087,6 +2441,34 @@ def _ingest_psd_upload(
     return edit, None, None
 
 
+def _ingest_png_upload(
+    manager: HandoffManager, meta: HandoffMeta, raw_bytes: bytes
+) -> tuple[EditRecord | None, str | None, str | None]:
+    """The flat-PNG (`kind: "png"`) counterpart of :func:`_ingest_psd_upload`:
+    decode *raw_bytes* and ingest it, as ONE ``asyncio.to_thread`` job -- the
+    decode used to run on the event loop ahead of an off-loop ingest
+    (review 2026-09-13). Same ``(edit, error, reason)`` contract.
+
+    The decode catch is broad on purpose (same rationale as
+    `_handle_manual_push_chunk`'s): Pillow's DecompressionBombError is a
+    direct Exception subclass the old ``(OSError, ValueError)`` tuple missed,
+    and an uncaught raise escapes the websocket message loop and tears down
+    the whole Tier-2 socket instead of failing one upload. An `ingest_edit`
+    failure still raises, exactly as before.
+    """
+    try:
+        image = _decode_image_bytes(raw_bytes)
+    except Exception as exc:
+        return None, f"Invalid image data: {exc}", "invalid_image"
+
+    logger.info("Ingesting plugin-sourced websocket upload for handoff %s", meta.handoff_id)
+    # Both the HTTP and websocket upload paths deliver final, already-
+    # flattened pixels with no PSD (re)compositing on our side, so both map
+    # to fidelity "plugin" -- see `_decode_and_ingest_upload`'s identical
+    # comment.
+    return manager.ingest_edit(meta.handoff_id, image, "plugin"), None, None
+
+
 async def _finish_upload_edit_ack(
     connection: PluginConnection, manager: HandoffManager, handoff_id: str, edit: EditRecord | None
 ) -> bool:
@@ -2149,17 +2531,20 @@ async def _handle_upload_edit_chunk(
     if not handoff_id:
         logger.warning("cpsb plugin sent upload_edit with no handoff_id, ignoring")
         return
+    if _in_rejected_burst(connection.rejected_upload_ids, handoff_id, seq):
+        return
     if (
         not isinstance(seq, int)
         or not isinstance(total, int)
         or total < 1
-        or data_b64 is None
+        or not isinstance(data_b64, str)
         or kind not in _VALID_UPLOAD_KINDS
     ):
         logger.warning(
             "cpsb plugin sent a malformed upload_edit chunk for %s, ignoring", handoff_id
         )
         connection.pending_uploads.pop(handoff_id, None)
+        _tombstone(connection.rejected_upload_ids, handoff_id)
         await connection.ws.send_json(
             {
                 "type": "upload_error",
@@ -2170,14 +2555,38 @@ async def _handle_upload_edit_chunk(
         )
         return
 
-    pending = connection.pending_uploads.setdefault(handoff_id, _PendingUpload(kind=kind))
-    pending.chunks.append(data_b64)
-    if len(pending.chunks) < total:
+    # The shared resource guard (PROTOCOL.md §3 "Transfer limits"): strict
+    # in-order seq, chunk-count/byte/pending-transfer caps. A rejection uses
+    # the malformed-chunk reply shape above, with the guard's own `reason`
+    # (`malformed`, or `too_large`/`busy` for the size and pending caps).
+    completed, guard_error, guard_reason = _accept_transfer_chunk(
+        connection,
+        connection.pending_uploads,
+        connection.rejected_upload_ids,
+        handoff_id,
+        seq,
+        total,
+        data_b64,
+        lambda: _PendingUpload(kind=kind),
+    )
+    if guard_error is not None:
+        logger.warning("cpsb plugin upload_edit for %s rejected: %s", handoff_id, guard_error)
+        await connection.ws.send_json(
+            {
+                "type": "upload_error",
+                "handoff_id": handoff_id,
+                "error": guard_error,
+                "reason": guard_reason,
+            }
+        )
+        return
+    if completed is None:
         return  # More chunks still to come.
 
-    # Reassembly complete -- pop so a later, unrelated upload for the same
-    # handoff_id starts from a clean buffer.
-    pending = connection.pending_uploads.pop(handoff_id)
+    # Reassembly complete -- the guard already removed the buffer, so a
+    # later, unrelated upload for the same handoff_id starts clean.
+    assert isinstance(completed, _PendingUpload)
+    pending = completed
     try:
         raw_bytes = base64.b64decode("".join(pending.chunks), validate=True)
     except (ValueError, binascii.Error) as exc:
@@ -2256,30 +2665,6 @@ async def _handle_upload_edit_chunk(
             )
             return
     else:
-        try:
-            image = Image.open(io.BytesIO(raw_bytes))
-            image.load()
-        except Exception as exc:
-            # Broad on purpose (same rationale as _handle_manual_push_chunk's
-            # decode): Pillow's DecompressionBombError is a direct Exception
-            # subclass the old (OSError, ValueError) tuple missed, and an
-            # uncaught raise here escapes the websocket message loop and
-            # tears down the whole Tier-2 socket instead of failing one
-            # upload.
-            await connection.ws.send_json(
-                {
-                    "type": "upload_error",
-                    "handoff_id": handoff_id,
-                    "error": f"Invalid image data: {exc}",
-                    "reason": "invalid_image",
-                }
-            )
-            return
-
-        logger.info("Ingesting plugin-sourced websocket upload for handoff %s", handoff_id)
-        # Both the HTTP and websocket upload paths deliver final, already-
-        # flattened pixels with no PSD (re)compositing on our side, so both
-        # map to fidelity "plugin" -- see upload_route's identical comment.
         # Off-loop for the same reason as upload_route's call (2026-08-26
         # audit): this handler runs on the ONE serial plugin-websocket
         # message loop, so a blocking ingest here stalls every OTHER
@@ -2288,10 +2673,82 @@ async def _handle_upload_edit_chunk(
         # strictly in order -- the loop just isn't pinned to a thread doing
         # disk I/O while this one is in flight (do NOT confuse this with
         # `_handle_live_frame`, which stays synchronous/lean by design and
-        # is out of this audit's scope).
-        edit = await asyncio.to_thread(manager.ingest_edit, handoff_id, image, "plugin")
+        # is out of this audit's scope). The PNG decode now rides in the
+        # SAME job (`_ingest_png_upload`, mirroring the psd branch's single
+        # `_ingest_psd_upload` call above) instead of running on the loop
+        # first (review 2026-09-13).
+        edit, error_message, reason = await asyncio.to_thread(
+            _ingest_png_upload, manager, meta, raw_bytes
+        )
+        if error_message is not None:
+            await connection.ws.send_json(
+                {
+                    "type": "upload_error",
+                    "handoff_id": handoff_id,
+                    "error": error_message,
+                    "reason": reason,
+                }
+            )
+            return
 
     await _finish_upload_edit_ack(connection, manager, handoff_id, edit)
+
+
+def _ingest_manual_push(
+    manager: HandoffManager, push_id: str, title: str, raw_bytes: bytes
+) -> tuple[HandoffMeta | None, str | None, str | None]:
+    """Blocking half of :func:`_handle_manual_push_chunk` -- decode the pushed
+    image, create its handoff, write the flat managed PSD, ingest the first
+    edit -- as ONE ``asyncio.to_thread`` job.
+
+    Never raises (an exception here would escape the websocket message loop
+    and tear down the whole Tier-2 socket). Returns ``(meta, None, None)`` on
+    success, or ``(None, error, reason)`` with the `manual_push_error` text
+    and `reason` to send: ``"Invalid image data: ..."``/``"invalid_image"``
+    when the bytes don't decode (no handoff is created), or the generic
+    ingest failure with NO reason once a handoff exists (which is then
+    marked ``error``) -- a server-side failure, not a property of the bytes.
+    """
+    try:
+        image = _decode_image_bytes(raw_bytes)
+    except Exception as exc:
+        # Deliberately broad, mirroring _ingest_psd_upload's identical
+        # posture: Pillow raises more than OSError/ValueError here -- most
+        # concretely DecompressionBombError (a direct Exception subclass) on
+        # a huge whole-document send, ~179M pixels at Pillow's default
+        # MAX_IMAGE_PIXELS, well within Photoshop's 30k x 30k range. An
+        # uncaught raise here doesn't fail one push, it escapes the
+        # websocket message loop and tears down the ENTIRE Tier-2 socket
+        # (verified live), killing every other in-flight transfer with it.
+        return None, f"Invalid image data: {exc}", "invalid_image"
+
+    meta: HandoffMeta | None = None
+    try:
+        meta = manager.create(
+            origin_node_id=f"ps-push:{push_id}",
+            origin_kind="manual_send",
+            workflow_name="",
+            source=SourceRef(filename=title, subfolder="", type="temp"),
+            original_image=image,
+        )
+        # `_write_managed_psd_copy`'s normalize step is load-bearing here --
+        # see its docstring ("P"/"I;16" pushes crashed the socket without it).
+        _write_managed_psd_copy(manager.psd_path(meta), None, image)
+        manager.note_source_written(meta.handoff_id)
+        manager.ingest_edit(meta.handoff_id, image, "plugin")
+    except Exception:
+        # Same never-let-it-escape-the-message-loop posture as the decode
+        # above. If the handoff was already created, mark it errored rather
+        # than deleting it: "error" is visible in the gallery (diagnosable,
+        # removable) AND in PURGEABLE_STATUSES (cleanup reclaims it), while
+        # a silently-abandoned "pending" handoff would sit unexplained
+        # forever -- pending is not purgeable.
+        logger.exception("cpsb: manual_push %s failed while creating its handoff", push_id)
+        if meta is not None:
+            with contextlib.suppress(Exception):
+                manager.mark_error(meta.handoff_id, "Photoshop push failed while ingesting")
+        return None, "Server failed to ingest the pushed image (see the ComfyUI log)", None
+    return meta, None, None
 
 
 async def _handle_manual_push_chunk(
@@ -2335,103 +2792,95 @@ async def _handle_manual_push_chunk(
     if not push_id:
         logger.warning("cpsb plugin sent manual_push with no push_id, ignoring")
         return
-    if push_id in connection.rejected_push_ids:
+    if _in_rejected_burst(connection.rejected_push_ids, push_id, seq):
         # This push already got its manual_push_error (e.g. a malformed chunk
         # mid-stream) -- but the sender transmits every chunk back-to-back
         # before any reply can reach it, so the REST of the burst still
-        # arrives. Without this tombstone, setdefault() below would silently
-        # recreate a _PendingPush whose len(chunks) can never reach `total`,
-        # leaking a multi-MB partial buffer on the connection until the
-        # socket closes.
+        # arrives. Without this tombstone it would recreate a partial buffer
+        # that can never complete (or draw one error reply per chunk).
         return
-    if not isinstance(seq, int) or not isinstance(total, int) or total < 1 or data_b64 is None:
+    if (
+        not isinstance(seq, int)
+        or not isinstance(total, int)
+        or total < 1
+        or not isinstance(data_b64, str)
+    ):
         logger.warning("cpsb plugin sent a malformed manual_push chunk for %s, ignoring", push_id)
         connection.pending_pushes.pop(push_id, None)
-        connection.rejected_push_ids.add(push_id)
+        _tombstone(connection.rejected_push_ids, push_id)
         await connection.ws.send_json(
             {
                 "type": "manual_push_error",
                 "push_id": push_id,
                 "error": "Malformed manual_push chunk",
+                "reason": "malformed",
             }
         )
         return
 
-    pending = connection.pending_pushes.setdefault(push_id, _PendingPush(title=title))
-    pending.chunks.append(data_b64)
-    if len(pending.chunks) < total:
-        return  # More chunks still to come.
-
-    pending = connection.pending_pushes.pop(push_id)
-    try:
-        raw_bytes = base64.b64decode("".join(pending.chunks), validate=True)
-    except (ValueError, binascii.Error) as exc:
-        await connection.ws.send_json(
-            {"type": "manual_push_error", "push_id": push_id, "error": f"Invalid base64: {exc}"}
-        )
-        return
-
-    try:
-        image = Image.open(io.BytesIO(raw_bytes))
-        image.load()
-    except Exception as exc:
-        # Deliberately broad, mirroring _ingest_psd_upload's identical
-        # posture: Pillow raises more than OSError/ValueError here -- most
-        # concretely DecompressionBombError (a direct Exception subclass) on
-        # a huge whole-document send, ~179M pixels at Pillow's default
-        # MAX_IMAGE_PIXELS, well within Photoshop's 30k x 30k range. An
-        # uncaught raise here doesn't fail one push, it escapes the
-        # websocket message loop and tears down the ENTIRE Tier-2 socket
-        # (verified live), killing every other in-flight transfer with it.
-        await connection.ws.send_json(
-            {"type": "manual_push_error", "push_id": push_id, "error": f"Invalid image data: {exc}"}
-        )
-        return
-
-    meta: HandoffMeta | None = None
-    try:
-        # 2026-08-26 event-loop-blocking audit follow-up: create() (mkdir +
-        # thumbnail encode/resize + meta.json write), the managed-PSD write,
-        # and ingest_edit() (PNG encode + dedup hash + edit/meta file I/O)
-        # are the same blocking calls already dispatched through
-        # `asyncio.to_thread` at their other call sites (`open_handoff_route`,
-        # `upload_route`, `_handle_upload_edit_chunk`) -- and THIS handler
-        # runs on the ONE serial plugin-websocket message loop, so blocking
-        # here stalls every other handoff's traffic on the connection too.
-        # Awaiting still processes this connection's messages strictly in
-        # order, exactly like `_handle_upload_edit_chunk`'s dispatches.
-        meta = await asyncio.to_thread(
-            manager.create,
-            origin_node_id=f"ps-push:{push_id}",
-            origin_kind="manual_send",
-            workflow_name="",
-            source=SourceRef(filename=pending.title, subfolder="", type="temp"),
-            original_image=image,
-        )
-        psd_path = manager.psd_path(meta)
-        # `_write_managed_psd_copy`'s normalize step is load-bearing here --
-        # see its docstring ("P"/"I;16" pushes crashed the socket without it).
-        await asyncio.to_thread(_write_managed_psd_copy, psd_path, None, image)
-        manager.note_source_written(meta.handoff_id)
-        await asyncio.to_thread(manager.ingest_edit, meta.handoff_id, image, "plugin")
-    except Exception:
-        # Same never-let-it-escape-the-message-loop posture as the decode
-        # above. If the handoff was already created, mark it errored rather
-        # than deleting it: "error" is visible in the gallery (diagnosable,
-        # removable) AND in PURGEABLE_STATUSES (cleanup reclaims it), while
-        # a silently-abandoned "pending" handoff would sit unexplained
-        # forever -- pending is not purgeable.
-        logger.exception("cpsb: manual_push %s failed while creating its handoff", push_id)
-        if meta is not None:
-            with contextlib.suppress(Exception):
-                manager.mark_error(meta.handoff_id, "Photoshop push failed while ingesting")
+    # The shared resource guard (PROTOCOL.md §3 "Transfer limits").
+    completed, guard_error, guard_reason = _accept_transfer_chunk(
+        connection,
+        connection.pending_pushes,
+        connection.rejected_push_ids,
+        push_id,
+        seq,
+        total,
+        data_b64,
+        lambda: _PendingPush(title=title),
+    )
+    if guard_error is not None:
+        logger.warning("cpsb plugin manual_push %s rejected: %s", push_id, guard_error)
         await connection.ws.send_json(
             {
                 "type": "manual_push_error",
                 "push_id": push_id,
-                "error": "Server failed to ingest the pushed image (see the ComfyUI log)",
+                "error": guard_error,
+                "reason": guard_reason,
             }
         )
+        return
+    if completed is None:
+        return  # More chunks still to come.
+
+    assert isinstance(completed, _PendingPush)
+    pending = completed
+    try:
+        raw_bytes = base64.b64decode("".join(pending.chunks), validate=True)
+    except (ValueError, binascii.Error) as exc:
+        await connection.ws.send_json(
+            {
+                "type": "manual_push_error",
+                "push_id": push_id,
+                "error": f"Invalid base64: {exc}",
+                "reason": "malformed",
+            }
+        )
+        return
+
+    # 2026-08-26 event-loop-blocking audit follow-up: create() (mkdir +
+    # thumbnail encode/resize + meta.json write), the managed-PSD write, and
+    # ingest_edit() (PNG encode + dedup hash + edit/meta file I/O) are the
+    # same blocking calls dispatched off the loop at their other call sites
+    # -- and THIS handler runs on the ONE serial plugin-websocket message
+    # loop, so blocking here stalls every other handoff's traffic on the
+    # connection too. The PNG decode in front of them had stayed on the loop
+    # (review 2026-09-13); now decode, create, write and ingest run as ONE
+    # worker-thread job (`_ingest_manual_push`) instead of a thread hop per
+    # step. Awaiting still processes this connection's messages strictly in
+    # order, exactly like `_handle_upload_edit_chunk`'s dispatches.
+    meta, push_error, push_reason = await asyncio.to_thread(
+        _ingest_manual_push, manager, push_id, pending.title, raw_bytes
+    )
+    if push_error is not None or meta is None:
+        reply: dict[str, Any] = {
+            "type": "manual_push_error",
+            "push_id": push_id,
+            "error": push_error or "Server failed to ingest the pushed image",
+        }
+        if push_reason is not None:
+            reply["reason"] = push_reason
+        await connection.ws.send_json(reply)
         return
 
     logger.info(
@@ -2640,37 +3089,52 @@ async def _handle_refine_push(
     seq = msg.get("seq")
     total = msg.get("total")
     data_b64 = msg.get("data_b64")
+    if refine_id and _in_rejected_burst(connection.rejected_refine_ids, refine_id, seq):
+        return  # Tail of an already-rejected burst (see `_in_rejected_burst`).
     if not refine_id or not isinstance(seq, int) or not isinstance(total, int) or total <= 0:
         logger.warning("cpsb: refine_push with missing/invalid framing, ignoring")
         return
 
-    async def _reject(error: str) -> None:
+    async def _reject(error: str, reason: str) -> None:
         connection.pending_refines.pop(refine_id, None)
         logger.warning("cpsb: refine_push %s rejected: %s", refine_id, error)
         try:
             await connection.ws.send_json(
-                {"type": "refine_error", "refine_id": refine_id, "error": error}
+                {"type": "refine_error", "refine_id": refine_id, "error": error, "reason": reason}
             )
         except Exception:
             logger.warning("cpsb: refine_error reply not sent", exc_info=True)
 
     if not isinstance(data_b64, str):
-        await _reject("chunk without data_b64")
+        _tombstone(connection.rejected_refine_ids, refine_id)
+        await _reject("chunk without data_b64", "malformed")
         return
 
-    pending = connection.pending_refines.setdefault(refine_id, _PendingRefine())
-    pending.chunks.append(data_b64)
-    if len(pending.chunks) < total:
+    # The shared resource guard (PROTOCOL.md §3 "Transfer limits").
+    completed, guard_error, guard_reason = _accept_transfer_chunk(
+        connection,
+        connection.pending_refines,
+        connection.rejected_refine_ids,
+        refine_id,
+        seq,
+        total,
+        data_b64,
+        _PendingRefine,
+    )
+    if guard_error is not None:
+        await _reject(guard_error, guard_reason or "malformed")
+        return
+    if completed is None:
         return
 
-    connection.pending_refines.pop(refine_id, None)
+    pending = completed
     try:
         png = base64.b64decode("".join(pending.chunks), validate=True)
     except (ValueError, binascii.Error) as exc:
-        await _reject(f"invalid base64: {exc}")
+        await _reject(f"invalid base64: {exc}", "malformed")
         return
     if not png.startswith(_PNG_MAGIC):
-        await _reject("payload is not a PNG stream")
+        await _reject("payload is not a PNG stream", "invalid_image")
         return
 
     slot = app[_APP_KEY_REFINE]
@@ -2850,6 +3314,10 @@ async def _handle_plugin_message(
     raw: str,
     app: web.Application | None = None,
 ) -> None:
+    # Every inbound message is an idle-expiry checkpoint for partial chunked
+    # transfers (PROTOCOL.md §3 "Transfer limits"); the keepalive tick is the
+    # other one, for a connection that has gone quiet altogether.
+    _expire_idle_transfers(connection)
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
@@ -2997,9 +3465,13 @@ async def websocket_route(request: web.Request) -> web.WebSocketResponse:
     try:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
-                await _handle_plugin_message(
-                    context, manager, connection, msg.data, app=request.app
-                )
+                # While a handler runs this loop is NOT reading the socket --
+                # including the client's pongs -- so the keepalive must not
+                # count that time against the client (`_reader_busy`).
+                with _reader_busy(connection):
+                    await _handle_plugin_message(
+                        context, manager, connection, msg.data, app=request.app
+                    )
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 logger.warning("cpsb plugin websocket error: %s", ws.exception())
     finally:

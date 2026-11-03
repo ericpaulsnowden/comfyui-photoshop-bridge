@@ -266,10 +266,13 @@ function splitIntoChunks(data) {
  * @property {'upload_error'} type
  * @property {string} handoff_id
  * @property {string} error
- * @property {'unknown_handoff' | 'inactive' | 'invalid_image' | 'malformed'} [reason] -
+ * @property {'unknown_handoff' | 'inactive' | 'invalid_image' | 'malformed' | 'too_large' | 'busy'} [reason] -
  * Mirrors `POST /cpsb/upload`'s HTTP status codes: `unknown_handoff`/
  * `inactive` are the 404/409 equivalents (never worth retrying identical
- * bytes); `invalid_image`/`malformed` are retryable.
+ * bytes); `invalid_image`/`malformed` are retryable. `too_large` (a
+ * transfer over the server's size limits) is never worth retrying either;
+ * `busy` (too many transfers in flight on this connection) is transient
+ * and retryable (docs/PROTOCOL.md §3 "Transfer limits").
  */
 
 /**
@@ -806,8 +809,8 @@ class ConnectionManager extends EventTarget {
       return
     }
     if (msg.type === 'manual_push_error') {
-      const errorMsg = /** @type {{push_id: string, error: string}} */ (msg)
-      this._onManualPushResult(errorMsg.push_id, null, errorMsg.error || 'Push rejected')
+      const errorMsg = /** @type {{push_id: string, error: string, reason?: string}} */ (msg)
+      this._onManualPushResult(errorMsg.push_id, null, errorMsg.error || 'Push rejected', errorMsg.reason)
       return
     }
     if (msg.type === 'refine_ok') {
@@ -816,8 +819,8 @@ class ConnectionManager extends EventTarget {
       return
     }
     if (msg.type === 'refine_error') {
-      const errorMsg = /** @type {{refine_id: string, error: string}} */ (msg)
-      this._onRefinePushResult(errorMsg.refine_id, null, errorMsg.error || 'Refine rejected')
+      const errorMsg = /** @type {{refine_id: string, error: string, reason?: string}} */ (msg)
+      this._onRefinePushResult(errorMsg.refine_id, null, errorMsg.error || 'Refine rejected', errorMsg.reason)
       return
     }
     // open_handoff / handoff_cancelled / anything future and unrecognized —
@@ -953,15 +956,17 @@ class ConnectionManager extends EventTarget {
   /**
    * Resolves or rejects the in-flight {@link pushManualSendOverWs} call for
    * `pushId` (`manual_push_ok` -> resolve with the server's new
-   * `handoffId`, `manual_push_error` -> reject). A result for a `pushId`
-   * with no pending push is ignored — mirrors {@link _onUploadResult}.
+   * `handoffId`, `manual_push_error` -> reject, with `error.reason` set when
+   * the server sent one). A result for a `pushId` with no pending push is
+   * ignored — mirrors {@link _onUploadResult}.
    * @param {string} pushId
    * @param {string | null} handoffId - The new handoff id on success, `null`
    * for `manual_push_error`.
    * @param {string | null} errorMessage - `null` for `manual_push_ok`.
+   * @param {string | undefined} [reason]
    * @returns {void}
    */
-  _onManualPushResult(pushId, handoffId, errorMessage) {
+  _onManualPushResult(pushId, handoffId, errorMessage, reason) {
     const pending = this._pendingPushes.get(pushId)
     if (!pending) return
     this._pendingPushes.delete(pushId)
@@ -970,7 +975,9 @@ class ConnectionManager extends EventTarget {
       pending.resolve(/** @type {string} */ (handoffId))
       return
     }
-    pending.reject(new Error(errorMessage))
+    const error = new Error(errorMessage)
+    if (reason) /** @type {any} */ (error).reason = reason
+    pending.reject(error)
   }
 
   /**
@@ -1311,15 +1318,18 @@ class ConnectionManager extends EventTarget {
    * @param {string} refineId
    * @param {number | null} requestId - The server's request id on `refine_ok`.
    * @param {string | null} errorMessage - `null` for `refine_ok`.
+   * @param {string | undefined} [reason] - Set as `error.reason` on a rejection.
    * @returns {void}
    */
-  _onRefinePushResult(refineId, requestId, errorMessage) {
+  _onRefinePushResult(refineId, requestId, errorMessage, reason) {
     const pending = this._pendingRefinePushes.get(refineId)
     if (!pending) return
     this._pendingRefinePushes.delete(refineId)
     clearTimeout(pending.timer)
     if (errorMessage) {
-      pending.reject(new Error(errorMessage))
+      const error = new Error(errorMessage)
+      if (reason) /** @type {any} */ (error).reason = reason
+      pending.reject(error)
     } else {
       pending.resolve(/** @type {number} */ (requestId))
     }

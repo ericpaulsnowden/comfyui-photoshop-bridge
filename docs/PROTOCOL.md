@@ -251,7 +251,9 @@ node, so this is the idiomatic substitute.
 Query param `dir`: omitted/empty → the pack default dir (ComfyUI input); the literal
 `dir=ROOTS` → the roots listing (`dir`/`parent` null): "ComfyUI Input" + "Home" + /Volumes
 (macOS) / drive letters (Windows). Otherwise `dir` must be an absolute existing directory
-(400 on relative/missing/not-a-dir). Optional `ext` narrows the extension filter (default
+(400 on relative/missing/not-a-dir; also 400 when the listing takes longer than 5 s — a
+slow or unreachable share — on every supported Python, 3.10 included). Optional `ext`
+narrows the extension filter (default
 `.psd`/`.psb`). Response: `{dir, parent (null at a filesystem root), sep, dirs:[{name}],
 files:[{name,size,mtime}], truncated}` — **names only** (the client joins each with
 `dir`+`sep`; ROOTS entries additionally carry an absolute `path`, since there's nothing to
@@ -370,7 +372,8 @@ Plugin → server:
   only actually read once, when the upload completes. See "File transfer chunking"
   below for how chunks are produced/reassembled. Server replies `upload_ok` once every
   chunk `0..total-1` has arrived and the reassembled bytes decode and ingest cleanly, or
-  `upload_error` otherwise.
+  `upload_error` otherwise — including immediately, mid-transfer, when a chunk breaks the
+  "Transfer limits" below (`reason` `"malformed"`, `"too_large"` or `"busy"`).
 - `{"type": "manual_push", "push_id": "...", "seq": 0, "total": 3, "data_b64": "...",
   "title": "Background (layer)"}` — "send a layer/document to ComfyUI" (2026-07-23), the
   reverse of every other round trip: the plugin initiates, with no ComfyUI node or
@@ -386,8 +389,15 @@ Plugin → server:
   node-less handoff), writes a normal flat managed PSD copy, and ingests the SAME pushed
   image as the handoff's first edit — it arrives already `edited`, ready for **Add**.
   Replies `manual_push_ok` (`{"push_id", "handoff_id"}`, the new id) or
-  `manual_push_error` (`{"push_id", "error"}`) — an invalid/malformed transfer never
-  creates a handoff at all.
+  `manual_push_error` (`{"push_id", "error", "reason"}`) — an invalid/malformed transfer
+  never creates a handoff at all. A chunk that breaks the "Transfer limits" below is
+  answered with `manual_push_error` immediately, mid-transfer. `reason` uses the
+  `upload_error` vocabulary (below): `malformed` (bad chunk framing/order, invalid
+  base64), `too_large`, `busy`, or `invalid_image` (the bytes don't decode); it is
+  OMITTED only when the server itself failed after accepting the image (the handoff it
+  had created is marked `error`; see the ComfyUI log) — and by servers older than this
+  field. The plugin never retries a `manual_push_error` (a push is a non-idempotent
+  create; `uploader.js` `pushManualSend`).
 - `{"type": "live_frame", "seq": 12, "data_b64": "<jpeg>", "doc_title": "sketch.psd"}` —
   realtime drawing (docs/roadmap/realtime-drawing.md M1): one save-free snapshot of the
   Live-Mode document (JPEG, captured via `imaging.getPixels` downscaled to 512/768/1024px
@@ -439,10 +449,13 @@ Plugin → server:
   canvas capture (exported at document size, proportionally capped ≤4096px long side
   plugin-side), chunked per the universal convention. Reassembled server-side into the
   app-level refine slot; bumps the refine `request_id`; replies
-  `refine_ok {refine_id, request_id}` / `refine_error {refine_id, error}` (invalid
-  base64 / non-PNG stores nothing) and emits `cpsb.refine` (§5) so the frontend runs the
-  refine branch exactly once. The slot is APP-level (survives plugin reconnects), unlike
-  the live-frame slot.
+  `refine_ok {refine_id, request_id}` / `refine_error {refine_id, error, reason}` (invalid
+  base64 / non-PNG stores nothing; a chunk that breaks the "Transfer limits" below gets
+  `refine_error` immediately, mid-transfer) and emits `cpsb.refine` (§5) so the frontend
+  runs the refine branch exactly once. `reason` uses the `upload_error` vocabulary
+  (below): `malformed` (bad chunk framing/order, invalid base64), `too_large`, `busy`, or
+  `invalid_image` (the payload is not a PNG stream); absent only from older servers. The
+  slot is APP-level (survives plugin reconnects), unlike the live-frame slot.
 - `{"type": "request_render"}` — refine pass R1: the plugin asks for the FULL-QUALITY
   last render (the app-level keep-latest slot `PhotoshopLivePreview` fills before
   downscaling its display copy — the refine-pass cornerstone). Server replies with
@@ -470,11 +483,24 @@ Server → plugin:
   reassembled and ingested (or was an idempotent duplicate of the latest edit — same
   "no error" treatment `POST /cpsb/upload` gives a duplicate).
 - `{"type": "upload_error", "handoff_id": "...", "error": "...", "reason": "unknown_handoff" |
-  "inactive" | "invalid_image" | "malformed"}` — a REMOTE-mode `upload_edit` failed.
-  `reason` mirrors `POST /cpsb/upload`'s HTTP status codes so a client can decide whether
-  retrying makes sense: `unknown_handoff`/`inactive` are the 404/409 equivalents (retrying
-  identical bytes can never change the outcome); `invalid_image`/`malformed` are left
-  retryable, matching the HTTP path's own behavior of still retrying after a 400.
+  "inactive" | "invalid_image" | "malformed" | "too_large" | "busy"}` — a REMOTE-mode
+  `upload_edit` failed. `reason` mirrors `POST /cpsb/upload`'s HTTP status codes so a
+  client can decide whether retrying makes sense: `unknown_handoff`/`inactive` are the
+  404/409 equivalents (retrying identical bytes can never change the outcome);
+  `invalid_image`/`malformed` are left retryable, matching the HTTP path's own behavior
+  of still retrying after a 400. The "Transfer limits" rejections below split three ways:
+  - `too_large` — the transfer broke a SIZE cap (declared chunk count, or cumulative
+    base64 size). Deterministic for the same bytes: a client must NOT retry (the plugin's
+    `uploader.js` gives up at once, like `unknown_handoff`/`inactive`).
+  - `busy` — too many transfers already partially received on this connection. Transient
+    (it clears as in-flight transfers complete or idle out), so retrying later can
+    succeed; the plugin retries it like any other failure. A real plugin never hits it —
+    it sends one transfer at a time.
+  - `malformed` — everything about order/framing: an out-of-order, duplicate or
+    gap `seq`, a `total` that changed mid-transfer, a missing/mistyped field.
+
+  `error` names the specific limit or problem in every case. `manual_push_error` and
+  `refine_error` carry the same `reason` vocabulary (see their bullets above).
 - `{"type": "handoff_cancelled", "handoff_id": "..."}` — stop tracking that document.
 - `{"type": "result_frame", "data_b64": "<jpeg>", "doc_title": "sketch.psd"}` — realtime
   drawing M3: one rendered live-loop result, sent by the `PhotoshopLivePreview` node
@@ -500,7 +526,20 @@ Server → plugin:
   layer per refine; Replace first deletes existing top-level layers with the same name.
   Fire-and-forget: no ack, plugin-side failures are logged there.
 - `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
-  the socket (plugin reconnects with backoff).
+  the socket (plugin reconnects with backoff). **The 15s deadline only runs while the
+  connection is idle:** the server reads this socket with ONE loop that awaits each
+  message handler to completion, so while a handler is running (a large layered-PSD
+  ingest, a manual push, a `request_file` stream — even with the heavy work on a worker
+  thread) the plugin's pong sits unread in the socket buffer; likewise while an inbound
+  chunked transfer (`upload_edit`/`manual_push`/`refine_push`) is still arriving, the
+  pong is queued behind the plugin's own chunks. In either case the server knows it is
+  the busy one and does not count that time against the plugin: the deadline is extended
+  until the busy stretch ends, then the plugin gets a fresh 15s for the queued pong to be
+  read. A hard ceiling of **10 minutes** after the ping still closes the socket, so a
+  plugin that dies during a busy stretch is dropped. No new pings are sent while one is
+  outstanding. (Previously a slow ingest got the plugin disconnected mid-save —
+  review item 7, 2026-09-13.) The plugin needs no change: it already answers every
+  `ping` immediately.
 
 **File transfer chunking (`request_file`/`file_chunk`, `upload_edit`,
 `manual_push`, `refine_push`, `render_chunk`, and `add_layer_chunk`):** all use the
@@ -518,6 +557,45 @@ end of the full encoded string). A zero-byte file still produces exactly one chu
 (`total: 1`, `data_b64: ""`), never a degenerate empty stream. The server's plugin
 websocket is opened with a generous inbound `max_msg_size` (8 MiB) as a safety margin —
 chunking already keeps every real frame well under 1MB on its own.
+
+**Transfer limits (server-enforced, INBOUND `upload_edit`, `manual_push`, `refine_push`;
+review item 10, 2026-09-13):** reassembly buffers are held in memory (deliberately — no
+disk spooling), so one shared server-side guard bounds them. Each limit is a module
+constant in `cpsb/routes.py`:
+
+| Limit | Value | Constant | Rejection `reason` |
+|---|---|---|---|
+| Declared chunk count (`total`) per transfer | at most **4,096** | `_TRANSFER_MAX_CHUNKS` | `too_large` |
+| Cumulative `data_b64` per transfer | at most **1 GiB of base64 text** (≈ **768 MiB** of file) | `_TRANSFER_MAX_B64_CHARS` | `too_large` |
+| Partially received transfers per connection (all three kinds combined) | at most **4** | `_TRANSFER_MAX_PENDING` | `busy` |
+| Idle time before a partial transfer is discarded | **120 s** with no chunk | `_TRANSFER_IDLE_SECONDS` | — (silent, see below) |
+| Strict order (next bullet) | — | — | `malformed` |
+
+- **Strict order.** Every chunk must carry `seq == ` the number of chunks already
+  received for that id (so a transfer starts at `seq: 0` and counts up with no gaps or
+  repeats), and the same `total` as its `seq: 0` chunk. Anything else — a duplicate, a
+  gap, a transfer that doesn't start at 0, a changed `total` — is rejected.
+- **On any rejection** the server discards that id's partial buffer and replies at once
+  with the message type's ordinary error (`upload_error`, `manual_push_error`, or
+  `refine_error`) carrying the `reason` from the table — `too_large` must not be retried,
+  `busy` may be — and an `error` naming the limit. Because the sender
+  transmits every chunk before any reply can reach it, the REST of that burst is dropped
+  silently (no further replies). A later `seq: 0` chunk for the same id is a fresh
+  attempt and is processed normally — which is what an `upload_edit` retry (same
+  `handoff_id`) sends.
+- **Sizing.** With the standard ~700,000-character chunks the byte cap binds first
+  (~1,534 chunks); the chunk-count cap only stops a sender from splitting a transfer into
+  a huge number of tiny frames. ≈768 MiB of file is ~7.7× ComfyUI's own default 100 MB
+  upload cap and at or above the largest single string the plugin's JavaScript engine can
+  build for its one-shot base64 encode (V8 caps strings at 2^29–2^30 characters), so no
+  real layered PSD the plugin can send is refused. Worst-case buffered text per
+  connection is 4 × 1 GiB.
+- **Idle expiry** is checked on every inbound message and on every keepalive tick. Time
+  the server spends busy in a handler (when nobody's chunks are being read) does not
+  count toward it. Expiry is silent; a sender that later resumes the discarded transfer
+  gets the ordinary out-of-order rejection on its next chunk. 120 s is twice the plugin's
+  own 60 s per-transfer timeout, so the plugin has always given up first.
+- Outbound transfers (`file_chunk`, `render_chunk`, `add_layer_chunk`) are unaffected.
 
 **Server address (plugin-side, user-configurable):** the plugin targets a single
 `host:port` base (default `localhost:8188`), from which it derives both the WebSocket
@@ -607,6 +685,12 @@ end here. It:
 4. Updates `meta.json` (status `edited`, appends to `edits`).
 5. Unblocks a waiting bridge node for this handoff, if any.
 6. Emits `cpsb.updated` (below).
+
+Every upload path (`POST /cpsb/upload`, the websocket `upload_edit` and `manual_push`)
+decodes the delivered bytes and ingests them in ONE worker-thread job
+(`asyncio.to_thread`): neither the PNG decode nor `ingest_edit` runs on ComfyUI's event
+loop (review 2026-09-13 moved the decode, which still ran on the loop, into the same
+job). Error replies are unchanged.
 
 Tier 1 PSD read: try the embedded Maximize-Compatibility composite first
 (fidelity `composite`); if absent, re-composite via psd-tools (fidelity `recomposite`).

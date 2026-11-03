@@ -37,6 +37,15 @@ const MAX_ATTEMPTS = 3
 const RETRY_DELAY_MS = 1000
 
 /**
+ * `upload_error` reasons (docs/PROTOCOL.md §3) for which resending the
+ * identical bytes can never succeed, so {@link uploadEditOverWebsocket} gives
+ * up at once instead of retrying. Kept in hand-sync with the server's reason
+ * strings — this pack's convention for small stable string sets.
+ * @type {ReadonlySet<string>}
+ */
+const NON_RETRYABLE_UPLOAD_REASONS = new Set(['unknown_handoff', 'inactive', 'too_large'])
+
+/**
  * @param {number} ms
  * @returns {Promise<void>}
  */
@@ -113,12 +122,17 @@ async function uploadEditOverHttp(handoffId, pngBytes) {
  * ack) instead of `fetch`. Used for both `kind`s (flat PNG via
  * {@link uploadEdit}, layered PSD via {@link uploadLayeredPsd}) — only the
  * bytes and the `kind` tag differ; the retry/backoff/error-classification
- * behavior is identical either way. An `upload_error` whose `.reason` is
- * `"unknown_handoff"` or `"inactive"` — the websocket equivalent of the
- * HTTP path's non-retried 404/409 — is not retried either, since resending
- * the identical bytes cannot change the handoff's server-side state. Every
- * other failure (timeout, dropped connection, any other `upload_error`)
- * retries like a network failure would over HTTP.
+ * behavior is identical either way. An `upload_error` whose `.reason` is in
+ * {@link NON_RETRYABLE_UPLOAD_REASONS} is not retried: `"unknown_handoff"`/
+ * `"inactive"` (the websocket equivalent of the HTTP path's non-retried
+ * 404/409 — resending the identical bytes cannot change the handoff's
+ * server-side state) and `"too_large"` (the transfer broke one of the
+ * server's size limits, docs/PROTOCOL.md §3 "Transfer limits" — the same
+ * bytes would be refused again, after streaming them across twice more).
+ * Every other failure (timeout, dropped connection, any other
+ * `upload_error`, including `"busy"`, the server's transient
+ * too-many-transfers-in-flight answer) retries like a network failure
+ * would over HTTP.
  * @param {string} handoffId
  * @param {Uint8Array} bytes
  * @param {'png' | 'psd'} kind
@@ -131,10 +145,14 @@ async function uploadEditOverWebsocket(handoffId, bytes, kind) {
       return true
     } catch (error) {
       const reason = /** @type {any} */ (error) && /** @type {any} */ (error).reason
-      if (reason === 'unknown_handoff' || reason === 'inactive') {
+      if (NON_RETRYABLE_UPLOAD_REASONS.has(reason)) {
+        const why =
+          reason === 'too_large'
+            ? 'the file is over the server transfer size limit'
+            : 'the handoff is unknown or no longer active'
         logError(
           `upload (kind=${kind}) for handoff ${handoffId} rejected (${describeError(error)}) ` +
-            `— not retrying, the handoff is unknown or no longer active`
+            `— not retrying, ${why}`
         )
         return false
       }
@@ -213,8 +231,9 @@ const PUSH_CONNECTION_FAILURES = new Set([
  *   `upload_edit` never had this problem only because it is keyed by an
  *   existing handoff_id and therefore naturally idempotent.
  * - A `manual_push_error` is not retried: the server's rejections here
- *   (bad base64, undecodable image, ingest failure) are deterministic for
- *   the same bytes — resending an identical multi-MB payload twice more can
+ *   (bad base64, undecodable image, ingest failure, and a transfer over the
+ *   server's size limits — `reason: "too_large"`) are deterministic for the
+ *   same bytes — resending an identical multi-MB payload twice more can
  *   only stall the shared control socket.
  * Each retry that IS made mints a fresh `push_id`: reusing one would let a
  * reconnected server mix a stale partial buffer with the new attempt's

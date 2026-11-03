@@ -259,6 +259,7 @@ The round trip, the eleven nodes, the gallery, and cross-machine editing all wor
 - **`.avif` loads too, when ComfyUI's own image library (Pillow) can read it** — current ComfyUI installs ship a Pillow that does, so nothing extra is needed. Load PSD only offers formats Pillow reads *by itself*: JPEG XL, HEIC, and HEIF switch on automatically the day a Pillow release reads them, and stay off until then. A decoder some other node pack installs is deliberately ignored, so the file list doesn't depend on which other packs you have. AVIF photos are rotated the way ComfyUI's own Load Image rotates them, and an animated AVIF loads its first frame. AVIF can't be sent back to Photoshop for editing (same as TIFF today). Illustrator `.ai` and camera raw/`.dng` open through Photoshop itself, via a dedicated Tier-2 "Open via Photoshop" node (see the roadmap).
 - **Save-As to a different file or format breaks the automatic link.** The watcher only watches the exact managed hand-off path. If you Save As elsewhere, the document stays open in Photoshop — so it never shows as "Closed without saving" either — but no edit ever arrives at the card, which just sits at "Editing" with nothing to tell you why. Recover with drag-and-drop: drop the saved-elsewhere image onto that card in the sidebar gallery to import it manually.
 - **Remote/headless ComfyUI needs Tier 2.** Tier 1 opens a local file and watches the local filesystem, so it needs Photoshop and ComfyUI on the same machine (with a GUI session). For remote ComfyUI, use the Tier 2 plugin and point it at the server's address.
+- **One file the Tier 2 plugin sends over its connection tops out at about 768 MB** — remote-mode (cross-machine) saves, "send to ComfyUI" pushes, and Refine captures alike. That is well above ComfyUI's own default 100 MB upload limit and about the largest file the plugin can encode in one go anyway; a bigger transfer is refused as soon as it crosses the limit (the plugin logs it and doesn't re-send it) rather than exhausting the server's memory. Same-machine (LOCAL mode) saves go through the HTTP upload route instead and aren't subject to this limit. The exact server-side limits are listed in [docs/PROTOCOL.md](docs/PROTOCOL.md) §3, "Transfer limits".
 
 ## Troubleshooting
 
@@ -272,7 +273,11 @@ thread (v0.5.74), so a busy workflow no longer blocks the rest of the server
 (other opens, other saves, the gallery) — but that save still shares the same
 CPU as the running workflow, so its own acknowledgment can lag a few seconds
 behind a real save rather than failing outright. Give it a moment before
-assuming a save failed, especially for a large layered PSD. Browsing to a
+assuming a save failed, especially for a large layered PSD. A long save also no
+longer knocks the Photoshop panel offline: the server used to mistake the time it
+spent ingesting a big file for a dead plugin and drop the connection mid-save; it
+now waits out its own busy time (up to 10 minutes) before applying the heartbeat
+check. Browsing to a
 folder on an unreachable network share now answers with a clear error after
 5 seconds instead of freezing the server for the OS timeout.
 

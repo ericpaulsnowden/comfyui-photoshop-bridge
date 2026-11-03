@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import os
 import platform
 import threading
 import time
+import types
 from pathlib import Path
 
 import aiohttp
@@ -1194,6 +1196,37 @@ class TestFsList:
         # Answered well before the fake work's own 0.6s sleep would finish --
         # the whole point of asyncio.wait_for over a plain await.
         assert elapsed < 0.5
+
+    async def test_py310_asyncio_timeout_error_is_still_a_400(
+        self, client, tmp_path, monkeypatch
+    ):
+        """On Python 3.10 (still allowed by pyproject) `asyncio.wait_for` raises
+        `asyncio.TimeoutError`, a class DISTINCT from the builtin `TimeoutError`
+        until 3.11 made it an alias -- the old bare `except TimeoutError:` let
+        it escape as a 500. Reproduced on any interpreter by handing the route
+        a 3.10-shaped `asyncio` whose `wait_for` raises its own, distinct
+        `TimeoutError` class."""
+
+        class Py310AsyncioTimeoutError(Exception):
+            """3.10's asyncio.TimeoutError: NOT a builtin TimeoutError."""
+
+        async def wait_for_that_times_out(awaitable, timeout):
+            awaitable.close()  # never scheduled; avoids a "never awaited" warning
+            raise Py310AsyncioTimeoutError
+
+        py310_asyncio = types.SimpleNamespace(**vars(asyncio))
+        py310_asyncio.TimeoutError = Py310AsyncioTimeoutError
+        py310_asyncio.wait_for = wait_for_that_times_out
+        monkeypatch.setattr(routes_module, "asyncio", py310_asyncio)
+
+        target = tmp_path / "slow_share_py310"
+        target.mkdir()
+        response = await client.get("/cpsb/fs/list", params={"dir": str(target)})
+
+        assert response.status == 400
+        data = await response.json()
+        assert "took longer than" in data["error"]
+        assert "unreachable share" in data["error"]
 
     async def test_fast_scan_is_unaffected_by_the_timeout_wrapper(self, client, tmp_path):
         """Regression guard alongside the timeout test above: an ordinary,
@@ -3265,6 +3298,7 @@ class TestManualPush:
                 "type": "manual_push_error",
                 "push_id": "push-5",
                 "error": "Malformed manual_push chunk",
+                "reason": "malformed",
             }
 
     async def test_invalid_image_gets_manual_push_error_and_no_handoff(
@@ -3437,6 +3471,8 @@ class TestManualPush:
             msg = await ws.receive_json(timeout=5)
             assert msg["type"] == "manual_push_error"
             assert msg["push_id"] == "push-boom"
+            # A server-side failure, not a property of the bytes: no reason.
+            assert "reason" not in msg
             orphans = [m for m in manager.list_all() if m.origin_node_id == "ps-push:push-boom"]
             assert len(orphans) == 1
             assert orphans[0].status == "error"  # terminal, visible, purgeable
@@ -3837,6 +3873,7 @@ class TestRefinePush:
             reply = await asyncio.wait_for(ws.receive_json(), timeout=5)
             assert reply["type"] == "refine_error"
             assert reply["refine_id"] == "bad"
+            assert reply["reason"] == "invalid_image"
             assert routes_module.get_refine_canvas(client.app) is None
             assert routes_module.get_refine_request_id(client.app) == 0
 
@@ -3856,6 +3893,7 @@ class TestRefinePush:
             )
             reply = await asyncio.wait_for(ws.receive_json(), timeout=5)
             assert reply["type"] == "refine_error"
+            assert reply["reason"] == "malformed"
             assert routes_module.get_refine_canvas(client.app) is None
 
 
@@ -4081,3 +4119,586 @@ class TestOffLoopPlumbingIsTransparent:
 
             reassembled = base64.b64decode("".join(chunks[i] for i in range(total)))
             assert reassembled == expected
+
+
+class _PingAnsweringClient:
+    """Drives the CLIENT side of a plugin websocket for the keepalive tests:
+    a background task reads every frame, answers `ping` with `pong` while
+    `answer_pings` is set (counting each ping it saw), and queues every other
+    message for the test to await -- so a ping arriving mid-test can never be
+    mistaken for (or swallow) the reply the test is waiting for."""
+
+    def __init__(self, ws) -> None:
+        self.ws = ws
+        self.answer_pings = True
+        self.pings_seen = 0
+        self.inbox: asyncio.Queue[dict] = asyncio.Queue()
+        self.task = asyncio.ensure_future(self._pump())
+
+    async def _pump(self) -> None:
+        async for frame in self.ws:
+            if frame.type != aiohttp.WSMsgType.TEXT:
+                continue
+            msg = json.loads(frame.data)
+            if msg.get("type") == "ping":
+                self.pings_seen += 1
+                if self.answer_pings:
+                    await self.ws.send_json({"type": "pong"})
+            else:
+                await self.inbox.put(msg)
+
+    async def next_message(self, timeout: float = 5.0) -> dict:
+        return await asyncio.wait_for(self.inbox.get(), timeout=timeout)
+
+    async def stop(self) -> None:
+        self.task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self.task
+
+
+class TestKeepaliveWhileBusy:
+    """Review item 7 (2026-09-13): the receive loop awaits each handler to
+    completion, so during a slow ingest the client's pongs sit UNREAD in the
+    socket even though the client answers every ping -- and the keepalive
+    used to close the connection as if the plugin were dead. The keepalive
+    now does not enforce its pong deadline while the connection is busy
+    (PROTOCOL.md §3 keepalive), up to `_KEEPALIVE_BUSY_CEILING_SECONDS`.
+    Timings are shrunk via monkeypatch so the real mechanism runs in ~1 s.
+    """
+
+    @pytest.fixture
+    def fast_keepalive(self, monkeypatch):
+        monkeypatch.setattr(routes_module, "_PING_INTERVAL_SECONDS", 0.1)
+        monkeypatch.setattr(routes_module, "_PONG_TIMEOUT_SECONDS", 0.3)
+        monkeypatch.setattr(routes_module, "_PONG_POLL_SECONDS", 0.02)
+
+    async def _open_remote_handoff(self, client, context, ws) -> tuple[_PingAnsweringClient, str]:
+        await _connect_tier2_plugin(ws, context, local_mode=False)
+        plugin = _PingAnsweringClient(ws)
+        await wait_until(lambda: routes_module.tier2_connected(client.app))
+        data = await (await client.post("/cpsb/open", json=open_body())).json()
+        command = await plugin.next_message()
+        assert command["type"] == "open_handoff"
+        return plugin, data["handoff_id"]
+
+    async def test_slow_ingest_does_not_trip_the_pong_deadline(
+        self, client, context, manager, source_image, launches, monkeypatch, fast_keepalive
+    ):
+        original_ingest = manager.ingest_edit
+
+        def slow_ingest(*args, **kwargs):
+            time.sleep(1.2)  # 4x the pong timeout, on the worker thread
+            return original_ingest(*args, **kwargs)
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            plugin, handoff_id = await self._open_remote_handoff(client, context, ws)
+            monkeypatch.setattr(manager, "ingest_edit", slow_ingest)
+
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((7, 70, 140))).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+            ack = await plugin.next_message(timeout=10)
+
+            # The ingest completed and was acked over the SAME socket...
+            assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
+            assert manager.get(handoff_id).status == "edited"
+            # ...although the keepalive was live throughout and the 1.2 s
+            # ingest kept the reader from reading any pong for ~4x the pong
+            # timeout -- the exact shape that used to close the socket.
+            assert plugin.pings_seen >= 1
+            assert not ws.closed
+            assert routes_module.tier2_connected(client.app)
+
+            # And the pong queued during the ingest is honored afterwards:
+            # normal ping/pong rounds resume with the socket still up.
+            pings_after_ack = plugin.pings_seen
+            await asyncio.sleep(0.8)
+            assert plugin.pings_seen >= pings_after_ack + 2
+            assert not ws.closed
+            assert routes_module.tier2_connected(client.app)
+            await plugin.stop()
+
+    async def test_hard_ceiling_still_drops_a_client_that_stops_answering(
+        self, client, context, manager, source_image, launches, monkeypatch, fast_keepalive
+    ):
+        monkeypatch.setattr(routes_module, "_KEEPALIVE_BUSY_CEILING_SECONDS", 0.8)
+        original_ingest = manager.ingest_edit
+        ingest_done = threading.Event()
+
+        def very_slow_ingest(*args, **kwargs):
+            try:
+                time.sleep(2.5)  # well past the 0.8 s ceiling
+                return original_ingest(*args, **kwargs)
+            finally:
+                ingest_done.set()
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            plugin, handoff_id = await self._open_remote_handoff(client, context, ws)
+            monkeypatch.setattr(manager, "ingest_edit", very_slow_ingest)
+
+            plugin.answer_pings = False  # the client "dies" as the ingest starts
+            sent_at = time.monotonic()
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(png_bytes((1, 2, 3))).decode("ascii"),
+                    "fidelity": "plugin",
+                }
+            )
+
+            await asyncio.wait_for(plugin.task, timeout=5)  # pump ends when the socket closes
+            closed_after = time.monotonic() - sent_at
+            assert ws.closed
+            # Dropped by the ceiling WHILE the server was still busy -- not
+            # by the old 0.3 s deadline (which the busy state suspends), and
+            # not merely after the ingest finished. (>= 0.6, not 0.8: the
+            # unanswered ping may have gone out up to one interval before the
+            # upload was sent.)
+            assert closed_after >= 0.6
+            assert not ingest_done.is_set()
+
+        # Let the worker thread finish before teardown. The plugin slot is
+        # released once the receive loop exits, i.e. when that handler returns.
+        assert await asyncio.to_thread(ingest_done.wait, 10)
+        await wait_until(lambda: not routes_module.tier2_connected(client.app))
+
+    async def test_idle_unresponsive_client_is_still_dropped_at_the_pong_timeout(
+        self, client, context, fast_keepalive
+    ):
+        """The unchanged path: with nothing in progress, a missing pong still
+        closes the socket after the normal timeout -- not the busy ceiling."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            plugin = _PingAnsweringClient(ws)
+            plugin.answer_pings = False
+            started = time.monotonic()
+            await asyncio.wait_for(plugin.task, timeout=5)
+            assert ws.closed
+            assert time.monotonic() - started < 2.0  # far below the 600 s ceiling
+
+    async def test_inbound_transfer_in_progress_holds_the_deadline_until_it_idles_out(
+        self, client, context, monkeypatch, fast_keepalive
+    ):
+        """A partially received transfer counts as busy too (the client's
+        pong is queued behind its own upload chunks on the wire) -- but only
+        until the transfer idles out, so a client that dies mid-upload is
+        still dropped promptly afterwards."""
+        monkeypatch.setattr(routes_module, "_TRANSFER_IDLE_SECONDS", 0.8)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            plugin = _PingAnsweringClient(ws)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            connection = client.app[routes_module._APP_KEY_PLUGIN].connection
+
+            plugin.answer_pings = False
+            started = time.monotonic()
+            await ws.send_json(
+                {
+                    "type": "manual_push",
+                    "push_id": "push-stalls",
+                    "seq": 0,
+                    "total": 2,
+                    "data_b64": "aGk=",
+                    "title": "x",
+                }
+            )
+            await wait_until(lambda: "push-stalls" in connection.pending_pushes)
+
+            await asyncio.wait_for(plugin.task, timeout=5)
+            assert ws.closed
+            assert time.monotonic() - started >= 0.8  # not before the transfer idled out
+            assert "push-stalls" not in connection.pending_pushes
+
+
+class TestDecodeRunsOffTheLoop:
+    """Review 2026-09-13 (performance item 2): the PNG decode (`Image.open` +
+    `load()`) at all three upload sites ran ON the event loop ahead of an
+    off-loop ingest. It now rides in the same worker-thread job as the work
+    that follows it; each test below proves both that and that a decode
+    failure still produces the exact same error message/code as before."""
+
+    async def test_http_upload(self, client, manager, source_image, monkeypatch):
+        response = await client.post("/cpsb/open", json=open_body())
+        handoff_id = (await response.json())["handoff_id"]
+        recorder = OffLoopRecorder(routes_module._decode_image_bytes)
+        monkeypatch.setattr(routes_module, "_decode_image_bytes", recorder)
+
+        bad = await client.post("/cpsb/upload", data=upload_form(handoff_id, b"not a png"))
+        assert bad.status == 400
+        assert (await bad.json())["error"].startswith("Invalid image data: ")
+        assert manager.get(handoff_id).edits == []
+
+        good = await client.post("/cpsb/upload", data=upload_form(handoff_id, png_bytes((9, 8, 7))))
+        assert good.status == 200
+        assert (await good.json())["ok"] is True
+        assert recorder.on_event_loop == [False, False]
+
+    async def test_websocket_upload_edit(
+        self, client, context, manager, source_image, launches, monkeypatch
+    ):
+        recorder = OffLoopRecorder(routes_module._decode_image_bytes)
+        monkeypatch.setattr(routes_module, "_decode_image_bytes", recorder)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            data = await (await client.post("/cpsb/open", json=open_body())).json()
+            handoff_id = data["handoff_id"]
+            await ws.receive_json(timeout=5)  # open_handoff command
+
+            for payload in (b"not a png", png_bytes((40, 50, 60))):
+                await ws.send_json(
+                    {
+                        "type": "upload_edit",
+                        "handoff_id": handoff_id,
+                        "seq": 0,
+                        "total": 1,
+                        "data_b64": base64.b64encode(payload).decode("ascii"),
+                        "fidelity": "plugin",
+                    }
+                )
+            bad = await ws.receive_json(timeout=5)
+            assert bad["type"] == "upload_error"
+            assert bad["handoff_id"] == handoff_id
+            assert bad["reason"] == "invalid_image"
+            assert bad["error"].startswith("Invalid image data: ")
+            good = await ws.receive_json(timeout=5)
+            assert good == {"type": "upload_ok", "handoff_id": handoff_id}
+
+        assert recorder.on_event_loop == [False, False]
+
+    async def test_websocket_manual_push(self, client, context, manager, monkeypatch):
+        recorder = OffLoopRecorder(routes_module._decode_image_bytes)
+        monkeypatch.setattr(routes_module, "_decode_image_bytes", recorder)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+            before = len(manager.list_all())
+
+            for push_id, payload in (
+                ("push-bad", b"not an image"),
+                ("push-ok", png_bytes((5, 10, 15))),
+            ):
+                await ws.send_json(
+                    {
+                        "type": "manual_push",
+                        "push_id": push_id,
+                        "seq": 0,
+                        "total": 1,
+                        "data_b64": base64.b64encode(payload).decode("ascii"),
+                        "title": "x",
+                    }
+                )
+            bad = await ws.receive_json(timeout=5)
+            assert bad["type"] == "manual_push_error"
+            assert bad["push_id"] == "push-bad"
+            assert bad["error"].startswith("Invalid image data: ")
+            assert bad["reason"] == "invalid_image"
+            good = await ws.receive_json(timeout=5)
+            assert good["type"] == "manual_push_ok"
+            assert len(manager.list_all()) == before + 1  # only the good push created one
+
+        assert recorder.on_event_loop == [False, False]
+
+
+class _InboundKind:
+    """One of the three INBOUND chunked transfers the shared guard covers."""
+
+    def __init__(self, msg_type, id_field, ok_type, error_type, buffers_attr, extra) -> None:
+        self.msg_type = msg_type
+        self.id_field = id_field
+        self.ok_type = ok_type
+        self.error_type = error_type
+        self.buffers_attr = buffers_attr
+        self.extra = extra
+
+    def chunk(self, key: str, seq, total, data_b64: str = "aGk=") -> dict:
+        return {
+            "type": self.msg_type,
+            self.id_field: key,
+            "seq": seq,
+            "total": total,
+            "data_b64": data_b64,
+            **self.extra,
+        }
+
+    def assert_rejected(
+        self, msg: dict, key: str, needle: str, reason: str = "malformed"
+    ) -> None:
+        """Every kind's error reply carries the same `reason` vocabulary:
+        `too_large` for the size caps (never retried), `busy` for the
+        pending-transfer cap (retryable), `malformed` for order/framing."""
+        assert msg["type"] == self.error_type, msg
+        assert msg[self.id_field] == key
+        assert needle in msg["error"], msg["error"]
+        assert msg["reason"] == reason, msg
+
+
+_INBOUND_KINDS = [
+    _InboundKind(
+        "upload_edit",
+        "handoff_id",
+        "upload_ok",
+        "upload_error",
+        "pending_uploads",
+        {"fidelity": "plugin"},
+    ),
+    _InboundKind(
+        "manual_push",
+        "push_id",
+        "manual_push_ok",
+        "manual_push_error",
+        "pending_pushes",
+        {"title": "t.png"},
+    ),
+    _InboundKind("refine_push", "refine_id", "refine_ok", "refine_error", "pending_refines", {}),
+]
+
+
+class TestTransferLimits:
+    """Review item 10 (2026-09-13): the three inbound chunked transfers had no
+    aggregate bound -- chunks accumulated until the sender's declared total,
+    whatever it was, and `seq` was never checked. One shared guard
+    (`_accept_transfer_chunk`) now enforces PROTOCOL.md §3 "Transfer limits"
+    for all of them; every rejection path is exercised per message type.
+
+    Each rejected transfer is followed by a SENTINEL: a fresh one-chunk
+    transfer with invalid base64, which every handler answers with its own
+    error reply. Receiving the sentinel's reply next proves the rejected
+    burst's remaining chunks were dropped silently (no reply each)."""
+
+    @pytest.fixture(params=_INBOUND_KINDS, ids=lambda kind: kind.msg_type)
+    def kind(self, request) -> _InboundKind:
+        return request.param
+
+    async def _connect(self, client, context, ws):
+        await _connect_tier2_plugin(ws, context, local_mode=False)
+        await wait_until(lambda: routes_module.tier2_connected(client.app))
+        return client.app[routes_module._APP_KEY_PLUGIN].connection
+
+    async def _assert_sentinel_is_next(self, ws, kind: _InboundKind) -> None:
+        await ws.send_json(kind.chunk("sentinel", 0, 1, data_b64="!!!"))
+        reply = await ws.receive_json(timeout=5)
+        assert reply["type"] == kind.error_type
+        assert reply[kind.id_field] == "sentinel"
+        assert "base64" in reply["error"].lower()
+        assert reply["reason"] == "malformed"
+
+    async def test_declared_chunk_count_over_the_limit(self, client, context, kind, monkeypatch):
+        monkeypatch.setattr(routes_module, "_TRANSFER_MAX_CHUNKS", 3)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 0, 4))
+            kind.assert_rejected(
+                await ws.receive_json(timeout=5), "k", "the limit is 3", reason="too_large"
+            )
+            for seq in (1, 2, 3):  # rest of the burst: dropped, no replies
+                await ws.send_json(kind.chunk("k", seq, 4))
+            await self._assert_sentinel_is_next(ws, kind)
+            assert "k" not in getattr(connection, kind.buffers_attr)
+
+    async def test_chunk_count_at_the_limit_is_accepted(self, client, context, kind, monkeypatch):
+        monkeypatch.setattr(routes_module, "_TRANSFER_MAX_CHUNKS", 3)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            for seq in (0, 1):
+                await ws.send_json(kind.chunk("k", seq, 3))
+
+            def two_chunks_buffered() -> bool:
+                pending = getattr(connection, kind.buffers_attr).get("k")
+                return pending is not None and len(pending.chunks) == 2
+
+            await wait_until(two_chunks_buffered)
+
+    async def test_gap_in_seq_rejected_and_buffer_dropped(self, client, context, kind):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 0, 4))
+            await ws.send_json(kind.chunk("k", 2, 4))  # seq 1 skipped
+            kind.assert_rejected(await ws.receive_json(timeout=5), "k", "expected seq 1, got 2")
+            await ws.send_json(kind.chunk("k", 3, 4))  # tail of the burst: dropped silently
+            await self._assert_sentinel_is_next(ws, kind)
+            assert "k" not in getattr(connection, kind.buffers_attr)
+
+    async def test_duplicate_seq_rejected(self, client, context, kind):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 0, 3))
+            await ws.send_json(kind.chunk("k", 0, 3))
+            kind.assert_rejected(await ws.receive_json(timeout=5), "k", "expected seq 1, got 0")
+            await self._assert_sentinel_is_next(ws, kind)
+            assert "k" not in getattr(connection, kind.buffers_attr)
+
+    async def test_transfer_not_starting_at_seq_zero_rejected(self, client, context, kind):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 1, 3))
+            kind.assert_rejected(await ws.receive_json(timeout=5), "k", "expected seq 0")
+            await ws.send_json(kind.chunk("k", 2, 3))  # tail: dropped silently
+            await self._assert_sentinel_is_next(ws, kind)
+            assert "k" not in getattr(connection, kind.buffers_attr)
+
+    async def test_total_changing_mid_transfer_rejected(self, client, context, kind):
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 0, 3))
+            await ws.send_json(kind.chunk("k", 1, 2))
+            kind.assert_rejected(await ws.receive_json(timeout=5), "k", "total changed")
+            await self._assert_sentinel_is_next(ws, kind)
+            assert "k" not in getattr(connection, kind.buffers_attr)
+
+    async def test_cumulative_size_over_the_limit(self, client, context, kind, monkeypatch):
+        monkeypatch.setattr(routes_module, "_TRANSFER_MAX_B64_CHARS", 10)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 0, 3, data_b64="AAAAAAAA"))  # 8 chars: fine
+            await ws.send_json(kind.chunk("k", 1, 3, data_b64="AAAA"))  # 12 > 10
+            kind.assert_rejected(
+                await ws.receive_json(timeout=5), "k", "size limit", reason="too_large"
+            )
+            await ws.send_json(kind.chunk("k", 2, 3, data_b64="AAAA"))  # tail: dropped
+            await self._assert_sentinel_is_next(ws, kind)
+            assert "k" not in getattr(connection, kind.buffers_attr)
+
+    async def test_too_many_concurrent_transfers(self, client, context, kind, monkeypatch):
+        monkeypatch.setattr(routes_module, "_TRANSFER_MAX_PENDING", 2)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k1", 0, 2))
+            await ws.send_json(kind.chunk("k2", 0, 2))
+            await ws.send_json(kind.chunk("k3", 0, 2))
+            kind.assert_rejected(
+                await ws.receive_json(timeout=5), "k3", "Too many concurrent", reason="busy"
+            )
+            buffers = getattr(connection, kind.buffers_attr)
+            assert set(buffers) == {"k1", "k2"}  # the two in flight are untouched
+            assert "k3" not in buffers
+
+    async def test_idle_transfer_expires_on_the_next_message(
+        self, client, context, kind, monkeypatch
+    ):
+        monkeypatch.setattr(routes_module, "_TRANSFER_IDLE_SECONDS", 0.2)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 0, 2))
+            await wait_until(lambda: "k" in getattr(connection, kind.buffers_attr))
+            await asyncio.sleep(0.4)
+            await ws.send_json({"type": "pong"})  # any inbound message is a checkpoint
+            await wait_until(lambda: "k" not in getattr(connection, kind.buffers_attr))
+
+            # A sender resuming the discarded transfer is told it's broken.
+            await ws.send_json(kind.chunk("k", 1, 2))
+            kind.assert_rejected(await ws.receive_json(timeout=5), "k", "expected seq 0")
+
+    async def test_idle_transfer_expires_on_the_keepalive_tick(
+        self, client, context, kind, monkeypatch
+    ):
+        """A connection that goes quiet altogether is swept by the keepalive."""
+        monkeypatch.setattr(routes_module, "_TRANSFER_IDLE_SECONDS", 0.2)
+        monkeypatch.setattr(routes_module, "_PING_INTERVAL_SECONDS", 0.1)
+        monkeypatch.setattr(routes_module, "_PONG_POLL_SECONDS", 0.02)
+        async with client.ws_connect("/cpsb/ws") as ws:
+            connection = await self._connect(client, context, ws)
+            await ws.send_json(kind.chunk("k", 0, 2))
+            await wait_until(lambda: "k" in getattr(connection, kind.buffers_attr))
+            # No further inbound messages at all.
+            await wait_until(lambda: "k" not in getattr(connection, kind.buffers_attr), 3)
+
+    async def test_fresh_attempt_after_a_rejection_completes(
+        self, client, context, kind, source_image
+    ):
+        """A rejected burst never poisons the connection -- nor the id itself:
+        a fresh seq-0 attempt with the SAME id (exactly what the plugin's
+        `upload_edit` retry sends) clears the tombstone and runs the full
+        happy path through to its ok reply."""
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await self._connect(client, context, ws)
+            key = "k"
+            if kind.msg_type == "upload_edit":  # needs a real, active handoff
+                data = await (await client.post("/cpsb/open", json=open_body())).json()
+                key = data["handoff_id"]
+                assert (await ws.receive_json(timeout=5))["type"] == "open_handoff"
+
+            await ws.send_json(kind.chunk(key, 1, 2))
+            kind.assert_rejected(await ws.receive_json(timeout=5), key, "expected seq 0")
+
+            chunks = b64_chunks(png_bytes((3, 6, 9)), chunk_chars=64)
+            assert len(chunks) > 1
+            for seq, chunk in enumerate(chunks):
+                await ws.send_json(kind.chunk(key, seq, len(chunks), data_b64=chunk))
+            reply = await ws.receive_json(timeout=5)
+            assert reply["type"] == kind.ok_type, reply
+            assert reply[kind.id_field] == key
+
+
+class TestTransferLimitsUnits:
+    """Guard details that are cheaper to pin down without a socket."""
+
+    def _connection(self) -> routes_module.PluginConnection:
+        return routes_module.PluginConnection(ws=object())  # never sends here
+
+    def test_pending_cap_counts_every_kind_together(self, monkeypatch):
+        monkeypatch.setattr(routes_module, "_TRANSFER_MAX_PENDING", 2)
+        connection = self._connection()
+        connection.pending_uploads["h"] = routes_module._PendingUpload(kind="png", total=2)
+        connection.pending_pushes["p"] = routes_module._PendingPush(title="t", total=2)
+        completed, error, reason = routes_module._accept_transfer_chunk(
+            connection,
+            connection.pending_refines,
+            connection.rejected_refine_ids,
+            "r",
+            0,
+            2,
+            "aGk=",
+            routes_module._PendingRefine,
+        )
+        assert completed is None
+        assert error is not None and "Too many concurrent" in error
+        assert reason == "busy"
+        assert "r" in connection.rejected_refine_ids
+
+    def test_idle_clock_excludes_time_the_reader_spent_busy(self, monkeypatch):
+        """While the server sits in a slow handler nobody's chunks are read,
+        so that time must never count against a transfer's idle budget."""
+        monkeypatch.setattr(routes_module, "_TRANSFER_IDLE_SECONDS", 1.0)
+        connection = self._connection()
+        now = time.monotonic()
+        pending = routes_module._PendingPush(title="t", total=3, last_chunk_at=now - 10.0)
+        connection.pending_pushes["p"] = pending
+        # 9.5 of the last 10 s were spent busy in handlers -> only 0.5 s idle.
+        pending.busy_mark = 0.0
+        connection.busy_seconds = 9.5
+        routes_module._expire_idle_transfers(connection, now)
+        assert "p" in connection.pending_pushes
+        # With only 5 s of that busy, 5 s of genuine silence -> expired.
+        connection.busy_seconds = 5.0
+        routes_module._expire_idle_transfers(connection, now)
+        assert "p" not in connection.pending_pushes
+
+    def test_reader_busy_accumulates_and_counts_the_current_stretch(self):
+        connection = self._connection()
+        with routes_module._reader_busy(connection):
+            assert connection.busy == 1
+            assert routes_module._connection_busy(connection)
+            time.sleep(0.05)
+            assert routes_module._reader_busy_seconds(connection, time.monotonic()) >= 0.05
+        assert connection.busy == 0
+        assert connection.busy_since is None
+        assert connection.busy_seconds >= 0.05
+        assert not routes_module._connection_busy(connection)
+
+    def test_tombstones_are_bounded(self, monkeypatch):
+        monkeypatch.setattr(routes_module, "_TRANSFER_MAX_TOMBSTONES", 3)
+        tombstones: dict[str, None] = {}
+        for key in ("a", "b", "c", "d"):
+            routes_module._tombstone(tombstones, key)
+        assert list(tombstones) == ["b", "c", "d"]
