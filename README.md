@@ -4,7 +4,7 @@ Right-click any image in ComfyUI, choose **Open in Photoshop**, make your edit, 
 
 > **Project status: pre-1.0, actively developed.** The core round trip and the nodes below work today and are used day to day; expect rough edges and occasional breaking changes before 1.0. See the [releases/tags](https://github.com/ericpaulsnowden/comfyui-photoshop-bridge/tags) for the current version — the backend, frontend, and Photoshop plugin all report their version, and the ComfyUI sidebar shows an amber "update available" hint when they drift out of sync.
 
-**Want to see it working first?** Every workflow in [examples/](examples/) is annotated on the canvas and ready to load — seven files between them cover all eleven nodes, from a no-Photoshop-required PSD compose to the full realtime drawing loop. See [examples/README.md](examples/README.md) for which need Photoshop and which don't.
+**Want to see it working first?** Every workflow in [examples/](examples/) is annotated on the canvas and ready to load — eight files between them cover all eleven nodes, from a no-Photoshop-required PSD compose to the full realtime drawing loop. See [examples/README.md](examples/README.md) for which need Photoshop and which don't.
 
 ## How it works
 
@@ -100,6 +100,8 @@ The input side of **realtime drawing**. Toggle **Live Mode** in the plugin panel
 
 A **CAPTURE SIZE** control in the main panel (512 / 768 / 1024, persisted) sets the live frames' long side — use 1024 with SDXL-class models for sharper results. Frames are ephemeral: never written to disk, never added to the gallery. The MASK output is always empty (the live stream is JPEG, which carries no alpha); derive masks downstream.
 
+**Restart ComfyUI mid-session and Live Mode just keeps going:** the moment the plugin reconnects it sends your current canvas as a fresh frame, without waiting for your next stroke, so the first render after a restart or a dropped connection shows what's on screen rather than nothing.
+
 ### Photoshop Live Prompt
 
 > **Plugin: not needed** — falls back to its own text widget, so a ComfyUI-only setup works.
@@ -161,7 +163,7 @@ A ready-made workflow ships in [`examples/live_drawing_lcm.json`](examples/live_
 
 Expect about a second from stroke to re-render on a strong GPU: live iteration, not 30fps video. The seed is fixed on purpose, so only your drawing and your prompt change the output.
 
-**The refine pass** turns a good live render into a finished one. Click **Refine** on the render (hover it in the preview panel) and the workflow's refine branch runs **once** at high quality — pausing live re-renders while it works — then delivers the result wherever you wired it: back to the preview pane (**Live Preview**), straight into your document as a layer (**Add Layer**), or both. Prefer to drive it yourself? Un-mute **Refine Source** and press Queue in ComfyUI, no plugin required.
+**The refine pass** turns a good live render into a finished one. Click **Refine** on the render (hover it in the preview panel) and the workflow's refine branch runs **once** at high quality — pausing live re-renders while it works — then delivers the result wherever you wired it: back to the preview pane (**Live Preview**), straight into your document as a layer (**Add Layer**), or both. If the queue request for the Refine run fails outright, the refine branch is re-muted and live re-rendering resumes straight away instead of staying paused. Prefer to drive it yourself? Un-mute **Refine Source** and press Queue in ComfyUI, no plugin required.
 
 ## Beyond the nodes
 
@@ -323,7 +325,7 @@ Both tiers converge on the same backend ingest step, so the rest of ComfyUI (cac
 
 ## Documentation
 
-- **[examples/README.md](examples/README.md)** — the example workflows index: which of the seven files need Photoshop, which need the plugin, and what each one teaches.
+- **[examples/README.md](examples/README.md)** — the example workflows index: which of the eight files need Photoshop, which need the plugin, and what each one teaches.
 - **[docs/INSTALL.md](docs/INSTALL.md)** — detailed install steps and the Maximize Compatibility walkthrough.
 - **[docs/PROTOCOL.md](docs/PROTOCOL.md)** — the interface contract (routes, WebSocket protocol, file schemas). Start here if you're building against this project or contributing code.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup, code style, and PR expectations.

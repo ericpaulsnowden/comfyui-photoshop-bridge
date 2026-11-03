@@ -49,7 +49,7 @@ An implementation that disagrees with `docs/PROTOCOL.md` is a bug — in the cod
 pytest
 ```
 
-Frontend and plugin code doesn't have an automated test setup yet (tracked for M1/M4); until it does, describe your manual verification steps in the PR description.
+`pytest` also runs the JavaScript suites in `tests/js/*.test.mjs` (via `tests/test_plugin_js.py`, needs `node` >= 20 on PATH, skipped without it). They load the real, unmodified `web/cpsb/*.js` (ES modules) and `photoshop_plugin/*.js` (CommonJS) into a Node `vm` context with stubbed ComfyUI / Photoshop / websocket APIs (`tests/js/harness.mjs`) — currently covering the live loop's Refine recovery and Live Mode's reconnect baseline. To run one directly: `node --experimental-vm-modules tests/js/live_loop.test.mjs`. Everything else in the frontend and plugin has no automated coverage yet (tracked for M1/M4) and needs a Photoshop / ComfyUI session; describe your manual verification steps in the PR description.
 
 ## Pull request expectations
 

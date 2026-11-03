@@ -44,6 +44,28 @@
  * (Eric's auto-pause decision: the refine gets the GPU to itself; the newest
  * strokes render on resume). NOT gated on arming — a refine is an explicit
  * click and works with `auto_queue` Off or no Live Canvas at all.
+ *
+ * REFINE RECOVERY — the restore-and-resume above normally rides on ComfyUI's
+ * queue-drain `status` event, but some paths submit NO job (so no drain ever
+ * comes), and one path delivers the drain BEFORE we hear back:
+ * - `app.queuePrompt` REJECTS, or THROWS SYNCHRONOUSLY: nothing was
+ *   submitted. The enqueue's own failure handler restores the modes and ends
+ *   the refine pause (and the in-flight bookkeeping is released either way —
+ *   a synchronous throw used to leave it set forever).
+ * - EARLY DRAIN: a fast job can queue AND finish (`status` 1 then 0) before
+ *   `app.queuePrompt`'s promise settles (it does more async work after the
+ *   POST). A drain is deliberately ignored while an enqueue is in flight (a
+ *   stale pre-enqueue "0" must not end a refine that has not been
+ *   serialised yet), so the settle handler re-checks: if the queue went busy
+ *   since this fire and is idle now, the drain already happened — finish it
+ *   then. Every restore goes through the idempotent {@link endRefine}, so a
+ *   drain and a failure can never double-restore, and a late event can never
+ *   re-apply an old mode over something the user changed since.
+ * Known limit: ComfyUI's own `app.queuePrompt` also swallows submission
+ * errors (a graph that fails validation shows its error dialog and RESOLVES
+ * `false`) — indistinguishable here from "queued behind a running enqueue",
+ * which also resolves `false` — so that case still waits for the next queue
+ * activity to restore the modes.
  */
 
 import { app } from '../../../scripts/app.js'
@@ -59,9 +81,23 @@ const REFINE_SOURCE_NODE_TYPE = 'PhotoshopRefineSource'
 /** litegraph node modes: 0 = ALWAYS (active), 2 = NEVER (muted). */
 const NODE_MODE_ALWAYS = 0
 
-let queueInFlight = false
+/**
+ * The `app.queuePrompt` calls we made that have not settled yet (resolved,
+ * rejected or thrown). A SET, not a boolean: overlapping enqueues (a live fire
+ * still in flight when Refine is clicked, or a double click) must each be
+ * accounted for, or the first to settle would clear the flag under the others.
+ * Each entry says whether it carries a refine.
+ * @type {Set<{refine: boolean}>}
+ */
+const pendingEnqueues = new Set()
 let trailing = false
 let queueRemaining = 0
+
+/** True once ComfyUI reported a NON-EMPTY queue (`queue_remaining` > 0) since
+ * the newest {@link fireQueue} — i.e. our job was accepted. It is what lets the
+ * settle handler recognise an early drain (queued and finished before
+ * `app.queuePrompt` resolved). */
+let queueSeenBusy = false
 
 /** True from a `cpsb.refine` queue until that queue drains — pauses the live
  * auto-queue (Eric's decision: refine gets the GPU to itself; strokes keep
@@ -114,21 +150,72 @@ function isArmed(graph = app.graph, depth = 0) {
 }
 
 /**
- * Queues one run. `queueInFlight` covers the enqueue round-trip;
+ * Whether any of our `app.queuePrompt` calls is still unsettled — the
+ * "enqueue round-trip" half of the single-slot rule (the other half is
+ * `queueRemaining`, ComfyUI's own status feed).
+ * @returns {boolean}
+ */
+function isEnqueueing() {
+  return pendingEnqueues.size > 0
+}
+
+/**
+ * Queues one run. The pending-enqueue set covers the enqueue round-trip;
  * `queueRemaining` (ComfyUI's own status feed, below) covers execution —
- * together they enforce the single-slot rule the file doc describes.
+ * together they enforce the single-slot rule the file doc describes. Every
+ * outcome of `app.queuePrompt` — resolved, rejected OR a synchronous throw —
+ * ends in {@link settleEnqueue}, so the in-flight state can never be left set.
+ * @param {boolean} [forRefine] - This enqueue carries a Refine (its failure
+ * must end the refine pause; a plain live fire's must not).
  * @returns {void}
  */
-function fireQueue() {
-  queueInFlight = true
-  app
-    .queuePrompt(0)
-    .catch((error) => {
+function fireQueue(forRefine = false) {
+  const entry = { refine: forRefine }
+  pendingEnqueues.add(entry)
+  queueSeenBusy = false
+  let result
+  try {
+    result = Promise.resolve(app.queuePrompt(0))
+  } catch (error) {
+    settleEnqueue(entry, true, error)
+    return
+  }
+  result.then(
+    () => settleEnqueue(entry, false),
+    (error) => settleEnqueue(entry, true, error)
+  )
+}
+
+/**
+ * One `app.queuePrompt` call finished, one way or another: release its
+ * in-flight slot, then recover. A FAILED refine enqueue submitted no job, so
+ * no queue-drain event will ever restore the source nodes — do it here (unless
+ * another refine enqueue is still pending: that one owns the recovery, and
+ * restoring now could re-mute the branch before it is serialised). A
+ * successful settle re-checks for an early drain. A failed plain live fire
+ * does not retry on its own (a dead server would loop); the next live event
+ * does.
+ * @param {{refine: boolean}} entry
+ * @param {boolean} failed
+ * @param {unknown} [error]
+ * @returns {void}
+ */
+function settleEnqueue(entry, failed, error) {
+  pendingEnqueues.delete(entry)
+  try {
+    if (failed) {
       api.warn('live loop: queuePrompt failed', error)
-    })
-    .finally(() => {
-      queueInFlight = false
-    })
+      const refineStillPending = [...pendingEnqueues].some((e) => e.refine)
+      if (entry.refine && refining && !refineStillPending) {
+        endRefine()
+        resumeLive()
+      }
+      return
+    }
+    if (queueSeenBusy) onQueueQuiet() // early drain: it already came and went
+  } catch (settleError) {
+    api.warn('live loop: failed to settle queuePrompt', settleError)
+  }
 }
 
 /**
@@ -147,7 +234,7 @@ function requestQueue() {
     trailing = true
     return
   }
-  if (queueInFlight || queueRemaining > 0) {
+  if (isEnqueueing() || queueRemaining > 0) {
     // Busy — remember that newer state exists, render it when the queue
     // drains. One flag, not a counter: only the NEWEST state matters.
     trailing = true
@@ -195,34 +282,73 @@ function onRefineRequest() {
     )
     return
   }
-  for (const node of sources) {
-    const mode = node.mode ?? NODE_MODE_ALWAYS
-    if (mode !== NODE_MODE_ALWAYS) {
-      unmutedRefineNodes.push({ node, mode })
-      node.mode = NODE_MODE_ALWAYS
+  try {
+    for (const node of sources) {
+      const mode = node.mode ?? NODE_MODE_ALWAYS
+      if (mode !== NODE_MODE_ALWAYS) {
+        unmutedRefineNodes.push({ node, mode })
+        node.mode = NODE_MODE_ALWAYS
+      }
     }
+    refining = true
+    fireQueue(true)
+  } catch (error) {
+    // Never leave the branch un-muted behind a refine that did not start.
+    endRefine()
+    throw error
   }
-  refining = true
-  fireQueue()
 }
 
 /**
  * Restores the modes {@link onRefineRequest} overrode (muted stays muted,
- * bypassed stays bypassed) and ends the refine pause.
+ * bypassed stays bypassed) and ends the refine pause. Idempotent: the entry
+ * list is emptied, so a second call (a drain AND a failure both arriving) is a
+ * no-op and can never re-apply a stale mode over a change the user made since.
  * @returns {void}
  */
 function endRefine() {
-  for (const entry of unmutedRefineNodes) {
-    entry.node.mode = entry.mode
-  }
+  const entries = unmutedRefineNodes
   unmutedRefineNodes = []
   refining = false
+  for (const entry of entries) {
+    entry.node.mode = entry.mode
+  }
+}
+
+/**
+ * Fires the coalesced trailing run, if one is owed and nothing blocks it (no
+ * refine pause, no enqueue in flight, and an idle queue). The queue check
+ * matters on the failure path: a rejected refine enqueue can settle while an
+ * earlier live job is still executing, and firing then would put two runs in
+ * the queue — the single-slot rule. `trailing` stays set instead, and the
+ * drain fires it.
+ * @returns {void}
+ */
+function resumeLive() {
+  if (!trailing || refining || isEnqueueing() || queueRemaining > 0) return
+  trailing = false
+  if (isArmed()) fireQueue()
+}
+
+/**
+ * The queue is idle and no enqueue is in flight: a refine (if one is running)
+ * is over — success OR error, either way the run has ended — so re-mute its
+ * branch, then resume the live loop.
+ * @returns {void}
+ */
+function onQueueQuiet() {
+  if (queueRemaining !== 0 || isEnqueueing()) return
+  if (refining) endRefine()
+  resumeLive()
 }
 
 /**
  * ComfyUI's own execution-status feed. `detail.exec_info.queue_remaining`
  * shape confirmed against `Comfy-Org/ComfyUI_frontend`'s api.ts `status`
  * event payload (the same feed the stock queue counter renders from).
+ * A drain seen while an enqueue is still in flight is NOT acted on here (see
+ * the REFINE RECOVERY note in the file doc): {@link settleEnqueue} re-checks
+ * once the enqueue settles.
  * @param {CustomEvent} event
  * @returns {void}
  */
@@ -230,16 +356,11 @@ function onComfyStatus(event) {
   const remaining = event?.detail?.exec_info?.queue_remaining
   if (typeof remaining !== 'number') return
   queueRemaining = remaining
-  if (remaining !== 0) return
-  if (refining && !queueInFlight) {
-    // The refine queue drained (success OR error — either way the run is
-    // over): re-mute the refine branch and resume the live loop.
-    endRefine()
+  if (remaining !== 0) {
+    if (remaining > 0) queueSeenBusy = true
+    return
   }
-  if (trailing && !queueInFlight && !refining) {
-    trailing = false
-    if (isArmed()) fireQueue()
-  }
+  onQueueQuiet()
 }
 
 /**

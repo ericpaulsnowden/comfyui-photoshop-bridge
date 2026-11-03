@@ -398,7 +398,14 @@ Plugin → server:
   ignored; the counter is display/logging only — the node's cache key is a content hash
   of the frame bytes, §6f), and emits `cpsb.live` (§5). `PhotoshopLiveCanvas` (§6f)
   serves the newest frame; invalid base64/non-JPEG payloads are dropped with a log line,
-  never an error reply and never a socket teardown.
+  never an error reply and never a socket teardown. **Baseline on every (re)connect:**
+  because that slot dies with the connection, a NEW connection starts with no frame, so
+  the plugin treats every fresh transition to `connected` during an active Live Mode
+  session (first connect, auto-reconnect after a drop or a server restart, Connect after a
+  manual disconnect or a superseded standby, a server-base change) as "nothing has been
+  sent yet": it forgets the last history-state id it captured and the next ~300ms tick
+  sends the current canvas as a `live_frame` WITHOUT waiting for a new stroke. Ticks while
+  not `connected` send nothing and do not consume that baseline.
 - `{"type": "live_prompt", "text": "a red origami bird"}` — realtime drawing prompt
   control: the text the user typed in the panel's **LIVE PROMPT** field
   (`photoshop_plugin/livePrompt.js`, debounced ~250ms so a burst of keystrokes sends one
@@ -650,8 +657,9 @@ research/research-annotate-node.md retain the design if ever revisited.
 - `"cpsb.refine"` — a Refine click's canvas upload completed (refine pass R2):
   `{"request_id": 3}`. The frontend live loop (§8) un-mutes the graph's
   `PhotoshopRefineSource` node(s), queues exactly ONE run, re-mutes them when the queue
-  drains, and pauses the live auto-queue for the duration (strokes keep streaming;
-  trailing state renders on resume).
+  drains — or at once if the queue request itself fails (§8 "Refine recovery") — and
+  pauses the live auto-queue for the duration (strokes keep streaming; trailing state
+  renders on resume).
 
 **Universal cancel (product-owner requirement 2026-07-17):** ANY node that shows the
 "Editing in Photoshop…" badge (badges.js) MUST expose a working cancel ✕, regardless of
@@ -1447,7 +1455,29 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
   strokes keep streaming and the newest state renders on resume). NOT gated on arming —
   a refine is an explicit click and works with `auto_queue` Off or no Live Canvas node.
   No `PhotoshopRefineSource` in the graph → a console warning, nothing queued, nothing
-  paused.
+  paused. **Refine recovery** (release review item 5): the drain-based restore above
+  needs a queue event, but some paths submit no job or deliver the event early, so every
+  outcome of the `app.queuePrompt(0)` call is accounted for. (a) The call REJECTS or
+  THROWS SYNCHRONOUSLY — no job was submitted, no drain will come: the source nodes' modes
+  are restored, the refine pause ends and the trailing live run (if one is owed) fires;
+  the in-flight bookkeeping is released either way (a synchronous throw used to leave it
+  set, deferring every later live request forever). A plain live fire that fails releases
+  its slot but does not retry on its own (a dead server must not loop); the next live
+  event queues normally. (b) EARLY DRAIN — a fast job can queue and finish (`status`
+  `queue_remaining` > 0 then 0) before `queuePrompt`'s promise settles. A drain seen while
+  an enqueue is in flight is deliberately NOT acted on (a stale idle `0` from before the
+  job was accepted must not re-mute a branch that is not serialised yet); when the enqueue
+  settles, the loop re-checks: queue went busy since the fire and is idle now → the drain
+  already happened, finish it then. (c) Restoring is idempotent (the remembered-modes list
+  is emptied on first use), so a drain and a failure can never double-restore, and a late
+  event can never re-apply an old mode over a change the user made since. Overlapping
+  enqueues (a live fire still in flight at the Refine click, a double click) are tracked
+  individually: a failing refine enqueue defers to another refine enqueue still pending,
+  and a failing live fire never touches a refine. Known limit: ComfyUI's own
+  `app.queuePrompt` catches submission/validation errors itself (error dialog, then
+  resolves `false` with no job queued) — indistinguishable from the also-`false` "queued
+  behind an enqueue already processing" — so a refine whose graph fails validation still
+  waits for the next queue activity to restore the modes.
 - **Gallery** (v0.5.36; overhauled 2026-07-22): each card leads with ONE larger
   thumbnail — the latest edit, or the original when no edit exists yet — with the
   original layered underneath for comparison. Grid is the gallery's ONLY layout (the

@@ -40,6 +40,16 @@
  * next tick re-checks the (by then newer) history id. Frames are
  * fire-and-forget over the existing control websocket — no acks, no
  * retries; a dropped frame is replaced by the next stroke's.
+ *
+ * RECONNECT BASELINE — a NEW backend connection starts with no live frame
+ * (the server's keep-latest slot lives and dies with the connection,
+ * PROTOCOL.md §3), but `lastHistoryId` still says "this canvas state was
+ * already sent". Left alone, an UNCHANGED canvas would be skipped on every
+ * poll after a reconnect — the prompt and creativity controls (re-flushed on
+ * connect) could then trigger a render with no image behind it, and the user
+ * sees nothing happen until the next stroke. So every fresh transition to
+ * "connected" during an active session clears `lastHistoryId` and the next
+ * tick sends a baseline frame (see the `statechange` listener below).
  */
 
 const { app, core, imaging } = require('photoshop')
@@ -145,6 +155,24 @@ let seq = 0
 function notifyChanged() {
   liveEvents.dispatchEvent(new CustomEvent('change', { detail: { ...state } }))
 }
+
+// The one place this plugin learns a backend connection was (re)established
+// is ConnectionManager's `statechange` event with status "connected" — fired
+// only from the end of the hello/hello_ack/ready handshake, so it is exactly
+// "a NEW server-side connection now exists" (first connect, auto-reconnect
+// after a drop or a server restart, Connect after a manual disconnect or
+// superseded standby, and a server-base change all land here). Registered at
+// module load, like previewPanel.js's control re-flush on the same event, so
+// it works whether or not the panel is mounted. No connection state is
+// mirrored here: the event carries it, and the tick still asks
+// `connection.getState()` before sending. Level-triggered on purpose — a
+// repeated "connected" would at worst re-send one redundant baseline frame.
+connection.addEventListener('statechange', (event) => {
+  const detail = /** @type {CustomEvent} */ (event).detail
+  if (!detail || detail.status !== 'connected' || !state.active) return
+  lastHistoryId = null // the next tick re-captures and sends a baseline frame
+  logInfo('live mode: backend (re)connected — re-sending a baseline frame')
+})
 
 /**
  * @param {number} documentId
