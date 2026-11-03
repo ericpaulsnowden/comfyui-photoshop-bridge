@@ -82,17 +82,18 @@ def _write_fake_repo(root: Path, version: str = "1.2.3") -> None:
 def _read_all_versions(root: Path) -> dict[str, str]:
     return {
         "cpsb/version.py": re.search(
-            r'__version__\s*=\s*"([\d.]+)"', (root / "cpsb" / "version.py").read_text()
+            r'__version__\s*=\s*"([\d.]+)"',
+            (root / "cpsb" / "version.py").read_text(encoding="utf-8"),
         ).group(1),
         "pyproject.toml": re.search(
-            r'(?m)^version\s*=\s*"([\d.]+)"', (root / "pyproject.toml").read_text()
+            r'(?m)^version\s*=\s*"([\d.]+)"', (root / "pyproject.toml").read_text(encoding="utf-8")
         ).group(1),
         "manifest.json": json.loads(
-            (root / "photoshop_plugin" / "manifest.json").read_text()
+            (root / "photoshop_plugin" / "manifest.json").read_text(encoding="utf-8")
         )["version"],
         "version.js": re.search(
             r"FRONTEND_VERSION\s*=\s*'([\d.]+)'",
-            (root / "web" / "cpsb" / "version.js").read_text(),
+            (root / "web" / "cpsb" / "version.js").read_text(encoding="utf-8"),
         ).group(1),
     }
 
@@ -180,7 +181,7 @@ class TestBumpAll:
         """
         _write_fake_repo(tmp_path, "1.2.3")
         manifest_path = tmp_path / "photoshop_plugin" / "manifest.json"
-        manifest = json.loads(manifest_path.read_text())
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["version"] = "1.9.9"
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
         before = _read_all_versions(tmp_path)
@@ -195,14 +196,14 @@ class TestBumpAll:
         else in each file (other keys, comments, formatting) is untouched.
         """
         _write_fake_repo(tmp_path, "1.2.3")
-        pyproject_before = (tmp_path / "pyproject.toml").read_text()
+        pyproject_before = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
 
         bump_version_module.bump_all(tmp_path, "patch", dry_run=False)
 
-        pyproject_after = (tmp_path / "pyproject.toml").read_text()
+        pyproject_after = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
         assert pyproject_after == pyproject_before.replace('"1.2.3"', '"1.2.4"')
         manifest = json.loads(
-            (tmp_path / "photoshop_plugin" / "manifest.json").read_text()
+            (tmp_path / "photoshop_plugin" / "manifest.json").read_text(encoding="utf-8")
         )
         assert manifest["manifestVersion"] == 5  # untouched sibling key
         assert manifest["id"] == "com.example.test-plugin"

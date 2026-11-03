@@ -194,7 +194,7 @@ class TestIgnoredFiles:
         # Files this package writes itself must not be treated as saves.
         (folder / "edit_001.png").write_bytes(b"not a real edit")
         (folder / "orig_thumb.png").write_bytes(b"thumb rewrite")
-        (folder / "meta.json").write_text('{"touched": true}')
+        (folder / "meta.json").write_text('{"touched": true}', encoding="utf-8")
 
         settle_quietly(DEBOUNCE_MS / 1000 * 4)
         assert manager.get(meta.handoff_id).status == "pending"

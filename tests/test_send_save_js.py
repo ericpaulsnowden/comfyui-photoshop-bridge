@@ -53,6 +53,8 @@ def _scenario_names() -> list[str]:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",  # Node writes UTF-8; the Windows locale default is cp1252
+        errors="replace",
         timeout=60,
         check=True,
     )
@@ -69,6 +71,8 @@ def scenario_results() -> dict[str, dict]:
         [NODE, str(SCENARIOS_JS)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
         check=False,
     )

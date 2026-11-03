@@ -24,6 +24,12 @@ from cpsb.handoff import (
     compute_source_hash,
 )
 
+#: Pause between two handoff creations whose `created_ts` ordering a test relies on.
+#: `created_ts` is `time.time()`, which only advances every ~15.6 ms on Windows
+#: before Python 3.13, so a 10 ms gap can leave both stamps identical and make
+#: "newest wins" a coin flip. 50 ms spans several ticks.
+CLOCK_TICK_PAD = 0.05
+
 
 def make_image(color: tuple[int, int, int], size: tuple[int, int] = (32, 24)) -> Image.Image:
     return Image.new("RGB", size, color)
@@ -36,6 +42,13 @@ def output_source(filename: str = "ComfyUI_00042_.png") -> SourceRef:
 @pytest.fixture
 def manager(context: CpsbContext) -> HandoffManager:
     return HandoffManager(context)
+
+
+def read_stored_meta(context: CpsbContext, handoff_id: str) -> dict:
+    """The handoff's on-disk ``meta.json`` decoded (explicitly UTF-8: the
+    manager writes UTF-8, and Windows' locale default would be cp1252)."""
+    meta_path = context.cpsb_input_dir / handoff_id / "meta.json"
+    return json.loads(meta_path.read_text(encoding="utf-8"))
 
 
 def create_handoff(manager: HandoffManager, **overrides):
@@ -59,7 +72,7 @@ class TestCreate:
         assert (folder / "orig_thumb.png").is_file()
         assert len(meta.handoff_id) == 8
         assert meta.status == "pending"
-        stored = json.loads((folder / "meta.json").read_text())
+        stored = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
         assert stored["handoff_id"] == meta.handoff_id
         assert stored["source"] == {
             "filename": "ComfyUI_00042_.png",
@@ -77,7 +90,7 @@ class TestCreate:
         meta = create_handoff(manager, original_image=original)
         assert meta.source_hash == compute_source_hash(original)
         assert meta.source_hash != compute_source_hash(make_image((11, 20, 30)))
-        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
+        stored = read_stored_meta(context, meta.handoff_id)
         assert stored["source_hash"] == meta.source_hash
 
     def test_legacy_meta_without_source_hash_loads_as_none(self):
@@ -407,7 +420,7 @@ class TestSupersede:
 class TestFindActive:
     def test_newest_active_wins(self, manager):
         create_handoff(manager)
-        time.sleep(0.01)
+        time.sleep(CLOCK_TICK_PAD)
         second = create_handoff(manager, origin_kind="terminal_output")
         active = manager.find_active_for_node("17")
         assert active.handoff_id == second.handoff_id
@@ -436,7 +449,7 @@ class TestWorkflowScoping:
 
     def test_same_node_id_coexists_across_workflows(self, manager):
         first = create_handoff(manager, workflow_name="workflow-a")
-        time.sleep(0.01)
+        time.sleep(CLOCK_TICK_PAD)
         second = create_handoff(manager, workflow_name="workflow-b")
         assert manager.find_active_for_node("17", "workflow-a").handoff_id == first.handoff_id
         assert manager.find_active_for_node("17", "workflow-b").handoff_id == second.handoff_id
@@ -578,9 +591,9 @@ class TestCleanup:
     @staticmethod
     def _age_meta(context: CpsbContext, handoff_id: str, days: float) -> None:
         meta_path = context.cpsb_input_dir / handoff_id / "meta.json"
-        data = json.loads(meta_path.read_text())
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
         data["updated_ts"] = time.time() - days * 86400
-        meta_path.write_text(json.dumps(data))
+        meta_path.write_text(json.dumps(data), encoding="utf-8")
 
     def test_old_terminal_handoffs_purged_at_boot(self, context):
         manager = HandoffManager(context)
@@ -859,11 +872,11 @@ class TestIdempotentCancel:
         meta = create_handoff(manager)
         manager.mark_cancelled(meta.handoff_id)
         meta_path = context.cpsb_input_dir / meta.handoff_id / "meta.json"
-        written_before = meta_path.read_text()
+        written_before = meta_path.read_text(encoding="utf-8")
 
         manager.mark_cancelled(meta.handoff_id)
 
-        assert meta_path.read_text() == written_before
+        assert meta_path.read_text(encoding="utf-8") == written_before
 
     def test_tier1_fallback_recovery_from_error_is_not_blocked(self, manager):
         """The idempotency guard is scoped to mark_cancelled only: a handoff
@@ -910,7 +923,7 @@ class TestEditInPlaceFields:
         )
         assert meta.edit_in_place is True
         assert meta.original_path == str(original.resolve())
-        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
+        stored = read_stored_meta(context, meta.handoff_id)
         assert stored["edit_in_place"] is True
         assert stored["original_path"] == str(original.resolve())
         # orig_thumb.png is still written -- the gallery keeps working even
@@ -1098,7 +1111,7 @@ class TestTriggerPolicy:
     def test_create_records_a_custom_policy(self, manager, context):
         meta = create_handoff(manager, trigger_policy="Ignore (do nothing)")
         assert meta.trigger_policy == "Ignore (do nothing)"
-        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
+        stored = read_stored_meta(context, meta.handoff_id)
         assert stored["trigger_policy"] == "Ignore (do nothing)"
 
     def test_to_dict_from_dict_round_trip(self, manager):
@@ -1229,7 +1242,7 @@ class TestPsdFilename:
 
     def test_persisted_in_meta_json(self, manager, context):
         meta = create_handoff(manager, source=named_source("Eric-Headshot.jpg"))
-        stored = json.loads((context.cpsb_input_dir / meta.handoff_id / "meta.json").read_text())
+        stored = read_stored_meta(context, meta.handoff_id)
         assert stored["psd_filename"] == "Eric-Headshot.psd"
 
     def test_to_dict_from_dict_round_trip(self, manager):

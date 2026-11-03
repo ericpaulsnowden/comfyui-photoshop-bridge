@@ -35,6 +35,7 @@ which is fast and needs no Observer at all.
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -216,7 +217,16 @@ class TestManagedCopySecondWrite:
         # ordering a real debounce window enforces.
 
         write_psd(psd_path, Image.new("RGB", (12, 12), (3, 3, 3)))
+        # The three flat-colour PSDs are the SAME byte size, so the (size,
+        # mtime_ns) signature is told apart by mtime alone -- and file mtimes
+        # tick coarsely (~15.6 ms on Windows NTFS, a kernel tick elsewhere), so
+        # three back-to-back writes can land on one timestamp. A real
+        # Photoshop save always carries a later mtime than our own earlier
+        # write; pin that explicitly instead of hoping the clock advanced.
+        later_ns = stat_2.st_mtime_ns + 2_000_000_000
+        os.utime(psd_path, ns=(later_ns, later_ns))
         stat_3 = psd_path.stat()
+        assert stat_3.st_mtime_ns != stat_2.st_mtime_ns
         assert not manager.is_own_write(psd_path, stat_3.st_size, stat_3.st_mtime_ns)
 
 

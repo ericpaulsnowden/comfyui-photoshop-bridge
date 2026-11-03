@@ -30,7 +30,13 @@ def _node_major() -> int:
         return 0
     try:
         out = subprocess.run(
-            [NODE, "--version"], capture_output=True, text=True, timeout=30, check=False
+            [NODE, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return 0
@@ -53,6 +59,11 @@ def test_js_suite(script: Path) -> None:
         [NODE, "--experimental-vm-modules", str(script)],
         capture_output=True,
         text=True,
+        # Node always writes UTF-8; decode it as such rather than as the
+        # locale codepage (cp1252 on Windows), which would garble or raise on
+        # a non-ASCII character in a failure message.
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
         env=env,
         check=False,

@@ -315,7 +315,9 @@ class TestOpen:
 
         # Tier 1 launch attempted with the handoff PSD, then marked editing.
         assert len(launches.calls) == 1
-        assert launches.calls[0][0].endswith(f"{handoff_id}/{SOURCE_PSD_FILENAME}")
+        # Compare path COMPONENTS, not a "/"-joined suffix string: on Windows the
+        # launcher gets a backslash-separated path (str(Path)).
+        assert Path(launches.calls[0][0]).parts[-2:] == (handoff_id, SOURCE_PSD_FILENAME)
         # The blocking launch must have run off the event loop (to_thread).
         assert launches.on_event_loop == [False]
         assert manager.get(handoff_id).status == "editing"
@@ -450,7 +452,7 @@ class TestOpen:
         handoff_id = (await response.json())["handoff_id"]
         assert manager.get(handoff_id).trigger_policy == "Ignore (do nothing)"
         stored = json.loads(
-            (context.cpsb_input_dir / handoff_id / "meta.json").read_text()
+            (context.cpsb_input_dir / handoff_id / "meta.json").read_text(encoding="utf-8")
         )
         assert stored["trigger_policy"] == "Ignore (do nothing)"
 
@@ -1122,12 +1124,15 @@ class TestFsList:
         assert data["truncated"] is True
         assert len(data["files"]) == 500
 
-    async def test_parent_is_null_at_a_filesystem_root(self, client):
-        response = await client.get("/cpsb/fs/list", params={"dir": "/"})
+    async def test_parent_is_null_at_a_filesystem_root(self, client, tmp_path):
+        # The platform's own root ("/" on POSIX, "C:\" on Windows). A bare "/" is
+        # NOT an absolute path on Windows (no drive), so the route rightly 400s it.
+        root = Path(tmp_path.anchor)
+        response = await client.get("/cpsb/fs/list", params={"dir": str(root)})
 
         assert response.status == 200
         data = await response.json()
-        assert data["dir"] == "/"
+        assert data["dir"] == str(root.resolve())
         assert data["parent"] is None
 
     async def test_locality_flag_defaults_to_ungated_for_a_simulated_remote_caller(
@@ -1267,7 +1272,7 @@ class TestOpenPsdEditInPlace:
         assert meta.edit_in_place is False
         assert meta.original_path is None
         assert manager.psd_path(meta).read_bytes() == original
-        assert launches.calls[0][0].endswith(f"{handoff_id}/{meta.psd_filename}")
+        assert Path(launches.calls[0][0]).parts[-2:] == (handoff_id, meta.psd_filename)
 
     async def test_edit_in_place_skips_the_copy(self, client, context, manager, launches, tmp_path):
         original_file = context.input_dir / "sample.psd"
