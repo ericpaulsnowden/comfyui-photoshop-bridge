@@ -139,7 +139,17 @@ function bootstrap() {
       )
       return
     }
-    await deliverEdit(record.handoffId)
+    const status = await deliverEdit(record.handoffId)
+    if (status === 'save_failed') {
+      // deliverEdit already logged it and stopped before sending anything; this
+      // command has no panel row to show the status on, so say it out loud
+      // (the same visible-alert rule as the no-document cases above).
+      await core.showAlert(
+        `Send edit back: “${doc.title}” has unsaved changes and Photoshop could not ` +
+          `save it${record.lastError ? ` (${record.lastError})` : ''}, so nothing was ` +
+          'sent to ComfyUI. Save the document, then try again.'
+      )
+    }
   }
 
   entrypoints.setup({

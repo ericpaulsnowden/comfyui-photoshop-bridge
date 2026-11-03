@@ -33,10 +33,14 @@ const { runExport } = require('./exporter.js')
 const { uploadEdit, uploadLayeredPsd } = require('./uploader.js')
 
 /**
- * @typedef {'editing' | 'exporting' | 'sent' | 'export_failed' | 'upload_failed'} CpsbLocalHandoffStatus
+ * @typedef {'editing' | 'exporting' | 'sent' | 'save_failed' | 'export_failed' | 'upload_failed'} CpsbLocalHandoffStatus
  * Local, panel-facing status for a tracked document — distinct from (and
  * coarser than) the server's own `meta.json` status enum (PROTOCOL.md §1);
  * this plugin only ever deals with documents it has successfully opened.
+ * `save_failed` means a manual Send found unsaved changes on a handoff
+ * whose delivery depends on the saved file (see
+ * {@link deliveryDependsOnSavedFile}), could not save the document first,
+ * and therefore sent NOTHING — never stale bytes.
  */
 
 /**
@@ -51,11 +55,13 @@ const { uploadEdit, uploadLayeredPsd } = require('./uploader.js')
  * @property {boolean} wantsLayeredPsd - Mirrors `open_handoff.wants_layered_psd`
  * (docs/PROTOCOL.md §3, §6d) — `true` for a Photoshop Annotate node handoff,
  * whose managed PSD copy carries a paintable "Instructions" layer.
- * Consulted by `deliverEdit` ONLY in `'remote'` mode: `true` there means the
- * save pipeline uploads `sandboxFile`'s own raw PSD bytes (`kind: "psd"`)
- * instead of running the flat-PNG export. Meaningless in `'local'` mode —
- * the shared filesystem already gives the server this handoff's real,
- * layered save with no upload at all.
+ * Consulted by `deliverEdit` in two ways. In `'remote'` mode, `true` means
+ * the save pipeline uploads `sandboxFile`'s own raw PSD bytes (`kind:
+ * "psd"`) instead of running the flat-PNG export. In BOTH modes, `true`
+ * means the handoff's real payload is the SAVED FILE (remote: the bytes the
+ * plugin reads; local: the managed PSD the server's Annotate node re-opens
+ * after the flat-PNG upload lands), so a manual Send saves an
+ * unsaved document first ({@link deliveryDependsOnSavedFile}).
  * @property {import('uxp').storage.File | null} sandboxFile - The REMOTE-mode
  * sandbox copy `openRemote` downloaded into — the same file Photoshop's own
  * Cmd/Ctrl+S overwrites in place on every save — re-read directly for the
@@ -63,6 +69,9 @@ const { uploadEdit, uploadLayeredPsd } = require('./uploader.js')
  * wrote the real, current, layered document there). `null` in `'local'`
  * mode (nothing was downloaded; `path` points at the real, shared-
  * filesystem file instead).
+ * @property {string | null} lastError - The reason the most recent
+ * `deliverEdit` stopped before sending (`status === 'save_failed'`), else
+ * `null`. Cleared at the start of every delivery.
  */
 
 /** @type {Map<string, CpsbHandoffRecord>} handoffId -> record */
@@ -144,7 +153,8 @@ async function openHandoff(msg) {
       docTitle: doc.title,
       status: 'editing',
       wantsLayeredPsd: Boolean(msg.wants_layered_psd),
-      sandboxFile: opened.file
+      sandboxFile: opened.file,
+      lastError: null
     }
     byHandoffId.set(handoffId, record)
     if (record.path) byPath.set(record.path, record)
@@ -433,13 +443,149 @@ function findOpenDocument(record) {
  * — untouched. Unlike `runExport`'s duplicate-flatten-export pipeline, this
  * never touches Photoshop's DOM at all (plain file I/O against a file
  * that's already fully written), so no `core.executeAsModal` wrapper is
- * needed.
+ * needed. It trusts that the file IS current: a manual Send gets that from
+ * {@link ensureDocumentSaved} before calling this; the save listener gets it
+ * from the save that triggered it.
  * @param {import('uxp').storage.File} file
  * @returns {Promise<Uint8Array>}
  */
 async function readSandboxPsdBytes(file) {
   const contents = await file.read({ format: formats.binary })
   return new Uint8Array(/** @type {ArrayBuffer} */ (contents))
+}
+
+/**
+ * How long after one of OUR OWN programmatic saves ({@link
+ * saveDocumentBeforeSend}) completes that a `save` notification for that
+ * document is still treated as that save's echo and ignored by the save
+ * listener. While the save is in flight the suppression has no deadline at
+ * all (`Infinity`); this grace only covers a notification that Photoshop
+ * delivers AFTER `executeAsModal` has resolved (UXP may defer a listener
+ * callback until the modal scope ends). Deliberately SHORT, because the two
+ * ways to be wrong are not symmetric: a late echo that slips through just
+ * delivers the same bytes a second time (the server dedups an identical
+ * edit — docs/PROTOCOL.md §2 `POST /cpsb/upload`), whereas a window that is
+ * too long would swallow a REAL Cmd/Ctrl+S the user makes right afterwards.
+ * Same order of magnitude as `saveListener.js`'s own 500ms debounce.
+ */
+const OWN_SAVE_NOTIFICATION_GRACE_MS = 1000
+
+/**
+ * documentId -> epoch-ms deadline until which a `save` notification for that
+ * document is the echo of a save THIS MODULE issued (`Infinity` while the
+ * save is in flight). Read by the save listener through
+ * {@link isOwnSaveNotification}; written only by {@link saveDocumentBeforeSend}.
+ * Keyed by document id (not handoff id) because that is what the listener
+ * resolves from the notification descriptor.
+ * @type {Map<number, number>}
+ */
+const ownSaveSuppressedUntil = new Map()
+
+/**
+ * handoffId -> the save-before-send already in flight for it, so two Sends
+ * fired back to back (a double-click on the panel button, the menu command
+ * plus the button) share ONE `doc.save()` instead of the second one
+ * colliding with the first's modal scope.
+ * @type {Map<string, Promise<void>>}
+ */
+const saveBeforeSendInFlight = new Map()
+
+/**
+ * Whether a `save` notification for *documentId* is the echo of a save this
+ * module issued itself (so the save listener must NOT start a second
+ * delivery for it — the manual Send that caused the save is already
+ * delivering). Self-clearing once the grace window has passed.
+ * @param {number} documentId
+ * @returns {boolean}
+ */
+function isOwnSaveNotification(documentId) {
+  const until = ownSaveSuppressedUntil.get(documentId)
+  if (until === undefined) return false
+  if (Date.now() < until) return true
+  ownSaveSuppressedUntil.delete(documentId)
+  return false
+}
+
+/**
+ * Whether delivering *record* depends on the document's SAVED FILE rather
+ * than on a fresh export of the live document. True exactly for a
+ * `wantsLayeredPsd` (Annotate) handoff, in both modes:
+ *
+ * - REMOTE: {@link readSandboxPsdBytes} reads the sandbox PSD straight off
+ *   disk — whatever Photoshop last wrote there is what gets uploaded.
+ * - LOCAL: the plugin uploads a flat PNG exported from the live document,
+ *   but the server's Annotate node does not consume that PNG: the upload
+ *   only marks the edit as arrived, after which `cpsb.annotate.
+ *   _read_ps_saved_psd` re-opens the managed PSD on disk for the
+ *   `Instructions` layer (PROTOCOL.md §6d). Unsaved strokes are in the PNG
+ *   but not in that file.
+ *
+ * Every other handoff (the plain Edit-in-Photoshop bridge node, Compose,
+ * Load PSD, Run Photoshop Action) is consumed from the exported PNG, which
+ * {@link runExport} produces from `doc.duplicate()` of the LIVE document —
+ * saved or not — so it never has this problem, and must NOT be saved here
+ * (for an `edit_in_place` handoff the saved file is the user's own original).
+ * @param {CpsbHandoffRecord} record
+ * @returns {boolean}
+ */
+function deliveryDependsOnSavedFile(record) {
+  if (!record.wantsLayeredPsd) return false
+  return record.mode === 'local' || Boolean(record.sandboxFile)
+}
+
+/**
+ * Saves *doc* (no dialog) inside `core.executeAsModal`, marking the document
+ * as "our own save in flight" so the save listener ignores the `save`
+ * notification this save produces. The mark is released
+ * {@link OWN_SAVE_NOTIFICATION_GRACE_MS} after the save settles — on failure
+ * as well as success, so a stray notification from a half-finished save can
+ * never start a stale delivery either.
+ * @param {import('photoshop').Document} doc
+ * @returns {Promise<void>}
+ * @throws Whatever `executeAsModal` / `Document.save()` throws (read-only
+ * file, modal unavailable or cancelled, ...).
+ */
+async function saveDocumentBeforeSend(doc) {
+  ownSaveSuppressedUntil.set(doc.id, Infinity)
+  try {
+    await core.executeAsModal(
+      async () => {
+        await doc.save()
+      },
+      { commandName: 'ComfyUI: save before send' }
+    )
+  } finally {
+    ownSaveSuppressedUntil.set(doc.id, Date.now() + OWN_SAVE_NOTIFICATION_GRACE_MS)
+  }
+}
+
+/**
+ * Makes the document's on-disk copy current before a manual Send reads it.
+ * `Document.saved` is `true` only when there are no unsaved changes; any
+ * other value — `false`, or `undefined` on a Photoshop build that does not
+ * expose the property — is treated as "may be dirty" and saved, because an
+ * unnecessary save of an unchanged document is harmless while a skipped one
+ * uploads stale bytes. Concurrent callers for the same handoff share one save.
+ * @param {CpsbHandoffRecord} record
+ * @param {import('photoshop').Document} doc
+ * @returns {Promise<boolean>} `true` if a save was performed (or joined),
+ * `false` if the document was already saved.
+ * @throws If the save fails — the caller must then send nothing.
+ */
+async function ensureDocumentSaved(record, doc) {
+  if (doc.saved === true) return false
+  let pending = saveBeforeSendInFlight.get(record.handoffId)
+  if (!pending) {
+    logInfo(
+      `handoff ${record.handoffId}: "${record.docTitle}" has unsaved changes — saving before send`
+    )
+    pending = saveDocumentBeforeSend(doc).finally(() => {
+      saveBeforeSendInFlight.delete(record.handoffId)
+    })
+    saveBeforeSendInFlight.set(record.handoffId, pending)
+  }
+  await pending
+  return true
 }
 
 /**
@@ -457,25 +603,58 @@ async function readSandboxPsdBytes(file) {
  * Photoshop save) and both "Send" entry points (the plugin command and the
  * panel's per-document button) — neither of those callers needs to know
  * this sequence exists.
+ *
+ * SAVE-BEFORE-SEND (docs/PROTOCOL.md §6d): when the handoff's delivery
+ * depends on the saved file ({@link deliveryDependsOnSavedFile}) and the
+ * call is a MANUAL Send, the document is saved first if it has unsaved
+ * changes — otherwise the previous on-disk contents would be delivered while
+ * the panel reports success, silently dropping everything painted since the
+ * last save. If that save fails the delivery STOPS: status `save_failed`,
+ * `record.lastError` set, an error logged, and nothing is sent or uploaded.
+ * The save's own `save` notification is suppressed (see
+ * {@link isOwnSaveNotification}) so one Send never delivers twice.
+ *
  * @param {string} handoffId
- * @returns {Promise<void>}
+ * @param {{afterNativeSave?: boolean}} [options] `afterNativeSave: true` is
+ * passed ONLY by the save listener: its trigger is a save Photoshop has just
+ * completed, so the file is current by definition, and attempting a save of
+ * our own from inside that notification could collide with the one still
+ * finishing. That path behaves exactly as it did before the dirty check existed.
+ * @returns {Promise<CpsbLocalHandoffStatus | undefined>} The record's final
+ * status (so a caller can react to `save_failed`), or `undefined` when the
+ * handoff is unknown or its document is no longer open.
  */
-async function deliverEdit(handoffId) {
+async function deliverEdit(handoffId, { afterNativeSave = false } = {}) {
   const record = byHandoffId.get(handoffId)
   if (!record) {
     logWarn(`deliverEdit: unknown handoff ${handoffId}`)
-    return
+    return undefined
   }
   const doc = findOpenDocument(record)
   if (!doc) {
     logWarn(
       `deliverEdit: document for handoff ${handoffId} ("${record.docTitle}") is no longer open`
     )
-    return
+    return undefined
   }
-  connection.send({ type: 'save_detected', handoff_id: handoffId })
+  record.lastError = null
   record.status = 'exporting'
   notifyChanged()
+  if (!afterNativeSave && deliveryDependsOnSavedFile(record)) {
+    try {
+      await ensureDocumentSaved(record, doc)
+    } catch (error) {
+      record.lastError = describeError(error)
+      record.status = 'save_failed'
+      logError(
+        `could not save "${record.docTitle}" before sending handoff ${handoffId} — nothing was ` +
+          `sent: ${record.lastError}`
+      )
+      notifyChanged()
+      return record.status
+    }
+  }
+  connection.send({ type: 'save_detected', handoff_id: handoffId })
   try {
     let uploaded
     if (record.mode === 'remote' && record.wantsLayeredPsd && record.sandboxFile) {
@@ -494,6 +673,7 @@ async function deliverEdit(handoffId) {
     logError(`export failed for handoff ${handoffId} ("${record.docTitle}"): ${describeError(error)}`)
   }
   notifyChanged()
+  return record.status
 }
 
 module.exports = {
@@ -504,5 +684,6 @@ module.exports = {
   findByPath,
   getActiveHandoffs,
   clearAllHandoffs,
-  deliverEdit
+  deliverEdit,
+  isOwnSaveNotification
 }

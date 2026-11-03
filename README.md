@@ -213,7 +213,7 @@ Today the plugin installs as an **unpackaged developer plugin** (a packaged, one
 3. In UDT: **Add Plugin** → select `photoshop_plugin/manifest.json` from your cloned copy of this repo, then **Load**.
 4. The **ComfyUI** panel appears (Plugins menu). It auto-connects to `localhost:8188` by default; the pill shows **Connected** when it's talking to ComfyUI.
 
-Once installed, a plain Cmd/Ctrl+S sends your edit back automatically — the panel's "Send" button (one per open document) is just a manual fallback for saves that don't fire a normal save event (e.g. Export As).
+Once installed, a plain Cmd/Ctrl+S sends your edit back automatically — the panel's "Send" button (one per open document) is just a manual fallback for saves that don't fire a normal save event (e.g. Export As). For an **Annotate for Edit** document, Send **saves the document first** if it has unsaved changes (so the strokes you just painted always arrive); if Photoshop can't save it — say the file is read-only — nothing is sent and the row shows `save_failed` rather than quietly delivering the old version.
 
 The plugin **sets Maximize PSD Compatibility to Always for you** the first time it connects — so you can skip the manual Tier-1 step above. It only writes the preference if it isn't already Always, logs what it did in the panel, and never blocks connecting if it can't. You can turn this off in the panel's **Advanced** section if you'd rather manage the preference yourself.
 
@@ -223,7 +223,7 @@ To edit on one computer while ComfyUI runs on another:
 
 1. Start ComfyUI on the server machine with `--listen` (so it's reachable over the network) and note its address.
 2. In the plugin panel, open **Advanced → ComfyUI server (host:port)**, enter the server's address (e.g. `192.168.1.50:8188` or a Tailscale address), and press **Apply / Connect**.
-3. Open an image from ComfyUI — it opens in Photoshop on *your* machine, and a plain Cmd/Ctrl+S sends the edit back. The PSD download and the edit upload both ride the same WebSocket connection (chunked), so the whole round trip works over the network, not just the connection.
+3. Open an image from ComfyUI — it opens in Photoshop on *your* machine, and a plain Cmd/Ctrl+S sends the edit back. The PSD download and the edit upload both ride the same WebSocket connection (chunked), so the whole round trip works over the network, not just the connection. (Annotate for Edit uploads your layered PSD itself, so the **Instructions** layer survives the trip; pressing **Send** instead of Cmd/Ctrl+S saves any unsaved strokes first.)
 
 This bridge's `/cpsb/*` routes live on ComfyUI's own server process, so `--listen` exposes them exactly as it exposes the rest of ComfyUI's API — no separate authentication layer — so only do this on a network you'd already trust with ComfyUI itself.
 

@@ -342,7 +342,10 @@ Plugin → server:
   the machine the user is at) — leaving the handoff in `error` with the plugin's message
   so the real failure is visible.
 - `{"type": "save_detected", "handoff_id": "..."}` — informational (UI badge); pixels
-  follow via POST `/cpsb/upload` (LOCAL mode) or `upload_edit` (REMOTE mode).
+  follow via POST `/cpsb/upload` (LOCAL mode) or `upload_edit` (REMOTE mode). For a MANUAL
+  Send of an Annotate handoff with unsaved changes it is sent only AFTER the plugin's own
+  save-before-send completes (§6d), and not at all when that save fails — a `save_detected`
+  with no pixels behind it would be a lie.
 - `{"type": "document_closed", "handoff_id": "..."}` — gallery overhaul (2026-07-22): the
   plugin's own periodic `app.documents` check (`photoshop_plugin/handoffs.js`'s
   `startDocumentCloseWatcher`/`pruneClosedHandoffs`, every 5s) detected that a tracked
@@ -1182,9 +1185,47 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     them to `manager.psd_path(meta)` — the exact path a local save would overwrite — and
     ingests via the same path the Tier-1 watcher uses, so the layered read above then runs
     identically to local mode. Malformed bytes error (`upload_error reason:invalid_image`)
-    before touching disk. Non-annotate handoffs and local mode are byte-for-byte unchanged
-    (flat PNG). NB: the actual UXP file-read-after-save, and real multi-MB PSD transfer
+    before touching disk. Non-annotate handoffs and local mode are unchanged on the wire
+    (flat PNG; local mode's one difference is "Save before send" below). NB: the actual UXP file-read-after-save, and real multi-MB PSD transfer
     timing, are only provable on Eric's two machines.
+  - **Save before send** (review item 6, 2026-11-03 — was a silent data-loss bug). The
+    re-read above is only correct if Photoshop has ALREADY written the file. The panel's
+    Send button and the "Send edit back" command are manual and fire with no save, so
+    `deliverEdit` used to upload whatever was last on disk while the panel said `sent`:
+    every stroke painted since the previous Cmd/Ctrl+S stayed in Photoshop. Now, for a
+    MANUAL Send of a `wants_layered_psd` handoff whose `Document.saved` is not `true`,
+    `deliverEdit` first saves the document — `Document.save()` inside
+    `core.executeAsModal`, no dialog — and only then reads/exports and uploads. The
+    dirty test treats an absent `saved` property as "may be dirty" (an unneeded save is
+    harmless, a skipped one uploads stale bytes). It applies in BOTH modes, because
+    LOCAL has the same hole one hop later: the plugin uploads a PNG exported from the
+    live document, but all that upload does for an Annotate handoff is make
+    `meta.edits` non-empty — `_read_ps_saved_psd` then re-opens the managed PSD on
+    disk for the `Instructions` layer, so unsaved strokes were in the PNG and absent
+    from the file the node reads. It deliberately does NOT apply to any other handoff
+    (Edit in Photoshop, Compose, Load PSD, Run Action): their payload is the flat PNG
+    that `runExport` cuts from `doc.duplicate()` of the LIVE document, saved or not, and
+    for a Load PSD *edit original* handoff the saved file is the user's own original,
+    which a Send must not overwrite. Failure rule: if the save throws (read-only file,
+    modal scope unavailable or cancelled) NOTHING is sent — no `save_detected`, no
+    upload — the record's status becomes `save_failed` with `lastError` set, the error
+    is logged, and the "Send edit back" command raises an alert (the panel row shows the
+    status, reason on hover). Retrying after fixing the cause just works.
+  - **No double delivery.** The save-before-send itself makes Photoshop fire a `save`
+    notification, which would otherwise start a second delivery of the same bytes
+    through `saveListener.js`. `handoffs.js` therefore marks the document "own save in
+    flight" (no deadline) from before `doc.save()` until `executeAsModal` settles,
+    plus a 1000 ms grace afterwards for an echo UXP delivers late — on success AND on
+    failure — and `handleSave` drops a notification for a marked document BEFORE its
+    500 ms debounce, so an ignored echo never consumes the debounce window. The grace is
+    short on purpose: a late echo that slips through only re-sends identical bytes (the
+    server dedups by hash in `ingest_edit` — §2 `POST /cpsb/upload`), but a long window would swallow a REAL
+    Cmd/Ctrl+S. The listener's own deliveries pass `afterNativeSave: true`, which skips
+    the dirty check entirely: the file was just written by Photoshop, and a save of our
+    own from inside a save's notification could collide with the one still finishing.
+    Two Sends at once share one in-flight save. `tests/test_send_save_js.py` (Node-VM
+    scenarios in `tests/js/`) pins all of this; the Photoshop-only parts (`saved` really
+    flipping, no save dialog, notification timing) are listed in that file's docstring.
 - MASK resolution precedence: (1) the PS-mode `Instructions`-layer mask above; (2) else
   the `mask` input socket (ComfyUI-only tier: MaskEditor or any mask source upstream);
   (3) else zeros.

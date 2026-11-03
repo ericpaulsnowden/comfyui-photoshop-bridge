@@ -268,6 +268,8 @@ function initPanel() {
     const status = document.createElement('div')
     status.className = 'cpsb-handoff-status'
     status.textContent = record.status
+    // A `save_failed` row carries the reason on hover (the Advanced log has it too).
+    status.title = record.lastError || ''
 
     const button = document.createElement('sp-button')
     button.setAttribute('variant', 'secondary')

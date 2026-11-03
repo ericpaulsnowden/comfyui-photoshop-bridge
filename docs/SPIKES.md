@@ -27,6 +27,7 @@ This project is pre-release — see the status note at the top of the [main READ
 - [x] 6. Silent PNG export via `batchPlay` — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
 - [x] 7. Save-event listener + document identity — **PASS** (2026-07-17, PS 27.8.0; see LIVE RESULTS)
 - [x] 8. Programmatic Maximize Compatibility preference — **CONFIRMED IN PRODUCTION** (v0.5.31, auto-set-on-connect; validated live by Eric 2026-07-21 — see LIVE RESULTS)
+- [ ] 9. Save-before-send (`Document.saved` + `Document.save()` in `executeAsModal`, and the `save` notification it causes) — **OPEN, code-complete, needs live Photoshop** (added 2026-11-03 for review item 6; PROTOCOL.md §6d)
 
 ---
 
@@ -214,6 +215,28 @@ _Confirmed call sequence (including any extra calls needed) and queuePrompt beha
 
 ### Results
 **Get/set WORKED, via the typed API rather than a batchPlay descriptor** (v0.5.31 commit message: "Turned out cleaner than a batchPlay spike: UXP exposes the preference through its typed API (PS ≥ 24.0) — `app.preferences.fileHandling.maximizeCompatibility`, set to `constants.MaximizeCompatibility.ALWAYS` inside `core.executeAsModal`"). New `photoshop_plugin/prefs.js`: on first successful connect of a session, reads the pref and sets it to Always only if it isn't already (fire-and-forget, once-per-session, idempotent, try/catch-wrapped), gated by a default-ON Advanced-section toggle so users can opt out. Final yes/no: **yes, automatic preference-setting works** — recorded on the living test checklist as "Plugin auto-sets Maximize PSD Compatibility on connect — v0.5.31 — validated by Eric · 2026-07-21 (spike 8 confirmed on real Photoshop)" (`research/checklists/comfy-ps-bridge.html`). The v0.5.31 commit itself shipped the code without a live Photoshop available to test on ("NOT verifiable here (no Photoshop): that the typed setter actually flips the preference... that IS the spike-8 live test") — the checklist record from two days later is the actual live-validation evidence.
+
+---
+
+## Spike 9 — Save-before-send (added 2026-11-03, review item 6)
+
+**Goal:** confirm the three Photoshop behaviors `photoshop_plugin/handoffs.js`'s `deliverEdit` now leans on so a manual Send of an Annotate handoff never uploads a stale file (PROTOCOL.md §6d, "Save before send"): (a) `Document.saved` is `false` after painting a stroke and `true` after a save; (b) `await doc.save()` inside `core.executeAsModal` saves a PSD opened from a file in place with no dialog; (c) when Photoshop delivers the `save` notification that save causes, relative to the `save()` promise.
+
+**Gates:** whether the dirty check can trust `Document.saved` (the code treats a missing property as dirty, so the worst case is an unneeded save), and whether the listener-echo suppression window in `handoffs.js` (no deadline while the save is in flight + 1000 ms grace) is long enough that one Send never delivers twice.
+
+**Procedure:** (run it once with the plugin pointed at a REMOTE ComfyUI and once with LOCAL; use an Annotate for Edit node in "Wait for first save" or "Re-run on every save", and keep the panel's Advanced log open)
+1. **The bug.** Queue the node so the document opens. On the `Instructions` layer paint a stroke and do NOT save (the tab shows the modified marker). Press the panel row's **Send** (or Plugins ▸ ComfyUI for Photoshop ▸ Send edit back). Expect: the log shows `has unsaved changes — saving before send`, then `sent edit for handoff …`; the modified marker clears; the stroke is in the node's `mask`/`annotated` output and in the gallery card. (Before the fix the mask was empty.) If the stroke is missing and the "saving before send" line is absent, `Document.saved` read `true` on a dirty document — record that.
+2. **No double delivery.** Repeat step 1 with a fresh stroke and count: exactly one `sent edit for handoff` log line per Send; on a remote server exactly one `Ingesting plugin-sourced websocket PSD upload` line in the ComfyUI console; in "Re-run on every save" the workflow queues once, not twice.
+3. **Saved document, no extra save.** Cmd/Ctrl+S, then Send. Expect no `saving before send` line and one `sent edit`.
+4. **Native save unchanged.** A plain Cmd/Ctrl+S delivers exactly once, and a Cmd/Ctrl+S pressed ~2 s AFTER a Send still delivers (the suppression grace must not swallow it).
+5. **Failure.** Right-click the document tab ▸ Reveal in Finder/Explorer, mark the PSD read-only (Finder: Get Info ▸ Locked; Windows: Read-only attribute), paint a stroke, Send. Expect: the row shows `save_failed` (hover for the reason), an error log line says `nothing was sent`, the Send-edit-back command shows an alert, and ComfyUI receives nothing new. Note whether Photoshop raises its own dialog. Unlock the file and Send again: it succeeds and the stroke arrives.
+6. **Unaffected handoffs.** For an Edit in Photoshop (bridge) document, paint without saving and Send: the stroke arrives and the document stays modified (no save happened). For a Load PSD "edit original" document, Send must not change the original file's modified time.
+
+**Status:**
+- [ ] **OPEN** — implemented and covered by `tests/test_send_save_js.py` against fakes; the Photoshop-only facts above are unverified until run live.
+
+### Results
+_Not yet run on real Photoshop._
 
 ---
 

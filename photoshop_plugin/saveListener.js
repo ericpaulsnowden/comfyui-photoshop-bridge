@@ -8,7 +8,7 @@
 
 const { app, action } = require('photoshop')
 
-const { findByDocumentId, deliverEdit } = require('./handoffs.js')
+const { findByDocumentId, deliverEdit, isOwnSaveNotification } = require('./handoffs.js')
 const { logError, describeError } = require('./log.js')
 
 /** Debounce window per document (quality bar: "Debounce double-fires... 500ms"). */
@@ -77,10 +77,20 @@ function resolveSavedDocumentId(descriptor) {
 async function handleSave(descriptor) {
   const documentId = resolveSavedDocumentId(descriptor)
   if (documentId == null) return
+  // The save this notification reports may be OUR OWN: a manual Send of an
+  // unsaved layered handoff saves the document first (handoffs.js's
+  // `deliverEdit`, docs/PROTOCOL.md §6d) and is already delivering — a second
+  // delivery here would upload the same bytes twice. Checked BEFORE the
+  // debounce so an ignored echo never consumes (or extends) the debounce
+  // window that belongs to real saves.
+  if (isOwnSaveNotification(documentId)) return
   if (isDebounced(documentId)) return
   const record = findByDocumentId(documentId)
   if (!record) return // Not a document this plugin opened — ignore.
-  await deliverEdit(record.handoffId)
+  // afterNativeSave: Photoshop has just finished writing this file, so it is
+  // current by definition — skip deliverEdit's save-before-send dirty check
+  // (it must never try to save from inside a save's own notification).
+  await deliverEdit(record.handoffId, { afterNativeSave: true })
 }
 
 /**
