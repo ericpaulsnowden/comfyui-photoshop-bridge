@@ -3,7 +3,7 @@
   "id": "com.epsnowden.comfyui-photoshop-bridge",
   "name": "ComfyUI for Photoshop",
   "shortname": "comfyui-ps",
-  "version": "0.5.81",
+  "version": "0.5.82",
   "main": "panel.html",
   "host": {
     "app": "PS",

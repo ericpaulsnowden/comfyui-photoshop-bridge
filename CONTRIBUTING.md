@@ -54,8 +54,6 @@ pytest
 
 CI (`.github/workflows/ci.yml`) runs `ruff check .`, `scripts/check_version_sync.py` and the full suite on Linux and Windows against Python 3.10, 3.13 and 3.14 for every push to `main` and every pull request. Run the first two locally before pushing: `ruff check .` and `python scripts/check_version_sync.py`. If you change the version, use `scripts/bump_version.py` so every file moves together.
 
-Frontend and plugin code doesn't have an automated test setup yet (tracked for M1/M4); until it does, describe your manual verification steps in the PR description.
-
 ## Pull request expectations
 
 - **Behavior changes get tests.** If you changed what the code does (not just how it's written), add or update a `pytest` case that would have caught the bug or regression.
