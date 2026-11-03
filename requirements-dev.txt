@@ -1,0 +1,40 @@
+# Development and CI dependencies for comfyui-photoshop-bridge. Not needed to RUN the pack.
+#
+#     python -m pip install -r requirements.txt -r requirements-dev.txt
+#
+# Install into a throwaway venv (python -m venv .venv), NOT into your ComfyUI
+# environment: the runtime pins below are exact and would replace the versions
+# ComfyUI itself runs on. (ComfyUI Manager only ever reads requirements.txt, so
+# none of this reaches users.)
+#
+# Pinned to the versions the suite is verified green on, so an upstream release
+# cannot redden CI on its own. Transitive dependencies are left to pip.
+# requirements.txt keeps the loose ranges users actually install; the exact
+# runtime pins here only decide what the TESTS run against.
+#
+# torch is deliberately NOT listed: ComfyUI provides it, and a plain
+# `pip install torch` on Linux is a multi-GB CUDA download. This suite is NOT
+# torch-free: without torch about 40 tests FAIL and about 100 more skip (of 862),
+# so the suite must run in an environment that has it. CI installs the CPU build
+# in its own step (.github/workflows/ci.yml); locally, use your ComfyUI venv or add:
+#     pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+# --- test runner and linter ---
+pytest==9.1.1
+pytest-asyncio==1.4.0        # pyproject.toml sets asyncio_mode = "auto"
+ruff==0.15.22
+
+# --- runtime packages (same names as requirements.txt, exact versions) ---
+watchdog==6.0.0
+psd-tools==1.17.4
+pillow==12.3.0
+numpy==2.5.1; python_version >= "3.12"
+numpy==2.2.6; python_version < "3.12"     # numpy 2.5 needs Python >= 3.12
+
+# --- provided by ComfyUI, imported by the route tests ---
+aiohttp==3.14.1
+
+# --- test-only: writes the TIFF fixtures that Load PSD's .tif/.tiff tests read back ---
+# Without it those 9 tests skip instead of running. Not a runtime dependency.
+tifffile==2026.10.15; python_version >= "3.12"
+tifffile==2025.5.10; python_version < "3.12"   # tifffile 2026 needs Python >= 3.12

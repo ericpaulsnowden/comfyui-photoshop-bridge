@@ -1,0 +1,83 @@
+# Continuous integration for comfyui-photoshop-bridge.
+#
+# `git clone` and ComfyUI-Manager install whatever is on main, so a push that
+# breaks here breaks someone else's ComfyUI. Every push to main and every pull
+# request runs the lint, the version-consistency check and the full test suite on
+# Linux AND Windows (cross-OS path bugs have bitten this project before), on the
+# oldest Python the pack claims to support and on two newer ones.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: py${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # Let every leg finish: a Windows-only failure must not hide a Linux one.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # 3.10 is the floor in pyproject.toml's requires-python; 3.13 is the
+        # mainstream ComfyUI runtime; 3.14 is the newest release and the
+        # interpreter the author develops on.
+        python-version: ["3.10", "3.13", "3.14"]
+    defaults:
+      run:
+        # Git Bash on Windows too, so every step below is plain bash.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      # ComfyUI provides torch, so it is not in requirements-dev.txt. The tests that
+      # need it skip without it, which would leave them silently unrun in CI. On
+      # Linux the default PyPI wheel is the multi-GB CUDA build; the CPU index
+      # serves a small one. (On Windows the PyPI wheel is already CPU-only, so the
+      # extra index changes nothing.) Keep the version in step with the local venv.
+      - name: Install PyTorch (CPU build)
+        run: python -m pip install torch==2.13.0 --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Show tool versions
+        run: |
+          python --version
+          node --version
+          python -m pip list
+
+      # The next three steps run even if an earlier one failed, so one red run
+      # reports every problem instead of one at a time.
+      - name: Version strings agree
+        if: ${{ !cancelled() }}
+        run: python scripts/check_version_sync.py
+
+      - name: Lint (ruff)
+        if: ${{ !cancelled() }}
+        run: python -m ruff check .
+
+      - name: Tests
+        if: ${{ !cancelled() }}
+        run: python -m pytest -q -rs tests

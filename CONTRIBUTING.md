@@ -22,9 +22,10 @@ This is the current layout:
    ```
 3. Install dependencies:
    ```bash
-   pip install -r requirements.txt
-   pip install pytest ruff
+   pip install -r requirements.txt -r requirements-dev.txt
    ```
+   `requirements-dev.txt` is everything the test suite and linter need beyond the runtime dependencies: `pytest`, `pytest-asyncio` (the async tests will not run without it), `ruff`, and exact pins of the runtime packages and `aiohttp` that CI tests against. Use a venv of your own for this — the pins would overwrite the versions in a ComfyUI environment. `torch` is deliberately not in the file (ComfyUI provides it), but the suite needs it — without torch about 40 tests fail and about 100 more skip. Run the suite from an environment that has torch, or add the CPU build with `pip install torch --extra-index-url https://download.pytorch.org/whl/cpu`.
+
    Runtime dependencies are intentionally minimal: `watchdog` (file-watching for Tier 1), `psd-tools` (PSD read/write), `Pillow` (image conversion), `numpy` (image tensor <-> PIL conversion).
 4. For work on `photoshop_plugin/`, you'll also need the UXP Developer Tool to load the plugin into Photoshop without going through the `.ccx` install flow — see [docs/SPIKES.md](docs/SPIKES.md)'s prerequisites for version requirements.
 
@@ -50,6 +51,10 @@ pytest
 ```
 
 `pytest` also runs the JavaScript suites in `tests/js/*.test.mjs` (via `tests/test_plugin_js.py`, needs `node` >= 20 on PATH, skipped without it). They load the real, unmodified `web/cpsb/*.js` (ES modules) and `photoshop_plugin/*.js` (CommonJS) into a Node `vm` context with stubbed ComfyUI / Photoshop / websocket APIs (`tests/js/harness.mjs`) — currently covering the live loop's Refine recovery and Live Mode's reconnect baseline. To run one directly: `node --experimental-vm-modules tests/js/live_loop.test.mjs`. Everything else in the frontend and plugin has no automated coverage yet (tracked for M1/M4) and needs a Photoshop / ComfyUI session; describe your manual verification steps in the PR description.
+
+CI (`.github/workflows/ci.yml`) runs `ruff check .`, `scripts/check_version_sync.py` and the full suite on Linux and Windows against Python 3.10, 3.13 and 3.14 for every push to `main` and every pull request. Run the first two locally before pushing: `ruff check .` and `python scripts/check_version_sync.py`. If you change the version, use `scripts/bump_version.py` so every file moves together.
+
+Frontend and plugin code doesn't have an automated test setup yet (tracked for M1/M4); until it does, describe your manual verification steps in the PR description.
 
 ## Pull request expectations
 
