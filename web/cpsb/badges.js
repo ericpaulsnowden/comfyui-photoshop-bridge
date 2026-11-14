@@ -707,8 +707,39 @@ function notifyEditArrived({ origin_node_id: nodeId, handoff_id: handoffId }) {
 }
 
 /**
- * Subscribes to `cpsb.status` / `cpsb.updated`. Call once from `cpsb.js`'s
- * `setup()`.
+ * Reconciles badges with the cached `/cpsb/status` handoffs, which is what
+ * live events alone cannot do: a ComfyUI tab reload mid-edit starts with no
+ * badge, and a terminal event missed while the browser's websocket was down
+ * would leave one spinning forever. An `editing` handoff (document not
+ * reported closed) gets a badge if its node has none; a badge whose handoff
+ * the cache holds in any other state is cleared. A handoff the cache does
+ * not hold is left alone (the cache may simply be older than the event).
+ */
+function reconcileWithState() {
+  for (const [nodeId, badge] of badgesByNode) {
+    const meta = badge.handoffId ? state.getHandoffById(badge.handoffId) : undefined
+    if (meta && !(meta.status === 'editing' && meta.plugin_doc_open !== false)) {
+      badgesByNode.delete(nodeId)
+    }
+  }
+  for (const meta of state.getAllHandoffs()) {
+    const nodeId = String(meta.origin_node_id)
+    if (meta.status !== 'editing' || meta.plugin_doc_open === false) continue
+    if (badgesByNode.has(nodeId)) continue
+    badgesByNode.set(nodeId, {
+      kind: 'editing',
+      since: Date.now(),
+      handoffId: meta.handoff_id
+    })
+  }
+  ensureAnimationTimer()
+  app.graph?.setDirtyCanvas(true, false)
+}
+
+/**
+ * Subscribes to `cpsb.status` / `cpsb.updated`, reconciles with the
+ * `/cpsb/status` cache, and re-syncs that cache when ComfyUI's websocket
+ * reconnects. Call once from `cpsb.js`'s `setup()`.
  */
 export function init() {
   api.onStatusChanged((detail) => {
@@ -724,5 +755,15 @@ export function init() {
     } catch (error) {
       api.warn('failed to clear node badge from cpsb.updated', error)
     }
+  })
+  state.subscribe(() => {
+    try {
+      reconcileWithState()
+    } catch (error) {
+      api.warn('failed to reconcile node badges with /cpsb/status', error)
+    }
+  })
+  api.onReconnected(() => {
+    state.refresh()
   })
 }

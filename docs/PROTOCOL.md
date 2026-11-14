@@ -334,6 +334,12 @@ Plugin → server:
   separately exempt, which is why LOCAL mode's HTTP never needed this) — REMOTE mode's
   `fetch()` calls to a remote ComfyUI simply fail, so both directions ride the control
   websocket that is already open and already proven to work cross-machine.
+  The probe's `file:` URL percent-encodes each path segment (a `#`, `?` or `%` in a folder
+  name would otherwise truncate it under WHATWG parsing and wrongly answer REMOTE); how
+  UXP itself decodes it is unverified. If the socket closes while the probe is pending
+  (superseded with 4000, ping timeout, user Disconnect) the handshake is abandoned
+  without touching state — the close handler's standby/retry state stands, and no
+  `ready` is sent.
 - `{"type": "opened", "handoff_id": "...", "document_id": 123}` — document open
   succeeded; server sets status `editing` and records `plugin_doc_open: true`
   (`HandoffMeta.plugin_doc_open`, gallery overhaul 2026-07-22).
@@ -524,7 +530,8 @@ Server → plugin:
   ideally" ruling: pixels arrive capped, the LAYER lands full-canvas. Placement honors
   the main panel's REFINED LAYER Stack/Replace preference (`prefs.js`): Stack adds a new
   layer per refine; Replace first deletes existing top-level layers with the same name.
-  Fire-and-forget: no ack, plugin-side failures are logged there.
+  Fire-and-forget: no ack; a plugin-side placement failure is logged AND shown to the
+  user as a Photoshop alert (the user is waiting on that layer).
 - `{"type": "ping"}` — every 30s; plugin must `pong` within 15s or the server closes
   the socket (plugin reconnects with backoff). **The 15s deadline only runs while the
   connection is idle:** the server reads this socket with ONE loop that awaits each
@@ -667,6 +674,12 @@ network, i.e. started with `--listen`.
   name (`source.filename`, shown by `web/cpsb/gallery.js` in place of the usual workflow
   name, which a pushed card has none of).
 
+  **Failures are visible.** This command has no panel row to show an error on, so — like
+  "Send edit back" — every failure (no open document, export failure, delivery failure
+  after the uploader's retries) is both logged and shown as a Photoshop alert; the panel
+  button's own failure path alerts too. Success stays silent (the new gallery card is the
+  confirmation).
+
 ---
 
 ## 4. Ingest pipeline (backend, both tiers)
@@ -754,6 +767,15 @@ node type or whether the node has an image preview — imageless nodes (Edit in 
 Annotate for Edit, Compose Layers to PSD) included. A stuck editing badge with no cancel
 is the worst failure mode, especially when Photoshop opened on a different (server)
 machine the user can't reach. Cancel calls /cpsb/cancel (§2).
+
+The badge set is not driven by live events alone: `badges.js` also derives it from the
+`state.js` `/cpsb/status` cache (an `editing` handoff whose `plugin_doc_open` is not
+`false` gets a badge; a badge whose handoff the cache holds in any other state is
+cleared), and the frontend re-fetches `/cpsb/status` when ComfyUI's own websocket fires
+`reconnected` — so a tab reload mid-edit restores the badge and a terminal event missed
+during a dropped browser websocket cannot leave one spinning forever. `state.js` also
+re-fetches once more when an event arrives during an in-flight fetch (the answer may
+predate the change), so the cache always converges.
 
 A blocking wait (`HandoffManager.wait_for_edit`) must ALSO honor two non-badge escape
 hatches, so a node can never wedge until its timeout: (a) ComfyUI's OWN "Cancel current

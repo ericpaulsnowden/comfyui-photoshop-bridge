@@ -12,6 +12,7 @@
  * would have logged the failed send on its side).
  */
 
+const { core } = require('photoshop')
 const { connection, base64Decode } = require('./connection.js')
 const { logInfo, logWarn, describeError } = require('./log.js')
 const { addImageAsLayer } = require('./addAsLayer.js')
@@ -51,6 +52,10 @@ connection.addEventListener('message', (event) => {
   )
   addImageAsLayer(bytes, 'png', { layerName, mode }).catch((error) => {
     logWarn(`refined layer placement failed: ${describeError(error)}`)
+    // No panel row to show it on, and the user is waiting for that layer.
+    Promise.resolve(
+      core.showAlert(`Add as layer: could not place the refined image (${describeError(error)}).`)
+    ).catch(() => {})
   })
 })
 

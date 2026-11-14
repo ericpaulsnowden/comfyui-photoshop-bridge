@@ -215,14 +215,22 @@ async function runLayerExport(doc) {
 /**
  * The "Send to ComfyUI" Plugins-menu command's handler (manifest.json's
  * `sendToComfyUI` entrypoint, wired in index.js). Never throws -- every
- * failure is logged, mirroring this plugin's existing "Send"/`sendBackNow`
- * command's identical silent-on-success, log-on-failure posture: the new
- * card appearing in the ComfyUI gallery IS the success confirmation, no
- * separate toast (this command context has no guaranteed panel to show one
- * in anyway).
+ * failure is logged AND shown in an alert (as the "Send edit back" command
+ * does), because this command context has no panel row to show it on.
+ * Success stays silent: the new card appearing in the ComfyUI gallery IS the
+ * confirmation.
  * @returns {Promise<void>}
  */
 async function sendToComfyUI() {
+  /** Failures must be seen: this command has no panel row to show them on. */
+  const fail = async (/** @type {string} */ message) => {
+    logError(message)
+    try {
+      await core.showAlert(`Send to ComfyUI: ${message}`)
+    } catch (_error) {
+      // The log line above is all that is left if even the alert fails.
+    }
+  }
   /** @type {import('photoshop').Document | null} */
   let doc
   try {
@@ -231,7 +239,7 @@ async function sendToComfyUI() {
     doc = null
   }
   if (!doc) {
-    logError('"Send to ComfyUI": no active document')
+    await fail('no document is open.')
     return
   }
 
@@ -277,16 +285,18 @@ async function sendToComfyUI() {
       title = `${doc.title} (whole document)`
     }
   } catch (error) {
-    logError(`"Send to ComfyUI" (${choice}) export failed: ${describeError(error)}`)
+    await fail(`could not export the ${choice === 'layer' ? 'layer' : 'document'} (${describeError(error)}); nothing was sent.`)
     return
   }
 
   const handoffId = await pushManualSend(title, bytes)
   if (handoffId) {
     logInfo(`"Send to ComfyUI" (${choice}) delivered as handoff ${handoffId}`)
+  } else {
+    // pushManualSend logged the failure after exhausting its retries; say it
+    // out loud too, so a failed send is not mistaken for a slow one.
+    await fail('the image could not be delivered to ComfyUI (see the plugin log); nothing was sent.')
   }
-  // pushManualSend already logs its own failure after exhausting retries --
-  // nothing more to do here on a null result.
 }
 
 module.exports = { sendToComfyUI }
