@@ -15,16 +15,21 @@ async function setup(initial = []) {
   const handoffs = new Map(initial.map((h) => [h.handoff_id, h]))
   const cb = { status: () => {}, reconnected: () => {}, stateChanged: () => {} }
   const timer = { tick: null, cleared: false }
-  const calls = { refresh: 0 }
+  const calls = { refresh: 0, cancelled: [] }
+  const active = { workflow: '' }
   const api = {
     warn: () => {},
     onStatusChanged: (fn) => (cb.status = fn),
     onUpdated: () => {},
-    onReconnected: (fn) => (cb.reconnected = fn)
+    onReconnected: (fn) => (cb.reconnected = fn),
+    cancelHandoff: async (id) => {
+      calls.cancelled.push(id)
+    }
   }
   const state = {
     subscribe: (fn) => (cb.stateChanged = fn),
     getHandoffById: (id) => handoffs.get(id),
+    workflowMatches: (name) => !active.workflow || !name || name === active.workflow,
     getAllHandoffs: () => Array.from(handoffs.values()),
     refresh: async () => {
       calls.refresh += 1
@@ -56,7 +61,7 @@ async function setup(initial = []) {
     if (timer.tick) timer.tick()
     return timer.tick !== null
   }
-  return { handoffs, cb, calls, spinning }
+  return { handoffs, cb, calls, spinning, active, badges }
 }
 
 const editing = { handoff_id: 'h1', origin_node_id: '7', status: 'editing' }
@@ -96,4 +101,27 @@ test('a ComfyUI websocket reconnect re-syncs /cpsb/status', async () => {
   const { cb, calls } = await setup()
   cb.reconnected()
   assert.equal(calls.refresh, 1)
+})
+
+test("another workflow's editing handoff on the same node id gets no badge and no cancel", async () => {
+  const { handoffs, cb, calls, spinning, active, badges } = await setup()
+  active.workflow = 'B.json'
+  handoffs.set('wfA', { ...editing, handoff_id: 'wfA-edit', workflow_name: 'A.json' })
+  cb.stateChanged()
+  assert.equal(spinning(), false)
+
+  const node = { id: 7, size: [300, 120], flags: {}, widgets: [] }
+  badges.installBadgeHook(node)
+  let drawn = 0
+  const ctx = new Proxy({}, { get: (_t, prop) => (prop === 'measureText' ? () => ({ width: 80 }) : () => { drawn += 1 }) })
+  node.onDrawForeground(ctx, null, null)
+  assert.equal(drawn, 0, 'nothing drawn on the unrelated node')
+  node.onMouseDown({}, [150, 60], null)
+  node.onMouseDown({}, [280, 10], null)
+  assert.deepEqual(calls.cancelled, [])
+
+  // Switching to workflow A: state notifies, the next reconcile adds the badge.
+  active.workflow = 'A.json'
+  cb.stateChanged()
+  assert.equal(spinning(), true)
 })
