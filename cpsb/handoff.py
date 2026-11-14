@@ -1163,7 +1163,9 @@ class HandoffManager:
         # disk (both PSD ingest paths write it before calling in).
         with self._lock:
             known = self._handoffs.get(handoff_id)
-            layered_psd = self.psd_path(known) if known is not None and known.wants_layered_psd else None
+            layered_psd = (
+                self.psd_path(known) if known is not None and known.wants_layered_psd else None
+            )
         mask_digest = None
         if layered_psd is not None and layered_psd.exists():
             from .annotate import instructions_mask_digest  # annotate imports this module
