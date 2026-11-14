@@ -4841,5 +4841,6 @@ async def test_late_open_failed_does_not_revive_a_retired_handoff(
 
     assert manager.get(meta.handoff_id).status == retired_status
     assert launches.calls == []
-    assert manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (9, 9, 9)), "plugin") is None
+    late_save = Image.new("RGB", (8, 8), (9, 9, 9))
+    assert manager.ingest_edit(meta.handoff_id, late_save, "plugin") is None
     assert manager.get(meta.handoff_id).edits == []
