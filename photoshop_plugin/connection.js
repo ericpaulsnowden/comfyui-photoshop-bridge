@@ -315,13 +315,29 @@ function splitIntoChunks(data) {
  * `file:/Users/user/Documents/tmp`) rather than the triple-slash `file:///`
  * form — see `uxp-api/reference-js/.../persistent-file-storage/file-system-provider.md`.
  * Windows paths are normalized to forward slashes first
- * (`C:\foo\bar` -> `file:/C:/foo/bar`).
+ * (`C:\foo\bar` -> `file:/C:/foo/bar`). A UNC path (`\\host\share\x`) keeps
+ * its host as the URL authority (`file://host/share/x`).
+ *
+ * Every path segment is percent-encoded: left raw, a `#` or `?` in a folder
+ * name starts the URL's fragment/query and a `%` starts an escape, so under
+ * WHATWG URL parsing `C:\Projects #2\in` would be read as `/C:/Projects%20`.
+ * The drive-letter colon, the `/` separators and the UNC host stay as-is;
+ * spaces and non-ASCII become `%20` / UTF-8 escapes. NOTE: how the UXP
+ * runtime itself decodes these URLs is UNVERIFIED (no Photoshop in the test
+ * rig); the encoding is correct under WHATWG rules, which is what the
+ * pure-function test checks.
  * @param {string} absolutePath
  * @returns {string}
  */
 function pathToFileUrl(absolutePath) {
   const normalized = absolutePath.replace(/\\/g, '/')
-  return normalized.startsWith('/') ? `file:${normalized}` : `file:/${normalized}`
+  const isUnc = normalized.startsWith('//')
+  const segments = normalized.replace(/^\/+/, '').split('/')
+  const host = isUnc ? segments.shift() : ''
+  const encoded = segments.map((segment, index) =>
+    index === 0 && !isUnc && /^[A-Za-z]:$/.test(segment) ? segment : encodeURIComponent(segment)
+  )
+  return `file:${isUnc ? `//${host}` : ''}/${encoded.join('/')}`
 }
 
 /**
@@ -995,7 +1011,14 @@ class ConnectionManager extends EventTarget {
           `v${msg.server_version} — update whichever is behind (connection is fine)`
       )
     }
-    this.localMode = await this._probeLocalMode(msg.input_cpsb_path)
+    const socket = this._socket
+    const localMode = await this._probeLocalMode(msg.input_cpsb_path)
+    // The socket can close during the probe (superseded with 4000, ping
+    // timeout, or the user pressing Disconnect). Its onclose already put the
+    // standby / retry state where it belongs; finishing the handshake now
+    // would wipe that and report "connected" with no socket.
+    if (!socket || this._socket !== socket) return
+    this.localMode = localMode
     /** @type {CpsbReadyMessage} */
     const ready = { type: 'ready', local_mode: this.localMode }
     this.send(ready)

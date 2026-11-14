@@ -43,6 +43,7 @@ const { resendLiveCreativity: resendCreativity } = require('./liveCreativity.js'
 // "version" field, so the panel's version line and the handshake can never
 // disagree.
 const uxp = require('uxp')
+const { core } = require('photoshop')
 
 /** @type {Record<import('./connection.js').CpsbConnectionState['status'], string>} */
 const STATUS_LABELS = {
@@ -570,6 +571,9 @@ function initPanel() {
     sendButton.addEventListener('click', () => {
       sendToComfyUI().catch((error) => {
         logError(`"Send to ComfyUI" (panel) failed: ${describeError(error)}`)
+        Promise.resolve(
+          core.showAlert(`Send to ComfyUI: failed (${describeError(error)}).`)
+        ).catch(() => {})
       })
     })
   }

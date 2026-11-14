@@ -669,6 +669,19 @@ export function onStatusChanged(callback) {
 }
 
 /**
+ * Subscribes to ComfyUI's own `reconnected` event (the browser's websocket to
+ * ComfyUI dropped and came back). `cpsb.*` events sent while it was down are
+ * gone, so consumers re-sync from `/cpsb/status`.
+ * @param {() => void} callback
+ * @returns {() => void} Unsubscribe function.
+ */
+export function onReconnected(callback) {
+  const handler = () => callback()
+  api.addEventListener('reconnected', handler)
+  return () => api.removeEventListener('reconnected', handler)
+}
+
+/**
  * @typedef {Object} CpsbLiveEvent
  * Payload of the `cpsb.live` websocket event (PROTOCOL.md §5, realtime
  * drawing M1/M2): a new live-drawing frame landed in the server's

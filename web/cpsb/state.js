@@ -58,6 +58,8 @@ const listeners = new Set()
 
 let initPromise = /** @type {Promise<void> | null} */ (null)
 let refreshPromise = /** @type {Promise<void> | null} */ (null)
+/** A refresh was requested while one was in flight (see {@link refresh}). */
+let refreshDirty = false
 
 function notify() {
   for (const listener of listeners) {
@@ -87,24 +89,32 @@ function applyStatusResponse(
 }
 
 /**
- * Re-fetches `/cpsb/status` and replaces the cache. Concurrent calls share
- * one in-flight request.
+ * Re-fetches `/cpsb/status` and replaces the cache. A call made while a
+ * fetch is already in flight cannot share that response — the server may
+ * have answered before the change that prompted this call — so it marks the
+ * fetch dirty and ONE follow-up fetch runs after the current one settles
+ * (any number of calls during a fetch coalesce into that single extra
+ * fetch). The returned promise resolves after the follow-up too.
  * @returns {Promise<void>}
  */
 export function refresh() {
-  if (refreshPromise) return refreshPromise
-  refreshPromise = api
-    .getStatus()
-    .then((response) => {
-      applyStatusResponse(response)
-      notify()
-    })
-    .catch((error) => {
-      api.warn('failed to refresh /cpsb/status', error)
-    })
-    .finally(() => {
-      refreshPromise = null
-    })
+  if (refreshPromise) {
+    refreshDirty = true
+    return refreshPromise
+  }
+  refreshPromise = (async () => {
+    do {
+      refreshDirty = false
+      try {
+        applyStatusResponse(await api.getStatus())
+        notify()
+      } catch (error) {
+        api.warn('failed to refresh /cpsb/status', error)
+      }
+    } while (refreshDirty)
+  })().finally(() => {
+    refreshPromise = null
+  })
   return refreshPromise
 }
 
