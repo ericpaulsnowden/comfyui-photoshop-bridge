@@ -185,7 +185,7 @@ PURGEABLE_STATUSES: frozenset[str] = frozenset(
 TERMINAL_STATUSES: frozenset[str] = frozenset({"cancelled", "discarded", "superseded", "error"})
 
 #: Terminal statuses the USER chose (everything but ``error``): a late open
-#: confirmation must never bring one of these back to ``editing``.
+#: confirmation or failure report must never move one of these anywhere.
 _RETIRED_STATUSES: frozenset[str] = TERMINAL_STATUSES - {"error"}
 
 _SECONDS_PER_DAY = 86400
@@ -992,7 +992,18 @@ class HandoffManager:
         return meta
 
     def mark_error(self, handoff_id: str, error: str) -> HandoffMeta:
-        return self._transition(handoff_id, status="error", error=error)
+        """Record a failure. Like :meth:`mark_editing`, a handoff the user
+        already retired stays exactly as it is (logged at info): callers
+        decide on the returned status whether anything further (e.g. a
+        Tier 1 fallback launch) should happen."""
+        meta = self._transition(
+            handoff_id, status="error", error=error, noop_from=_RETIRED_STATUSES
+        )
+        if meta.status != "error":
+            logger.info(
+                "Error report for %s ignored: handoff is already %s", handoff_id, meta.status
+            )
+        return meta
 
     def mark_cancelled(self, handoff_id: str) -> HandoffMeta:
         """Mark *handoff_id* cancelled: unblocks any waiter, notifies the UI.

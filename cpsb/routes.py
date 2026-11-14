@@ -3367,10 +3367,12 @@ async def _handle_plugin_message(
         error_text = str(msg.get("error") or "Plugin failed to open")
         if handoff_id:
             try:
-                manager.mark_error(handoff_id, error_text)
+                failed = manager.mark_error(handoff_id, error_text)
             except HandoffNotFoundError:
                 logger.warning("Plugin reported open_failed for unknown handoff %s", handoff_id)
             else:
+                if failed.status != "error":
+                    return  # retired handoff: stays retired, no fallback launch
                 # Only fall back to a server-side Tier 1 launch when the plugin
                 # is on the SERVER's own machine (local mode). For a REMOTE
                 # plugin, a Tier 1 launch would open Photoshop on the SERVER --
@@ -3462,11 +3464,13 @@ async def websocket_route(request: web.Request) -> web.WebSocketResponse:
     previous = _plugin(request)
     connection = PluginConnection(ws=ws)
     _set_plugin(request.app, connection)
-    if previous is not None:
-        await previous.ws.close(code=4000, message=b"replaced by a new connection")
-
-    keepalive_task = asyncio.ensure_future(_keepalive_loop(connection))
+    keepalive_task: asyncio.Future | None = None
+    # Everything after the install is inside the try: a handler cancelled
+    # while closing the displaced socket must still clear its own slot entry.
     try:
+        if previous is not None:
+            await previous.ws.close(code=4000, message=b"replaced by a new connection")
+        keepalive_task = asyncio.ensure_future(_keepalive_loop(connection))
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
                 # While a handler runs this loop is NOT reading the socket --
@@ -3479,9 +3483,10 @@ async def websocket_route(request: web.Request) -> web.WebSocketResponse:
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 logger.warning("cpsb plugin websocket error: %s", ws.exception())
     finally:
-        keepalive_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await keepalive_task
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keepalive_task
         if _plugin(request) is connection:
             _set_plugin(request.app, None)
             _emit_tier2(context, connected=False, ps_version=None)

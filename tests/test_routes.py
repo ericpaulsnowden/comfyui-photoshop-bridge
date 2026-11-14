@@ -2531,6 +2531,33 @@ class TestPluginWebsocket:
         assert not ws_c.closed
         await ws_c.close()
 
+    async def test_cancellation_while_closing_the_displaced_socket_never_leaves_the_slot_taken(
+        self, client
+    ):
+        """A handler cancelled inside the old socket's close must not leave
+        its own (never-ready) connection installed in the slot."""
+        from unittest import mock
+
+        class _Old:
+            async def close(self, **_kw):
+                raise asyncio.CancelledError
+
+        app = client.app
+        app[routes_module._APP_KEY_PLUGIN].connection = routes_module.PluginConnection(ws=_Old())
+        handler = next(
+            r for r in app.router.routes() if r.resource.canonical == "/cpsb/ws"
+        ).handler
+        request = mock.Mock()
+        request.app = app
+
+        with (
+            mock.patch.object(web.WebSocketResponse, "prepare", new=mock.AsyncMock()),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await handler(request)
+
+        assert app[routes_module._APP_KEY_PLUGIN].connection is None
+
     async def test_disconnect_emits_tier2_event(self, client, context, events, launches):
         async with client.ws_connect("/cpsb/ws") as ws:
             await self.handshake(ws, context)
@@ -4784,3 +4811,35 @@ async def test_late_opened_message_does_not_reactivate_a_cancelled_handoff(
 
     assert manager.get(meta.handoff_id).status == "cancelled"
     assert manager.find_active_for_node("17") is None
+
+
+@pytest.mark.parametrize("retire", ["mark_cancelled", "mark_discarded", "supersede"])
+async def test_late_open_failed_does_not_revive_a_retired_handoff(
+    context, manager, launches, monkeypatch, retire
+):
+    """PROTOCOL.md §2: a late `open_failed` must neither move a retired handoff
+    to `error`, nor trigger the Tier 1 fallback launch, nor let later saves in."""
+    monkeypatch.setattr(routes_module, "tier1_status", lambda: Tier1Status(available=True))
+    meta = manager.create(
+        origin_node_id="17",
+        origin_kind="load_image",
+        workflow_name="wf",
+        source=SourceRef(filename="x.png", subfolder="", type="output"),
+        original_image=Image.new("RGB", (8, 8), (1, 2, 3)),
+    )
+    write_psd(manager.psd_path(meta), Image.new("RGB", (8, 8), (1, 2, 3)))
+    getattr(manager, retire)(meta.handoff_id)
+    retired_status = manager.get(meta.handoff_id).status
+
+    connection = routes_module.PluginConnection(ws=None, local_mode=True)
+    await routes_module._handle_plugin_message(
+        context,
+        manager,
+        connection,
+        json.dumps({"type": "open_failed", "handoff_id": meta.handoff_id, "error": "late failure"}),
+    )
+
+    assert manager.get(meta.handoff_id).status == retired_status
+    assert launches.calls == []
+    assert manager.ingest_edit(meta.handoff_id, Image.new("RGB", (8, 8), (9, 9, 9)), "plugin") is None
+    assert manager.get(meta.handoff_id).edits == []
