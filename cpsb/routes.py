@@ -3344,8 +3344,8 @@ async def _handle_plugin_message(
         handoff_id = msg.get("handoff_id")
         if handoff_id:
             try:
-                manager.mark_editing(handoff_id)
-                manager.set_plugin_doc_open(handoff_id, True)
+                if manager.mark_editing(handoff_id).status == "editing":
+                    manager.set_plugin_doc_open(handoff_id, True)
             except HandoffNotFoundError:
                 logger.warning("Plugin opened unknown handoff %s", handoff_id)
     elif msg_type == "document_closed":
@@ -3454,12 +3454,16 @@ async def websocket_route(request: web.Request) -> web.WebSocketResponse:
     context = _context(request)
     manager = _manager(request)
 
+    # Install FIRST, close the displaced socket after: no await may sit
+    # between reading the slot and writing it, or two overlapping
+    # replacements both install and one socket is left open outside the slot.
+    # The newest connection always wins; each one closes exactly the
+    # connection it displaced.
     previous = _plugin(request)
-    if previous is not None:
-        await previous.ws.close(code=4000, message=b"replaced by a new connection")
-
     connection = PluginConnection(ws=ws)
     _set_plugin(request.app, connection)
+    if previous is not None:
+        await previous.ws.close(code=4000, message=b"replaced by a new connection")
 
     keepalive_task = asyncio.ensure_future(_keepalive_loop(connection))
     try:

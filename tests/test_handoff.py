@@ -370,6 +370,33 @@ class TestSiblingOutputs:
         assert edit2.sibling_output.filename == "ComfyUI_00042__ps2.png"
         assert (context.output_dir / "ComfyUI_00042__ps2.png").is_file()
 
+    def test_fresh_handoff_for_same_source_never_overwrites_earlier_sibling(
+        self, manager, context
+    ):
+        """A superseded handoff's sibling must survive a later handoff for the
+        same output: the new one gets the next free name, not ``_ps1`` again,
+        and the first manifest entry still points at the first pixels."""
+        first = create_handoff(manager, origin_kind="terminal_output")
+        edit_a = manager.ingest_edit(first.handoff_id, make_image((9, 9, 9)), "composite")
+        first_bytes = (context.output_dir / edit_a.sibling_output.filename).read_bytes()
+        manager.supersede(first.handoff_id)
+
+        second = create_handoff(manager, origin_kind="terminal_output")
+        edit_b = manager.ingest_edit(second.handoff_id, make_image((7, 7, 7)), "composite")
+
+        assert edit_b.sibling_output.filename != edit_a.sibling_output.filename
+        assert (context.output_dir / edit_a.sibling_output.filename).read_bytes() == first_bytes
+        assert (context.output_dir / edit_b.sibling_output.filename).read_bytes() != first_bytes
+
+    def test_sibling_skips_a_name_already_on_disk(self, manager, context):
+        """Even a file no manifest knows about (the user's own) is never overwritten."""
+        existing = context.output_dir / "ComfyUI_00042__ps1.png"
+        existing.write_bytes(b"user file")
+        meta = create_handoff(manager, origin_kind="terminal_output")
+        edit = manager.ingest_edit(meta.handoff_id, make_image((9, 9, 9)), "composite")
+        assert edit.sibling_output.filename == "ComfyUI_00042__ps2.png"
+        assert existing.read_bytes() == b"user file"
+
     def test_sibling_respects_subfolder(self, manager, context):
         meta = create_handoff(
             manager,
@@ -1399,3 +1426,26 @@ class TestDerivePsdFilenameSanitization:
         manual split exists).
         """
         assert handoff_module._derive_psd_filename("..jpg") == DEFAULT_PSD_FILENAME
+
+
+class TestTerminalStaysTerminal:
+    """PROTOCOL.md §2: a user-retired handoff is never re-activated by a late
+    open confirmation (Photoshop's `opened`, or a Tier 1 launch finishing)."""
+
+    @pytest.mark.parametrize("retire", ["mark_cancelled", "mark_discarded", "supersede"])
+    def test_mark_editing_does_not_reactivate_a_retired_handoff(self, manager, retire):
+        meta = create_handoff(manager)
+        getattr(manager, retire)(meta.handoff_id)
+        retired_status = manager.get(meta.handoff_id).status
+
+        result = manager.mark_editing(meta.handoff_id)
+
+        assert result.status == retired_status
+        assert manager.get(meta.handoff_id).status == retired_status
+        assert manager.find_active_for_node("17") is None
+
+    def test_mark_editing_still_recovers_from_open_error(self, manager):
+        """Tier 2 `open_failed` -> Tier 1 launch fallback (PROTOCOL.md §3)."""
+        meta = create_handoff(manager)
+        manager.mark_error(meta.handoff_id, "plugin could not open it")
+        assert manager.mark_editing(meta.handoff_id).status == "editing"
