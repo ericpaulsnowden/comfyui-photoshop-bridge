@@ -524,8 +524,34 @@ function handleUpdated(payload) {
     })
     return
   }
+  // The one place that decides whether this edit may touch the open graph.
+  // An unknown handoff (status cache not loaded yet, e.g. at startup) is not
+  // "allowed": the emitting server knows it, so one /cpsb/status fetch
+  // resolves it; still unknown after that -> touch nothing.
   const meta = state.getHandoffById(payload.handoff_id)
-  if (meta && !state.workflowMatches(meta.workflow_name)) {
+  if (meta) {
+    routeUpdated(payload, meta)
+  } else {
+    state.refresh().then(() => routeUpdated(payload, state.getHandoffById(payload.handoff_id)))
+  }
+}
+
+/**
+ * @param {import('./api.js').CpsbUpdatedEvent} payload
+ * @param {import('./api.js').CpsbHandoffMeta | undefined} meta
+ */
+function routeUpdated(payload, meta) {
+  if (!meta) {
+    ui.showToast({
+      severity: 'info',
+      summary: 'Edit received',
+      detail:
+        'Could not tell which workflow this edit belongs to, so nothing was changed. ' +
+        'It is waiting in the Photoshop Edits gallery.'
+    })
+    return
+  }
+  if (!state.workflowMatches(meta.workflow_name)) {
     handleOtherWorkflow(meta)
     return
   }
