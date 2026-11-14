@@ -22,7 +22,12 @@ function fakeElement() {
   }
 }
 
-function setupSend({ doc = { title: 'Doc' }, exportFails = false, pushResult = 'h1' } = {}) {
+function setupSend({
+  doc = { title: 'Doc' },
+  exportFails = false,
+  pushResult = 'h1',
+  pickerThrows = false
+} = {}) {
   const alerts = []
   const photoshop = {
     app: { activeDocument: doc },
@@ -44,7 +49,20 @@ function setupSend({ doc = { title: 'Doc' }, exportFails = false, pushResult = '
       './uploader.js': { pushManualSend: async () => pushResult },
       './connection.js': { connection: { getState: () => ({ status: 'connected' }) } }
     },
-    { document: { createElement: fakeElement, body: fakeElement() } }
+    {
+      document: {
+        createElement: () => {
+          const el = fakeElement()
+          if (pickerThrows) {
+            el.uxpShowModal = async () => {
+              throw new Error('host is in a modal state')
+            }
+          }
+          return el
+        },
+        body: fakeElement()
+      }
+    }
   )
   return { sendToComfyUI, alerts }
 }
@@ -69,6 +87,14 @@ test('Send to ComfyUI delivery failure (push returned null) alerts', async () =>
   await sendToComfyUI()
   assert.equal(alerts.length, 1)
   assert.match(alerts[0], /could not be delivered/)
+})
+
+test('Send to ComfyUI picker failure (dialog cannot open) alerts once', async () => {
+  const { sendToComfyUI, alerts } = setupSend({ pickerThrows: true })
+  await sendToComfyUI()
+  assert.equal(alerts.length, 1)
+  assert.match(alerts[0], /modal state/)
+  assert.match(alerts[0], /nothing was sent/)
 })
 
 test('a successful Send to ComfyUI shows no alert', async () => {

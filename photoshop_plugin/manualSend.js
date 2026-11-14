@@ -268,7 +268,7 @@ async function sendToComfyUI() {
   try {
     choice = await showSendPicker()
   } catch (error) {
-    logError(`"Send to ComfyUI" picker failed: ${describeError(error)}`)
+    await fail(`could not show the send options (${describeError(error)}); nothing was sent.`)
     return
   }
   if (!choice) {

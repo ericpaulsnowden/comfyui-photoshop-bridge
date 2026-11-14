@@ -726,6 +726,9 @@ function reconcileWithState() {
     const nodeId = String(meta.origin_node_id)
     if (meta.status !== 'editing' || meta.plugin_doc_open === false) continue
     if (badgesByNode.has(nodeId)) continue
+    // Node ids are only unique within one workflow; state notifies on a
+    // workflow switch, so the next reconcile adds the new workflow's badges.
+    if (!state.workflowMatches(meta.workflow_name)) continue
     badgesByNode.set(nodeId, {
       kind: 'editing',
       since: Date.now(),
