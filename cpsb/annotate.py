@@ -366,8 +366,12 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None, Image.I
     return image, mask, combined
 
 
-def instructions_mask_digest(psd_path: Path) -> str | None:
-    """SHA256 of the saved PSD's Instructions-layer mask, or ``None`` without that layer.
+def instructions_mask_digest(psd: PSDImage) -> str | None:
+    """SHA256 of the open PSD's Instructions-layer mask, or ``None`` without that layer.
+
+    Raises whatever psd-tools raises for a malformed layer channel; callers
+    that receive untrusted bytes (:func:`cpsb.routes._ingest_psd_upload`) call
+    this inside their own validation so that is reported as an invalid PSD.
 
     The ingest-dedup and ``IS_CHANGED`` identity for an Annotate edit
     (PROTOCOL.md §6d): the node's MASK depends on the Instructions layer
@@ -375,7 +379,6 @@ def instructions_mask_digest(psd_path: Path) -> str | None:
     background's own colour changes this digest while the composite stays
     byte-identical.
     """
-    psd = PSDImage.open(psd_path)
     layer = _find_top_level_layer(psd, INSTRUCTIONS_LAYER_NAME)
     if layer is None:
         return None

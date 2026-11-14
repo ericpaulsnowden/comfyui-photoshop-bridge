@@ -2423,8 +2423,16 @@ def _ingest_psd_upload(
         ``None``. On failure, ``edit`` is ``None`` and ``error``/``reason``
         describe an `upload_error` to send back.
     """
+    mask_digest = None
     try:
-        PSDImage.open(io.BytesIO(raw_bytes))
+        parsed = PSDImage.open(io.BytesIO(raw_bytes))
+        if meta.wants_layered_psd:
+            # The Instructions layer is part of an Annotate edit's identity; a
+            # malformed layer channel must fail HERE (before the write below),
+            # not escape ingest_edit.
+            from .annotate import instructions_mask_digest  # annotate imports this module
+
+            mask_digest = instructions_mask_digest(parsed)
     except Exception as exc:  # any parse failure just means "not a PSD"
         return None, f"Invalid PSD data: {exc}", "invalid_image"
 
@@ -2437,7 +2445,7 @@ def _ingest_psd_upload(
         return None, f"Could not read uploaded PSD: {exc}", "invalid_image"
 
     logger.info("Ingesting plugin-sourced websocket PSD upload for handoff %s", meta.handoff_id)
-    edit = manager.ingest_edit(meta.handoff_id, image, fidelity)
+    edit = manager.ingest_edit(meta.handoff_id, image, fidelity, mask_digest)
     return edit, None, None
 
 
