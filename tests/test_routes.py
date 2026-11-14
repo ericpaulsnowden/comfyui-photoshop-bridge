@@ -4694,7 +4694,11 @@ class TestTransferLimitsUnits:
         with routes_module._reader_busy(connection):
             assert connection.busy == 1
             assert routes_module._connection_busy(connection)
-            time.sleep(0.05)
+            # Sleep well past the 50 ms we assert: Windows' monotonic clock
+            # ticks at ~15.6 ms, so a 50 ms sleep can read back as 47 ms
+            # (CI flake 2026-11-13, py3.10 windows). 100 ms leaves a full
+            # tick's margin on either side of the measurement.
+            time.sleep(0.1)
             assert routes_module._reader_busy_seconds(connection, time.monotonic()) >= 0.05
         assert connection.busy == 0
         assert connection.busy_since is None
