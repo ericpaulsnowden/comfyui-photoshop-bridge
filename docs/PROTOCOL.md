@@ -763,6 +763,14 @@ promptly; and (b) the handoff transitioning to a terminal ERROR (e.g. the plugin
 `timeout_seconds`. Both, like cancel/timeout, make the node raise
 `InterruptProcessingException`.
 
+Paste-back is scoped to the active workflow: every workflow tab shares one graph and node
+ids are small per-workflow integers, so on `cpsb.updated` the frontend looks the handoff up
+and applies the same rule as the §1 active-handoff lookup (names equal, or either empty =
+wildcard). For a handoff of a *different* workflow it writes no widget, refreshes no
+preview, does not auto-queue and only shows a toast — the edit stays in the gallery. The
+gallery's Reveal / Add-as-node and the node "Editing in Photoshop…" badge apply the same
+rule.
+
 Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
 widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
 "[Add as node]" for `terminal_output`). Auto-queue policy:

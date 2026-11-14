@@ -203,7 +203,7 @@ function cardCapabilities(displayStatus) {
  */
 function revealInWorkflow(meta) {
   try {
-    const node = pasteback.getNodeByIdFlexible(meta.origin_node_id)
+    const node = pasteback.getNodeForHandoff(meta)
     if (!node) {
       ui.showToast({
         severity: 'warn',
@@ -376,7 +376,7 @@ function addAsNode(meta) {
     return
   }
   try {
-    const node = pasteback.getNodeByIdFlexible(meta.origin_node_id)
+    const node = pasteback.getNodeForHandoff(meta)
     pasteback.addLoadImageNodeNear(node, {
       filename: latestEdit.filename,
       subfolder: api.editSubfolder(meta),
@@ -586,11 +586,12 @@ function buildCard(meta) {
   // Reveal only makes sense when the origin node is actually in the graph
   // that's open right now — otherwise `centerOnNode` has nothing to center
   // on and the action just fails (the user's "Reveal fails most of the
-  // time"). `getNodeByIdFlexible` reads live `app.graph`, so this is the
-  // current-workflow check, and buildCard re-runs on every rebuild() (each
+  // time"). `getNodeForHandoff` reads live `app.graph` AND requires the
+  // handoff's workflow to match the open one (node ids collide across
+  // workflows), so this is the current-workflow check, and buildCard re-runs on every rebuild() (each
   // cpsb.* event / tab mount), so a workflow switch while the gallery is
   // open re-evaluates it — visibility is never cached across renders.
-  const originNodePresent = !!pasteback.getNodeByIdFlexible(meta.origin_node_id)
+  const originNodePresent = !!pasteback.getNodeForHandoff(meta)
 
   const thumb = buildCardThumb(meta, latestEdit)
 
