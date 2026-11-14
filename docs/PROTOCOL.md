@@ -767,9 +767,11 @@ Paste-back is scoped to the active workflow: every workflow tab shares one graph
 ids are small per-workflow integers, so on `cpsb.updated` the frontend looks the handoff up
 and applies the same rule as the §1 active-handoff lookup (names equal, or either empty =
 wildcard). For a handoff of a *different* workflow it writes no widget, refreshes no
-preview, does not auto-queue and only shows a toast — the edit stays in the gallery. The
+preview, does not auto-queue and only shows a toast — the edit stays in the gallery. A handoff
+not yet in the frontend's status cache (startup) is resolved with one `/cpsb/status` fetch
+first; if it is still unknown, nothing is written or queued (toast only). The
 gallery's Reveal / Add-as-node and the node "Editing in Photoshop…" badge apply the same
-rule.
+rule, and the mounted gallery re-evaluates them when the active workflow changes.
 
 Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
 widget update for `load_image`/`bridge_node`; cosmetic preview + toast with

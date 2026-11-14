@@ -142,7 +142,36 @@ export function initState() {
  */
 export function subscribe(callback) {
   listeners.add(callback)
-  return () => listeners.delete(callback)
+  startWorkflowWatch()
+  return () => {
+    listeners.delete(callback)
+    if (listeners.size === 0) stopWorkflowWatch()
+  }
+}
+
+// The ComfyUI frontend emits no event extensions can rely on when the user
+// switches workflow tabs (`graphChanged` fires on edits, not reliably on a
+// switch), yet workflow-scoped views (the gallery's Reveal) depend on the
+// active workflow. So while anything is subscribed, a cheap poll of the
+// active workflow's name notifies subscribers when it changes.
+const WORKFLOW_WATCH_MS = 500
+let workflowWatchTimer = /** @type {ReturnType<typeof setInterval> | null} */ (null)
+let watchedWorkflowName = /** @type {string | undefined} */ (undefined)
+
+function startWorkflowWatch() {
+  if (workflowWatchTimer !== null) return
+  watchedWorkflowName = getWorkflowName()
+  workflowWatchTimer = setInterval(() => {
+    const name = getWorkflowName()
+    if (name === watchedWorkflowName) return
+    watchedWorkflowName = name
+    notify()
+  }, WORKFLOW_WATCH_MS)
+}
+
+function stopWorkflowWatch() {
+  if (workflowWatchTimer !== null) clearInterval(workflowWatchTimer)
+  workflowWatchTimer = null
 }
 
 /**
