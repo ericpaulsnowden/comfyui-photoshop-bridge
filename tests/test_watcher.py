@@ -432,3 +432,61 @@ class TestSharedOriginal:
         settle_quietly(DEBOUNCE_MS / 1000 * 3)
         assert len(manager.get(rerunning).edits) == 1  # once per save
         assert manager.get(ignoring).edits == []  # its own policy still applies
+
+
+class TestCorruptInstructionsChannel:
+    """An Annotate save whose composite reads fine but whose Instructions
+    channel is corrupt is an unreadable save: skipped, handoff left active.
+    """
+
+    @staticmethod
+    def _write_layered(path: Path, *, corrupt: bool) -> None:
+        import io
+
+        from psd_tools import PSDImage
+        from psd_tools.constants import Compression
+
+        from cpsb.annotate import INSTRUCTIONS_LAYER_NAME
+
+        psd = PSDImage.new(mode="RGB", size=(4, 4), depth=8)
+        psd.create_pixel_layer(Image.new("RGB", (4, 4), (255, 0, 0)), name="Base", top=0, left=0)
+        psd.create_pixel_layer(
+            Image.new("RGBA", (4, 4), (255, 0, 0, 255)), name=INSTRUCTIONS_LAYER_NAME, top=0, left=0
+        )
+        buffer = io.BytesIO()
+        psd.save(buffer)
+        if corrupt:
+            psd = PSDImage.open(io.BytesIO(buffer.getvalue()))
+            channel = psd[1]._channels[0]
+            channel.compression = Compression.RAW
+            channel.data = b"x"
+            buffer = io.BytesIO()
+            psd.save(buffer)
+        path.write_bytes(buffer.getvalue())
+
+    def test_corrupt_channel_is_skipped_without_raising_then_a_good_save_ingests(
+        self, context, manager
+    ):
+        meta = manager.create(
+            origin_node_id="18",
+            origin_kind="bridge_node",
+            workflow_name="",
+            source=SourceRef(filename="annotate_18.png", subfolder="", type="temp"),
+            original_image=Image.new("RGB", (4, 4), (255, 0, 0)),
+            wants_layered_psd=True,
+        )
+        psd_path = manager.psd_path(meta)
+        psd_path.parent.mkdir(parents=True, exist_ok=True)
+        watcher = CpsbWatcher(context, manager)  # never started: drive the ingest directly
+
+        self._write_layered(psd_path, corrupt=True)
+        watcher._ingest_settled(meta.handoff_id, psd_path)  # must not raise
+        refreshed = manager.get(meta.handoff_id)
+        assert refreshed.edits == []
+        assert refreshed.status == "pending"
+
+        self._write_layered(psd_path, corrupt=False)
+        watcher._ingest_settled(meta.handoff_id, psd_path)
+        refreshed = manager.get(meta.handoff_id)
+        assert len(refreshed.edits) == 1
+        assert refreshed.status == "edited"

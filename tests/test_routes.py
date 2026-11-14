@@ -3178,6 +3178,77 @@ class TestPluginWebsocketFileTransfer:
             assert ack == {"type": "upload_ok", "handoff_id": handoff_id}
             assert manager.get(handoff_id).status == "edited"
 
+    async def test_upload_edit_psd_with_malformed_instructions_channel_gets_upload_error(
+        self, client, context, manager, launches, tmp_path
+    ):
+        """A PSD whose flattened preview is fine but whose Instructions layer
+        channel is corrupt is an invalid layered PSD: `upload_error` /
+        `invalid_image`, the connection survives, and the managed copy is
+        never clobbered.
+        """
+        from psd_tools.constants import Compression
+
+        good = PSDImage.open(
+            io.BytesIO(layered_psd_bytes(tmp_path, base_color=(1, 1, 1), size=(4, 4)))
+        )
+        channel = good[1]._channels[0]
+        channel.compression = Compression.RAW
+        channel.data = b"x"
+        buffer = io.BytesIO()
+        good.save(buffer)
+        corrupt = buffer.getvalue()
+
+        async with client.ws_connect("/cpsb/ws") as ws:
+            await _connect_tier2_plugin(ws, context, local_mode=False)
+            await wait_until(lambda: routes_module.tier2_connected(client.app))
+
+            meta = manager.create(
+                origin_node_id="44",
+                origin_kind="bridge_node",
+                workflow_name="",
+                source=SourceRef(filename="annotate_44.png", subfolder="", type="temp"),
+                original_image=Image.new("RGB", (4, 4), (1, 1, 1)),
+                wants_layered_psd=True,
+            )
+            handoff_id = meta.handoff_id
+
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(corrupt).decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "psd",
+                }
+            )
+            msg = await ws.receive_json(timeout=5)
+            assert msg["type"] == "upload_error"
+            assert msg["handoff_id"] == handoff_id
+            assert msg["reason"] == "invalid_image"
+            assert manager.get(handoff_id).edits == []
+            assert not manager.psd_path(meta).is_file()
+
+            # The connection is still alive: a good upload right after works.
+            await ws.send_json(
+                {
+                    "type": "upload_edit",
+                    "handoff_id": handoff_id,
+                    "seq": 0,
+                    "total": 1,
+                    "data_b64": base64.b64encode(
+                        layered_psd_bytes(tmp_path, base_color=(1, 1, 1), size=(4, 4))
+                    ).decode("ascii"),
+                    "fidelity": "plugin",
+                    "kind": "psd",
+                }
+            )
+            assert await ws.receive_json(timeout=5) == {
+                "type": "upload_ok",
+                "handoff_id": handoff_id,
+            }
+
     async def test_upload_edit_psd_kind_for_non_annotate_handoff_falls_back_to_flatten(
         self, client, context, manager, source_image, launches, tmp_path
     ):

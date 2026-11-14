@@ -205,6 +205,16 @@ _SECONDS_PER_DAY = 86400
 _OWN_WRITE_REGISTRY_MAX = 128
 
 
+class _ComputeMaskDigest:
+    """Type of :data:`COMPUTE_MASK_DIGEST`."""
+
+
+#: Default for :meth:`HandoffManager.ingest_edit`'s ``mask_digest``: "the caller
+#: did not compute it -- read it from the handoff's managed PSD". Distinct from
+#: ``None``, which means "computed: not applicable / no Instructions layer".
+COMPUTE_MASK_DIGEST = _ComputeMaskDigest()
+
+
 class HandoffNotFoundError(Exception):
     """Raised for any operation on an unknown or already-purged handoff_id."""
 
@@ -1119,7 +1129,11 @@ class HandoffManager:
         return policy != _IGNORE_TRIGGER_POLICY
 
     def ingest_edit(
-        self, handoff_id: str, image: Image.Image, fidelity: Fidelity
+        self,
+        handoff_id: str,
+        image: Image.Image,
+        fidelity: Fidelity,
+        mask_digest: str | None | _ComputeMaskDigest = COMPUTE_MASK_DIGEST,
     ) -> EditRecord | None:
         """Ingest a newly-arrived edit -- the convergence point for both tiers.
 
@@ -1161,16 +1175,21 @@ class HandoffManager:
         # the background's own colour): its mask digest is part of the edit's
         # identity. Read off-lock like the PNG encode -- the PSD is already on
         # disk (both PSD ingest paths write it before calling in).
-        with self._lock:
-            known = self._handoffs.get(handoff_id)
-            layered_psd = (
-                self.psd_path(known) if known is not None and known.wants_layered_psd else None
-            )
-        mask_digest = None
-        if layered_psd is not None and layered_psd.exists():
-            from .annotate import instructions_mask_digest  # annotate imports this module
+        # Callers that already parsed the PSD (and handle a malformed one their
+        # own way) pass the digest in; only the rest pay for a read here.
+        if isinstance(mask_digest, _ComputeMaskDigest):
+            with self._lock:
+                known = self._handoffs.get(handoff_id)
+                layered_psd = (
+                    self.psd_path(known) if known is not None and known.wants_layered_psd else None
+                )
+            mask_digest = None
+            if layered_psd is not None and layered_psd.exists():
+                from psd_tools import PSDImage
 
-            mask_digest = instructions_mask_digest(layered_psd)
+                from .annotate import instructions_mask_digest  # annotate imports this module
+
+                mask_digest = instructions_mask_digest(PSDImage.open(layered_psd))
         with self._lock:
             meta = self._handoffs.get(handoff_id)
             if meta is None:

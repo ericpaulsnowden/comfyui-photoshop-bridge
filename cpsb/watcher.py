@@ -417,7 +417,7 @@ class CpsbWatcher:
             )
             return
 
-        image, fidelity = self._read_with_retry(path)
+        image, fidelity, mask_digest = self._read_with_retry(path, meta.wants_layered_psd)
         if image is None or fidelity is None:
             # Deliberately NOT mark_error: "error" is terminal, and a save
             # that failed to read once (file still locked, or the retry
@@ -443,14 +443,31 @@ class CpsbWatcher:
                 },
             )
             return
-        self._manager.ingest_edit(handoff_id, image, fidelity)
+        self._manager.ingest_edit(handoff_id, image, fidelity, mask_digest)
 
     @staticmethod
-    def _read_with_retry(path: Path) -> tuple[Image.Image | None, PsdFidelity | None]:
+    def _read_with_retry(
+        path: Path, layered: bool
+    ) -> tuple[Image.Image | None, PsdFidelity | None, str | None]:
+        """``(image, fidelity, mask_digest)``, or all ``None`` after the last failed attempt.
+
+        *layered* (an Annotate handoff) also digests the Instructions layer
+        (:func:`cpsb.annotate.instructions_mask_digest`) inside the same retry
+        loop, so a PSD whose layer data is unreadable is treated exactly like
+        one whose composite is: retried, then skipped until the next save.
+        """
         last_error: Exception | None = None
         for attempt in range(1, _READ_ATTEMPTS + 1):
             try:
-                return read_edited_psd(path)
+                image, fidelity = read_edited_psd(path)
+                mask_digest = None
+                if layered:
+                    from psd_tools import PSDImage
+
+                    from .annotate import instructions_mask_digest  # annotate imports routes
+
+                    mask_digest = instructions_mask_digest(PSDImage.open(path))
+                return image, fidelity, mask_digest
             except Exception as exc:
                 # Deliberately broad: a PSD mid-write can fail in many ways
                 # (truncated compression stream, incomplete header, a lock
@@ -466,4 +483,4 @@ class CpsbWatcher:
         logger.warning(
             "Giving up reading %s after %d attempts: %s", path, _READ_ATTEMPTS, last_error
         )
-        return None, None
+        return None, None, None
