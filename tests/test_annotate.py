@@ -1836,3 +1836,81 @@ class TestIsChanged:
             unique_id="107",
         )
         assert isinstance(result, str)
+
+
+class TestMaskOnlyChangeIsAChange:
+    """Painting on Instructions in the background's own colour changes the MASK
+    but not the flattened composite -- it must still count as a new save.
+    """
+
+    @staticmethod
+    def _paint(count: int) -> Image.Image:
+        """A 4x4 transparent layer with *count* opaque RED pixels (the base is solid red)."""
+        layer = Image.new("RGBA", (4, 4), (0, 0, 0, 0))
+        for x in range(count):
+            layer.putpixel((x, 0), (255, 0, 0, 255))
+        return layer
+
+    @staticmethod
+    def _save(manager: HandoffManager, meta, base: Image.Image, instructions: Image.Image):
+        """One REMOTE layered save through the real server-side entry point."""
+        scratch = manager.psd_path(meta).parent / "uploaded.psd"
+        make_layered_psd(scratch, base, instructions)
+        return routes_module._ingest_psd_upload(manager, meta, scratch.read_bytes())
+
+    def _annotate_handoff(self, manager: HandoffManager, base: Image.Image, layered: bool):
+        return manager.create(
+            origin_node_id="300",
+            origin_kind="bridge_node",
+            workflow_name="",
+            source=SourceRef(filename="annotate_300.png", subfolder="", type="temp"),
+            original_image=base,
+            wants_layered_psd=layered,
+        )
+
+    def test_second_save_with_different_mask_and_same_composite_is_ingested(
+        self, configured, manager
+    ):
+        base = Image.new("RGB", (4, 4), RED)
+        meta = self._annotate_handoff(manager, base, layered=True)
+
+        first, error, _ = self._save(manager, meta, base, self._paint(1))
+        assert error is None and first is not None
+        second, error, _ = self._save(manager, meta, base, self._paint(3))
+        assert error is None
+        assert second is not None  # the mask changed, so this is NOT "no change"
+        assert len(manager.get(meta.handoff_id).edits) == 2
+
+    def test_resave_with_identical_mask_and_composite_is_still_deduplicated(
+        self, configured, manager
+    ):
+        base = Image.new("RGB", (4, 4), RED)
+        meta = self._annotate_handoff(manager, base, layered=True)
+
+        assert self._save(manager, meta, base, self._paint(3))[0] is not None
+        assert self._save(manager, meta, base, self._paint(3))[0] is None
+
+    def test_non_annotate_handoff_keeps_composite_only_dedup(self, configured, manager):
+        base = Image.new("RGB", (4, 4), RED)
+        meta = self._annotate_handoff(manager, base, layered=False)
+
+        assert self._save(manager, meta, base, self._paint(1))[0] is not None
+        assert self._save(manager, meta, base, self._paint(3))[0] is None
+
+    def test_is_changed_differs_when_only_the_mask_differs(self, configured, manager):
+        base = Image.new("RGB", (4, 4), RED)
+        meta = self._annotate_handoff(manager, base, layered=True)
+        kwargs = {
+            "image": tensor_from_image(base),
+            "instruction": "",
+            "mode": AnnotateMode.RERUN_EVERY_SAVE,
+            "box_composite": False,
+            "timeout_seconds": 1800,
+            "unique_id": "300",
+        }
+
+        self._save(manager, meta, base, self._paint(1))
+        first = annotate_module.PhotoshopAnnotate.IS_CHANGED(**kwargs)
+        self._save(manager, meta, base, self._paint(3))
+        second = annotate_module.PhotoshopAnnotate.IS_CHANGED(**kwargs)
+        assert first != second

@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -109,6 +110,19 @@ logger = logging.getLogger("cpsb")
 _RUN_ACTION_SEND_TIMEOUT_SECONDS = 10.0
 
 
+def action_identity_hash(image: Image.Image, action_name: str, action_set: str) -> str:
+    """A handoff's identity for this node: the input pixels AND which Action runs on them.
+
+    Recorded as the handoff's ``source_hash`` and compared on every
+    ``execute()``: the same pixels with a different ``action_name`` or
+    ``action_set`` is a different operation, so the finished handoff for the
+    old Action is superseded instead of being served as the new one's result.
+    The NUL separators keep ("a", "bc") and ("ab", "c") distinct.
+    """
+    blob = f"{compute_source_hash(image)}\0{action_name}\0{action_set}"
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
 class PhotoshopAction:
     """Plays a saved Photoshop Action on ``image``, Tier-2-plugin-required (see module docstring).
 
@@ -127,7 +141,10 @@ class PhotoshopAction:
     Node-reuse semantics mirror :meth:`cpsb.nodes.PhotoshopBridge.execute`
     exactly: a handoff whose recorded ``source_hash`` no longer matches the
     current input is superseded (an edit made against OLD pixels must never
-    be served for a new input); once an edit has arrived it is served
+    be served for a new input) -- here that identity is the pixels PLUS the
+    ``action_name``/``action_set`` (:func:`action_identity_hash`), so picking
+    a different Action on the same image runs it rather than replaying the
+    old result; once an edit has arrived it is served
     without reopening Photoshop or resending ``run_action``.
     """
 
@@ -250,7 +267,7 @@ class PhotoshopAction:
             nodes._raise_interrupt()
 
         pil_image = nodes._tensor_to_pil(image)
-        incoming_hash = compute_source_hash(pil_image)
+        incoming_hash = action_identity_hash(pil_image, action_name, action_set)
 
         active = manager.find_active_for_node(node_id)
         if (
@@ -259,10 +276,11 @@ class PhotoshopAction:
             and active.source_hash != incoming_hash
         ):
             # Mirrors PhotoshopBridge.execute()'s identical check: an edit
-            # recorded against OLD pixels must never be served for a new
-            # input -- retire the stale handoff and start fresh.
+            # recorded against OLD pixels -- or produced by a DIFFERENT
+            # Action -- must never be served for a new input; retire the
+            # stale handoff and start fresh.
             logger.info(
-                "cpsb action: node %s: input changed, superseding handoff %s",
+                "cpsb action: node %s: input or action changed, superseding handoff %s",
                 node_id,
                 active.handoff_id,
             )

@@ -40,7 +40,7 @@ import cpsb.actions as actions_module
 import cpsb.nodes as nodes_module
 import cpsb.routes as routes_module
 from cpsb.context import CpsbContext
-from cpsb.handoff import HandoffManager, SourceRef, compute_source_hash
+from cpsb.handoff import HandoffManager, SourceRef
 
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
@@ -153,7 +153,13 @@ def no_tier2_action(context: CpsbContext, manager: HandoffManager):
     nodes_module._state = None
 
 
-def make_action_handoff(manager: HandoffManager, node_id: str, source: Image.Image) -> str:
+def make_action_handoff(
+    manager: HandoffManager,
+    node_id: str,
+    source: Image.Image,
+    action_name: str = "A",
+    action_set: str = "S",
+) -> str:
     """A bare ``bridge_node`` handoff for *source* (no Photoshop open, no PSD
     written) -- for the "already has an edit" consume tests, which only care
     about ingest + tensor output. The caller must later call ``execute()``
@@ -168,6 +174,7 @@ def make_action_handoff(manager: HandoffManager, node_id: str, source: Image.Ima
         workflow_name="",
         source=SourceRef(filename=f"action_{node_id}.png", subfolder="", type="temp"),
         original_image=source,
+        source_hash=actions_module.action_identity_hash(source, action_name, action_set),
     )
     return meta.handoff_id
 
@@ -509,6 +516,47 @@ class TestConsumePath:
 
 
 class TestNodeReuseSemantics:
+    @pytest.mark.parametrize(
+        ("second_name", "second_set"), [("B", "S"), ("A", "Other set")], ids=["name", "set"]
+    )
+    def test_changed_action_with_same_pixels_runs_the_new_action(
+        self, tier2_action, manager, plugin_socket, second_name, second_set
+    ):
+        """Identity is pixels + action name + action set: a completed Action A
+        must never be served as the result of a different selected Action.
+        """
+        tensor = make_tensor(RED)
+
+        def _deliver(color: tuple[int, int, int]):
+            active = manager.find_active_for_node("8")
+            manager.ingest_edit(active.handoff_id, Image.new("RGB", (24, 16), color), "plugin")
+
+        threading.Timer(0.3, lambda: _deliver((0, 0, 255))).start()
+        tier2_action.execute(
+            image=tensor, action_name="A", action_set="S", timeout_seconds=10, unique_id="8"
+        )
+        old = manager.find_active_for_node("8")
+        assert old.status == "edited"
+
+        threading.Timer(0.3, lambda: _deliver((0, 255, 0))).start()
+        result = tier2_action.execute(
+            image=tensor,
+            action_name=second_name,
+            action_set=second_set,
+            timeout_seconds=10,
+            unique_id="8",
+        )
+
+        fresh = manager.find_active_for_node("8")
+        assert manager.get(old.handoff_id).status == "superseded"
+        assert fresh.handoff_id != old.handoff_id
+        run_actions = [m for m in plugin_socket.sent if m["type"] == "run_action"]
+        assert (run_actions[-1]["action_name"], run_actions[-1]["action_set"]) == (
+            second_name,
+            second_set,
+        )
+        assert result[0][0, 0, 0, 1] == 1.0  # the NEW action's (green) result, not A's blue
+
     def test_changed_input_supersedes_and_reopens_fresh_handoff(self, tier2_action, manager):
         """B1 parity with the bridge node: an edit made for OLD pixels must
         never be served for a new input.
@@ -535,7 +583,9 @@ class TestNodeReuseSemantics:
         assert manager.get(old.handoff_id).status == "superseded"
         fresh = manager.find_active_for_node("6")
         assert fresh.handoff_id != old.handoff_id
-        assert fresh.source_hash == compute_source_hash(Image.new("RGB", (24, 16), GREEN))
+        assert fresh.source_hash == actions_module.action_identity_hash(
+            Image.new("RGB", (24, 16), GREEN), "A", "S"
+        )
 
     def test_requeue_after_timeout_reuses_and_reopens_same_handoff(
         self, tier2_action, manager, plugin_socket
