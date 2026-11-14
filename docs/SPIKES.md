@@ -233,7 +233,7 @@ _Confirmed call sequence (including any extra calls needed) and queuePrompt beha
 6. **Unaffected handoffs.** For an Edit in Photoshop (bridge) document, paint without saving and Send: the stroke arrives and the document stays modified (no save happened). For a Load PSD "edit original" document, Send must not change the original file's modified time.
 
 **Status:**
-- [ ] **OPEN** — implemented and covered by `tests/test_send_save_js.py` against fakes; the Photoshop-only facts above are unverified until run live.
+- [ ] **OPEN** — implemented and covered by `tests/js/send_save.test.mjs` against fakes; the Photoshop-only facts above are unverified until run live.
 
 ### Results
 _Not yet run on real Photoshop._

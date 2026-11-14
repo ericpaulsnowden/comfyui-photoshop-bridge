@@ -2,7 +2,7 @@
 
 The JS under ``web/cpsb`` (ES modules) and ``photoshop_plugin`` (CommonJS) is
 loaded UNMODIFIED into a ``vm`` context with stubbed imports (see
-``tests/js/harness.mjs``) and driven the way ComfyUI / Photoshop drive it. Each
+``tests/js/harness.mjs``, the one loader) and driven the way ComfyUI / Photoshop drive it. Each
 ``tests/js/*.test.mjs`` file is one pytest case here; on failure the Node
 runner's output (which names the failing JS test and its assertion) is the
 assertion message.
@@ -54,7 +54,7 @@ pytestmark = pytest.mark.skipif(_node_major() < 20, reason="needs node >= 20 on 
 )
 def test_js_suite(script: Path) -> None:
     env = {**os.environ, "NODE_NO_WARNINGS": "1"}
-    env.pop("CPSB_JS_ROOT", None)  # always test THIS checkout
+    env.pop("CPSB_JS_ROOT", None)  # the harness's only override; always test THIS checkout
     result = subprocess.run(
         [NODE, "--experimental-vm-modules", str(script)],
         capture_output=True,
