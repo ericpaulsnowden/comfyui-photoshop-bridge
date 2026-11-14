@@ -84,13 +84,13 @@ Switch **`mode`** to **Wait for first save** or **Re-run on every save** to draw
 - **`annotated`** — image *and* marks combined, for visual-prompt edit models that take no mask ("edit what I circled"). The `box_composite` toggle picks the form: off = your real strokes, on = a tidy red box at their bounding box (what Kontext / Qwen-Image-Edit respond to).
 - **`instruction`** — your text, verbatim.
 
-Rename or delete the Instructions layer and it's treated as a plain edited image. The two Photoshop modes are the same ones **Edit in Photoshop** offers, so you iterate the same way in either node — but unlike every other node here, this one *defaults* to **Pass through**. A **Re-open in Photoshop** button gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
+Painting on the Instructions layer always counts as a new save — even in the background's own colour, where the flattened picture doesn't change but your mask does. Rename or delete the Instructions layer and it's treated as a plain edited image. The two Photoshop modes are the same ones **Edit in Photoshop** offers, so you iterate the same way in either node — but unlike every other node here, this one *defaults* to **Pass through**. A **Re-open in Photoshop** button gets you back into your annotation — Instructions layer and strokes intact — after you've closed it.
 
 ### Run Photoshop Action
 
 > **Plugin: REQUIRED** — there is no way to trigger a Photoshop Action without it. The node says so clearly if the plugin isn't connected.
 
-Give it an image and the name of a **saved Photoshop Action** (plus its set), and it opens the image, plays that Action, and returns the processed result to your workflow — no manual step. Heads-up: an Action that pops an interactive dialog mid-run can stall Photoshop, so use Actions that run start-to-finish unattended.
+Give it an image and the name of a **saved Photoshop Action** (plus its set), and it opens the image, plays that Action, and returns the processed result to your workflow — no manual step. Pick a different Action (or set) for the same image and the new one runs; the same Action on the same image reuses the finished result. Heads-up: an Action that pops an interactive dialog mid-run can stall Photoshop, so use Actions that run start-to-finish unattended.
 
 ### Photoshop Live Canvas
 

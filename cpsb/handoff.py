@@ -252,6 +252,12 @@ class EditRecord:
     ts: float
     fidelity: Fidelity
     sibling_output: SiblingOutput | None = None
+    #: Digest of the saved PSD's Instructions-layer mask
+    #: (:func:`cpsb.annotate.instructions_mask_digest`), recorded only for an
+    #: Annotate handoff (``wants_layered_psd``) whose PSD has that layer --
+    #: ``None`` for every other edit. Part of the edit's identity next to the
+    #: flattened PNG: a mask-only change leaves the composite untouched.
+    mask_digest: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -259,6 +265,7 @@ class EditRecord:
             "ts": self.ts,
             "fidelity": self.fidelity,
             "sibling_output": self.sibling_output.to_dict() if self.sibling_output else None,
+            "mask_digest": self.mask_digest,
         }
 
     @classmethod
@@ -277,6 +284,7 @@ class EditRecord:
             ts=data["ts"],
             fidelity=data["fidelity"],
             sibling_output=SiblingOutput.from_dict(sibling) if sibling else None,
+            mask_digest=data.get("mask_digest"),
         )
 
 
@@ -1148,6 +1156,19 @@ class HandoffManager:
         writes -- stays inside ``with self._lock:``, unchanged.
         """
         png_bytes = _encode_png(image)
+        # An Annotate handoff's outputs also depend on the saved PSD's
+        # Instructions layer, which the flattened composite can hide (paint in
+        # the background's own colour): its mask digest is part of the edit's
+        # identity. Read off-lock like the PNG encode -- the PSD is already on
+        # disk (both PSD ingest paths write it before calling in).
+        with self._lock:
+            known = self._handoffs.get(handoff_id)
+            layered_psd = self.psd_path(known) if known is not None and known.wants_layered_psd else None
+        mask_digest = None
+        if layered_psd is not None and layered_psd.exists():
+            from .annotate import instructions_mask_digest  # annotate imports this module
+
+            mask_digest = instructions_mask_digest(layered_psd)
         with self._lock:
             meta = self._handoffs.get(handoff_id)
             if meta is None:
@@ -1169,7 +1190,7 @@ class HandoffManager:
                 )
                 return None
 
-            edit = self._append_edit_locked(meta, png_bytes, fidelity)
+            edit = self._append_edit_locked(meta, png_bytes, fidelity, mask_digest)
             if edit is None:
                 return None
             self._unblock_waiter_locked(handoff_id)
@@ -1179,7 +1200,11 @@ class HandoffManager:
         return edit
 
     def _append_edit_locked(
-        self, meta: HandoffMeta, png_bytes: bytes, fidelity: Fidelity
+        self,
+        meta: HandoffMeta,
+        png_bytes: bytes,
+        fidelity: Fidelity,
+        mask_digest: str | None = None,
     ) -> EditRecord | None:
         """Assumes the lock is held AND *png_bytes* is already the encoded
         PNG -- see :meth:`ingest_edit`'s own lock-scope note (2026-08-26)
@@ -1189,7 +1214,11 @@ class HandoffManager:
         new_hash = _hash_bytes(png_bytes)
         if meta.edits:
             previous_path = folder / meta.edits[-1].filename
-            if previous_path.exists() and _hash_bytes(previous_path.read_bytes()) == new_hash:
+            if (
+                previous_path.exists()
+                and _hash_bytes(previous_path.read_bytes()) == new_hash
+                and meta.edits[-1].mask_digest == mask_digest
+            ):
                 logger.info("ingest_edit: duplicate save for handoff %s, skipping", meta.handoff_id)
                 return None
 
@@ -1210,6 +1239,7 @@ class HandoffManager:
             ts=time.time(),
             fidelity=fidelity,
             sibling_output=sibling,
+            mask_digest=mask_digest,
         )
         meta.edits.append(edit)
         meta.status = "edited"

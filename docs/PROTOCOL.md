@@ -700,7 +700,13 @@ end here. It:
    result is addressable as `subfolder="cpsb/<id>", type="input"` by LoadImage widgets
    and `/view`).
 2. Skips ingestion if the new edit's SHA256 equals the previous edit's (idempotency —
-   the watchdog and plugin may both fire for one save).
+   the watchdog and plugin may both fire for one save). For an Annotate handoff
+   (`wants_layered_psd`) the edit's identity is the PNG hash AND `mask_digest` — the sha256
+   of the saved PSD's `Instructions`-layer mask, recorded on the edit entry (`null` when
+   not an Annotate handoff or the layer is gone) — because painting on Instructions in the
+   background's own colour changes the MASK without changing the flattened composite;
+   such a save is a real change (new edit, `cpsb.updated`), not a duplicate. Every other
+   handoff keeps composite-only dedup.
 3. If `origin_kind == "terminal_output"` and the source was in `output/` and setting
    `sibling_outputs` is on: also writes `<origname>_ps<N>.png` next to the original
    output file and records it as `sibling_output` in the edit entry. `<N>` is the first
@@ -1378,7 +1384,8 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     downstream iteration doesn't reopen PS every run); once the doc is closed, re-entry is
     the **Re-open in Photoshop button** below, NOT a re-queue.
   - IS_CHANGED returns early only for "Pass through"; both PS modes fold the latest-edit
-    hash so an auto-queued re-run actually re-executes with the new mask.
+    hash — plus that edit's `mask_digest` when it has one (§4 step 2), so a mask-only save
+    changes the key — so an auto-queued re-run actually re-executes with the new mask.
 - **Re-open button** (v0.5.30, `web/cpsb/annotate.js`): the Annotate node has no context menu
   (no `node.imgs`; excluded from §8's allowlist), so a `button`-type widget "Re-open in
   Photoshop" (serialize:false) is added on `nodeCreated`. It looks up the node's active
@@ -1396,6 +1403,12 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `action_name` (STRING) + `action_set` (STRING, default "") — plain strings, NOT a dropdown,
   because UXP cannot enumerate Actions at node-def time; `timeout_seconds` (INT, default
   1800); hidden `unique_id`. Outputs `(IMAGE, MASK)`.
+- **Handoff identity = pixels + `action_name` + `action_set`** (`actions.action_identity_hash`,
+  recorded as the handoff's `source_hash`). Re-running with the same pixels but a different
+  Action (or set) supersedes the finished handoff and plays the new Action — never replays
+  the old result; an unchanged Action on unchanged pixels still consumes the existing edit
+  without reopening Photoshop. (A handoff recorded with the old pixels-only hash is
+  superseded once on its first re-run.)
 - **Tier-2-plugin-REQUIRED** — the pack's ethos exception (there is no ComfyUI-only or Tier-1
   way to run a saved Photoshop Action). `execute()` calls `routes.tier2_connected` BEFORE
   creating any handoff; with no plugin it raises `InterruptProcessingException` with a clear

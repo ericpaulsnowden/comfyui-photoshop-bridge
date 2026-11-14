@@ -366,6 +366,23 @@ def _read_ps_saved_psd(psd_path: Path) -> tuple[Image.Image, Any | None, Image.I
     return image, mask, combined
 
 
+def instructions_mask_digest(psd_path: Path) -> str | None:
+    """SHA256 of the saved PSD's Instructions-layer mask, or ``None`` without that layer.
+
+    The ingest-dedup and ``IS_CHANGED`` identity for an Annotate edit
+    (PROTOCOL.md §6d): the node's MASK depends on the Instructions layer
+    independently of the flattened composite, so a stroke painted in the
+    background's own colour changes this digest while the composite stays
+    byte-identical.
+    """
+    psd = PSDImage.open(psd_path)
+    layer = _find_top_level_layer(psd, INSTRUCTIONS_LAYER_NAME)
+    if layer is None:
+        return None
+    mask = _layer_alpha_mask(psd, layer)
+    return hashlib.sha256(mask.tobytes()).hexdigest()
+
+
 def _mask_tensor_to_array(mask_tensor: Any) -> Any:
     """First frame of a ComfyUI ``MASK`` tensor as an ``(H, W)`` float32 numpy array."""
     import numpy as np
@@ -785,7 +802,13 @@ def _fold_edit_hash_for_is_changed(
         and (active.source_hash is None or active.source_hash == source_hash)
         and active.edits
     ):
-        return manager.latest_edit_hash(active.handoff_id)
+        edit_hash = manager.latest_edit_hash(active.handoff_id)
+        if edit_hash is None:
+            return None
+        # A mask-only change leaves the edit PNG's hash identical (see
+        # instructions_mask_digest), so the mask digest rides along.
+        digest = active.edits[-1].mask_digest
+        return edit_hash if digest is None else f"{edit_hash}:{digest}"
     return None
 
 
