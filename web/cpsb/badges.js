@@ -90,6 +90,7 @@
 
 import { app } from '../../../scripts/app.js'
 import * as api from './api.js'
+import * as state from './state.js'
 import * as ui from './ui.js'
 
 /**
@@ -419,12 +420,27 @@ function getBadgeAnchorRect(node) {
 }
 
 /**
+ * The badge to show on *node*: the one stored for its id, unless its handoff
+ * belongs to a different workflow than the open one (every workflow tab
+ * shares one graph and node ids collide across workflows, so a bare id match
+ * would paint workflow A's "Editing" pill onto workflow B's unrelated node).
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ */
+function badgeFor(node) {
+  const badge = badgesByNode.get(String(node.id))
+  if (!badge) return undefined
+  const meta = badge.handoffId ? state.getHandoffById(badge.handoffId) : undefined
+  if (meta && !state.workflowMatches(meta.workflow_name)) return undefined
+  return badge
+}
+
+/**
  * @param {CanvasRenderingContext2D} ctx
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 function drawBadge(ctx, node) {
   const nodeId = String(node.id)
-  const badge = badgesByNode.get(nodeId)
+  const badge = badgeFor(node)
   if (!badge) return // cheap when inactive: one Map lookup, nothing else.
   if (node.flags?.collapsed) return
 
@@ -553,7 +569,7 @@ function cancelFromBadge(nodeId, handoffId) {
  * exact `LGraphCanvas.ts` call site and its native title-button precedent.
  */
 function handleMouseDown(node, pos) {
-  const badge = badgesByNode.get(String(node.id))
+  const badge = badgeFor(node)
   if (!badge?.closeRect || !badge.handoffId) return false
   if (!isInRect(pos, badge.closeRect)) return false
   cancelFromBadge(String(node.id), badge.handoffId)
@@ -565,7 +581,7 @@ function handleMouseDown(node, pos) {
  * @param {[number, number]} pos - Node-local point (offset from `node.pos`).
  */
 function updateHover(node, pos) {
-  const badge = badgesByNode.get(String(node.id))
+  const badge = badgeFor(node)
   if (!badge?.pillRect) return // cheap bail: no badge here.
   const hovered = isInRect(pos, badge.pillRect)
   if (hovered === !!badge.hovered) return // no visible change, skip the repaint.
@@ -577,7 +593,7 @@ function updateHover(node, pos) {
  * @param {import('../../../scripts/app.js').LGraphNode} node
  */
 function clearHover(node) {
-  const badge = badgesByNode.get(String(node.id))
+  const badge = badgeFor(node)
   if (badge?.hovered) {
     badge.hovered = false
     app.graph?.setDirtyCanvas(true, false)

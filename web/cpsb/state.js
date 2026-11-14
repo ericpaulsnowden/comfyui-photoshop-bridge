@@ -178,7 +178,7 @@ export function getWorkflowName() {
  * @param {string | undefined} candidateName
  * @returns {boolean}
  */
-function workflowMatches(candidateName) {
+export function workflowMatches(candidateName) {
   const current = getWorkflowName() || ''
   const candidate = candidateName || ''
   if (!current || !candidate) return true

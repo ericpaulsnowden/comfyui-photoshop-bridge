@@ -71,6 +71,21 @@ export function getNodeByIdFlexible(id) {
 }
 
 /**
+ * The origin node of a handoff, but only when the handoff belongs to the
+ * workflow that is open right now (`state.workflowMatches`: equal names, or
+ * either side empty = wildcard). Every workflow tab shares one `app.graph`
+ * and node ids are small per-workflow integers, so a bare id lookup can
+ * return a DIFFERENT workflow's node that happens to share the id — this is
+ * the lookup to use whenever a handoff (not a bare node id) names the node.
+ * @param {import('./api.js').CpsbHandoffMeta | null | undefined} meta
+ * @returns {import('../../../scripts/app.js').LGraphNode | null}
+ */
+export function getNodeForHandoff(meta) {
+  if (!meta || !state.workflowMatches(meta.workflow_name)) return null
+  return getNodeByIdFlexible(meta.origin_node_id)
+}
+
+/**
  * @param {import('./api.js').CpsbImageRef | null | undefined} a
  * @param {import('./api.js').CpsbImageRef | null | undefined} b
  * @returns {boolean}
@@ -469,17 +484,25 @@ function handleLoadPsd(payload) {
 }
 
 /**
+ * An edit arrived for a handoff of a workflow other than the open one: its
+ * node id may collide with an unrelated node here, so touch nothing and do
+ * not queue. The edit is already in the gallery.
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ */
+function handleOtherWorkflow(meta) {
+  ui.showToast({
+    severity: 'info',
+    summary: 'Edit received for another workflow',
+    detail:
+      `The edit for workflow "${meta.workflow_name}" is waiting in the Photoshop Edits ` +
+      'gallery. Open that workflow to use it.'
+  })
+}
+
+/**
  * @param {import('./api.js').CpsbUpdatedEvent} payload
  */
 function handleUpdated(payload) {
-  if (payload.origin_kind === 'terminal_output') {
-    handleTerminalOutput(payload)
-    return
-  }
-  if (payload.origin_kind === 'load_psd') {
-    handleLoadPsd(payload)
-    return
-  }
   if (payload.origin_kind === 'manual_send') {
     // A Photoshop-initiated push ("Send to ComfyUI", 2026-07-23) NEVER had a
     // graph node — its origin_node_id is the synthesized `ps-push:...`
@@ -499,6 +522,19 @@ function handleUpdated(payload) {
           type: payload.type
         })
     })
+    return
+  }
+  const meta = state.getHandoffById(payload.handoff_id)
+  if (meta && !state.workflowMatches(meta.workflow_name)) {
+    handleOtherWorkflow(meta)
+    return
+  }
+  if (payload.origin_kind === 'terminal_output') {
+    handleTerminalOutput(payload)
+    return
+  }
+  if (payload.origin_kind === 'load_psd') {
+    handleLoadPsd(payload)
     return
   }
   handleLoadImageOrBridge(payload)
