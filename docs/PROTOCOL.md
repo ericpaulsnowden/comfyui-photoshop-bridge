@@ -1360,8 +1360,8 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
     Cmd/Ctrl+S. The listener's own deliveries pass `afterNativeSave: true`, which skips
     the dirty check entirely: the file was just written by Photoshop, and a save of our
     own from inside a save's notification could collide with the one still finishing.
-    Two Sends at once share one in-flight save. `tests/test_send_save_js.py` (Node-VM
-    scenarios in `tests/js/`) pins all of this; the Photoshop-only parts (`saved` really
+    Two Sends at once share one in-flight save. `tests/js/send_save.test.mjs` (Node-VM
+    scenarios) pins all of this; the Photoshop-only parts (`saved` really
     flipping, no save dialog, notification timing) are listed in that file's docstring.
 - MASK resolution precedence: (1) the PS-mode `Instructions`-layer mask above; (2) else
   the `mask` input socket (ComfyUI-only tier: MaskEditor or any mask source upstream);

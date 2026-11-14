@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { loadCjs } from './harness.mjs'
+import { loadCjs, loadWorld } from './harness.mjs'
 
 /** Zero-delay timers: the uploader's 1 s / 2 s retry backoff would otherwise slow the suite. */
 const instantTimers = {
@@ -31,21 +31,18 @@ function setupUploader(reason) {
   const attempts = []
   const reject = (what) => {
     attempts.push(what)
-    // A plain object, not an Error: an Error built in this realm is not
-    // `instanceof Error` inside the VM, and uploader.js only reads
-    // `.message` / `.reason` from it anyway (as connection.js sets them).
-    throw { message: `rejected (${reason})`, reason }
+    throw world.makeError(`rejected (${reason})`, { reason })
   }
   const connection = {
     getState: () => ({ localMode: false }),
     uploadEditOverWs: async (_handoffId, _bytes, kind) => reject(`upload_edit:${kind}`),
     pushManualSendOverWs: async () => reject('manual_push')
   }
-  const uploader = loadCjs(
-    'photoshop_plugin/uploader.js',
-    { './connection.js': { connection }, './log.js': 'real' },
-    instantTimers
-  )
+  const world = loadWorld({
+    mocks: { './connection.js': { connection }, './log.js': 'real' },
+    globals: instantTimers
+  })
+  const uploader = world.load('uploader.js')
   return { uploader, attempts }
 }
 
