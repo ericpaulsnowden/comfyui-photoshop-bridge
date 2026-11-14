@@ -117,10 +117,12 @@ Status transitions:
 `opened`) → `edited` (≥1 edit ingested; stays `edited` as further saves append to `edits`).
 `cancelled` (user cancel), `discarded` (gallery discard), `superseded` (replaced by a
 "Start Fresh Edit"), `error` (open/ingest failure, with `error` string) are terminal.
-A late open confirmation (the plugin's `opened`, or a Tier 1 launch finishing) never
-re-activates a `cancelled`/`discarded`/`superseded` handoff: it is ignored (logged at
-info) and the handoff stays terminal. Only `error` may still move to `editing` (a failed
-Tier 2 open falling back to a Tier 1 launch, §3).
+A late open confirmation (the plugin's `opened`, or a Tier 1 launch finishing) or failure
+report (`open_failed`, `action_error`, a failed launch) never changes or re-activates a
+`cancelled`/`discarded`/`superseded` handoff: it is ignored (logged at info),
+`open_failed` makes no Tier 1 fallback launch, and later saves are not ingested. Only
+`error` may still move to `editing` (a failed Tier 2 open falling back to a Tier 1 launch,
+§3).
 "Closed" is **not** a status — the frontend derives it (`editing` AND
 `plugin_doc_open === false`, gallery overhaul 2026-07-22, replacing an earlier "editing
 and `updated_ts` older than 1h" client-only guess). `plugin_doc_open` (bool | None) is a
