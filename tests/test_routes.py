@@ -2484,6 +2484,53 @@ class TestPluginWebsocket:
         await ws2.close()
         await ws1.close()
 
+    async def test_overlapping_replacements_leave_only_the_newest_installed(
+        self, client, context, launches, monkeypatch
+    ):
+        """A connects; B's replacement is held inside A's close; C connects
+        before it is released. The slot must end on C (never go back to B)
+        and A and B must both be closed with 4000."""
+        def slot():
+            return client.app[routes_module._APP_KEY_PLUGIN].connection
+
+        release = asyncio.Event()
+        original_close = web.WebSocketResponse.close
+        calls = {"n": 0}
+
+        async def gated_close(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:  # A's close, issued by B's handler
+                await release.wait()
+            return await original_close(self, *args, **kwargs)
+
+        monkeypatch.setattr(web.WebSocketResponse, "close", gated_close)
+
+        ws_a = await client.ws_connect("/cpsb/ws")
+        await wait_until(lambda: slot() is not None)
+        conn_a = slot()
+
+        ws_b = await client.ws_connect("/cpsb/ws")
+        await wait_until(lambda: slot() is not conn_a)
+        conn_b = slot()
+
+        ws_c = await client.ws_connect("/cpsb/ws")
+        await wait_until(lambda: slot() is not conn_b)
+        conn_c = slot()
+
+        closed_b = await ws_b.receive(timeout=5)  # C displaced B while A's close is paused
+        assert closed_b.type == aiohttp.WSMsgType.CLOSE
+        assert closed_b.data == 4000
+
+        release.set()
+        closed_a = await ws_a.receive(timeout=5)
+        assert closed_a.type == aiohttp.WSMsgType.CLOSE
+        assert closed_a.data == 4000
+
+        assert slot() is conn_c
+        assert not conn_c.ws.closed
+        assert not ws_c.closed
+        await ws_c.close()
+
     async def test_disconnect_emits_tier2_event(self, client, context, events, launches):
         async with client.ws_connect("/cpsb/ws") as ws:
             await self.handshake(ws, context)
@@ -4711,3 +4758,29 @@ class TestTransferLimitsUnits:
         for key in ("a", "b", "c", "d"):
             routes_module._tombstone(tombstones, key)
         assert list(tombstones) == ["b", "c", "d"]
+
+
+async def test_late_opened_message_does_not_reactivate_a_cancelled_handoff(
+    context, manager
+):
+    """PROTOCOL.md §2: terminal states are terminal -- a plugin `opened` that
+    arrives after the user cancelled must not bring the handoff back."""
+    meta = manager.create(
+        origin_node_id="17",
+        origin_kind="load_image",
+        workflow_name="wf",
+        source=SourceRef(filename="x.png", subfolder="", type="output"),
+        original_image=Image.new("RGB", (8, 8), (1, 2, 3)),
+    )
+    manager.mark_cancelled(meta.handoff_id)
+
+    connection = routes_module.PluginConnection(ws=None)
+    await routes_module._handle_plugin_message(
+        context,
+        manager,
+        connection,
+        json.dumps({"type": "opened", "handoff_id": meta.handoff_id}),
+    )
+
+    assert manager.get(meta.handoff_id).status == "cancelled"
+    assert manager.find_active_for_node("17") is None

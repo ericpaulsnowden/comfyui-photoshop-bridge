@@ -180,9 +180,13 @@ PURGEABLE_STATUSES: frozenset[str] = frozenset(
 #: "no transition may ever leave this set": e.g. a Tier 2 ``open_failed``
 #: (status ``error``) falling back to a Tier 1 launch that then succeeds
 #: must still be able to move `error` -> `editing` (PROTOCOL.md §3); see
-#: ``HandoffManager._transition``'s ``noop_if_terminal`` parameter, which
-#: only ``mark_cancelled`` sets.
+#: ``HandoffManager._transition``'s ``noop_from`` parameter, which
+#: ``mark_cancelled`` and ``mark_editing`` set.
 TERMINAL_STATUSES: frozenset[str] = frozenset({"cancelled", "discarded", "superseded", "error"})
+
+#: Terminal statuses the USER chose (everything but ``error``): a late open
+#: confirmation must never bring one of these back to ``editing``.
+_RETIRED_STATUSES: frozenset[str] = TERMINAL_STATUSES - {"error"}
 
 _SECONDS_PER_DAY = 86400
 
@@ -949,7 +953,7 @@ class HandoffManager:
         waiter is unblocked or cancelled, and a terminal handoff (e.g. one
         the user already discarded in the narrow window before this message
         arrived) still accepts the update rather than being frozen the way
-        :meth:`mark_cancelled`'s ``noop_if_terminal`` freezes ``cancelled`` --
+        :meth:`mark_cancelled`'s ``noop_from`` freezes ``cancelled`` --
         there is nothing for a stray late report to corrupt here, only a
         fact to record.
 
@@ -970,8 +974,22 @@ class HandoffManager:
     # -- state transitions -------------------------------------------------
 
     def mark_editing(self, handoff_id: str) -> HandoffMeta:
-        """Tier 1 OS-launch succeeded, or the plugin sent ``opened``."""
-        return self._transition(handoff_id, status="editing")
+        """Tier 1 OS-launch succeeded, or the plugin sent ``opened``.
+
+        A late confirmation never re-activates a handoff the user already
+        retired (``cancelled``/``discarded``/``superseded``): that is left
+        unchanged (logged at info). ``error`` is the one terminal state that
+        may still move to ``editing`` -- a failed Tier 2 open falling back to
+        a Tier 1 launch that then succeeds (PROTOCOL.md §3).
+        """
+        meta = self._transition(handoff_id, status="editing", noop_from=_RETIRED_STATUSES)
+        if meta.status != "editing":
+            logger.info(
+                "Open confirmation for %s ignored: handoff is already %s",
+                handoff_id,
+                meta.status,
+            )
+        return meta
 
     def mark_error(self, handoff_id: str, error: str) -> HandoffMeta:
         return self._transition(handoff_id, status="error", error=error)
@@ -988,7 +1006,7 @@ class HandoffManager:
         *handoff_id* still raises :class:`HandoffNotFoundError` (the route
         maps that to 404, never 200).
         """
-        return self._transition(handoff_id, status="cancelled", noop_if_terminal=True)
+        return self._transition(handoff_id, status="cancelled", noop_from=TERMINAL_STATUSES)
 
     def mark_discarded(self, handoff_id: str) -> HandoffMeta:
         return self._transition(handoff_id, status="discarded")
@@ -1003,7 +1021,7 @@ class HandoffManager:
         *,
         status: HandoffStatus,
         error: str | None = None,
-        noop_if_terminal: bool = False,
+        noop_from: frozenset[str] = frozenset(),
     ) -> HandoffMeta:
         """Apply a status transition: mutate, persist, and emit ``cpsb.status``.
 
@@ -1012,11 +1030,12 @@ class HandoffManager:
             status: The new status.
             error: The new ``error`` string (cleared to ``None`` when
                 omitted).
-            noop_if_terminal: When ``True``, a handoff already in
-                :data:`TERMINAL_STATUSES` is left exactly as it is instead
-                of being overwritten. Only :meth:`mark_cancelled` sets
-                this: the other transitions must still be able to fire on
-                a terminal handoff by design -- notably a Tier 2
+            noop_from: A handoff already in one of these statuses is left
+                exactly as it is instead of being overwritten.
+                :meth:`mark_cancelled` passes all of :data:`TERMINAL_STATUSES`,
+                :meth:`mark_editing` the user-retired ones; the other
+                transitions must still be able to fire on a terminal
+                handoff by design -- notably a Tier 2
                 ``open_failed`` (status ``error``) falling back to a
                 Tier 1 launch that then succeeds needs `error` ->
                 `editing` to go through (PROTOCOL.md §3).
@@ -1028,7 +1047,7 @@ class HandoffManager:
             meta = self._handoffs.get(handoff_id)
             if meta is None:
                 raise HandoffNotFoundError(handoff_id)
-            if noop_if_terminal and meta.status in TERMINAL_STATUSES:
+            if meta.status in noop_from:
                 return HandoffMeta.from_dict(meta.to_dict())
             meta.status = status
             meta.error = error
@@ -1188,10 +1207,24 @@ class HandoffManager:
         return edit
 
     def _write_sibling_output(self, meta: HandoffMeta, png_bytes: bytes) -> SiblingOutput:
-        sibling_index = sum(1 for e in meta.edits if e.sibling_output is not None) + 1
         origname = Path(meta.source.filename).stem
         sibling_dir = self._ctx.output_dir / meta.source.subfolder
         sibling_dir.mkdir(parents=True, exist_ok=True)
+        # First free ``_psN``: never on disk and never named by ANY handoff's
+        # manifest (a fresh handoff for the same source must not reuse -- and
+        # so overwrite -- an earlier handoff's sibling). Assumes the lock.
+        claimed = {
+            (e.sibling_output.subfolder, e.sibling_output.filename)
+            for h in self._handoffs.values()
+            for e in h.edits
+            if e.sibling_output is not None
+        }
+        sibling_index = 1
+        while (
+            (meta.source.subfolder, f"{origname}_ps{sibling_index}.png") in claimed
+            or (sibling_dir / f"{origname}_ps{sibling_index}.png").exists()
+        ):
+            sibling_index += 1
         filename = f"{origname}_ps{sibling_index}.png"
         (sibling_dir / filename).write_bytes(png_bytes)
         return SiblingOutput(filename=filename, subfolder=meta.source.subfolder)

@@ -117,6 +117,10 @@ Status transitions:
 `opened`) → `edited` (≥1 edit ingested; stays `edited` as further saves append to `edits`).
 `cancelled` (user cancel), `discarded` (gallery discard), `superseded` (replaced by a
 "Start Fresh Edit"), `error` (open/ingest failure, with `error` string) are terminal.
+A late open confirmation (the plugin's `opened`, or a Tier 1 launch finishing) never
+re-activates a `cancelled`/`discarded`/`superseded` handoff: it is ignored (logged at
+info) and the handoff stays terminal. Only `error` may still move to `editing` (a failed
+Tier 2 open falling back to a Tier 1 launch, §3).
 "Closed" is **not** a status — the frontend derives it (`editing` AND
 `plugin_doc_open === false`, gallery overhaul 2026-07-22, replacing an earlier "editing
 and `updated_ts` older than 1h" client-only guess). `plugin_doc_open` (bool | None) is a
@@ -320,7 +324,10 @@ WebSocket upgrade endpoint for the UXP plugin. Protocol in §3 of this doc.
 
 Text frames, one JSON object per frame, every message has `"type"`. Unknown types are
 ignored (forward compatibility). The server allows **one** plugin connection; a new
-connection replaces the old (old socket closed with code 4000).
+connection replaces the old (old socket closed with code 4000). The server installs the
+new connection in the single slot synchronously and only then closes the displaced one,
+so overlapping replacements can never leave a socket open outside the slot: the newest
+connection always wins and every displaced one is closed with 4000.
 
 Plugin → server:
 - `{"type": "hello", "plugin_version": "0.1.0", "ps_version": "26.5", "uxp_version": "8.1"}`
@@ -694,7 +701,10 @@ end here. It:
    the watchdog and plugin may both fire for one save).
 3. If `origin_kind == "terminal_output"` and the source was in `output/` and setting
    `sibling_outputs` is on: also writes `<origname>_ps<N>.png` next to the original
-   output file and records it as `sibling_output` in the edit entry.
+   output file and records it as `sibling_output` in the edit entry. `<N>` is the first
+   index whose file does not already exist in that folder and is not named by any
+   handoff's manifest entry — so a later handoff for the same source (e.g. after "Start
+   Fresh Edit") never overwrites an earlier handoff's sibling.
 4. Updates `meta.json` (status `edited`, appends to `edits`).
 5. Unblocks a waiting bridge node for this handoff, if any.
 6. Emits `cpsb.updated` (below).
@@ -912,6 +922,9 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `existing_psd_path` pointed at it — §6c) is suppressed via the shared, path-keyed
   own-write registry (§1, v0.5.37) — suppression is not specific to the node that
   opened the original.
+  Several Load PSD nodes may edit the same original: a save is delivered to EVERY active
+  handoff watching it (each with its own debounce, each under its own `on_save` policy —
+  one node's "Ignore" never suppresses another's "Re-run workflow").
 - **Save-trigger policy** (v0.5.21): the node carries a COMBO widget `on_save`, appended
   as the LAST required input (ComfyUI restores a saved workflow's widget values BY
   POSITION — see `LGraphNode`'s `widgets_values` zip — so appending is the only placement

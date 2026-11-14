@@ -399,3 +399,36 @@ class TestEditInPlaceBootRecovery:
             assert fresh_watcher._original_by_handoff == {}
         finally:
             fresh_watcher.stop()
+
+
+class TestSharedOriginal:
+    """Several Load PSD nodes can edit the same original in place; a save must
+    reach every one of them, each under its own trigger policy."""
+
+    def test_every_handoff_watching_one_original_gets_the_save(self, watcher, manager, tmp_path):
+        original = tmp_path / "shared.psd"
+        write_psd(original, Image.new("RGB", (24, 16), (1, 1, 1)))
+        ids = []
+        for node_id, policy in (("1", "Ignore (do nothing)"), ("2", "Re-run workflow")):
+            meta = manager.create(
+                origin_node_id=node_id,
+                origin_kind="load_psd",
+                workflow_name="wf",
+                source=SourceRef(filename=original.name, subfolder="", type="input"),
+                original_image=Image.new("RGB", (24, 16), (10, 20, 30)),
+                source_hash="deadbeef" * 8,
+                edit_in_place=True,
+                original_path=str(original.resolve()),
+                trigger_policy=policy,
+            )
+            watcher.watch_original(meta.handoff_id, original)
+            ids.append(meta.handoff_id)
+        ignoring, rerunning = ids
+        settle_quietly(DEBOUNCE_MS / 1000 * 3)
+
+        write_psd(original, Image.new("RGB", (24, 16), (200, 0, 0)))
+
+        wait_for_edit_count(manager, rerunning, 1)
+        settle_quietly(DEBOUNCE_MS / 1000 * 3)
+        assert len(manager.get(rerunning).edits) == 1  # once per save
+        assert manager.get(ignoring).edits == []  # its own policy still applies

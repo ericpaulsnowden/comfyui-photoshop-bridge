@@ -188,7 +188,7 @@ class CpsbWatcher:
         # holding ``self._lock``. On macOS, fsevents' ``schedule`` blocks
         # coordinating with the observer's own dispatch thread -- and that
         # dispatch thread runs :meth:`notice`, which takes ``self._lock``
-        # (via ``_schedule``/``_handoff_for_original``). Holding the lock
+        # (via ``_schedule``/``_handoffs_for_original``). Holding the lock
         # across ``observer.schedule`` therefore deadlocks the moment a real
         # save event is being dispatched concurrently: main thread waits on
         # fsevents, fsevents' dispatcher waits on our lock. So: decide and
@@ -321,17 +321,15 @@ class CpsbWatcher:
         if meta is not None and path.name == meta.psd_filename:
             self._schedule(handoff_id, path)
             return
-        original_handoff_id = self._handoff_for_original(path)
-        if original_handoff_id is not None:
+        # Every handoff editing this original gets the save (each Load PSD
+        # node under its own trigger policy); each has its own debounce timer.
+        for original_handoff_id in self._handoffs_for_original(path):
             self._schedule(original_handoff_id, path)
 
-    def _handoff_for_original(self, path: Path) -> str | None:
+    def _handoffs_for_original(self, path: Path) -> list[str]:
         resolved = path.resolve()
         with self._lock:
-            for handoff_id, original in self._original_by_handoff.items():
-                if original == resolved:
-                    return handoff_id
-        return None
+            return [h for h, original in self._original_by_handoff.items() if original == resolved]
 
     def _schedule(self, handoff_id: str, path: Path) -> None:
         debounce_seconds = self._ctx.settings.get("debounce_ms", 800) / 1000
