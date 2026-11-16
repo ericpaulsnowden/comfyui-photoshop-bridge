@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import cast
 
 import pytest
 from PIL import Image
@@ -25,23 +24,8 @@ from psd_tools.constants import BlendMode
 
 import cpsb.layers as layers_module
 import cpsb.load_psd as load_psd_module
-import cpsb.nodes as nodes_module
-from cpsb.context import CpsbContext
-from cpsb.handoff import HandoffManager
 
 pytest.importorskip("torch")
-
-
-@pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
-def configured(context: CpsbContext, manager: HandoffManager):
-    nodes_module.configure(context, manager, cast("object", None), cast("object", None))
-    yield
-    nodes_module._state = None
 
 
 def build_grouped_psd(path: Path) -> None:

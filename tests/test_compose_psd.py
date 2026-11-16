@@ -18,14 +18,12 @@ active handoff).
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pytest
@@ -113,49 +111,6 @@ def _assert_written_path(payload: dict, context: CpsbContext) -> None:
     assert path.is_absolute()
     assert path.parent == context.input_dir.resolve()
     assert payload["path"].endswith(payload["filename"])
-
-
-@pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
-def configured(context: CpsbContext, manager: HandoffManager):
-    """Lightweight wiring: no real app/loop -- enough for IS_CHANGED/consume/compose
-    tests that never reach an open-Photoshop path (i.e. "Don't open" mode, or a
-    consume against a handoff that already has an edit).
-    """
-    nodes_module.configure(context, manager, cast("object", None), cast("object", None))
-    yield
-    nodes_module._state = None
-
-
-@pytest.fixture
-def launches(monkeypatch):
-    """Records every ``launch_photoshop`` call, patched the same way
-    ``tests/test_nodes.py`` does (through the ``routes`` module object, since
-    ``cpsb.nodes`` always calls it that way -- see that fixture's docstring).
-    """
-    calls: list[str] = []
-
-    def fake_launch(psd_path, override=""):
-        calls.append(str(psd_path))
-        return LaunchResult(ok=True)
-
-    monkeypatch.setattr(routes_module, "launch_photoshop", fake_launch)
-    return calls
-
-
-@pytest.fixture
-def loop_thread():
-    """A live event loop on a background thread, like PromptServer's own."""
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    yield loop
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=5)
 
 
 @pytest.fixture

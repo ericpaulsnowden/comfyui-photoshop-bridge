@@ -147,11 +147,6 @@ class OffLoopRecorder:
 
 
 @pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
 def launches(monkeypatch) -> LaunchRecorder:
     recorder = LaunchRecorder()
     monkeypatch.setattr(routes_module, "launch_photoshop", recorder)

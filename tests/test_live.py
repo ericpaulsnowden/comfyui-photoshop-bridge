@@ -42,11 +42,6 @@ def raises_interrupt():
 
 
 @pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
 def live_app(context: CpsbContext, manager: HandoffManager):
     """An installed app with a READY fake plugin connection -- the node reads
     the live slot through ``routes.get_live_frame(state.app)``."""
@@ -311,19 +306,6 @@ class _RecordingSocket:
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
-
-
-@pytest.fixture
-def loop_thread():
-    import asyncio
-    import threading
-
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    yield loop
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=5)
 
 
 @pytest.fixture

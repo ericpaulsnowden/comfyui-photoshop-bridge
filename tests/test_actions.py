@@ -21,7 +21,6 @@ node's own module docstring).
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import logging
 import subprocess
@@ -88,34 +87,6 @@ class _RecordingSocket:
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
-
-
-@pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
-def configured(context: CpsbContext, manager: HandoffManager):
-    """Wire ``nodes.configure`` with a fake app/loop -- fine for IS_CHANGED,
-    which never opens Photoshop or touches the loop.
-    """
-    nodes_module.configure(context, manager, cast("object", None), cast("object", None))
-    yield
-    nodes_module._state = None
-
-
-@pytest.fixture
-def loop_thread():
-    """A live event loop on a background thread, like PromptServer's own
-    (identical fixture to ``tests/test_nodes.py``'s own).
-    """
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    yield loop
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=5)
 
 
 @pytest.fixture

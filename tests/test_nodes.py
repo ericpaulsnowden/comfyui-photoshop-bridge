@@ -33,19 +33,6 @@ from cpsb.launcher import LaunchResult
 BridgeMode = nodes_module.BridgeMode
 
 
-@pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
-def configured(context: CpsbContext, manager: HandoffManager):
-    """Wire nodes.configure with the fake context; app/loop are unused by IS_CHANGED."""
-    nodes_module.configure(context, manager, cast("object", None), cast("object", None))
-    yield
-    nodes_module._state = None
-
-
 class TestImportability:
     def test_module_imports_without_torch(self):
         """Importing ``cpsb.nodes`` alone must not pull in torch.
@@ -240,17 +227,6 @@ def make_tensor(color: tuple[int, int, int]) -> np.ndarray:
 # compute_source_hash comparisons deterministic across conversions.
 RED = (255, 0, 0)
 GREEN = (0, 255, 0)
-
-
-@pytest.fixture
-def loop_thread():
-    """A live event loop on a background thread, like PromptServer's own."""
-    loop = asyncio.new_event_loop()
-    thread = threading.Thread(target=loop.run_forever, daemon=True)
-    thread.start()
-    yield loop
-    loop.call_soon_threadsafe(loop.stop)
-    thread.join(timeout=5)
 
 
 @pytest.fixture

@@ -139,39 +139,6 @@ def make_layered_psd(
 
 
 @pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
-def configured(context: CpsbContext, manager: HandoffManager):
-    """Wire ``nodes.configure`` with a fake app/loop.
-
-    Fine for anything that never actually opens Photoshop: pass-through mode
-    (which never looks up a handoff at all), or either Photoshop-touching
-    mode against a handoff that already has an edit
-    (``_resolve_wait_for_save_edit``/``_resolve_rerun_edit`` only reach the
-    open path when there is no consumable edit yet).
-    """
-    nodes_module.configure(context, manager, cast("object", None), cast("object", None))
-    yield
-    nodes_module._state = None
-
-
-@pytest.fixture
-def launches(monkeypatch):
-    """Records every ``launch_photoshop`` call (the Tier 1 open path)."""
-    calls: list[str] = []
-
-    def fake_launch(psd_path, override=""):
-        calls.append(str(psd_path))
-        return LaunchResult(ok=True)
-
-    monkeypatch.setattr(routes_module, "launch_photoshop", fake_launch)
-    return calls
-
-
-@pytest.fixture
 def node(context: CpsbContext, manager: HandoffManager, launches):
     """A configured ``PhotoshopAnnotate`` instance, real manager, fake launch."""
     app = web.Application()

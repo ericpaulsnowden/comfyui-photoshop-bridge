@@ -39,11 +39,6 @@ def output_source(filename: str = "ComfyUI_00042_.png") -> SourceRef:
     return SourceRef(filename=filename, subfolder="", type="output")
 
 
-@pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
 def read_stored_meta(context: CpsbContext, handoff_id: str) -> dict:
     """The handoff's on-disk ``meta.json`` decoded (explicitly UTF-8: the
     manager writes UTF-8, and Windows' locale default would be cp1252)."""

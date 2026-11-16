@@ -8,7 +8,6 @@ import hashlib
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
 
 import pytest
 from PIL import Image
@@ -17,22 +16,8 @@ from psd_tools import PSDImage
 import cpsb.load_psd as load_psd_module
 import cpsb.nodes as nodes_module
 import cpsb.raster_io as raster_io_module
-from cpsb.context import CpsbContext
-from cpsb.handoff import HandoffManager, SourceRef
+from cpsb.handoff import SourceRef
 from cpsb.psd_io import write_psd
-
-
-@pytest.fixture
-def manager(context: CpsbContext) -> HandoffManager:
-    return HandoffManager(context)
-
-
-@pytest.fixture
-def configured(context: CpsbContext, manager: HandoffManager):
-    """Wire nodes.configure -- cpsb.load_psd reuses this exact same shared state."""
-    nodes_module.configure(context, manager, cast("object", None), cast("object", None))
-    yield
-    nodes_module._state = None
 
 
 def write_test_psd(
