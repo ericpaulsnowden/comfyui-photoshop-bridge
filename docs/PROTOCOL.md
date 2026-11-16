@@ -6,7 +6,12 @@ PromptServer), the ComfyUI frontend extension (`web/js/`), and the Photoshop UXP
 plugin (`photoshop_plugin/`). If an implementation and this document disagree, the
 implementation is wrong or this document must be amended first — never drift silently.
 
-Referenced design rationale lives in `/PLAN.md` (repo parent) — section numbers cited as (§N).
+Comments and docstrings across the code cite design notes that are **not in this
+repository**: `PLAN.md` (section numbers cited as §N), `research-*.md` /
+`research/research-*.md`, `bridge-design-ethos.md`, and per-feature "implementation
+reports". They are the author's working notes, kept outside the repo, and record why a
+decision was made. Nothing in them is needed to work on the code: where a rule is binding
+it is restated here.
 
 ---
 

@@ -39,17 +39,11 @@
  *      use of the same API for document mutations. Reads are not wrapped —
  *      only the write needs modal scope.
  *
- * VERIFY(spike-8): all of the above is sourced from documentation and
- * cross-referenced type declarations, never exercised against a real
- * Photoshop from this environment (no Photoshop here — see docs/SPIKES.md
- * spike 8, still "Not started" as of this writing). The API SHAPE is
- * high-confidence; what remains genuinely unverified until run live is (a)
- * that the write actually takes effect and survives a Photoshop restart,
- * and (b) that no additional manifest permission is needed beyond what this
- * plugin already requests. If wrong, the failure mode is a caught
- * exception (see `ensureMaximizeCompatibility` below) — never a silent
- * corruption of the user's preferences, since this only ever calls the
- * documented setter with a documented enum value, never a raw descriptor.
+ * Verified on real Photoshop: shipped in v0.5.31 and validated live on
+ * 2026-07-21 (docs/SPIKES.md spike 8). A failure is still a caught exception
+ * (see `ensureMaximizeCompatibility` below), never a silent corruption of
+ * the user's preferences: this only ever calls the documented setter with a
+ * documented enum value, never a raw descriptor.
  */
 
 const { app, core, constants } = require('photoshop')

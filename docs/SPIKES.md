@@ -1,14 +1,15 @@
 # M0 Verification Spikes
 
-Before locking in the M1 implementation, we're validating eight assumptions the whole design leans on. Each one is small, throwaway, and answerable in isolation — pick one, follow its procedure, fill in its Results section, and check it off below.
+Nine small, throwaway experiments, each answering one assumption the design leans on. Spikes 1–8 were written before the first build; spike 9 was added later for one feature. Each has a procedure and a Results section.
 
-**Status as of 2026-07-20:** these M0 spikes have been overtaken by production. The pack shipped through **v0.5.30** — four nodes, the Tier-1 and Tier-2 round trips, and cross-machine (Mac Photoshop ↔ PC ComfyUI) editing — and Eric has personally validated the whole feature set on his own machines (50/50 manual-test items). Spikes 2, 6, 7 were proven live on Photoshop 27.8.0 (2026-07-17; see **LIVE RESULTS** at the bottom). Spikes **1, 3, 4, 5 are now confirmed in production** — the right-click menu, psd-tools PSD write fidelity, the save-detection watcher (Windows on Eric's PC + macOS in dev), and paste-back + auto-queue all ship and are validated by real use, not a throwaway spike. The one genuinely open item is **spike 8 (programmatic Maximize Compatibility)** — in progress as an auto-set-on-connect feature, pending live validation.
+**Status (2026-11-15):** spikes 1–8 are resolved; spike 9 is open.
 
-**Status as of 2026-07-27:** all eight spikes are now resolved — **spike 8 shipped as a real feature in v0.5.31** ("plugin auto-sets Maximize PSD Compatibility on connect") and was **live-validated by Eric on 2026-07-21** (recorded on the living test checklist, `research/checklists/comfy-ps-bridge.html`: "Plugin auto-sets Maximize PSD Compatibility on connect — v0.5.31 — validated by Eric · 2026-07-21 (spike 8 confirmed on real Photoshop)"). See the corrected checklist item and Spike 8 section below. Also stale in the 2026-07-20 paragraph above: the pack is at **v0.5.62** as of this date (not v0.5.30) with **eleven nodes** (not four — see the README's "The nodes" section), and the living test checklist now shows 111 archived/validated items (not 50), all 0 currently active. That paragraph is left as an unedited historical snapshot; treat the version/node-count numbers in it as dated 2026-07-20, not current. Evidence: `git -C comfyui-photoshop-bridge log --oneline`, `README.md`, `research/checklists/comfy-ps-bridge.html`.
+- **2, 6, 7** passed live on Photoshop 27.8.0 on 2026-07-17 (see **LIVE RESULTS** at the bottom).
+- **1, 3, 4, 5** are confirmed in production: the right-click menu, psd-tools PSD writes, the save-detection watcher (Windows and macOS) and paste-back with auto-queue all ship and are validated by real use.
+- **8** shipped as a feature in v0.5.31 (the plugin sets Maximize PSD Compatibility on connect) and was validated live by Eric on 2026-07-21.
+- **9** (save-before-send) is code-complete and still needs a run in real Photoshop.
 
-The rule: **M1 design isn't final until every spike below has a written yes/no/workaround answer.**
-
-This project is pre-release — see the status note at the top of the [main README](../README.md). The design assumptions these spikes were written to de-risk are now settled by the shipped, user-validated v0.5.30 feature set; only spike 8 (Maximize Compatibility) is still being proven live. **Update, 2026-07-27: spike 8 is no longer open — see above.**
+A new spike belongs here when a change depends on Photoshop or UXP behaviour nobody has yet observed on a real install (see [../CONTRIBUTING.md](../CONTRIBUTING.md)).
 
 ## Prerequisites
 

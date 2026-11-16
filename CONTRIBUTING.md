@@ -59,4 +59,4 @@ CI (`.github/workflows/ci.yml`) runs `ruff check .`, `scripts/check_version_sync
 - **Behavior changes get tests.** If you changed what the code does (not just how it's written), add or update a `pytest` case that would have caught the bug or regression.
 - **Photoshop-API-facing changes cite a spike.** Anything touching UXP APIs, `batchPlay` descriptors, or Photoshop preference/event behavior should reference the relevant entry in [docs/SPIKES.md](docs/SPIKES.md) — existing or new. If you discovered the behavior hands-on, add your findings to that spike's Results section so the next person doesn't have to re-derive it.
 - **Interface changes touch `docs/PROTOCOL.md` in the same PR** (see above), not a follow-up.
-- Keep PRs scoped to one milestone's worth of work where possible (M1 through M6 — ask in the PR or issue if you're not sure which milestone something belongs to). Easier to review, easier to revert.
+- Keep PRs scoped to one feature, or one milestone of a roadmap in [docs/roadmap/](docs/roadmap/), where possible. Easier to review, easier to revert.

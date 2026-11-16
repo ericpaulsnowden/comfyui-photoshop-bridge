@@ -2,10 +2,9 @@
 
 Opens ``image`` in Photoshop and plays a SAVED Photoshop Action on it
 programmatically -- no manual user step -- then returns the processed result
-to the workflow. Not yet in ``docs/PROTOCOL.md`` (out of scope for this
-change; see the implementation report for the new ``run_action`` /
-``action_ok`` / ``action_error`` websocket messages this node adds, to be
-folded into PROTOCOL.md's §3 message list and given its own §6e node section).
+to the workflow. Specified in ``docs/PROTOCOL.md`` §6e, including the
+``run_action`` / ``action_ok`` / ``action_error`` websocket messages this node
+adds.
 
 **This node is Tier-2-plugin-required, by design, not by accident.** This
 pack's ethos (``bridge-design-ethos.md``) is "everything possible must work
