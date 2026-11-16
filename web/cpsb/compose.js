@@ -409,7 +409,7 @@ function scheduleStabilize(node) {
  * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
  */
 function getLayerNamesWidget(node) {
-  return findWidgetByName(node, LAYER_NAMES_WIDGET_NAME)
+  return ui.findWidgetByName(node, LAYER_NAMES_WIDGET_NAME)
 }
 
 /**
@@ -656,15 +656,6 @@ const EXISTING_PSD_PATH_WIDGET_NAME = 'existing_psd_path'
 const BROWSE_BUTTON_WIDGET_NAME = 'cpsb_existing_psd_browse'
 
 /**
- * @param {import('../../../scripts/app.js').LGraphNode} node
- * @param {string} name
- * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
- */
-function findWidgetByName(node, name) {
-  return node.widgets?.find((w) => w.name === name)
-}
-
-/**
  * Moves *widget* (already appended to the END of `node.widgets` by
  * `node.addWidget`) so it renders directly after *afterWidget* instead.
  * litegraph widgets carry no explicit "position" field to set — `node.widgets`
@@ -704,7 +695,7 @@ function insertWidgetAfter(node, widget, afterWidget) {
  * @returns {import('../../../scripts/app.js').IBaseWidget}
  */
 function findOrCreateBrowseButton(node, existingPsdPathWidget) {
-  const existing = findWidgetByName(node, BROWSE_BUTTON_WIDGET_NAME)
+  const existing = ui.findWidgetByName(node, BROWSE_BUTTON_WIDGET_NAME)
   if (existing) return existing
   const browseButton = node.addWidget(
     'button',
@@ -743,7 +734,7 @@ export function attachAppendTargetWidgets(node) {
   if (node.__cpsbAppendTargetAttached) return
   node.__cpsbAppendTargetAttached = true
 
-  const existingPsdPathWidget = findWidgetByName(node, EXISTING_PSD_PATH_WIDGET_NAME)
+  const existingPsdPathWidget = ui.findWidgetByName(node, EXISTING_PSD_PATH_WIDGET_NAME)
   if (existingPsdPathWidget) {
     findOrCreateBrowseButton(node, existingPsdPathWidget)
   }

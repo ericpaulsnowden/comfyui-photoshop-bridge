@@ -3498,7 +3498,7 @@ class TestManualPush:
             ack = await ws.receive_json(timeout=5)
             meta = manager.get(ack["handoff_id"])
 
-            # Exactly what gallery.js's openBodyFromMeta sends for mode
+            # Exactly what open.js's openBodyFromMeta sends for mode
             # "original" on this card.
             response = await client.post(
                 "/cpsb/open",

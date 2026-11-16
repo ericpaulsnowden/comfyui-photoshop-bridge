@@ -35,11 +35,8 @@
  * every other open call site in this extension (`open.js`'s own file
  * header) — wherever Photoshop actually is, local or remote.
  *
- * `gallery.js`'s `openBodyFromMeta(meta, mode)` is the exact shape this
- * module needs but is a private, unexported helper there, and `gallery.js`
- * is out of scope for this change — so {@link reopenInPhotoshop} below
- * replicates its five-field body construction minimally rather than
- * importing it.
+ * The request body is `open.openBodyFromMeta(meta, 'original')`, the same
+ * helper the gallery's Re-open uses.
  */
 
 import * as api from './api.js'
@@ -73,36 +70,6 @@ export function isAnnotateNode(node) {
 }
 
 /**
- * @param {import('../../../scripts/app.js').LGraphNode} node
- * @param {string} name
- * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
- */
-function findWidgetByName(node, name) {
-  return node.widgets?.find((w) => w.name === name)
-}
-
-/**
- * Builds the `/cpsb/open` body for reopening *meta*'s handoff exactly as it
- * is — `mode:"original"` (this file's header). Mirrors `gallery.js`'s
- * private `openBodyFromMeta(meta, 'original')` field-for-field; kept as a
- * separate minimal copy here since that helper isn't exported and
- * `gallery.js` is out of scope for this change.
- * @param {import('./api.js').CpsbHandoffMeta} meta
- * @returns {import('./api.js').CpsbOpenRequest}
- */
-function reopenBodyFromMeta(meta) {
-  return {
-    filename: meta.source.filename,
-    subfolder: meta.source.subfolder,
-    type: meta.source.type,
-    origin_node_id: meta.origin_node_id,
-    origin_kind: meta.origin_kind,
-    workflow_name: meta.workflow_name,
-    mode: 'original'
-  }
-}
-
-/**
  * The button's click handler. Looks up this node's active handoff
  * (workflow-scoped, per {@link state.getActiveHandoffForNode}'s own doc
  * comment) and reopens it via the shared interactive open flow; if there is
@@ -126,7 +93,7 @@ async function reopenInPhotoshop(node) {
     return
   }
   try {
-    await open.openInteractive(reopenBodyFromMeta(handoff), {
+    await open.openInteractive(open.openBodyFromMeta(handoff, 'original'), {
       successSummary: 'Re-opening in Photoshop…'
     })
   } catch (error) {
@@ -150,7 +117,7 @@ async function reopenInPhotoshop(node) {
  * @returns {import('../../../scripts/app.js').IBaseWidget}
  */
 function findOrCreateReopenButton(node) {
-  const existing = findWidgetByName(node, REOPEN_BUTTON_WIDGET_NAME)
+  const existing = ui.findWidgetByName(node, REOPEN_BUTTON_WIDGET_NAME)
   if (existing) return existing
   const button = node.addWidget(
     'button',

@@ -309,3 +309,12 @@ export function formatRelativeTime(unixSeconds) {
   if (deltaD < 30) return `${deltaD}d ago`
   return new Date(unixSeconds * 1000).toLocaleDateString()
 }
+
+/**
+ * @param {import('../../../scripts/app.js').LGraphNode} node
+ * @param {string} name
+ * @returns {import('../../../scripts/app.js').IBaseWidget | undefined}
+ */
+export function findWidgetByName(node, name) {
+  return node.widgets?.find((w) => w.name === name)
+}

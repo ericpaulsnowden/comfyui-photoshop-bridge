@@ -236,26 +236,6 @@ function revealInWorkflow(meta) {
 }
 
 /**
- * Builds the `/cpsb/open` body shared by {@link reopenInPhotoshop} and
- * {@link openFreshCopy} — always the handoff's own recorded source triple
- * and origin, exactly what the handoff was created from.
- * @param {import('./api.js').CpsbHandoffMeta} meta
- * @param {"original" | "new"} mode
- * @returns {import('./api.js').CpsbOpenRequest}
- */
-function openBodyFromMeta(meta, mode) {
-  return {
-    filename: meta.source.filename,
-    subfolder: meta.source.subfolder,
-    type: meta.source.type,
-    origin_node_id: meta.origin_node_id,
-    origin_kind: meta.origin_kind,
-    workflow_name: meta.workflow_name,
-    mode
-  }
-}
-
-/**
  * "Re-open" for ACTIVE cards only ({@link cardCapabilities}): same handoff,
  * same PSD, layers intact (`mode:"original"`). Routed through the shared
  * `open.js` flow — the 428 remote-open confirm, the 409 chooser, and
@@ -265,7 +245,7 @@ function openBodyFromMeta(meta, mode) {
  * @param {import('./api.js').CpsbHandoffMeta} meta
  */
 async function reopenInPhotoshop(meta) {
-  await open.openInteractive(openBodyFromMeta(meta, 'original'), {
+  await open.openInteractive(open.openBodyFromMeta(meta, 'original'), {
     successSummary: 'Re-opening in Photoshop…'
   })
 }
@@ -279,7 +259,7 @@ async function reopenInPhotoshop(meta) {
  * @param {import('./api.js').CpsbHandoffMeta} meta
  */
 async function openFreshCopy(meta) {
-  await open.openInteractive(openBodyFromMeta(meta, 'new'), {
+  await open.openInteractive(open.openBodyFromMeta(meta, 'new'), {
     successSummary: 'Opening a fresh copy in Photoshop…'
   })
 }

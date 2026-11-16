@@ -244,3 +244,24 @@ export async function openInteractive(body, { successSummary = 'Opening in Photo
     return false
   }
 }
+
+/**
+ * Builds the `/cpsb/open` body that reopens (`mode: "original"`) or re-creates
+ * (`mode: "new"`) *meta*'s handoff — always the handoff's own recorded source
+ * triple and origin, exactly what it was created from. Shared by the gallery
+ * cards and the Annotate node's Re-open button.
+ * @param {import('./api.js').CpsbHandoffMeta} meta
+ * @param {"original" | "new"} mode
+ * @returns {import('./api.js').CpsbOpenRequest}
+ */
+export function openBodyFromMeta(meta, mode) {
+  return {
+    filename: meta.source.filename,
+    subfolder: meta.source.subfolder,
+    type: meta.source.type,
+    origin_node_id: meta.origin_node_id,
+    origin_kind: meta.origin_kind,
+    workflow_name: meta.workflow_name,
+    mode
+  }
+}
