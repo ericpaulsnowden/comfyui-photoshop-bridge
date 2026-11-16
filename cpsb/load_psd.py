@@ -89,7 +89,6 @@ from typing import Any
 from . import layers as layers_io
 from . import nodes, raster_io, routes
 from .context import CpsbContext
-from .handoff import HandoffManager, HandoffMeta
 from .psd_io import PSD_EXTENSIONS, read_edited_psd
 
 logger = logging.getLogger("cpsb")
@@ -226,64 +225,6 @@ def _layers_document(psd_path: Path, flatten_groups: bool) -> dict[str, Any]:
             psd_path,
         )
         return layers_io.empty_document()
-
-
-def _consume_active_edit(manager: HandoffManager, handoff_id: str) -> tuple[Any, Any] | None:
-    """``(IMAGE, MASK)`` tensors for *handoff_id*'s latest edit, if any.
-
-    Thin file-resolution wrapper around
-    :func:`cpsb.nodes._tensors_from_edit_file` -- the shared MASK-derivation
-    logic itself lives there, alongside
-    :class:`~cpsb.nodes.PhotoshopBridge`'s identical consume path.
-
-    Args:
-        manager: The handoff manager.
-        handoff_id: A handoff already confirmed to have at least one edit.
-
-    Returns:
-        The edit's tensors, or ``None`` if the edit file has vanished from
-        disk since (a filesystem race -- cheap to guard, shouldn't happen
-        in practice). Callers fall back to flattening the source PSD fresh
-        in that case, exactly as if no matching handoff existed at all.
-    """
-    edit_path = manager.edit_image_path(handoff_id)
-    if edit_path is None or not edit_path.exists():
-        return None
-    return nodes._tensors_from_edit_file(edit_path)
-
-
-def _find_matching_active_handoff(
-    manager: HandoffManager, node_id: str, file_hash: str
-) -> HandoffMeta | None:
-    """The active ``load_psd`` handoff for *node_id*, iff it has a consumable edit.
-
-    Shared by :meth:`PhotoshopLoadPSD.IS_CHANGED` and
-    :meth:`PhotoshopLoadPSD.execute` -- both need the identical "is there an
-    edit to consume instead of re-flattening" predicate (PROTOCOL.md §6b).
-
-    Args:
-        manager: The handoff manager.
-        node_id: This node instance's ``unique_id``, stringified.
-        file_hash: sha256 of the currently-selected PSD's raw bytes.
-
-    Returns:
-        The matching handoff, or ``None`` if any of the following holds --
-        each meaning "flatten the source PSD instead": no active handoff
-        for this node at all; one whose ``origin_kind`` isn't ``load_psd``
-        (defensive -- node ids are unique per graph, so this shouldn't
-        happen in practice, but a stray match must never be served); one
-        created from different bytes (the file on disk was swapped out
-        under the same filename); or one with no edits yet.
-    """
-    active = manager.find_active_for_node(node_id)
-    if (
-        active is not None
-        and active.origin_kind == "load_psd"
-        and active.source_hash == file_hash
-        and active.edits
-    ):
-        return active
-    return None
 
 
 class PhotoshopLoadPSD:
@@ -549,7 +490,7 @@ class PhotoshopLoadPSD:
         :meth:`cpsb.nodes.PhotoshopBridge.IS_CHANGED` both use. Returning
         just the file hash would NOT change once an edit lands (the
         selected file on disk is the ORIGINAL; edits live in the handoff
-        folder), so :func:`_find_matching_active_handoff`'s match folds the
+        folder), so :func:`cpsb.nodes._find_consumable_handoff`'s match folds the
         latest edit's own hash in whenever one is consumable (PROTOCOL.md
         §6b), changing the return value again on every subsequent save.
 
@@ -571,7 +512,7 @@ class PhotoshopLoadPSD:
         nothing)"-policy handoff is already decided server-side
         (``HandoffManager.should_ingest``) by the time this runs -- an
         ignored handoff simply never accumulates an edit for
-        :func:`_find_matching_active_handoff` to find, so there is nothing
+        :func:`cpsb.nodes._find_consumable_handoff` to find, so there is nothing
         for this cache key to react to beyond what it already does. Defaults
         to :data:`OnSaveMode.RERUN` so every pre-existing caller keeps
         working unchanged.
@@ -598,7 +539,9 @@ class PhotoshopLoadPSD:
         file_hash = hashlib.sha256(psd_path.read_bytes()).hexdigest()
         grouping = ":flatten" if flatten_groups else ""
 
-        active = _find_matching_active_handoff(state.manager, str(unique_id), file_hash)
+        active = nodes._find_consumable_handoff(
+            state.manager, str(unique_id), "load_psd", file_hash
+        )
         if active is not None:
             edit_hash = state.manager.latest_edit_hash(active.handoff_id)
             if edit_hash is not None:
@@ -684,9 +627,9 @@ class PhotoshopLoadPSD:
 
         layers_doc = _layers_document(psd_path, flatten_groups)
 
-        active = _find_matching_active_handoff(manager, node_id, source_hash)
+        active = nodes._find_consumable_handoff(manager, node_id, "load_psd", source_hash)
         if active is not None:
-            consumed = _consume_active_edit(manager, active.handoff_id)
+            consumed = nodes._consume_active_edit(manager, active.handoff_id)
             if consumed is not None:
                 logger.info(
                     "cpsb load_psd: node %s handoff %s: consuming latest edit",

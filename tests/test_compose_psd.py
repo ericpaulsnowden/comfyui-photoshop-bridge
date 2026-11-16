@@ -2308,7 +2308,7 @@ class TestHandoffIdentityReuseAndSupersede:
     documents" bug: HANDOFF IDENTITY. The waiter must poll the SAME
     handoff_id ingest_edit writes to -- across a plain re-queue while
     unsaved (defect 1: execute() had no reuse path at all, only
-    ``_find_matching_active_handoff``, whose predicate requires non-empty
+    ``nodes._find_consumable_handoff``, whose predicate requires non-empty
     ``edits`` and so never recognized an open-but-unsaved handoff as
     anything but "no handoff") and across a bare ``mode`` widget flip
     (defect 3: the OLD code folded ``mode`` into the very value recorded as

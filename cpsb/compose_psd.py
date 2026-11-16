@@ -64,7 +64,7 @@ from psd_tools.constants import ColorMode
 from . import layers as layers_io
 from . import nodes
 from .context import CpsbContext
-from .handoff import HandoffManager, HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
+from .handoff import HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
 from .psd_io import PSD_EXTENSIONS
 
 logger = logging.getLogger("cpsb")
@@ -508,77 +508,6 @@ def _compute_inputs_hash(
     hasher.update(b"\x00")
     hasher.update(mode.encode("utf-8"))
     return hasher.hexdigest()
-
-
-def _find_matching_active_handoff(
-    manager: HandoffManager, node_id: str, identity_hash: str
-) -> HandoffMeta | None:
-    """The active ``bridge_node`` handoff for *node_id*, iff it has a consumable edit.
-
-    Mirrors :meth:`cpsb.nodes.PhotoshopBridge.execute`'s consume predicate
-    (same shape, deliberately re-implemented rather than imported --
-    ``cpsb/nodes.py`` is owned elsewhere and keeps its check inline; a small
-    parallel helper here couples nothing to that module's internals). Used by
-    :meth:`PhotoshopComposePSD.IS_CHANGED` (:meth:`PhotoshopComposePSD.execute`
-    has its own inline reuse/supersede logic, since unlike this read-only
-    helper it must be able to mutate state via ``manager.supersede``).
-
-    The ``origin_kind == "bridge_node"`` filter matches what this node's own
-    open paths now write (:meth:`PhotoshopComposePSD._create_bridge_handoff`,
-    PROTOCOL.md §6c: "The handoff uses origin_kind ``bridge_node``"), so the
-    just-opened handoff -- and any edit saved into it -- is recognized on the
-    next queue and its edit consumed. It replaces the earlier ``load_psd``
-    filter the fire-and-forget ``edit_after`` build used.
-
-    Args:
-        manager: The handoff manager.
-        node_id: This node instance's ``unique_id``, stringified.
-        identity_hash: :func:`_compute_identity_hash` of the CURRENT inputs --
-            deliberately mode/prefix-FREE (see that function's docstring),
-            since a handoff's recorded ``source_hash`` is now identity-only
-            too.
-
-    Returns:
-        The matching handoff, or ``None`` when there is no active handoff for
-        this node, it isn't ``origin_kind == "bridge_node"`` (defensive --
-        e.g. a leftover handoff of another kind for the same node id), its
-        recorded ``source_hash`` doesn't equal *identity_hash* (the actual
-        inputs changed), or it has no edits yet -- each meaning "write a
-        fresh compose instead".
-    """
-    active = manager.find_active_for_node(node_id)
-    if (
-        active is not None
-        and active.origin_kind == "bridge_node"
-        and active.source_hash == identity_hash
-        and active.edits
-    ):
-        return active
-    return None
-
-
-def _consume_active_edit(manager: HandoffManager, handoff_id: str) -> tuple[Any, Any] | None:
-    """``(IMAGE, MASK)`` tensors for *handoff_id*'s latest edit, if any.
-
-    Thin file-resolution wrapper around
-    :func:`cpsb.nodes._tensors_from_edit_file` -- the shared MASK-derivation
-    logic itself lives there, identical to
-    :class:`~cpsb.nodes.PhotoshopBridge`'s and
-    :class:`~cpsb.load_psd.PhotoshopLoadPSD`'s own consume paths.
-
-    Args:
-        manager: The handoff manager.
-        handoff_id: A handoff already confirmed to have at least one edit.
-
-    Returns:
-        The edit's tensors, or ``None`` if the edit file has vanished from
-        disk since (a filesystem race). Callers fall back to composing
-        fresh, exactly as if no matching handoff existed at all.
-    """
-    edit_path = manager.edit_image_path(handoff_id)
-    if edit_path is None or not edit_path.exists():
-        return None
-    return nodes._tensors_from_edit_file(edit_path)
 
 
 def _centered_offset(item_size: int, canvas_size: int) -> int:
@@ -1838,7 +1767,9 @@ class PhotoshopComposePSD:
         identity_hash = _compute_identity_hash(
             pil_images, group_name, layer_names, append_target, stack_key
         )
-        active = _find_matching_active_handoff(state.manager, str(unique_id), identity_hash)
+        active = nodes._find_consumable_handoff(
+            state.manager, str(unique_id), "bridge_node", identity_hash
+        )
         if active is not None:
             edit_hash = state.manager.latest_edit_hash(active.handoff_id)
             if edit_hash is not None:
@@ -2069,7 +2000,7 @@ class PhotoshopComposePSD:
             active = None
 
         if active is not None and active.edits:
-            consumed = _consume_active_edit(manager, active.handoff_id)
+            consumed = nodes._consume_active_edit(manager, active.handoff_id)
             if consumed is not None:
                 logger.info(
                     "cpsb compose_psd: node %s handoff %s: consuming latest edit",
@@ -2473,7 +2404,7 @@ class PhotoshopComposePSD:
             nodes._raise_interrupt()
 
         # A normal return above means WaitOutcome.EDITED -- an edit is on disk.
-        consumed = _consume_active_edit(manager, meta.handoff_id)
+        consumed = nodes._consume_active_edit(manager, meta.handoff_id)
         if consumed is not None:
             image_tensor, mask_tensor = consumed
             return image_tensor, mask_tensor, result_name

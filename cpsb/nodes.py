@@ -290,6 +290,47 @@ def _tensors_from_edit_file(edit_path: Path) -> Any:
         return _tensors_from_image(edit_image)
 
 
+def _find_consumable_handoff(
+    manager: HandoffManager, node_id: str, origin_kind: str, source_hash: str
+) -> HandoffMeta | None:
+    """The active *origin_kind* handoff for *node_id*, iff it has an edit to consume.
+
+    The one "is there an edit to serve instead of producing fresh output"
+    predicate, shared by :class:`~cpsb.load_psd.PhotoshopLoadPSD`
+    (``"load_psd"``, hash of the selected file's bytes) and
+    :class:`~cpsb.compose_psd.PhotoshopComposePSD` (``"bridge_node"``, its
+    identity hash) -- each from both ``IS_CHANGED`` and ``execute``.
+
+    Returns:
+        The matching handoff, or ``None`` when there is no active handoff for
+        this node, it is of another kind (defensive -- a stray match must
+        never be served), it was created from different inputs
+        (``source_hash`` differs), or it has no edits yet.
+    """
+    active = manager.find_active_for_node(node_id)
+    if (
+        active is not None
+        and active.origin_kind == origin_kind
+        and active.source_hash == source_hash
+        and active.edits
+    ):
+        return active
+    return None
+
+
+def _consume_active_edit(manager: HandoffManager, handoff_id: str) -> tuple[Any, Any] | None:
+    """``(IMAGE, MASK)`` tensors for *handoff_id*'s latest edit, if any.
+
+    Returns ``None`` if the edit file has vanished from disk (a filesystem
+    race -- cheap to guard, shouldn't happen in practice); each caller then
+    falls back to its own fresh output.
+    """
+    edit_path = manager.edit_image_path(handoff_id)
+    if edit_path is None or not edit_path.exists():
+        return None
+    return _tensors_from_edit_file(edit_path)
+
+
 def _raise_interrupt() -> None:
     """Raise ComfyUI's own cancellation exception.
 
@@ -762,8 +803,8 @@ class PhotoshopBridge:
         has an identical "an edit already arrived" case but a different
         (non-tensor) fallback when it hasn't.
         """
-        path = manager.edit_image_path(handoff_id)
-        if path is None or not path.exists():
+        consumed = _consume_active_edit(manager, handoff_id)
+        if consumed is None:
             width, height = _image_tensor_size(fallback_image)
             return fallback_image, _zeros_mask_tensor(width, height)
-        return _tensors_from_edit_file(path)
+        return consumed
