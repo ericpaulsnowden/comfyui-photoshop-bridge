@@ -270,46 +270,6 @@ def _resolve_layer_names(
     return names
 
 
-def _array_to_pil(array: Any) -> Image.Image:
-    """A single uint8 HWC (or HW) array as a PIL image, mode matched to channels.
-
-    The channel count -- not a hardcoded ``"RGB"`` -- decides the PIL mode, so a
-    4-channel (RGBA) frame is never reinterpreted as a 3-byte-per-pixel RGB
-    buffer (that byte-misalignment tiled/shifted every pixel past (0,0) into
-    noise -- the exact symptom layer-decomposition models like "Qwen Image
-    Layered Control", which emit RGBA, produced). ALPHA IS PRESERVED: a
-    4-channel frame becomes an ``"RGBA"`` PIL so the downstream PSD layer carries
-    real per-pixel transparency (:func:`_build_group_psd`).
-
-    Args:
-        array: A uint8 numpy array, either 2-D ``(H, W)`` (grayscale) or 3-D
-            ``(H, W, C)`` with ``C`` channels.
-
-    Returns:
-        * ``ndim == 2`` or ``C == 1`` -> grayscale ``"L"`` -> ``.convert("RGB")``.
-        * ``C == 2`` -> first channel as grayscale -> ``.convert("RGB")`` (a
-          rare layout; treat band 0 as luminance, drop the odd second band).
-        * ``C == 3`` -> ``"RGB"`` (the normal-VAE path, unchanged).
-        * ``C >= 4`` -> ``"RGBA"`` from the first four channels (extras dropped).
-    """
-    import numpy as np
-
-    if array.ndim == 2:
-        return Image.fromarray(array, mode="L").convert("RGB")
-
-    channels = array.shape[-1]
-    if channels == 1:
-        return Image.fromarray(array[..., 0], mode="L").convert("RGB")
-    if channels == 2:
-        return Image.fromarray(array[..., 0], mode="L").convert("RGB")
-    if channels == 3:
-        return Image.fromarray(array, mode="RGB")
-    # 4+ channels: keep RGBA (a mismatched mode is what corrupted the buffer).
-    # ascontiguousarray because slicing off any extra channels yields a
-    # non-contiguous view Image.fromarray cannot read directly.
-    return Image.fromarray(np.ascontiguousarray(array[..., :4]), mode="RGBA")
-
-
 def _tensor_frames_to_pils(image: Any) -> list[Image.Image]:
     """Every frame of a ComfyUI ``IMAGE`` tensor (NHWC float32 [0,1]) as PIL images.
 
@@ -319,7 +279,7 @@ def _tensor_frames_to_pils(image: Any) -> list[Image.Image]:
     becomes its own PSD layer (PROTOCOL.md §6c: multi-image batches -> layers).
 
     Each frame's PIL mode is matched to its channel count by
-    :func:`_array_to_pil` rather than forced to ``"RGB"`` -- so a 4-channel
+    :func:`cpsb.nodes._array_to_pil` rather than forced to ``"RGB"`` -- so a 4-channel
     (RGBA) frame from a layer-decomposition model is expanded correctly (and
     keeps its alpha) instead of being garbled by an RGB reinterpretation of a
     4-byte-per-pixel buffer.
@@ -332,7 +292,7 @@ def _tensor_frames_to_pils(image: Any) -> list[Image.Image]:
         # Round-to-nearest (not truncate) so a channel's float value maps to the
         # nearest 8-bit level; solid colors are unaffected (255.0/0.0 are exact).
         array = np.clip(array * 255.0, 0, 255).round().astype(np.uint8)
-        frames.append(_array_to_pil(array))
+        frames.append(nodes._array_to_pil(array))
     return frames
 
 

@@ -841,6 +841,11 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   86400 — applies only to "Wait for first save"). Hidden: `unique_id` (UNIQUE_ID),
   `prompt` (PROMPT), `extra_pnginfo` (EXTRA_PNGINFO). (This replaces the earlier
   `wait_for_edit` BOOLEAN — pre-release breaking change, no migration shim.)
+- Channels: the `image` is read as 3-channel RGB (`nodes._tensor_to_pil`). A 4-channel
+  (RGBA) IMAGE is decoded by its real channel count and its **alpha dropped**; a
+  1-channel one becomes grey RGB. The same holds for the Annotate, Action and Live nodes,
+  which share that helper. (Before v0.5.90 a 4-channel IMAGE was reinterpreted as a
+  3-byte-per-pixel buffer and came out as shifted noise.) Only Compose (§6c) keeps alpha.
 - Mode semantics:
   - "Wait for first save": block in execute() until the first save arrives, deliver it
     downstream in the same run, done. Later saves into the still-open document are

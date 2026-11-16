@@ -158,14 +158,63 @@ def _state_if_configured() -> _NodeState | None:
     return _state
 
 
+def _array_to_pil(array: Any) -> Image.Image:
+    """A single uint8 HWC (or HW) array as a PIL image, mode matched to channels.
+
+    The channel count -- not a hardcoded ``"RGB"`` -- decides the PIL mode, so a
+    4-channel (RGBA) frame is never reinterpreted as a 3-byte-per-pixel RGB
+    buffer (that byte-misalignment tiled/shifted every pixel past (0,0) into
+    noise -- the exact symptom layer-decomposition models like "Qwen Image
+    Layered Control", which emit RGBA, produced). ALPHA IS PRESERVED: a
+    4-channel frame becomes an ``"RGBA"`` PIL so the downstream PSD layer carries
+    real per-pixel transparency (:func:`cpsb.compose_psd._build_group_psd`).
+
+    Args:
+        array: A uint8 numpy array, either 2-D ``(H, W)`` (grayscale) or 3-D
+            ``(H, W, C)`` with ``C`` channels.
+
+    Returns:
+        * ``ndim == 2`` or ``C == 1`` -> grayscale ``"L"`` -> ``.convert("RGB")``.
+        * ``C == 2`` -> first channel as grayscale -> ``.convert("RGB")`` (a
+          rare layout; treat band 0 as luminance, drop the odd second band).
+        * ``C == 3`` -> ``"RGB"`` (the normal-VAE path, unchanged).
+        * ``C >= 4`` -> ``"RGBA"`` from the first four channels (extras dropped).
+    """
+    import numpy as np
+
+    if array.ndim == 2:
+        return Image.fromarray(array, mode="L").convert("RGB")
+
+    channels = array.shape[-1]
+    if channels == 1:
+        return Image.fromarray(array[..., 0], mode="L").convert("RGB")
+    if channels == 2:
+        return Image.fromarray(array[..., 0], mode="L").convert("RGB")
+    if channels == 3:
+        return Image.fromarray(array, mode="RGB")
+    # 4+ channels: keep RGBA (a mismatched mode is what corrupted the buffer).
+    # ascontiguousarray because slicing off any extra channels yields a
+    # non-contiguous view Image.fromarray cannot read directly.
+    return Image.fromarray(np.ascontiguousarray(array[..., :4]), mode="RGBA")
+
+
 def _tensor_to_pil(image: Any) -> Image.Image:
-    """First frame of a ComfyUI ``IMAGE`` tensor (float32, [0, 1], NHWC) as a PIL image."""
+    """First frame of a ComfyUI ``IMAGE`` tensor (float32, [0, 1], NHWC) as an ``"RGB"`` PIL image.
+
+    Always ``"RGB"``: every caller (the bridge, Annotate, Action and Live
+    nodes) hashes, thumbnails, JPEG-encodes or PSD-writes the result as a
+    3-channel image. A 4-channel (RGBA) tensor is decoded by its real channel
+    count (:func:`_array_to_pil`) and its alpha dropped -- forcing ``"RGB"``
+    onto the 4-byte-per-pixel buffer instead shifted every pixel after the
+    first into noise, and Pillow 13 removes that reinterpretation altogether.
+    """
     import numpy as np
 
     frame = image[0]
     array = frame.cpu().numpy() if hasattr(frame, "cpu") else np.asarray(frame)
     array = np.clip(array * 255.0, 0, 255).astype(np.uint8)
-    return Image.fromarray(array, mode="RGB")
+    pil_image = _array_to_pil(array)
+    return pil_image if pil_image.mode == "RGB" else pil_image.convert("RGB")
 
 
 def _pil_to_tensor(image: Image.Image) -> Any:

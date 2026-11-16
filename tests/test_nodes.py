@@ -205,6 +205,30 @@ class TestTensorConversion:
         assert image.size == (24, 16)
         assert image.getpixel((0, 0)) == (255, 0, 0)
 
+    def test_four_channel_tensor_keeps_its_colours_and_drops_alpha(self):
+        """An RGBA IMAGE (layer-decomposition models emit these) used to be
+        read as a 3-byte-per-pixel buffer: pixel (0, 0) came out right and
+        every later pixel was shifted into noise. Check a pixel past the first.
+        """
+        tensor = np.zeros((1, 16, 24, 4), dtype=np.float32)
+        tensor[0, :, :, 0], tensor[0, :, :, 1], tensor[0, :, :, 2] = 200 / 255, 100 / 255, 50 / 255
+        tensor[0, :, :, 3] = 0.5
+        image = nodes_module._tensor_to_pil(tensor)
+        assert image.mode == "RGB"
+        assert image.size == (24, 16)
+        assert {image.getpixel(xy) for xy in [(0, 0), (1, 0), (23, 15)]} == {(200, 100, 50)}
+
+    def test_single_channel_tensor_becomes_grey_rgb(self):
+        tensor = np.full((1, 16, 24, 1), 128 / 255, dtype=np.float32)
+        image = nodes_module._tensor_to_pil(tensor)
+        assert image.mode == "RGB"
+        assert image.getpixel((5, 5)) == (128, 128, 128)
+
+    def test_three_channel_values_truncate_as_before(self):
+        """Unchanged for ordinary images: truncation, not rounding."""
+        tensor = np.full((1, 2, 2, 3), 0.999, dtype=np.float32)  # 254.745 -> 254
+        assert nodes_module._tensor_to_pil(tensor).getpixel((1, 1)) == (254, 254, 254)
+
 
 def make_tensor(color: tuple[int, int, int]) -> np.ndarray:
     """A 1x16x24 ComfyUI-layout float tensor of a solid color."""
