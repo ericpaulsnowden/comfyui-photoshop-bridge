@@ -90,7 +90,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
-from .psd_io import normalize_to_rgb8
+from .psd_io import PSD_EXTENSIONS, normalize_to_rgb8
 
 logger = logging.getLogger("cpsb")
 
@@ -162,6 +162,18 @@ def available_extensions() -> tuple[str, ...]:
     ``VALIDATE_INPUTS`` and ``GET /cpsb/status`` then always agree.
     """
     return TIFF_EXTENSIONS + pillow_native_extensions()
+
+
+def load_psd_extensions() -> tuple[str, ...]:
+    """Every extension the Load PSD node accepts in this process.
+
+    :data:`cpsb.psd_io.PSD_EXTENSIONS` (read with the full handoff/round-trip
+    machinery) plus :func:`available_extensions` (flat rasters). The node's
+    combo, its ``VALIDATE_INPUTS``, the preview route and ``GET /cpsb/status``
+    all read this one function, so none of them can list a file type another
+    would refuse.
+    """
+    return PSD_EXTENSIONS + available_extensions()
 
 
 def decode_to_rgb8(path: Path) -> Image.Image:

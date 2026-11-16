@@ -971,6 +971,10 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `pasteback.js`'s constants). `tests/test_load_psd.py`'s drift guard asserts all four
   agree, reading the JS as text — rewording one in isolation would otherwise silently stop
   a policy being honored, with no type error anywhere.
+- **One definition of each extension list:** `psd_io.PSD_EXTENSIONS` (`.psd`/`.psb`) is
+  imported by Load PSD, `/cpsb/open`, Compose's append target and the watcher;
+  `raster_io.load_psd_extensions()` (PSD-native + the flat formats below) feeds the combo,
+  `VALIDATE_INPUTS`, `/cpsb/psd_preview` and `/cpsb/status`.
 - **Non-PSD formats** (`cpsb/raster_io.py`): the node's file combo and `VALIDATE_INPUTS`
   also accept `.tif`/`.tiff` (Pillow, no dependency). `execute()` dispatches `.psd`/`.psb`
   to `read_edited_psd` and TIFF to `raster_io.decode_to_rgb8` (returns one PIL image, alpha
@@ -988,7 +992,7 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   Illustrator `.ai` and camera raw/`.dng` are NOT decoded in-process (v0.5.40 removed the
   optional `pypdfium2`/`rawpy` path — the pack bundles no third-party decoders); Photoshop
   opens them natively, so they belong to a dedicated Tier-2 "Open via Photoshop" node — see
-  `docs/roadmap/ps-external-decode.md`. NB: the `/cpsb/open` `_PSD_NATIVE_EXTENSIONS` gate
+  `docs/roadmap/ps-external-decode.md`. NB: the `/cpsb/open` `psd_io.PSD_EXTENSIONS` gate
   is unchanged, so "Open in Photoshop" for a loaded `.tif` is still a follow-up.
 - Frontend: the node type is allowlisted in `captureImageUploadType`'s detection (its
   hand-rolled widget bypasses the stock `image_upload` spec flag), and its context-menu

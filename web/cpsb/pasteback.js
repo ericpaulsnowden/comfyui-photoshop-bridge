@@ -291,7 +291,7 @@ const BRIDGE_MODE_RERUN = 'Re-run on every save'
  * file already reads everything else from) — the same hand-sync convention
  * this project already uses for small, stable string sets shared across
  * Python/JS (e.g. `cpsb.load_psd.PSD_EXTENSIONS`/
- * `cpsb.routes._PSD_NATIVE_EXTENSIONS`). `payload.trigger_policy` isn't
+ * `cpsb.psd_io.PSD_EXTENSIONS`). `payload.trigger_policy` isn't
  * (yet) declared on `CpsbUpdatedEvent` in `api.js` — out of this change's
  * file scope — but the backend always sends a real, non-empty string here
  * (`HandoffManager._emit_updated`), so reading it directly off the payload

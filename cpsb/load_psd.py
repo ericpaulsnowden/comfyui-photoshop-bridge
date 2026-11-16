@@ -37,7 +37,7 @@ upload widget, which is hardcoded to ``png``/``jpeg``/``webp`` and cannot
 accept a ``.psd``/``.psb`` file at all (PROTOCOL.md §6b: the frontend instead
 adds its own hand-rolled upload widget, out of this package's scope).
 
-Non-PSD formats (:func:`_accepted_extensions`, :mod:`cpsb.raster_io`) are
+Non-PSD formats (:func:`cpsb.raster_io.load_psd_extensions`, :mod:`cpsb.raster_io`) are
 flat rasters with no layers/handoff-round-trip concept -- decoding one is a
 single :func:`cpsb.raster_io.decode_to_rgb8` call rather than
 :func:`cpsb.psd_io.read_edited_psd`'s composite/recomposite machinery (see
@@ -51,7 +51,7 @@ decoders (``pypdfium2``/``rawpy``) into this pack -- see
 ``edit_original`` option is NOT extended to these formats here: whether
 "edit the original file in place" is even meaningful is a frontend
 (``web/cpsb``) and ``/cpsb/open`` (``cpsb.routes``) decision, both out of
-this change's scope (routes.py's ``_PSD_NATIVE_EXTENSIONS`` gate still only
+this change's scope (routes.py's :data:`cpsb.psd_io.PSD_EXTENSIONS` gate still only
 recognizes ``.psd``/``.psb`` for the handoff-creation/round-trip path today,
 so opening one of these new formats "in Photoshop" isn't wired up yet
 regardless of what this node's own combo now lists) -- see
@@ -90,41 +90,9 @@ from . import layers as layers_io
 from . import nodes, raster_io, routes
 from .context import CpsbContext
 from .handoff import HandoffManager, HandoffMeta
-from .psd_io import read_edited_psd
+from .psd_io import PSD_EXTENSIONS, read_edited_psd
 
 logger = logging.getLogger("cpsb")
-
-#: PSD-native extensions this node's combo lists and ``VALIDATE_INPUTS``
-#: accepts, case-insensitive (PROTOCOL.md §6b). Kept in sync with
-#: ``cpsb.routes._PSD_NATIVE_EXTENSIONS`` (the `/cpsb/open` side of the same
-#: constraint) by hand -- both are short, stable, two-entry tuples unlikely
-#: to drift, and importing one module's "private" constant into the other
-#: would couple them for no real benefit. Deliberately NOT broadened to the
-#: other formats this node now also accepts (below): this specific tuple's
-#: whole reason for existing is staying byte-identical to routes.py's own
-#: "can this be handed off/edited in Photoshop as a raw-bytes-preserving
-#: .psd" set -- see :func:`_accepted_extensions` for the combo's actual,
-#: broader accept-list, and :data:`cpsb.raster_io.EDIT_IN_PLACE_CAPABLE_EXTENSIONS`
-#: for which of the broader set could plausibly join this one later.
-PSD_EXTENSIONS: tuple[str, ...] = (".psd", ".psb")
-
-
-def _accepted_extensions() -> tuple[str, ...]:
-    """Every extension this node currently accepts, case-insensitive.
-
-    :data:`PSD_EXTENSIONS` (handled via :func:`cpsb.psd_io.read_edited_psd`,
-    with the full handoff/round-trip machinery) plus whatever
-    :func:`cpsb.raster_io.available_extensions` can decode (TIFF, plus AVIF
-    and any other format the installed Pillow decodes natively -- no optional
-    library; ``.ai``/raw moved to the Tier-2 "Open via Photoshop"
-    node) -- so the combo never lists, and
-    ``VALIDATE_INPUTS`` never accepts, a file type that would error on
-    selection (PROTOCOL.md-adjacent product requirement, 2026-07-19: "I
-    asked for file support beyond psd"). Shared by :func:`_list_psd_files`
-    and :meth:`PhotoshopLoadPSD.VALIDATE_INPUTS` so the two can't drift.
-    """
-    return PSD_EXTENSIONS + raster_io.available_extensions()
-
 
 class OnSaveMode:
     """String constants for the ``on_save`` COMBO input (product-owner
@@ -152,10 +120,7 @@ class OnSaveMode:
 
     These three exact strings are also ``cpsb.handoff.TriggerPolicy``'s three
     literal values -- kept in sync BY HAND, not imported (see
-    ``cpsb.handoff.TriggerPolicy``'s own docstring for why: the same
-    ``PSD_EXTENSIONS``/``_PSD_NATIVE_EXTENSIONS`` hand-sync convention this
-    module already uses, here also avoiding a circular import since this
-    module already imports from ``cpsb.handoff``).
+    ``cpsb.handoff.TriggerPolicy``'s own docstring for why).
     """
 
     #: Default -- today's exact pre-existing behavior for every already-
@@ -175,7 +140,7 @@ def _list_psd_files(input_dir: Path) -> list[str]:
 
     Despite the name (kept for minimal diff against this function's
     long-standing PSD-only history -- every call site/test already spells it
-    this way), this now lists every extension :func:`_accepted_extensions`
+    this way), this now lists every extension :func:`cpsb.raster_io.load_psd_extensions`
     covers: PSD-native (``.psd``/``.psb``) plus TIFF (2026-07-19 product ask:
     "I asked for file support beyond psd... especially dng, tiff and ai" --
     TIFF here; ``.ai``/raw via the Tier-2 node). Non-recursive, matching
@@ -188,12 +153,12 @@ def _list_psd_files(input_dir: Path) -> list[str]:
 
     Returns:
         Sorted filenames (not full paths) whose extension, lower-cased, is
-        one :func:`_accepted_extensions` currently covers. Empty if
+        one :func:`cpsb.raster_io.load_psd_extensions` currently covers. Empty if
         *input_dir* doesn't exist yet.
     """
     if not input_dir.is_dir():
         return []
-    accepted = _accepted_extensions()
+    accepted = raster_io.load_psd_extensions()
     return sorted(
         entry.name
         for entry in input_dir.iterdir()
@@ -326,7 +291,7 @@ class PhotoshopLoadPSD:
     ComfyUI's input dir (PROTOCOL.md §6b).
 
     The ``psd`` COMBO input lists every currently-accepted file in ComfyUI's
-    input directory (:func:`_list_psd_files`/:func:`_accepted_extensions`):
+    input directory (:func:`_list_psd_files`/:func:`cpsb.raster_io.load_psd_extensions`):
     ``.psd``/``.psb`` always, plus TIFF since 2026-07-19 (``.ai``/camera-raw
     are deliberately NOT decoded in-process -- they moved to the Tier-2
     "Open via Photoshop" route; see :mod:`cpsb.raster_io`); the frontend additionally
@@ -348,7 +313,7 @@ class PhotoshopLoadPSD:
     UNCHANGED by the 2026-07-19 format broadening above and still only works
     for a PSD-native selection: ``cpsb.routes``' handoff-creation route
     (``POST /cpsb/open``, out of this change's scope) still gates
-    ``origin_kind: "load_psd"`` on its own ``_PSD_NATIVE_EXTENSIONS``
+    ``origin_kind: "load_psd"`` on :data:`cpsb.psd_io.PSD_EXTENSIONS`
     (``.psd``/``.psb`` only), so selecting a newly-supported TIFF
     file and right-clicking "Open in Photoshop" is not yet wired up end to
     end -- this node's own :meth:`execute`/:meth:`IS_CHANGED` below are
@@ -550,7 +515,7 @@ class PhotoshopLoadPSD:
         """Friendly upfront check, mirroring ``LoadImage.VALIDATE_INPUTS``.
 
         Confirms the selected file still exists and has an accepted
-        extension (:func:`_accepted_extensions` -- PSD-native plus TIFF;
+        extension (:func:`cpsb.raster_io.load_psd_extensions` -- PSD-native plus TIFF;
         ``.ai``/camera-raw moved to the Tier-2 "Open via Photoshop" route)
         before the prompt is queued, rather than surfacing a raw
         ``FileNotFoundError``/decode error mid-run. A no-op (``True``) when
@@ -560,7 +525,7 @@ class PhotoshopLoadPSD:
         state = nodes._state_if_configured()
         if state is None:
             return True
-        if Path(psd).suffix.lower() not in _accepted_extensions():
+        if Path(psd).suffix.lower() not in raster_io.load_psd_extensions():
             return f"Unsupported file type: {psd!r}"
         resolved = _resolve_psd_path(state.context, psd)
         if resolved is None or not resolved.is_file():

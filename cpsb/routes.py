@@ -50,8 +50,8 @@ from .handoff import (
 )
 from .launcher import launch_photoshop, tier1_status
 from .locality import is_request_local
-from .psd_io import read_edited_psd, write_psd
-from .raster_io import available_extensions, decode_to_rgb8
+from .psd_io import PSD_EXTENSIONS, read_edited_psd, write_psd
+from .raster_io import available_extensions, decode_to_rgb8, load_psd_extensions
 from .version import __version__
 
 if TYPE_CHECKING:
@@ -180,18 +180,13 @@ _VALID_UPLOAD_KINDS = ("png", "psd")
 #: Valid `trigger_policy` values for the optional `POST /cpsb/open` field
 #: (product-owner requirement 2026-07-18, PROTOCOL.md §6b `on_save`). Kept
 #: in sync BY HAND with `cpsb.load_psd.OnSaveMode`'s three widget-combo
-#: strings and `cpsb.handoff.TriggerPolicy`'s three literal values -- the
-#: same hand-sync convention this module already uses for
-#: `_PSD_NATIVE_EXTENSIONS`/`cpsb.load_psd.PSD_EXTENSIONS`.
+#: strings and `cpsb.handoff.TriggerPolicy`'s three literal values.
 _VALID_TRIGGER_POLICIES: tuple[TriggerPolicy, ...] = (
     "Re-run workflow",
     "Update only (don't re-run)",
     "Ignore (do nothing)",
 )
 
-#: Extensions accepted for a psd-native (`origin_kind: "load_psd"`) source
-#: (PROTOCOL.md §2/§6b), case-insensitive.
-_PSD_NATIVE_EXTENSIONS = (".psd", ".psb")
 
 #: Fallback size for the psd-native placeholder thumbnail (PROTOCOL.md §2:
 #: "if flatten fails, a neutral placeholder thumb -- never fail the open for
@@ -797,7 +792,7 @@ async def _resolve_psd_native_source(
     )
     if source_path is None or not source_path.is_file():
         return None, _error(404, f"Source PSD not found: {fields['filename']}")
-    if source_path.suffix.lower() not in _PSD_NATIVE_EXTENSIONS:
+    if source_path.suffix.lower() not in PSD_EXTENSIONS:
         return None, _error(400, f"Not a .psd/.psb file: {fields['filename']}")
 
     raw_bytes, thumbnail_image = await asyncio.to_thread(_open_psd_native_source, source_path)
@@ -1476,7 +1471,7 @@ async def psd_preview_route(request: web.Request) -> web.Response:
     source_path = _resolve_source_path(context, filename, subfolder, source_type)
     if source_path is None or not source_path.is_file():
         return _error(404, f"PSD not found: {filename}")
-    if source_path.suffix.lower() not in _load_psd_extensions():
+    if source_path.suffix.lower() not in load_psd_extensions():
         return _error(400, f"Cannot preview (not a format Load PSD accepts): {filename}")
 
     # 2026-08-26 event-loop-blocking audit: hashing + a cache-miss flatten
@@ -1698,14 +1693,14 @@ def _parse_fs_list_extensions(raw: str) -> tuple[str, ...]:
     case-insensitive extension filter for ``GET /cpsb/fs/list``.
 
     Entries may be given with or without a leading dot. An empty/blank value
-    means "the pack's default allowlist" (:data:`_PSD_NATIVE_EXTENSIONS` --
+    means "the pack's default allowlist" (:data:`cpsb.psd_io.PSD_EXTENSIONS` --
     this is a PSD-target picker, not a general file browser) -- mirrors
     cprb's/epsnodes' identical ``_parse_extensions`` helper (same contract,
     independently implemented per pack per STANDARD-fs-browse.md).
     """
     parts = [part.strip().lower() for part in (raw or "").split(",")]
     cleaned = tuple(f".{p.lstrip('.')}" for p in parts if p.strip(". "))
-    return cleaned or _PSD_NATIVE_EXTENSIONS
+    return cleaned or PSD_EXTENSIONS
 
 
 def _fs_list_scan(
@@ -1819,7 +1814,7 @@ async def fs_list_route(request: web.Request) -> web.Response:
             protocol" status).
         ext: Optional, comma-separated, case-insensitive
             (:func:`_parse_fs_list_extensions`) -- defaults to
-            :data:`_PSD_NATIVE_EXTENSIONS` (``.psd``/``.psb``).
+            :data:`cpsb.psd_io.PSD_EXTENSIONS` (``.psd``/``.psb``).
 
     Returns:
         200 with ``{"dir", "parent", "sep", "dirs", "files", "truncated"}``
@@ -1954,19 +1949,6 @@ async def discard_route(request: web.Request) -> web.Response:
 # -- GET /cpsb/status ----------------------------------------------------------
 
 
-def _load_psd_extensions() -> tuple[str, ...]:
-    """Every extension the Load PSD node accepts in this process.
-
-    Mirrors ``cpsb.load_psd._accepted_extensions`` (which imports this module,
-    so it can't be imported back): PSD-native plus whatever
-    :func:`cpsb.raster_io.available_extensions` decodes -- TIFF always, AVIF
-    and friends only while the installed Pillow decodes them natively.
-    Reported in ``GET /cpsb/status`` so the frontend's upload filter follows
-    the server's real Pillow instead of a hardcoded list.
-    """
-    return _PSD_NATIVE_EXTENSIONS + available_extensions()
-
-
 @routes.get("/cpsb/status")
 async def status_route(request: web.Request) -> web.Response:
     manager = _manager(request)
@@ -1980,7 +1962,7 @@ async def status_route(request: web.Request) -> web.Response:
             "tier1_reason": tier1.reason,
             "tier2_connected": is_tier2_connected,
             "ps_version": plugin.ps_version if is_tier2_connected and plugin else None,
-            "load_psd_extensions": list(_load_psd_extensions()),
+            "load_psd_extensions": list(load_psd_extensions()),
             "handoffs": [m.to_dict() for m in manager.list_all(limit=200)],
         }
     )

@@ -342,8 +342,7 @@ class TestListPsdFiles:
 
 class TestBroadenedFormatsListing:
     """The combo/``VALIDATE_INPUTS`` accept-list is PSD-native plus TIFF
-    (:func:`load_psd_module._accepted_extensions` /
-    :func:`cpsb.raster_io.available_extensions`). ``.ai``/raw are NOT here --
+    (:func:`cpsb.raster_io.load_psd_extensions`). ``.ai``/raw are NOT here --
     they moved to the Tier-2 "Open via Photoshop" node, so Load PSD needs no
     optional decoder and this listing is deterministic with no monkeypatching.
     """

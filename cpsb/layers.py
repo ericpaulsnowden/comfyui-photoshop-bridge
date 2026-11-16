@@ -398,7 +398,7 @@ def document_from_psd(psd: PSDImage, *, flatten_groups: bool, source: str) -> di
 def document_from_flat_image(image: Image.Image, name: str) -> dict[str, Any]:
     """A single-layer LAYERS document for a flat raster (the TIFF path).
 
-    Load PSD accepts flat formats too (:func:`cpsb.load_psd._accepted_extensions`);
+    Load PSD accepts flat formats too (:func:`cpsb.raster_io.load_psd_extensions`);
     their ``layers`` output is the honest one-layer stack: full image at
     ``(0, 0)``, opaque, normal, visible -- so the output is ALWAYS a valid
     document regardless of the selected file's format.

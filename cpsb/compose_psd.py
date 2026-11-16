@@ -65,6 +65,7 @@ from . import layers as layers_io
 from . import nodes
 from .context import CpsbContext
 from .handoff import HandoffManager, HandoffMeta, SourceRef, WaitOutcome, compute_source_hash
+from .psd_io import PSD_EXTENSIONS
 
 logger = logging.getLogger("cpsb")
 
@@ -104,16 +105,6 @@ MODE_DONT_OPEN = "Don't open (composite only)"
 #: overlap between layers is purely a function of stacking order and each
 #: image's own bounding box, not blending).
 _LAYER_OPACITY = 255
-
-#: Extensions ``existing_psd_path`` accepts for the "append to existing
-#: document" feature (:func:`_resolve_append_target`). Identical to
-#: :data:`cpsb.load_psd.PSD_EXTENSIONS`, deliberately duplicated by hand
-#: rather than imported -- ``cpsb/load_psd.py`` is owned by another change
-#: in flight, and this is the same short, stable, two-entry-tuple
-#: hand-mirroring convention that module's own docstring already
-#: establishes for ``cpsb.routes._PSD_NATIVE_EXTENSIONS``.
-_PSD_EXTENSIONS: tuple[str, ...] = (".psd", ".psb")
-
 
 def _collect_connected_images(kwargs: dict[str, Any]) -> list[tuple[int, Any]]:
     """The connected ``image_N`` tensors from *kwargs*, paired with their slot
@@ -1108,7 +1099,7 @@ def _resolve_append_target(existing_psd_path: str) -> Path:
         ValueError: *existing_psd_path* is not a ``.psd``/``.psb`` path.
     """
     candidate = Path(existing_psd_path)
-    if candidate.suffix.lower() not in _PSD_EXTENSIONS:
+    if candidate.suffix.lower() not in PSD_EXTENSIONS:
         raise ValueError(
             f"existing_psd_path must be a .psd/.psb file, got: {existing_psd_path!r}"
         )

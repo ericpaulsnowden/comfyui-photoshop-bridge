@@ -48,7 +48,7 @@ from watchdog.observers import Observer
 
 from .context import CpsbContext
 from .handoff import ACTIVE_STATUSES, HandoffManager
-from .psd_io import PsdFidelity, read_edited_psd
+from .psd_io import PSD_EXTENSIONS, PsdFidelity, read_edited_psd
 
 if TYPE_CHECKING:
     from watchdog.observers.api import ObservedWatch
@@ -305,7 +305,7 @@ class CpsbWatcher:
         parent watch (PROTOCOL.md §6b), is exactly this common, high-volume,
         never-relevant case -- a managed copy and an ``edit_in_place``
         original are BOTH always ``.psd``/``.psb`` by construction
-        (:data:`cpsb.routes._PSD_NATIVE_EXTENSIONS`), so nothing real is ever
+        (:data:`cpsb.psd_io.PSD_EXTENSIONS`), so nothing real is ever
         filtered out here. This is not just an optimization: without it,
         EVERY raw event (however irrelevant) pays a
         :meth:`HandoffManager.get` lock-acquire-and-deepcopy, and under
@@ -314,7 +314,7 @@ class CpsbWatcher:
         to look like a hang in this module's own test suite.
         """
         path = Path(path_str)
-        if path.suffix.lower() not in (".psd", ".psb"):
+        if path.suffix.lower() not in PSD_EXTENSIONS:
             return
         handoff_id = path.parent.name
         meta = self._manager.get(handoff_id)

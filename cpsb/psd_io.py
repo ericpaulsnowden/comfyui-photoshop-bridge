@@ -57,6 +57,13 @@ logger = logging.getLogger("cpsb")
 #: `cpsb.routes`' upload handler for Tier 2 and never touches this module.)
 PsdFidelity = Literal["composite", "recomposite"]
 
+#: The PSD-native extensions, case-insensitive (PROTOCOL.md §2/§6b): what the
+#: Load PSD combo round-trips, what ``/cpsb/open`` accepts for
+#: ``origin_kind: "load_psd"``, what Compose appends to, and what the watcher
+#: looks at. The pack's one definition -- import it, don't re-spell it.
+PSD_EXTENSIONS: tuple[str, ...] = (".psd", ".psb")
+
+
 
 def write_psd(path: Path, image: Image.Image, compression: Compression = Compression.RLE) -> None:
     """Write *image* as a flat PSD at *path* for Photoshop to open and re-save.

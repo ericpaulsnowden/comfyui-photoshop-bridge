@@ -48,12 +48,8 @@ Fidelity = Literal["composite", "recomposite", "plugin"]
 #:
 #: These three exact strings are also `cpsb.load_psd.OnSaveMode`'s widget
 #: COMBO values (the `on_save` input on `PhotoshopLoadPSD`) -- kept in sync
-#: BY HAND rather than imported, the same hand-sync convention this project
-#: already uses for `PSD_EXTENSIONS`/`_PSD_NATIVE_EXTENSIONS` between
-#: `cpsb.load_psd` and `cpsb.routes` ("both are short, stable, ... entries
-#: unlikely to drift, and importing one module's constant into the other
-#: would couple them for no real benefit") -- here it also sidesteps a
-#: circular import, since `cpsb.load_psd` already imports from this module.
+#: BY HAND rather than imported: three short, stable strings, and
+#: `cpsb.load_psd` already imports from this module.
 TriggerPolicy = Literal["Re-run workflow", "Update only (don't re-run)", "Ignore (do nothing)"]
 
 #: Default `trigger_policy` for every handoff that doesn't explicitly request
