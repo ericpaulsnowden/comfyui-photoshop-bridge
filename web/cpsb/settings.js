@@ -2,8 +2,8 @@
  * @file Registers the frontend-only `cpsb.*` ComfyUI settings (PROTOCOL.md
  * §8) and provides read/write helpers: two boolean toggles, plus a
  * read-only version-info row. Distinct from the backend-persisted settings
- * exposed via `GET/POST /cpsb/settings` (`api.getBackendSettings` /
- * `api.updateBackendSettings`), which are not edited from this frontend.
+ * exposed via `GET/POST /cpsb/settings`, which are not edited from this
+ * frontend (README "Troubleshooting": set them with curl or in cpsb.json).
  *
  * Registration shape verified against `Comfy-Org/ComfyUI_frontend`
  * `src/types/comfy.ts` (`ComfyExtension.settings: SettingParams[]`) and

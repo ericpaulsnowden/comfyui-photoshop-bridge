@@ -197,18 +197,6 @@ export function warn(...args) {
  */
 
 /**
- * @typedef {Object} CpsbBackendSettings
- * Exactly the PROTOCOL.md §2 `GET/POST /cpsb/settings` object — no
- * `mask_channel_name`: it left the contract with the §4 mask-extraction
- * removal.
- * @property {string} photoshop_path
- * @property {number} debounce_ms
- * @property {number} cleanup_days
- * @property {boolean} sibling_outputs
- * @property {string} managed_folder_name
- */
-
-/**
  * @typedef {Object} CpsbUpdatedEvent
  * Payload of the `cpsb.updated` websocket message (PROTOCOL.md §5).
  * @property {string} handoff_id
@@ -526,31 +514,6 @@ export async function browseDirectory(dir = '') {
 }
 
 /**
- * GET `/cpsb/settings` — backend-persisted settings (distinct from the
- * ComfyUI-settings-API `cpsb.*` frontend preferences in `settings.js`).
- * @returns {Promise<CpsbBackendSettings>}
- * @throws {CpsbApiError}
- */
-export async function getBackendSettings() {
-  return request('/cpsb/settings', { method: 'GET' })
-}
-
-/**
- * POST `/cpsb/settings` — merge partial updates into the backend-persisted
- * settings.
- * @param {Partial<CpsbBackendSettings>} partial
- * @returns {Promise<CpsbBackendSettings>}
- * @throws {CpsbApiError}
- */
-export async function updateBackendSettings(partial) {
-  return request('/cpsb/settings', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(partial)
-  })
-}
-
-/**
  * `managed_folder_name`'s documented default (PROTOCOL.md §1/§2) — used only
  * as a last-resort fallback in {@link editSubfolder} for a `meta.json`
  * recovered before the `managed_dir` field existed (`managed_dir: null`).
@@ -585,19 +548,6 @@ export function editSubfolder(meta) {
  */
 export function thumbUrl(handoffId) {
   return api.apiURL(`/cpsb/thumb/${encodeURIComponent(handoffId)}`)
-}
-
-/**
- * Builds the URL for GET `/cpsb/file/{handoffId}` (the handoff's raw managed
- * PSD file, whatever name the server derived for it).
- * Included for completeness with every route in PROTOCOL.md §2; this
- * frontend never fetches it itself — it exists solely for the UXP plugin's
- * remote-mode download.
- * @param {string} handoffId
- * @returns {string}
- */
-export function fileUrl(handoffId) {
-  return api.apiURL(`/cpsb/file/${encodeURIComponent(handoffId)}`)
 }
 
 /**

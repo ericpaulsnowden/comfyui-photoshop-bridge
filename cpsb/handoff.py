@@ -759,13 +759,6 @@ class HandoffManager:
             meta = self._handoffs.get(handoff_id)
             return HandoffMeta.from_dict(meta.to_dict()) if meta is not None else None
 
-    def require(self, handoff_id: str) -> HandoffMeta:
-        """Like :meth:`get`, but raises :class:`HandoffNotFoundError` instead of ``None``."""
-        meta = self.get(handoff_id)
-        if meta is None:
-            raise HandoffNotFoundError(handoff_id)
-        return meta
-
     def find_active_for_node(
         self, origin_node_id: str, workflow_name: str = ""
     ) -> HandoffMeta | None:
