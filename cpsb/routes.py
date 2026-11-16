@@ -2514,6 +2514,12 @@ async def _handle_upload_edit_chunk(
     behavior of still retrying on a 400) otherwise.
     """
     handoff_id = msg.get("handoff_id")
+
+    async def reply_error(error: str, reason: str | None) -> None:
+        await connection.ws.send_json(
+            {"type": "upload_error", "handoff_id": handoff_id, "error": error, "reason": reason}
+        )
+
     seq = msg.get("seq")
     total = msg.get("total")
     data_b64 = msg.get("data_b64")
@@ -2535,14 +2541,7 @@ async def _handle_upload_edit_chunk(
         )
         connection.pending_uploads.pop(handoff_id, None)
         _tombstone(connection.rejected_upload_ids, handoff_id)
-        await connection.ws.send_json(
-            {
-                "type": "upload_error",
-                "handoff_id": handoff_id,
-                "error": "Malformed upload_edit chunk",
-                "reason": "malformed",
-            }
-        )
+        await reply_error("Malformed upload_edit chunk", "malformed")
         return
 
     # The shared resource guard (PROTOCOL.md §3 "Transfer limits"): strict
@@ -2561,14 +2560,7 @@ async def _handle_upload_edit_chunk(
     )
     if guard_error is not None:
         logger.warning("cpsb plugin upload_edit for %s rejected: %s", handoff_id, guard_error)
-        await connection.ws.send_json(
-            {
-                "type": "upload_error",
-                "handoff_id": handoff_id,
-                "error": guard_error,
-                "reason": guard_reason,
-            }
-        )
+        await reply_error(guard_error, guard_reason)
         return
     if completed is None:
         return  # More chunks still to come.
@@ -2580,36 +2572,15 @@ async def _handle_upload_edit_chunk(
     try:
         raw_bytes = base64.b64decode("".join(pending.chunks), validate=True)
     except (ValueError, binascii.Error) as exc:
-        await connection.ws.send_json(
-            {
-                "type": "upload_error",
-                "handoff_id": handoff_id,
-                "error": f"Invalid base64: {exc}",
-                "reason": "malformed",
-            }
-        )
+        await reply_error(f"Invalid base64: {exc}", "malformed")
         return
 
     meta = manager.get(handoff_id)
     if meta is None:
-        await connection.ws.send_json(
-            {
-                "type": "upload_error",
-                "handoff_id": handoff_id,
-                "error": "Unknown handoff_id",
-                "reason": "unknown_handoff",
-            }
-        )
+        await reply_error("Unknown handoff_id", "unknown_handoff")
         return
     if meta.status not in ACTIVE_STATUSES:
-        await connection.ws.send_json(
-            {
-                "type": "upload_error",
-                "handoff_id": handoff_id,
-                "error": f"Handoff is {meta.status}, not accepting uploads",
-                "reason": "inactive",
-            }
-        )
+        await reply_error(f"Handoff is {meta.status}, not accepting uploads", "inactive")
         return
 
     if not manager.should_ingest(handoff_id):
@@ -2645,14 +2616,7 @@ async def _handle_upload_edit_chunk(
             _ingest_psd_upload, manager, meta, raw_bytes
         )
         if error_message is not None:
-            await connection.ws.send_json(
-                {
-                    "type": "upload_error",
-                    "handoff_id": handoff_id,
-                    "error": error_message,
-                    "reason": reason,
-                }
-            )
+            await reply_error(error_message, reason)
             return
     else:
         # Off-loop for the same reason as upload_route's call (2026-08-26
@@ -2671,14 +2635,7 @@ async def _handle_upload_edit_chunk(
             _ingest_png_upload, manager, meta, raw_bytes
         )
         if error_message is not None:
-            await connection.ws.send_json(
-                {
-                    "type": "upload_error",
-                    "handoff_id": handoff_id,
-                    "error": error_message,
-                    "reason": reason,
-                }
-            )
+            await reply_error(error_message, reason)
             return
 
     await _finish_upload_edit_ack(connection, manager, handoff_id, edit)
@@ -2775,6 +2732,12 @@ async def _handle_manual_push_chunk(
     the plugin does not need to track it further.
     """
     push_id = msg.get("push_id")
+
+    async def reply_error(error: str, reason: str | None) -> None:
+        await connection.ws.send_json(
+            {"type": "manual_push_error", "push_id": push_id, "error": error, "reason": reason}
+        )
+
     seq = msg.get("seq")
     total = msg.get("total")
     data_b64 = msg.get("data_b64")
@@ -2798,14 +2761,7 @@ async def _handle_manual_push_chunk(
         logger.warning("cpsb plugin sent a malformed manual_push chunk for %s, ignoring", push_id)
         connection.pending_pushes.pop(push_id, None)
         _tombstone(connection.rejected_push_ids, push_id)
-        await connection.ws.send_json(
-            {
-                "type": "manual_push_error",
-                "push_id": push_id,
-                "error": "Malformed manual_push chunk",
-                "reason": "malformed",
-            }
-        )
+        await reply_error("Malformed manual_push chunk", "malformed")
         return
 
     # The shared resource guard (PROTOCOL.md §3 "Transfer limits").
@@ -2821,14 +2777,7 @@ async def _handle_manual_push_chunk(
     )
     if guard_error is not None:
         logger.warning("cpsb plugin manual_push %s rejected: %s", push_id, guard_error)
-        await connection.ws.send_json(
-            {
-                "type": "manual_push_error",
-                "push_id": push_id,
-                "error": guard_error,
-                "reason": guard_reason,
-            }
-        )
+        await reply_error(guard_error, guard_reason)
         return
     if completed is None:
         return  # More chunks still to come.
@@ -2838,14 +2787,7 @@ async def _handle_manual_push_chunk(
     try:
         raw_bytes = base64.b64decode("".join(pending.chunks), validate=True)
     except (ValueError, binascii.Error) as exc:
-        await connection.ws.send_json(
-            {
-                "type": "manual_push_error",
-                "push_id": push_id,
-                "error": f"Invalid base64: {exc}",
-                "reason": "malformed",
-            }
-        )
+        await reply_error(f"Invalid base64: {exc}", "malformed")
         return
 
     # 2026-08-26 event-loop-blocking audit follow-up: create() (mkdir +
