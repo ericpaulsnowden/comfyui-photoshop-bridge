@@ -146,9 +146,8 @@ class TestContractShape:
         pasteback = (
             Path(__file__).resolve().parents[1] / "web" / "cpsb" / "pasteback.js"
         ).read_text(encoding="utf-8")
-        # Only the two the frontend actually gates on; RERUN is the fall-through.
-        assert update_only in pasteback
-        assert ignore in pasteback
+        # The frontend queues on exactly one value; anything else never queues.
+        assert f"LOAD_PSD_TRIGGER_RERUN = '{rerun}'" in pasteback
 
     def test_widget_order_is_append_only(self, configured):
         """Critical for backward compatibility: ComfyUI's frontend restores

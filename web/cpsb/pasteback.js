@@ -31,7 +31,6 @@
 
 import { app } from '../../../scripts/app.js'
 import * as api from './api.js'
-import * as settings from './settings.js'
 import * as state from './state.js'
 import * as ui from './ui.js'
 
@@ -283,76 +282,44 @@ export function addLoadImageNodeNear(originNode, ref) {
 const BRIDGE_MODE_RERUN = 'Re-run on every save'
 
 /**
- * Exact `on_save` COMBO / `trigger_policy` values for a Load PSD node's
- * per-handoff save-trigger policy (product-owner requirement 2026-07-18,
- * PROTOCOL.md §6b) — kept in sync BY HAND with `cpsb.load_psd.OnSaveMode`
- * (the widget's own three strings) and `cpsb.handoff.TriggerPolicy` (the
- * persisted enum echoed verbatim in the `cpsb.updated` event payload this
- * file already reads everything else from) — the same hand-sync convention
- * this project already uses for small, stable string sets shared across
- * Python/JS (e.g. `cpsb.load_psd.PSD_EXTENSIONS`/
- * `cpsb.psd_io.PSD_EXTENSIONS`). `payload.trigger_policy` isn't
- * (yet) declared on `CpsbUpdatedEvent` in `api.js` — out of this change's
- * file scope — but the backend always sends a real, non-empty string here
- * (`HandoffManager._emit_updated`), so reading it directly off the payload
- * is safe.
+ * The one `on_save` COMBO / `trigger_policy` value that lets a Load PSD
+ * save queue the workflow (PROTOCOL.md §6b). Kept in sync BY HAND with
+ * `cpsb.load_psd.OnSaveMode.RERUN` and `cpsb.handoff.TriggerPolicy`; a
+ * Python test reads this file as text and fails if the string drifts.
  */
-const LOAD_PSD_TRIGGER_UPDATE_ONLY = "Update only (don't re-run)"
-/** @see LOAD_PSD_TRIGGER_UPDATE_ONLY */
-const LOAD_PSD_TRIGGER_IGNORE = 'Ignore (do nothing)'
+const LOAD_PSD_TRIGGER_RERUN = 'Re-run workflow'
 
 /**
- * Queues the workflow when policy allows it for this origin (PROTOCOL.md §5).
+ * Queues the workflow after an edit arrives, but ONLY when the node that
+ * opened Photoshop has its own control saying so (PROTOCOL.md §5; owner
+ * rule 2026-11-24). There is no global switch.
+ *
+ * - `load_psd`: the node's `on_save` widget, as persisted on the handoff at
+ *   open time and echoed in `payload.trigger_policy`. Queues only for
+ *   "Re-run workflow". ("Ignore (do nothing)" never reaches here at all:
+ *   the server does not ingest the save.)
+ * - `bridge_node` (Edit in Photoshop, Annotate for Edit, Compose Layers to
+ *   PSD): the node's `mode` widget. Queues only for "Re-run on every save".
+ *   In a blocking mode the arriving edit is delivered downstream inside the
+ *   run finishing at this very moment, so queueing again would run the whole
+ *   workflow (and its SaveImage nodes) twice per save.
+ * - everything else never queues: `load_image` (a right-click "Open in
+ *   Photoshop" on a regular image node — the edit lands on the node's
+ *   widget and waits for the user to queue), `terminal_output`, and
+ *   `manual_send`. None of those nodes has a control to ask.
+ *
  * Uses the documented `app.queuePrompt` overload (`number, batchCount = 1`);
- * `0` means "append normally", matching the long-standing extension
- * convention.
- *
- * Policy: `load_image` and `load_psd` both queue when the global
- * `cpsb.autoQueue` setting is on (PROTOCOL.md §5) — identical treatment
- * despite `load_psd` never touching a widget (see {@link handleLoadPsd}):
- * either way, an arriving edit only actually reaches the graph's outputs on
- * the NEXT execution (a changed widget value for `load_image`, a changed
- * `IS_CHANGED`/`execute()` result for `load_psd`, PROTOCOL.md §6b), so the
- * same "queue automatically, or leave it for the user" choice applies
- * equally to both. `bridge_node` queues IFF the origin node's `mode` widget
- * is "Re-run on every save" — a per-node explicit choice that overrides the
- * global setting. In the bridge's other modes, never: a blocking bridge
- * delivers the arriving edit downstream inside the run finishing at this
- * very moment, so re-queueing would run the whole workflow (and its
- * SaveImage nodes) a second time per save — confirmed in the field as "one
- * click saved multiple files." Safe by construction: blocking mode never
- * auto-queues, re-run mode never blocks.
- *
- * `load_psd` ADDITIONALLY never queues when this handoff's own
- * `trigger_policy` is "Update only (don't re-run)" or "Ignore (do nothing)"
- * (product-owner requirement 2026-07-18) — a per-node choice that, like the
- * bridge's `mode`, can only ever turn auto-queue OFF, never force it on:
- * the global `cpsb.autoQueue` setting is still checked FIRST and remains the
- * master switch, so global-off still wins over a per-node "Re-run
- * workflow", and a per-node "Update only"/"Ignore" still wins over
- * global-on. In practice `trigger_policy === "Ignore (do nothing)"` never
- * actually reaches this function for a `load_psd` origin at all: the
- * backend's `HandoffManager.should_ingest` gate suppresses ingestion (and
- * therefore the `cpsb.updated` event that calls this) entirely for that
- * policy — checked here anyway as a second line of defense, and because
- * `bridge_node`'s own `mode` read below has no such server-side backstop.
+ * `0` means "append normally".
  * @param {import('./api.js').CpsbOriginKind} originKind
  * @param {import('../../../scripts/app.js').LGraphNode | null} node - The
  * origin node when it still exists (needed to read a bridge's mode widget;
  * a deleted bridge node simply never re-queues).
  * @param {string} [triggerPolicy] - `payload.trigger_policy` from the
- * triggering `cpsb.updated` event (PROTOCOL.md §6b) — only consulted for a
- * `load_psd` origin; ignored for every other `originKind`.
+ * triggering `cpsb.updated` event — only consulted for a `load_psd` origin.
  */
 function maybeAutoQueue(originKind, node, triggerPolicy) {
-  if (originKind === 'load_image' || originKind === 'load_psd') {
-    if (!settings.getAutoQueue()) return
-    if (
-      originKind === 'load_psd' &&
-      (triggerPolicy === LOAD_PSD_TRIGGER_UPDATE_ONLY || triggerPolicy === LOAD_PSD_TRIGGER_IGNORE)
-    ) {
-      return
-    }
+  if (originKind === 'load_psd') {
+    if (triggerPolicy !== LOAD_PSD_TRIGGER_RERUN) return
   } else if (originKind === 'bridge_node') {
     const mode = node?.widgets?.find((w) => w.name === 'mode')?.value
     if (mode !== BRIDGE_MODE_RERUN) return

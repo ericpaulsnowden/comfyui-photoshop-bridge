@@ -319,7 +319,7 @@ Backend-persisted settings (stored at `<user_dir>/cpsb.json`), JSON object:
 "managed_folder_name": "photoshop"}`.
 POST merges partial updates and returns the full object. `managed_folder_name` is
 sanitized to a single safe path segment (no separators, no `..`); an invalid value falls
-back to the default. (Frontend-only preferences — auto-queue toggle — use ComfyUI's
+back to the default. (Frontend-only preferences — the upgrade-banner toggle — use ComfyUI's
 settings API instead, id prefix `cpsb.`.)
 
 ### GET `/cpsb/ws`
@@ -820,13 +820,19 @@ rule, and the mounted gallery re-evaluates them when the active workflow changes
 
 Frontend paste-back behavior on `cpsb.updated` is specified in PLAN §3 (clipspace-style
 widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
-"[Add as node]" for `terminal_output`). Auto-queue policy:
-- `load_image` and `load_psd` origins: queue when the `cpsb.autoQueue` setting is on.
-  (For `load_psd`, paste-back never rewrites the node's file widget — the edit is
-  consumed by the node's own execute()/IS_CHANGED, §6b.)
+"[Add as node]" for `terminal_output`). Auto-queue policy (v0.5.98, owner rule
+2026-11-24): **an arriving edit queues the workflow only when the node that opened
+Photoshop has its own control saying so.** There is no global setting.
+- `load_image` origins (a right-click "Open in Photoshop" on `LoadImage` or any other
+  regular image-upload node): NEVER. The edit is pasted onto the node's widget and waits
+  there until the user queues the workflow. (Before v0.5.98 these queued whenever the
+  now-removed `cpsb.autoQueue` setting was on, its default.)
+- `load_psd` origins: queue IFF the handoff's `trigger_policy` — the node's `on_save`
+  widget, read at open time (§6b) — is `"Re-run workflow"`. (Paste-back never rewrites
+  the node's file widget — the edit is consumed by the node's own execute()/IS_CHANGED.)
+- `terminal_output` and `manual_send` origins: NEVER.
 - `bridge_node` origins: queue IFF the origin node's `mode` widget is
-  `"Re-run on every save"` (§6) — the node-level mode overrides the global setting
-  (an explicit per-node choice must not be silently disabled elsewhere). For the
+  `"Re-run on every save"` (§6). For the
   other two modes, NEVER: a blocking bridge node delivers the arriving edit
   downstream inside the run completing at that moment, so a re-queue would run the
   entire workflow (and its SaveImage nodes) again per save — the field-reported
@@ -968,9 +974,9 @@ widget update for `load_image`/`bridge_node`; cosmetic preview + toast with
   `deliverEdit` → `ingest_edit`. A suppressed upload returns a SUCCESS-shaped response
   (`{"ok": true, "ignored": true}` / `upload_ok`) and logs at INFO — the plugin did nothing
   wrong, and a user who forgot they set Ignore needs it diagnosable from the console.
-- `maybeAutoQueue` (frontend) additionally refuses to queue for `Update only`/`Ignore`.
-  Precedence: the global `cpsb.autoQueue` setting is checked FIRST, so per-node OFF wins
-  over global ON, and global OFF still wins over per-node `Re-run workflow`.
+- `maybeAutoQueue` (frontend) queues a `load_psd` edit only for `Re-run workflow`. The
+  node's widget is the only switch: the global `cpsb.autoQueue` setting that used to
+  be checked first was removed in v0.5.98.
 - The policy string is duplicated across four layers that cannot import one another
   (`load_psd.OnSaveMode`, `handoff.TriggerPolicy`, `routes._VALID_TRIGGER_POLICIES`,
   `pasteback.js`'s constants). `tests/test_load_psd.py`'s drift guard asserts all four
@@ -1630,8 +1636,9 @@ useless to someone sitting elsewhere but legitimate for VNC/dual-screen setups.
   empty-workflow-name wildcard is still offered (no pixel identity is knowable client-side).
 - Batch nodes (`node.imgs.length > 1`): open the **currently displayed** image
   (`node.imageIndex ?? 0`); an "Open all N in Photoshop" item appears for N ≤ 8.
-- Frontend settings (ComfyUI settings API, ids): `cpsb.autoQueue` (bool, default true),
-  `cpsb.showUpgradeBanner` (bool, default true).
+- Frontend settings (ComfyUI settings API, ids): `cpsb.showUpgradeBanner` (bool, default
+  true). (`cpsb.autoQueue` was removed in v0.5.98 — §5; a value still stored in a user's
+  ComfyUI settings is ignored.)
 - **Live loop** (`web/cpsb/live.js`, realtime drawing M2): each `cpsb.live` event — AND
   each `cpsb.liveprompt` (prompt changed) and `cpsb.livecreativity` (level changed) event —
   queues at most ONE coalesced `queuePrompt(0)` via a shared `requestQueue()` seam (a

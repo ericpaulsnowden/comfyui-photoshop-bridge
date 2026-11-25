@@ -200,6 +200,8 @@ Expect about a second from stroke to re-render on a strong GPU: live iteration, 
 4. Hit Cmd/Ctrl+S.
 5. The edit appears back on the originating node automatically.
 
+**Saving never runs the workflow by itself from a right-click.** The edit lands on the node and waits; queue the workflow when you're ready. A save re-runs the workflow automatically only when the node that opened Photoshop has its own control for that and you've set it: **Load PSD**'s `on_save` (*Re-run workflow*), or the `mode` of **Edit in Photoshop**, **Annotate for Edit** and **Compose Layers to PSD** (*Re-run on every save*). There is no global auto-run setting. (Up to v0.5.97 a right-click edit on a Load Image node re-ran the workflow whenever the *Re-queue the workflow when an edit returns* setting was on; that setting is gone.)
+
 **One-time setup worth doing:** set Photoshop's Maximize PSD Compatibility preference to **Always** (Preferences → File Handling → Maximize PSD Compatibility). Without it, Photoshop pops a compatibility dialog on every save of a layered file, since the hand-off file is a PSD — see [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Tier 2 — installing the Photoshop plugin

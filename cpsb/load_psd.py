@@ -102,15 +102,10 @@ class OnSaveMode:
     governs :class:`PhotoshopLoadPSD` specifically, the same "the class and
     its own mode constants live together" pattern.
 
-    Before this existed, the ONLY lever a user had was the single GLOBAL
-    ``cpsb.autoQueue`` frontend setting (web/cpsb/settings.js) -- on or off
-    for every ``load_image``/``load_psd`` node at once -- plus, for the
-    unrelated ``PhotoshopBridge`` node only, its own per-node ``mode``. A
-    Load PSD node had no per-node override at all, and neither lever was
-    ever enforced SERVER-SIDE: a plugin upload with no ComfyUI browser tab
-    open bypassed both entirely (the reported "turn off all layers but one,
-    push it back, close the PSD without saving" workflow always re-ran the
-    graph regardless). ``on_save`` fixes both gaps: it is per-node, and the
+    This widget is the ONLY switch for whether a Load PSD save re-runs the
+    workflow (the global ``cpsb.autoQueue`` frontend setting that used to
+    sit in front of it was removed in v0.5.98: a save auto-runs a workflow
+    only when the node that opened Photoshop has a control saying so). The
     choice is persisted on the handoff record (``HandoffMeta.trigger_policy``,
     ``cpsb.handoff``) and enforced by ``HandoffManager.should_ingest`` at
     every ingest call site (the HTTP upload route, the plugin websocket's

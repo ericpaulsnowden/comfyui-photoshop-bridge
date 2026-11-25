@@ -38,13 +38,11 @@ Fidelity = Literal["composite", "recomposite", "plugin"]
 
 #: A handoff's save-trigger policy (product-owner requirement 2026-07-18):
 #: whether an arriving edit re-queues the workflow, is merely recorded for
-#: the next manual queue, or is not even ingested at all. Governs the ONLY
-#: existing lever this project previously had for this -- the frontend-only
-#: `cpsb.autoQueue` global setting plus `PhotoshopBridge`'s own `mode` widget
-#: (neither of which a `PhotoshopLoadPSD` node, nor a plugin upload with no
-#: browser tab open, could ever be gated by) -- with a per-handoff choice
-#: that is enforced SERVER-SIDE (see `HandoffManager.should_ingest`), not
-#: just suggested to a frontend that might not even be listening.
+#: the next manual queue, or is not even ingested at all. A per-handoff
+#: choice (a `PhotoshopLoadPSD` node's `on_save` widget) enforced SERVER-SIDE
+#: (see `HandoffManager.should_ingest`), not just suggested to a frontend
+#: that might not even be listening -- a plugin upload can arrive with no
+#: browser tab open.
 #:
 #: These three exact strings are also `cpsb.load_psd.OnSaveMode`'s widget
 #: COMBO values (the `on_save` input on `PhotoshopLoadPSD`) -- kept in sync

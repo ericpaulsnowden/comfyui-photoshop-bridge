@@ -1,7 +1,9 @@
 /**
  * @file Registers the frontend-only `cpsb.*` ComfyUI settings (PROTOCOL.md
- * §8) and provides read/write helpers: two boolean toggles, plus a
- * read-only version-info row. Distinct from the backend-persisted settings
+ * §8) and provides read/write helpers: one boolean toggle, plus a
+ * read-only version-info row. (There is no auto-queue setting: whether a
+ * save re-runs the workflow is decided by the node that opened Photoshop —
+ * pasteback.js `maybeAutoQueue`.) Distinct from the backend-persisted settings
  * exposed via `GET/POST /cpsb/settings`, which are not edited from this
  * frontend (README "Troubleshooting": set them with curl or in cpsb.json).
  *
@@ -43,7 +45,7 @@ import { el, injectStyles } from './ui.js'
  * boolean toggles, plus one purely-informational row whose `type` is a
  * "custom renderer" function instead of a data-type string (see the file
  * header for the verified source references).
- * @property {string} id - Dot-namespaced, e.g. `"cpsb.autoQueue"`.
+ * @property {string} id - Dot-namespaced, e.g. `"cpsb.showUpgradeBanner"`.
  * @property {string} name - Row label in the settings panel.
  * @property {"boolean" | ((name: string, setter: (v: unknown) => void, value: unknown, attrs?: Record<string, unknown>) => HTMLElement)} type
  * @property {boolean | string} defaultValue
@@ -81,24 +83,6 @@ function renderVersionRow() {
  * @type {CpsbSettingParams[]}
  */
 export const SETTINGS = [
-  {
-    id: 'cpsb.autoQueue',
-    name: 'Re-queue the workflow when an edit returns',
-    type: 'boolean',
-    defaultValue: true,
-    category: ['Photoshop Bridge', 'General', 'Re-queue after edit'],
-    tooltip:
-      'When on: an edit from a Load Image or Load PSD node automatically ' +
-      're-queues the workflow — ComfyUI’s own caching means only the ' +
-      'changed node and whatever is downstream of it actually re-run, not ' +
-      'the whole graph. When off: the edit still lands on the node right ' +
-      'away, but silently — nothing re-runs until you queue the workflow ' +
-      'yourself. Has no effect on Edit in Photoshop, Annotate for Edit, or ' +
-      'Compose Layers to PSD — those re-queue automatically only when their ' +
-      'own mode widget is set to "Re-run on every save", independent of this ' +
-      'setting. Run Photoshop Action has no mode widget and always waits for ' +
-      'the Action to finish, so this setting does not affect it either.'
-  },
   {
     id: 'cpsb.showUpgradeBanner',
     name: 'Show Photoshop panel upgrade banner',
@@ -160,13 +144,6 @@ function writeBooleanSetting(id, value) {
   } catch (error) {
     warn(`failed to write setting "${id}"`, error)
   }
-}
-
-/**
- * @returns {boolean} Current value of `cpsb.autoQueue` (default `true`).
- */
-export function getAutoQueue() {
-  return readBooleanSetting('cpsb.autoQueue', true)
 }
 
 /**
